@@ -1,0 +1,14 @@
+===SYSTEM===
+You are a careful technical assistant. Answer directly and concisely.
+===PROMPT===
+I am debugging a performance problem in a C server and I want your help reasoning about it. The server accepts connections on a single listening socket, hands each connection to a worker thread from a fixed pool of sixteen threads, and each worker parses a request, looks up a key in a shared hash table protected by a reader-writer lock, serialises a response into a per-connection buffer, and writes it back. Under light load the median response time is about two hundred microseconds and the ninety-ninth percentile is about four hundred microseconds. Under heavy load, at around forty thousand requests per second, the median stays near two hundred and fifty microseconds but the ninety-ninth percentile jumps to eleven milliseconds, and the machine is only about sixty percent busy across all cores. Walk me through the most likely causes of a tail of that shape, in order of how much I should suspect them, and say which measurement I should take first and why.
+===PROMPT===
+Explain how a CPU cache works, why there are several levels of it, and what a programmer can actually do about it. Be concrete about the mechanism rather than giving general advice.
+===PROMPT===
+What is the difference between a mutex, a spinlock and a reader-writer lock, and when would each one be the wrong choice? I care about the failure modes, not the definitions.
+===PROMPT===
+I have a build that works on Linux and fails to link on macOS with duplicate symbol errors for a handful of small helper functions defined in a header. Explain what is actually different between the two toolchains here, and give me the fix I should prefer and the fixes I should not.
+===PROMPT===
+Summarise, for someone who knows C but not machine learning, what a key-value cache is in a transformer, why it grows with context length, and what the practical consequences are for a machine with limited memory.
+===PROMPT===
+I am choosing between storing a time series as one row per sample in a relational table and as one row per hour with a binary blob of samples. The workload is heavy append, occasional range scan over a day, and rare single-sample lookup. Which would you choose and what would change your mind?

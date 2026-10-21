@@ -1,0 +1,165 @@
+# Binaries.
+# `pantheon` is now a SYMLINK to the per-backend binary the last build produced
+# (Makefile: PN_BIN / PN_COMPAT_BIN); each backend also writes its own file, so
+# a TT build can no longer overwrite a deployed CUDA one. All of them are
+# ignored, and the combination names too, so a `make USE_CUDA=1 USE_TT=1` tree
+# stays clean.
+pantheon
+pantheon-cpu
+pantheon-cuda
+pantheon-tt
+pantheon-metal
+pantheon-cuda-tt
+pantheon-cuda-metal
+pantheon-tt-metal
+pantheon-cuda-tt-metal
+tests/test_backend_guard
+tests/test_build
+tests/test_graph_capture_concurrency
+tests/test_attn_ring_retry
+tests/test_graph_capture_retry
+tests/test_gguf
+tests/test_arena
+tests/test_qmv
+tests/test_simd
+tests/test_chat
+tests/test_chat_request
+tests/test_tool_calling
+tests/test_tool_call_defects
+tests/test_tool_call_truncation
+tests/test_empty_argument
+tests/test_frame_capture
+tests/test_tool_grammar
+tests/test_tool_grammar_json
+tests/test_grammar_spec_chooser
+tests/test_grammar_mask_shortlist
+tests/test_grammar_topn_sampler
+tests/test_serve_emitter
+tests/test_tool_call_stream
+tests/test_repetition_loop_detector
+tests/test_registry
+tests/test_base64
+tests/test_session_affinity
+tests/test_session_watch
+tests/test_serve_shutdown
+tests/test_bs_load
+tests/test_sampler_parity
+tests/test_bpe_pretokenize
+tests/test_rwkvx
+
+# Debug symbols
+*.dSYM/
+
+# Object files
+*.o
+
+# macOS
+.DS_Store
+
+# TeamIDE: only what its PM reads from git is tracked -- project.yml and the
+# tasks/plans/notes/agents markdown (TeamIDE reads the kanban via `git ls-tree`,
+# so a blanket .teamide/ rule would hide it). Everything else under .teamide/ is
+# machine- or session-specific: subrepos.json (per-user clone URLs), chat
+# history, activity log, agent runs and reports, caches.
+.teamide/*
+!.teamide/project.yml
+!.teamide/tasks/
+!.teamide/plans/
+!.teamide/notes/
+!.teamide/agents/
+
+# qwen35moe test binaries (sources tracked, binaries not)
+tests/test_qwen35moe
+tests/test_qwen35moe_metal_coverage
+tests/test_qwen35moe_metal_coverage_fake
+
+# qwen35moe golden-vector generator binary (source + generated goldens tracked)
+tests/gen_golden_qwen35
+
+# Accelerator-parity harness binaries (sources tracked, binaries not)
+tests/test_chat_parity_gate
+tests/test_prefix_projection
+
+# qwen35moe GPU-vs-CPU parity harness binary (source tracked, binary not)
+tests/test_kernel_parity
+
+# 2-die barswap context-swap smoke test binary (source tracked, binary not)
+tests/test_2die_swap
+tests/bench_batch_decode
+tests/test_batch_decode_correct
+tests/test_batch_decoder
+
+# quality-eval driver binary + run artifacts (source, prompts, corpus tracked)
+tests/eval_ppl
+evals/out/
+
+# MemoryAware unit-test binary (source tracked, binary not)
+tests/test_memwatch
+tests/test_die_manager
+tests/test_model_registry
+tests/test_model_unload_reclaim
+# A4 embed-row unit-test binary (source tracked, binary not)
+tests/test_embed_row
+
+# Serve-scheduler + PC-batched gate binaries (source tracked, binary not)
+tests/test_serve_sched_qwen35
+tests/test_serve_sched_prefix_cache
+tests/test_prefix_cache_qwen35
+tests/bench_serve_prefix_cache
+tests/test_prefix_cache_sys
+
+# Local agent/editor notes; deliberately untracked.
+CLAUDE.md
+
+# Compiled test binaries (source tracked, binary not)
+tests/test_response_format_grammar
+tests/test_sampling_modifiers
+
+# Build artifacts (were in .git/info/exclude, which is local-only and never cloned)
+/libpantheon.a
+/build/
+
+# Model weights — multi-GB GGUFs land here. Never track.
+/models/
+
+# Foundry: the public tree carries it as a git submodule at ./foundry; a private
+# checkout may use a local symlink there instead, which must never be tracked.
+# The Makefile finds Foundry at FOUNDRY=<path>, else ./foundry, else ../foundry.
+
+# Plans, specs and benchmark write-ups live outside this repo. Symlinked in
+# for local convenience; never tracked or published here.
+/plans
+__pycache__/
+tests/bench_sampler_temp_delta
+tests/test_sparse_sampler_identity
+tests/test_topn_row_exact
+tests/test_grammar_arm_window
+tests/test_gdn_layout
+tests/test_tt_column_runs
+tests/test_qwen35_ckpt_band
+
+# Compiled test binaries. This used to be one line per test, so every NEW test
+# was untracked until someone remembered to add it -- and a `git add tests/`
+# then swept 2.8 MB of build artifacts into a commit. Pattern, not a roll-call.
+tests/test_*
+tests/bench_*
+tests/gen_golden_*
+!tests/*.c
+!tests/*.h
+
+# Parity-gate dumps and logs (L11 Mac CPU oracle): large, regenerable
+tests/parity_out/
+
+# Claude Code hooks are generated per machine by TeamIDE (they list local paths).
+.claude/hooks/
+
+# bench_ngram_accept --generate output (recorded token streams); make your own.
+tests/data/ngram_accept_dumps/
+
+# checkpoint-ceiling round captures (Mac side)
+tests/serve_prefix_think_ckpt/out/
+# toolcall stream probe captures
+tests/serve_toolcall_stream/out/
+# required-with-thinking proof captures
+tests/serve_required_thinking/out/
+tests/serve_required_thinking/probe_bin/

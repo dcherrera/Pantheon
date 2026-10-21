@@ -1,0 +1,22 @@
+--- a/src/models/qwen35moe_forward_cuda.c
++++ b/src/models/qwen35moe_forward_cuda.c
+@@ -5859,6 +5859,10 @@
+         float krow[PN_QWEN35MOE_ATTN_HEAD_DIM_MAX];
+         float vrow[PN_QWEN35MOE_ATTN_HEAD_DIM_MAX];
+         if (!scores) return -1;
++        /* CAUSALITY RED ARM (tests/causality_red): the first pass stores every row of the
++         * batch, the second re-attends with each row reading the WHOLE batch -- rows read
++         * K/V written by later rows. Run with QWEN35_FLASH=0 so this path is taken. */
++        for (int red_pass = 0; red_pass < 2; red_pass++)
+         for (int t = 0; t < n; t++) {
+             int pos = pos0 + t;
+             int cache_pos = pos % max_seq;
+@@ -5884,7 +5888,7 @@
+                 }
+             }
+ 
+-            int seq_len = (pos + 1 < max_seq) ? pos + 1 : max_seq;
++            int seq_len = (pos0 + n < max_seq) ? pos0 + n : max_seq;
+             const float *qhost = hb_q + (size_t)t * attn_dim;
+             float *aout = aout_all + (size_t)t * attn_dim;
+             for (int qh = 0; qh < n_head; qh++) {

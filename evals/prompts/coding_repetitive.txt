@@ -1,0 +1,52 @@
+Add a one-line doc comment above each function and reproduce this C code otherwise unchanged:
+static int clamp_int(int value, int low, int high) {
+    if (value < low) return low;
+    if (value > high) return high;
+    return value;
+}
+static float clamp_float(float value, float low, float high) {
+    if (value < low) return low;
+    if (value > high) return high;
+    return value;
+}
+static double clamp_double(double value, double low, double high) {
+    if (value < low) return low;
+    if (value > high) return high;
+    return value;
+}
+%%
+Rename the variable `buf` to `buffer` everywhere and reproduce this C function otherwise unchanged:
+int read_config_file(const char *path, char *buf, size_t buf_len) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    size_t n = fread(buf, 1, buf_len - 1, f);
+    buf[n] = '\0';
+    fclose(f);
+    if (n == 0) return -1;
+    return (int)n;
+}
+%%
+Write C getter functions int get_width(const shape_t *s), int get_height(const shape_t *s), int get_depth(const shape_t *s), int get_stride(const shape_t *s), int get_offset(const shape_t *s) for a struct shape_t with fields width, height, depth, stride, offset. Each getter returns the matching field.
+%%
+Continue this pattern up to case 9, keeping the exact same formatting:
+switch (digit) {
+case 0: return "zero";
+case 1: return "one";
+case 2: return "two";
+%%
+Translate this Python function to JavaScript, keeping the same names and structure:
+def sum_even_numbers(numbers):
+    total = 0
+    for number in numbers:
+        if number % 2 == 0:
+            total = total + number
+    return total
+%%
+Fix the off-by-one bug (the loop should include the last element) and reproduce this C function otherwise unchanged:
+float sum_array(const float *values, int count) {
+    float total = 0.0f;
+    for (int i = 0; i < count - 1; i++) {
+        total += values[i];
+    }
+    return total;
+}

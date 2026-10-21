@@ -1,0 +1,133 @@
+Write a C function that reverses a null-terminated string in place.
+%%
+Write a Python function that returns the n-th Fibonacci number iteratively.
+%%
+Complete this C function:
+int clamp(int v, int lo, int hi) {
+%%
+This C code crashes. Find the bug:
+char *dup = malloc(strlen(s));
+strcpy(dup, s);
+%%
+Write a bash one-liner that counts the number of lines containing "ERROR" in all .log files under /var/log.
+%%
+Explain what this code does:
+x = x ^ y; y = x ^ y; x = x ^ y;
+%%
+Write a SQL query that returns the three highest-paid employees per department from a table employees(id, name, dept, salary).
+%%
+Debug this Python:
+def add_item(item, items=[]):
+    items.append(item)
+    return items
+Why does the list grow across calls?
+%%
+Write a JavaScript function debounce(fn, ms) from scratch.
+%%
+Complete this Python function:
+def binary_search(arr, target):
+    lo, hi = 0, len(arr) - 1
+%%
+You have a tool named get_weather that takes {"city": string}. The user asks: "Do I need an umbrella in Paris today?" Respond with the tool call you would make, as JSON.
+%%
+You have tools read_file(path) and write_file(path, content). The user says: "Append a copyright line to LICENSE". List the tool calls you would make, in order, as JSON.
+%%
+Write a C function that computes the dot product of two float arrays of length n.
+%%
+What is wrong with this loop?
+for (unsigned i = 10; i >= 0; i--) printf("%u\n", i);
+%%
+Write a Python generator that yields all primes below a given limit using a sieve.
+%%
+Explain the difference between a mutex and a semaphore in two sentences.
+%%
+Write a git command that shows the diff of the last commit only.
+%%
+Refactor this to remove the repeated condition:
+if (a > 0) { x = 1; }
+if (a > 0) { y = 2; }
+if (a > 0) { z = 3; }
+%%
+Write a C function int popcount(uint32_t v) without using compiler builtins.
+%%
+What does the volatile keyword mean in C and when is it required?
+%%
+A farmer has 17 sheep. All but 9 run away. How many sheep are left?
+%%
+If a train travels 60 km in 45 minutes, what is its average speed in km/h?
+%%
+I have two ropes that each take exactly one hour to burn, but they burn unevenly. How can I measure 45 minutes?
+%%
+Which is larger: 2^10 or 10^3? Show your reasoning briefly.
+%%
+Alice is taller than Bob. Bob is taller than Carol. Carol is taller than Dave. Who is the second tallest?
+%%
+A bat and a ball cost $1.10 together. The bat costs $1.00 more than the ball. How much does the ball cost?
+%%
+What is 17 * 23? Compute it step by step.
+%%
+If today is Wednesday, what day of the week will it be in 100 days?
+%%
+Three friends split a restaurant bill of $75 equally, then add a 20% tip on the total. How much does each person pay?
+%%
+I am thinking of a number. Double it, add 10, and you get 36. What is my number?
+%%
+Sort these numbers in ascending order and explain your method: 34, 7, 23, 32, 5, 62.
+%%
+A snail climbs 3 meters up a wall each day but slides down 2 meters each night. The wall is 10 meters tall. On which day does it reach the top?
+%%
+How many times do the hour and minute hands of a clock overlap in 12 hours?
+%%
+If 5 machines take 5 minutes to make 5 widgets, how long do 100 machines take to make 100 widgets?
+%%
+What is the sum of the interior angles of a hexagon?
+%%
+Convert 0.625 to a fraction in lowest terms, showing the steps.
+%%
+A rectangle has perimeter 20 and area 24. What are its side lengths?
+%%
+Is 91 a prime number? Explain how you checked.
+%%
+You flip two fair coins. What is the probability of getting at least one head?
+%%
+Which weighs more: a kilogram of feathers or a kilogram of steel? Explain in one sentence.
+%%
+Explain photosynthesis to a 10-year-old in three sentences.
+%%
+Write a haiku about a mountain at dawn.
+%%
+What are three practical tips for improving sleep quality?
+%%
+Summarize the plot of Romeo and Juliet in two sentences.
+%%
+What is the capital of Australia, and why is it not Sydney?
+%%
+Draft a short, polite email declining a meeting invitation because of a schedule conflict.
+%%
+What is the difference between weather and climate?
+%%
+Recommend a simple dinner I can cook in 20 minutes with chicken, rice, and frozen vegetables.
+%%
+Explain the rules of rock-paper-scissors to someone who has never played.
+%%
+What causes seasons on Earth?
+%%
+Give me three creative names for a coffee shop next to a library.
+%%
+Translate "Good morning, how are you today?" into French and Spanish.
+%%
+What is a black hole, in plain language?
+%%
+List the planets of the solar system in order from the Sun.
+%%
+Write a two-sentence bedtime story about a robot who learns to paint.
+%%
+Why does bread rise when you bake it?
+%%
+What should I pack for a weekend hiking trip in cool weather?
+%%
+Explain inflation in economics using a simple everyday example.
+%%
+What is the difference between a virus and a bacterium?
+%%
+Describe the water cycle in four short steps.

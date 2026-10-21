@@ -1,0 +1,14 @@
+===SYSTEM===
+You are a writer. Produce the requested prose directly, with no preamble and no commentary.
+===PROMPT===
+Write the opening of a short story about a lighthouse keeper who discovers that the ship she has been signalling for thirty years does not exist.
+===PROMPT===
+Write a short essay arguing that the most important property of a tool is not its power but how quickly a person can tell that it has gone wrong.
+===PROMPT===
+Describe a city at four in the morning from the point of view of someone who has just finished a night shift and is not ready to go home.
+===PROMPT===
+Write a letter from an engineer to the person who will maintain her work after she is gone. She does not know who they are. She is not sentimental about it.
+===PROMPT===
+Write a scene in which two people who have known each other for a long time have an argument about something neither of them cares about, because the thing they do care about cannot be said.
+===PROMPT===
+Write a short piece of nature writing about a river in a place where the river is no longer the most important thing that happens there.

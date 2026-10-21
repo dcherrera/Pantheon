@@ -1,0 +1,13 @@
+--- a/src/accel/tt/pn_tt_attention.c
++++ b/src/accel/tt/pn_tt_attention.c
+@@ -194,6 +194,10 @@
+         free(constants);
+         return false;
+     }
++    /* CAUSALITY RED ARM (tests/causality_red): zero the 32 causal tiles, so every row of a
++     * prefill chunk attends to the whole chunk, its own future included. */
++    memset(constants + (size_t)FT_TT_OP_ATTENTION_CONST_CAUSAL_TILE * PN_TT_TILE_BF16, 0,
++           (size_t)32u * PN_TT_TILE_BF16);
+     ok = pn_tt_dram_alloc_zeroed(device, bytes, &device->attn_const_bank,
+                                  &device->attn_const_address) == 0 &&
+          pn_tt_write_dram(device, device->attn_const_bank, device->attn_const_address,

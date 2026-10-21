@@ -1,0 +1,425 @@
+/* SPDX-License-Identifier: AGPL-3.0-or-later */
+/* Copyright (C) 2026 David (Corey) Herrera */
+/**
+ * @file serve_prompt_tokens.c
+ * @brief Implementation of the ChatML prompt tokenizer and the client-re-render
+ *        projection (see serve_prompt_tokens.h).
+ *
+ * @status Complete.
+ * @issues None
+ * @todo None
+ */
+
+#include "serve_prompt_tokens.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "../core/bpe_pretokenize.h"
+#include "../core/chat.h"
+#include "../core/engine.h"
+#include "json_reader.h"
+#include "tokenizer/tokenizer.h"
+
+/* ============================================================
+ * Token builder — mirrors src/core/chat.c's ChatML(+think) layout, but over a
+ * full OpenAI messages[] array (multi-turn history), reusing the same
+ * tokenization primitives (special-token lookup + qwen35 BPE text encode).
+ * ============================================================ */
+
+typedef struct {
+    uint32_t *tokens;
+    int len;
+    int cap;
+} token_builder;
+
+static bool tb_init(token_builder *tb)
+{
+    tb->cap = 256;
+    tb->len = 0;
+    tb->tokens = malloc((size_t)tb->cap * sizeof(uint32_t));
+    return tb->tokens != NULL;
+}
+
+static void tb_push(token_builder *tb, uint32_t id)
+{
+    if (tb->len >= tb->cap) {
+        tb->cap *= 2;
+        uint32_t *grown = realloc(tb->tokens, (size_t)tb->cap * sizeof(uint32_t));
+        if (!grown) return;
+        tb->tokens = grown;
+    }
+    tb->tokens[tb->len++] = id;
+}
+
+static void tb_push_special(token_builder *tb, ft_tokenizer *tok, const char *s)
+{
+    int id = ft_token_to_id(tok, s);
+    if (id >= 0) tb_push(tb, (uint32_t)id);
+}
+
+/* Encode plain text with the model's tokenizer (qwen35 BPE for the mini, else
+ * the SentencePiece path) and append the ids. */
+static void tb_push_text(token_builder *tb, ft_tokenizer *tok, const char *text)
+{
+    if (!text || !*text) return;
+    int n = 0;
+    int *ids = (ft_get_model_type(tok) == 0)
+                   ? pn_bpe_encode(tok, text, &n)
+                   : ft_encode(tok, text, &n);
+    if (!ids) return;
+    for (int i = 0; i < n; i++)
+        if (ids[i] >= 0) tb_push(tb, (uint32_t)ids[i]);
+    free(ids);
+}
+
+/* The tool-call wrapper.  The vocab holds these as SINGLE special ids
+ * (nex-n2-mini: "<tool_call>" is id 248058), and tb_push_text would byte-encode
+ * the rendered STRING into the four ordinary ids "<","tool","_call",">".  Both
+ * are legal tokenizations of the same characters, so the ONLY thing that matters
+ * is that the prompt builder and the re-render projection pick the same one —
+ * which they do by both going through sg_encode_assistant_content.  Only
+ * assistant turns: a user/tool message that happens to contain the literal text
+ * stays ordinary text. */
+static const char *const TOOL_WRAPPER_MARKERS[] = { "<tool_call>", "</tool_call>" };
+#define TOOL_WRAPPER_MARKER_COUNT \
+    (sizeof(TOOL_WRAPPER_MARKERS) / sizeof(TOOL_WRAPPER_MARKERS[0]))
+
+/* Encode assistant-turn content, emitting any tool-call wrapper marker as its
+ * special id.  A marker the vocab does not know (id < 0) is left alone and
+ * encodes as ordinary text, so a model without these tokens tokenizes
+ * byte-identically to a plain tb_push_text. */
+static void tb_push_assistant_content(token_builder *tb, ft_tokenizer *tok,
+                                      const char *content)
+{
+    if (!content || !*content) return;
+    const char *pos = content;
+    while (*pos) {
+        const char *best = NULL;
+        size_t best_len = 0;
+        int best_id = -1;
+        for (size_t i = 0; i < TOOL_WRAPPER_MARKER_COUNT; i++) {
+            int id = ft_token_to_id(tok, TOOL_WRAPPER_MARKERS[i]);
+            if (id < 0) continue;
+            const char *at = strstr(pos, TOOL_WRAPPER_MARKERS[i]);
+            if (at && (!best || at < best)) {
+                best = at;
+                best_len = strlen(TOOL_WRAPPER_MARKERS[i]);
+                best_id = id;
+            }
+        }
+        if (!best) {
+            tb_push_text(tb, tok, pos);
+            return;
+        }
+        if (best > pos) {
+            size_t head_len = (size_t)(best - pos);
+            char *head = malloc(head_len + 1);
+            if (head) {
+                memcpy(head, pos, head_len);
+                head[head_len] = '\0';
+                tb_push_text(tb, tok, head);
+                free(head);
+            }
+        }
+        tb_push(tb, (uint32_t)best_id);
+        pos = best + best_len;
+    }
+}
+
+/* Emit one "<|im_start|>{role}\n{content}<|im_end|>\n" block.  An assistant
+ * turn's content goes through tb_push_assistant_content so a rendered tool call
+ * reproduces the ids the projection recorded (see TOOL_WRAPPER_MARKERS). */
+static void tb_push_turn(token_builder *tb, ft_tokenizer *tok,
+                         const char *role, const char *content)
+{
+    char header[64];
+    snprintf(header, sizeof(header), "%s\n", role);
+    tb_push_special(tb, tok, "<|im_start|>");
+    tb_push_text(tb, tok, header);
+    if (strcmp(role, "assistant") == 0)
+        tb_push_assistant_content(tb, tok, content);
+    else
+        tb_push_text(tb, tok, content);
+    tb_push_special(tb, tok, "<|im_end|>");
+    tb_push_text(tb, tok, "\n");
+}
+
+/* Whitespace the streaming emitter left-trims off the head of each channel and
+ * that a resent think block therefore cannot recover from the text alone (see
+ * serve_emitter.c's em_emit).  These are the canonical Qwen/N2 separators the
+ * model itself emits: "\n" right after the forced <think>, "\n\n" after the
+ * "</think>" close. */
+static const char THINK_LEAD_WS[] = "\n";
+static const char THINK_TAIL_WS[] = "\n\n";
+
+/* Emit the think block of a HISTORY assistant turn — "<think>{reasoning}</think>"
+ * plus the separators the emitter trimmed — for a client that resent the
+ * reasoning verbatim.  <think> and </think> go in as SPECIAL ids: tb_push_text
+ * would byte-encode them as ordinary text and never reach id 248068.
+ *
+ * This is the ONE definition of that span.  Both the prompt builder (below) and
+ * the reasoning-bearing resume projection (sg_encode_history_think_block) go
+ * through it, for the same reason tb_push_assistant_content is shared — a
+ * second implementation is free to drift, and a one-token drift costs a full
+ * re-prefill. */
+static void tb_push_history_think_block(token_builder *tb, ft_tokenizer *tok,
+                                        const char *reasoning)
+{
+    tb_push_special(tb, tok, "<think>");
+    tb_push_text(tb, tok, THINK_LEAD_WS);
+    tb_push_text(tb, tok, reasoning);
+    tb_push_special(tb, tok, "</think>");
+    tb_push_text(tb, tok, THINK_TAIL_WS);
+}
+
+/* Emit one assistant turn whose reasoning the client resent verbatim:
+ * "<|im_start|>assistant\n<think>{reasoning}</think>{content}<|im_end|>\n". */
+static void tb_push_assistant_think_turn(token_builder *tb, ft_tokenizer *tok,
+                                         const char *reasoning,
+                                         const char *content)
+{
+    tb_push_special(tb, tok, "<|im_start|>");
+    tb_push_text(tb, tok, "assistant\n");
+    tb_push_history_think_block(tb, tok, reasoning);
+    tb_push_assistant_content(tb, tok, content);
+    tb_push_special(tb, tok, "<|im_end|>");
+    tb_push_text(tb, tok, "\n");
+}
+
+/* Emit a tool-result turn per the model's chat_template: a tool message is fed
+ * back inside a <tool_response> wrapper on a user turn, so multi-step tool loops
+ * reconstruct the prompt shape the model was trained on. */
+static void tb_push_tool_response(token_builder *tb, ft_tokenizer *tok,
+                                  const char *content)
+{
+    tb_push_special(tb, tok, "<|im_start|>");
+    tb_push_text(tb, tok, "user\n<tool_response>\n");
+    tb_push_text(tb, tok, content);
+    tb_push_text(tb, tok, "\n</tool_response>");
+    tb_push_special(tb, tok, "<|im_end|>");
+    tb_push_text(tb, tok, "\n");
+}
+
+bool sg_no_think_enabled(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("PANTHEON_NO_THINK");
+        cached = (e && e[0] == '1') ? 1 : 0;
+    }
+    return cached != 0;
+}
+
+bool sg_chat_style_is_think(int chat_style)
+{
+    return chat_style == PN_CHAT_CHATML_THINK ||
+           chat_style == PN_CHAT_CHATML_THINK_NL;
+}
+
+bool sg_thinking_suppressed(sg_thinking_mode mode)
+{
+    if (mode == SG_THINKING_OFF) return true;
+    if (mode == SG_THINKING_ON)  return false;
+    return sg_no_think_enabled();      /* SG_THINKING_DEFAULT → the env decides */
+}
+
+/* Push the forced generation prefill for the assistant turn about to be
+ * generated — the tokens the model did not choose.  Returns how many. */
+static int tb_push_generation_prefill(token_builder *tb, ft_tokenizer *tok,
+                                      int chat_style, sg_thinking_mode thinking)
+{
+    int before = tb->len;
+    if (sg_chat_style_is_think(chat_style) && sg_thinking_suppressed(thinking)) {
+        /* No-Think: prefill a CLOSED empty think block so a hybrid
+         * Think/No-Think model (MiniCPM5, saber-orch) skips reasoning and acts
+         * DIRECTLY.  These four pushes are byte-for-byte the Qwen3.x template's
+         * enable_thinking=false serialization ("<think>\n\n</think>\n\n"), which
+         * is the only reasoning control that family's template exposes — hence a
+         * BINARY switch and not a graded effort level.  Requested per-request via
+         * `enable_thinking`, or process-wide via PANTHEON_NO_THINK. */
+        tb_push_special(tb, tok, "<think>");
+        tb_push_text(tb, tok, "\n\n");
+        tb_push_special(tb, tok, "</think>");
+        tb_push_text(tb, tok, "\n\n");
+    } else if (chat_style == PN_CHAT_CHATML_THINK) {
+        tb_push_special(tb, tok, "<think>");
+    } else if (chat_style == PN_CHAT_CHATML_THINK_NL) {
+        /* Bonsai-27B: the model's own template prefills '<think>\n' — the
+         * newline is part of the trained prefill.  Prefilling bare <think>
+         * leaves "\n\n</think>\n\n" (the template's NON-thinking serialization)
+         * as the natural greedy continuation, so the model deterministically
+         * closes the think block empty (Phase 3b bug). */
+        tb_push_special(tb, tok, "<think>");
+        tb_push_text(tb, tok, "\n");
+    }
+    return tb->len - before;
+}
+
+uint32_t *sg_build_prompt_tokens(struct pn_model *model,
+                                 const sg_message *messages, int n_messages,
+                                 sg_thinking_mode thinking,
+                                 int *n_out, int *sys_len_out,
+                                 int *think_prefill_out)
+{
+    ft_tokenizer *tok = model->tokenizer;
+    token_builder tb;
+    if (sys_len_out) *sys_len_out = 0;
+    if (think_prefill_out) *think_prefill_out = 0;
+    if (!tb_init(&tb)) return NULL;
+
+    /* Templates that lead with {{ bos_token }} (e.g. MiniCPM5) need BOS at
+     * position 0 — the model was trained with it and degenerates to whitespace
+     * without it.  Detected at load (model->chat_add_bos). */
+    if (model->chat_add_bos) {
+        int bid = ft_bos_id(tok);
+        if (bid >= 0) tb_push(&tb, (uint32_t)bid);
+    }
+
+    for (int i = 0; i < n_messages; i++) {
+        const char *role = messages[i].role ? messages[i].role : "user";
+        const char *content = messages[i].content ? messages[i].content : "";
+        const char *reasoning = messages[i].reasoning;
+        if (strcmp(role, "tool") == 0)
+            tb_push_tool_response(&tb, tok, content);
+        else if (reasoning && *reasoning && strcmp(role, "assistant") == 0 &&
+                 sg_chat_style_is_think(model->chat_style))
+            tb_push_assistant_think_turn(&tb, tok, reasoning, content);
+        else
+            tb_push_turn(&tb, tok, role, content);
+        if (i == 0 && sys_len_out && strcmp(role, "system") == 0)
+            *sys_len_out = tb.len;
+    }
+
+    tb_push_special(&tb, tok, "<|im_start|>");
+    tb_push_text(&tb, tok, "assistant\n");
+    int prefill_n = tb_push_generation_prefill(&tb, tok, model->chat_style,
+                                               thinking);
+    if (think_prefill_out) *think_prefill_out = prefill_n;
+    *n_out = tb.len;
+    return tb.tokens;
+}
+
+uint32_t *sg_encode_history_think_block(struct pn_model *model,
+                                        const char *reasoning, int *n_out)
+{
+    *n_out = 0;
+    if (!model || !reasoning || !reasoning[0]) return NULL;
+    /* Match sg_build_prompt_tokens exactly: a non-think chat style renders an
+     * assistant history turn WITHOUT a think block whatever `reasoning` says, so
+     * projecting one here would predict a prompt the builder never produces. */
+    if (!sg_chat_style_is_think(model->chat_style)) return NULL;
+    token_builder tb;
+    if (!tb_init(&tb)) return NULL;
+    tb_push_history_think_block(&tb, model->tokenizer, reasoning);
+    if (tb.len <= 0) {
+        free(tb.tokens);
+        return NULL;
+    }
+    *n_out = tb.len;
+    return tb.tokens;
+}
+
+uint32_t *sg_encode_assistant_content(struct pn_model *model, const char *text,
+                                      int *n_out)
+{
+    *n_out = 0;
+    if (!model || !text || !text[0]) return NULL;
+    token_builder tb;
+    if (!tb_init(&tb)) return NULL;
+    tb_push_assistant_content(&tb, model->tokenizer, text);
+    if (tb.len <= 0) {
+        free(tb.tokens);
+        return NULL;
+    }
+    *n_out = tb.len;
+    return tb.tokens;
+}
+
+/* ============================================================
+ * Client-re-render projection
+ * ============================================================ */
+
+/* Re-render the serve's OWN parsed calls into assistant-history syntax, through
+ * the very function the next request's `tool_calls` array will go through.
+ *
+ * The detour via JSON is deliberate and is the whole point: the calls are put
+ * back into the exact OpenAI wire shape the reply is about to carry, then handed
+ * to tc_render_assistant_tool_calls.  Rendering them any other way would be a
+ * SECOND implementation of the history syntax, free to drift from the one that
+ * actually runs next turn — and a one-token drift costs a full re-prefill.
+ * Returns an owned string, or NULL on OOM / no calls. */
+static char *render_own_calls_as_history(const tc_tool_call *calls, int n,
+                                         bool content_empty, tc_dialect dialect)
+{
+    if (!calls || n <= 0) return NULL;
+    json_writer jw;
+    if (!jw_init(&jw)) return NULL;
+    jw_raw(&jw, "[");
+    for (int i = 0; i < n; i++) {
+        if (i) jw_raw(&jw, ",");
+        jw_raw(&jw, "{\"id\":");
+        jw_string(&jw, calls[i].id ? calls[i].id : "");
+        jw_raw(&jw, ",\"type\":\"function\",\"function\":{\"name\":");
+        jw_string(&jw, calls[i].name ? calls[i].name : "");
+        jw_raw(&jw, ",\"arguments\":");
+        jw_string(&jw, calls[i].arguments ? calls[i].arguments : "{}");
+        jw_raw(&jw, "}}");
+    }
+    jw_raw(&jw, "]");
+    char *rendered = NULL;
+    if (!jw.oom) {
+        jr_value *dom = jr_parse(jw.data);
+        rendered = tc_render_assistant_tool_calls(dom, content_empty, dialect);
+        jr_free(dom);
+    }
+    jw_free(&jw);
+    return rendered;
+}
+
+/* Concatenate the turn's content and its rendered calls exactly as
+ * combine_assistant_tool_calls (openai_chat.c) will next turn.  Returns an owned
+ * string, or NULL on OOM. */
+static char *join_content_and_calls(const char *content, const char *calls_xml)
+{
+    size_t clen = content ? strlen(content) : 0;
+    size_t xlen = calls_xml ? strlen(calls_xml) : 0;
+    char *joined = malloc(clen + xlen + 1);
+    if (!joined) return NULL;
+    if (clen) memcpy(joined, content, clen);
+    if (xlen) memcpy(joined + clen, calls_xml, xlen);
+    joined[clen + xlen] = '\0';
+    return joined;
+}
+
+uint32_t *sg_project_client_rerender(struct pn_model *model,
+                                     const char *content, const char *tool_raw,
+                                     const void *tools, tc_dialect dialect,
+                                     int *n_out)
+{
+    *n_out = 0;
+    if (!model) return NULL;
+    if (!content) content = "";
+
+    char *calls_xml = NULL;
+    if (tool_raw && tool_raw[0]) {
+        tc_tool_call *calls = NULL;
+        int n_calls = 0;
+        if (tc_parse_tool_calls(tool_raw, (const jr_value *)tools, dialect,
+                                &calls, &n_calls) == 0 && n_calls > 0)
+            calls_xml = render_own_calls_as_history(calls, n_calls,
+                                                    content[0] == '\0', dialect);
+        tc_tool_calls_free(calls, n_calls);
+        /* A diverted block that will not parse back is a turn whose re-render we
+         * cannot predict — disable the rung rather than record a guess. */
+        if (!calls_xml) return NULL;
+    }
+
+    char *joined = join_content_and_calls(content, calls_xml);
+    free(calls_xml);
+    if (!joined) return NULL;
+    uint32_t *ids = sg_encode_assistant_content(model, joined, n_out);
+    free(joined);
+    return ids;
+}

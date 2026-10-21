@@ -1,0 +1,43 @@
+Write a C function that reverses a null-terminated string in place.
+%%
+This C code crashes. Find the bug:
+char *dup = malloc(strlen(s));
+strcpy(dup, s);
+%%
+Write a SQL query that returns the three highest-paid employees per department from a table employees(id, name, dept, salary).
+%%
+Complete this Python function:
+def binary_search(arr, target):
+    lo, hi = 0, len(arr) - 1
+%%
+Write a C function that computes the dot product of two float arrays of length n.
+%%
+Explain the difference between a mutex and a semaphore in two sentences.
+%%
+Write a C function int popcount(uint32_t v) without using compiler builtins.
+%%
+If a train travels 60 km in 45 minutes, what is its average speed in km/h?
+%%
+Alice is taller than Bob. Bob is taller than Carol. Carol is taller than Dave. Who is the second tallest?
+%%
+If today is Wednesday, what day of the week will it be in 100 days?
+%%
+Sort these numbers in ascending order and explain your method: 34, 7, 23, 32, 5, 62.
+%%
+If 5 machines take 5 minutes to make 5 widgets, how long do 100 machines take to make 100 widgets?
+%%
+A rectangle has perimeter 20 and area 24. What are its side lengths?
+%%
+Which weighs more: a kilogram of feathers or a kilogram of steel? Explain in one sentence.
+%%
+What are three practical tips for improving sleep quality?
+%%
+Draft a short, polite email declining a meeting invitation because of a schedule conflict.
+%%
+Explain the rules of rock-paper-scissors to someone who has never played.
+%%
+Translate "Good morning, how are you today?" into French and Spanish.
+%%
+Write a two-sentence bedtime story about a robot who learns to paint.
+%%
+Explain inflation in economics using a simple everyday example.

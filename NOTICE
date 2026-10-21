@@ -1,0 +1,54 @@
+Pantheon
+Copyright (C) 2026 David (Corey) Herrera and the Pantheon contributors.
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option) any
+later version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE.  See the GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License along
+with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+The full license text is in LICENSE.
+SPDX-License-Identifier: AGPL-3.0-or-later
+
+
+Contributions
+-------------
+Contributions are accepted under the Contributor License Agreement in CLA.md
+(CLA-CORPORATE.md for organizations), with a Developer Certificate of Origin
+sign-off on every commit. Contributors retain copyright in their contributions.
+The signature roster is .cla/signatures.md.
+
+
+Third-party code
+----------------
+Pantheon has no external dependencies. It links Foundry
+(https://git.teamide.dev/David/Foundry.git), which is under the same AGPL-3.0
+terms and the same copyright holder.
+
+src/accel/tt/pn_tt_device.c uses the ARC telemetry tag numbers and names
+defined by the TelemetryTag enumeration of tt-umd
+(https://github.com/tenstorrent/tt-umd), (c) 2025 Tenstorrent Inc.,
+licensed under the Apache License, Version 2.0. Only those numbers and names
+are used; no tt-umd source code is included. A copy of the Apache License 2.0
+is in LICENSES/Apache-2.0.txt.
+
+Model weights executed by Pantheon carry their own licenses, entirely separate
+from this one and entirely between you and whoever published them.
+
+
+Trademarks
+----------
+No right is granted to use the "Pantheon" name or any associated logo to name or
+promote a derivative product. Factual statements that your product uses Pantheon
+are fine.
+
+
+Contact
+-------
+coreyh55@gmail.com

@@ -1,0 +1,17 @@
+# The two documents of chat_parity_corpus.txt that carry an `S` system block, alone.
+#
+# A per-document perplexity ratio depends on NOTHING outside its own document — parity_score
+# accumulates per document and the ratio is that document's accel perplexity over its own CPU
+# perplexity — so doc 0 and doc 1 here read exactly what they read in the full corpus, and are
+# directly comparable to the recorded 0.95728 / 1.03282 (host arm) and 1.90783 / 1.84081
+# (card arm). The corpus MEAN and the verdict are not comparable and must not be quoted as if
+# they were: this corpus exists to price an instrument arm at half the card time, not to
+# replace the gate.
+#
+# Texts are copied verbatim from chat_parity_corpus.txt.
+
+S	You are a helpful assistant. Answer directly and concisely. Do not think out loud.
+U	Explain how a CPU cache works.
+
+S	You are a careful technical assistant. Answer directly and concisely.
+U	I am debugging a performance problem in a C server and I want your help reasoning about it. The server accepts connections on a single listening socket, hands each connection to a worker thread from a fixed pool of sixteen threads, and each worker parses a request, looks up a key in a shared hash table protected by a reader-writer lock, serialises a response into a per-connection buffer, and writes it back. Under light load the median response time is about two hundred microseconds and the ninety-ninth percentile is about four hundred microseconds, which is fine. Under heavy load, at around forty thousand requests per second, the median stays near two hundred and fifty microseconds but the ninety-ninth percentile jumps to eleven milliseconds, and the machine is only about sixty percent busy across all cores, so it is not simply saturated. I have already checked that the network interface is not dropping packets and that the socket receive queues are not overflowing. The hash table is read-mostly: writes are under one percent of operations. Each response buffer is allocated from a global allocator on every request and freed at the end. The worker threads are not pinned to cores. Profiling with a sampling profiler shows about thirty percent of cycles inside the lock acquisition path, but the profile is flat and does not obviously point at one caller. Please walk me through the most likely causes of a tail latency of that shape, in order of how much I should suspect them, explain what evidence would confirm or rule out each one, and tell me which measurement I should take first and why. Be concrete about the mechanism in each case rather than giving general advice, and say explicitly which of these could produce a tail that is fifty times the median while leaving the median almost unchanged.
