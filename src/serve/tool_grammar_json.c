@@ -16,7 +16,8 @@
  *   ↵```                          (fence close, iff the fence was opened)
  *
  * with NAME ∈ the tool names, the "function" key spellable also as "name",
- * "arguments" also as "parameters", KEY ∈ that tool's parameter names, EVERY
+ * "arguments" also as "parameters", KEY ∈ that tool's parameter names not yet
+ * written in this call (no ',' once every key is written), EVERY
  * `required` key present, and each <value> typed to its schema (string → a
  * quoted JSON string, integer/number → a numeric literal, boolean → true/false,
  * object/array → a balanced {…}/[…], else a quoted string).  An empty
@@ -63,6 +64,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "field_pattern.h"
+#include "reasoned_reply_tracker.h"
+#include "think_close_rule.h"
 #include "tool_param_empty_value_rule.h"
 
 /* ── compiled string set (tool names, or one tool's parameter keys) ── */
@@ -89,6 +93,13 @@ typedef struct {
     bool      *forbids_empty; /* [keys.n] schema forbids an empty value for this
                                * key — tool_param_empty_value_rule.h */
     int        n_required;  /* count of required keys */
+    bool      *required_if_reasoned; /* [keys.n] named by the request's
+                               * `required_if_reasoned` and not already required
+                               * (tgj_require_if_reasoned); NULL = none */
+    int        n_required_if_reasoned;
+    bool      *string_typed; /* [keys.n] schema `type` is absent or "string" */
+    field_pattern **patterns; /* [keys.n] the request's `field_patterns` rule per
+                               * key (tgj_apply_field_patterns); NULL = none */
 } tgj_tool;
 
 struct tgj_grammar {
@@ -121,6 +132,7 @@ typedef enum {
 
 #define TGJ_NAME_MAX 256
 #define TGJ_MAX_ARGS 64      /* max distinct arg keys tracked per call */
+#define TGJ_STEER_MAX 32     /* longest forced literal tgj_steer installs */
 
 /* Largest `enum` compiled into a closed alternation.  A schema listing more
  * members than this keeps its plain type instead of the enum — the same
@@ -131,10 +143,12 @@ typedef enum {
 /* Reasoning grace budget — same rationale + value as the XML grammar. */
 #define TGJ_REASON_BUDGET 8192
 
+/* Whitespace a compelled opener may follow (tool_grammar.c TG_OPENER_WS_MAX). */
+#define TGJ_OPENER_WS_MAX 16
+
 /* Literals. */
 static const char FENCE_OPEN[]  = "```json";
 static const char FENCE_CLOSE[] = "```";
-static const char THINK_CLOSE[] = "</think>";
 static const char KEY_FUNCTION[] = "function";
 static const char KEY_NAME[]     = "name";
 static const char KEY_ARGS[]     = "arguments";
@@ -171,7 +185,10 @@ struct tgj_state {
      * once the block has closed. */
     bool      think_gated;
     int       think_term;      /* rolling-prefix length of "</think>" seen */
+    bool      think_close_token; /* only the "</think>" TOKEN closes reasoning */
     int       reason_chars;    /* grace char budget counter */
+    int       opener_ws;       /* whitespace chars taken before a compelled
+                                * opener (TGJ_OPENER_WS_MAX) */
 
     /* FREE-region opener tracker: matching the ```json fence OR a bare '{'. */
     int  free_fence;           /* chars of FENCE_OPEN matched (>=0) */
@@ -207,11 +224,33 @@ struct tgj_state {
                                 * stashed at TGJ_ARG_KEY, consumed at the closing
                                 * quote (tool_param_empty_value_rule.h) */
     int       val_depth;       /* nesting depth for object/array values */
+    /* FIELD PATTERN (tgj_apply_field_patterns) on the string value being
+     * emitted, stashed at TGJ_ARG_KEY; NULL = no rule.  The pattern judges the
+     * DECODED string, so escapes are decoded before their bytes are fed:
+     * `pat_hex_left` counts the \uXXXX digits still owed, `pat_unit` holds the
+     * code unit being read, `pat_high` a high surrogate waiting for its low
+     * half.  POD, so clone/copy carry it. */
+    const field_pattern *val_pattern;
+    fp_set    pat_live;
+    int       pat_hex_left;
+    unsigned  pat_unit;
+    unsigned  pat_high;
+    /* STEER (tgj_steer): a forced literal the next chars must spell, consumed
+     * one char at a time before the char is stepped as usual; steer_pos ==
+     * steer_len = none pending. */
+    char          steer_lit[TGJ_STEER_MAX];
+    unsigned char steer_len, steer_pos;
     bool      val_started;     /* the value's first structural char was seen */
 
     /* Arguments bookkeeping: which required keys are still outstanding. */
     bool key_done[TGJ_MAX_ARGS];   /* key i already emitted this call */
     int  required_left;            /* required keys not yet emitted */
+    /* This call owes the tool's `required_if_reasoned` keys too: the reply
+     * reasoned and this is its first call.  Set when the NAME is matched. */
+    bool owes_reasoned_keys;
+    /* Did the reply reason, and how many calls reached a NAME
+     * (reasoned_reply_tracker.h; watched only after tgj_watch_reasoning). */
+    reasoned_reply reply;
 };
 
 /* ── set helpers ── */
@@ -351,7 +390,9 @@ static bool build_tool_params(tgj_tool *t, const jr_value *fn) {
     t->enums = calloc((size_t)np, sizeof(tgj_set));
     t->required = calloc((size_t)np, sizeof(bool));
     t->forbids_empty = calloc((size_t)np, sizeof(bool));
-    if (!t->types || !t->enums || !t->required || !t->forbids_empty) return false;
+    t->string_typed = calloc((size_t)np, sizeof(bool));
+    if (!t->types || !t->enums || !t->required || !t->forbids_empty || !t->string_typed)
+        return false;
 
     for (int k = 0; k < np; k++) {
         const char *key = jr_object_key_at(props, k);
@@ -367,6 +408,7 @@ static bool build_tool_params(tgj_tool *t, const jr_value *fn) {
          * is absent or "string" — so this never contradicts the schema. */
         if (t->enums[idx].n > 0) t->types[idx] = TGJ_T_ENUM;
         t->forbids_empty[idx] = tool_param_forbids_empty_value(prop);
+        t->string_typed[idx] = !type || strcmp(type, "string") == 0;
         t->required[idx] = key_is_required(required, key);
         if (t->required[idx]) t->n_required++;
     }
@@ -412,7 +454,13 @@ void tgj_free(tgj_grammar *g) {
         set_free(&g->tools[i].keys);
         free(g->tools[i].types);
         free(g->tools[i].required);
+        free(g->tools[i].required_if_reasoned);
         free(g->tools[i].forbids_empty);
+        free(g->tools[i].string_typed);
+        if (g->tools[i].patterns) {
+            for (int k = 0; k < g->tools[i].keys.n; k++) fp_free(g->tools[i].patterns[k]);
+            free(g->tools[i].patterns);
+        }
     }
     free(g->tools);
     set_free(&g->names);
@@ -454,7 +502,65 @@ tgj_state *tgj_state_new_required(const tgj_grammar *g, bool think_open) {
     /* No open think block: the first generated char is already the answer,
      * so the call is compelled from token 0 (nothing to wait for). */
     if (!think_open) st->reasoning_ended = true;
+    else reasoned_reply_begin(&st->reply);
     return st;
+}
+
+void tgj_watch_reasoning(tgj_state *st) {
+    if (st) reasoned_reply_begin(&st->reply);
+}
+
+/* Mark `key` reasoned-only on one tool, unless the schema already requires it. */
+static bool mark_required_if_reasoned(tgj_tool *t, const char *key) {
+    int idx = set_exact_match(&t->keys, -1, key, (int)strlen(key));
+    if (idx < 0 || t->required[idx]) return true;
+    if (!t->required_if_reasoned) {
+        t->required_if_reasoned = calloc((size_t)t->keys.n, sizeof(bool));
+        if (!t->required_if_reasoned) return false;
+    }
+    if (!t->required_if_reasoned[idx]) t->n_required_if_reasoned++;
+    t->required_if_reasoned[idx] = true;
+    return true;
+}
+
+bool tgj_require_if_reasoned(tgj_grammar *g, const jr_value *names) {
+    if (!g || jr_kind(names) != JR_ARRAY) return true;
+    int n = jr_array_len(names);
+    for (int i = 0; i < n; i++) {
+        const char *key = jr_as_string(jr_array_get(names, i));
+        if (!key || !*key) continue;
+        for (int t = 0; t < g->n_tools; t++)
+            if (!mark_required_if_reasoned(&g->tools[t], key)) return false;
+    }
+    return true;
+}
+
+/* Compile one tool's `field_patterns` entry (an object: key -> pattern).  Only a
+ * plain string value takes a pattern (not an enum, number, bool or container,
+ * and not an undeclared type).  False when a pattern does not compile / OOM. */
+static bool apply_tool_patterns(tgj_tool *t, const jr_value *props) {
+    for (int k = 0; k < t->keys.n; k++) {
+        const char *src = jr_as_string(jr_object_get(props, t->keys.items[k]));
+        if (!src || t->types[k] != TGJ_T_STRING || !t->string_typed[k]) continue;
+        if (!t->patterns) {
+            t->patterns = calloc((size_t)t->keys.n, sizeof(field_pattern *));
+            if (!t->patterns) return false;
+        }
+        fp_free(t->patterns[k]);
+        t->patterns[k] = fp_compile(src, NULL, 0);
+        if (!t->patterns[k]) return false;
+    }
+    return true;
+}
+
+bool tgj_apply_field_patterns(tgj_grammar *g, const jr_value *field) {
+    if (!g || jr_kind(field) != JR_OBJECT) return true;
+    for (int t = 0; t < g->n_tools; t++) {
+        const jr_value *props = jr_object_get(field, g->tools[t].name);
+        if (jr_kind(props) == JR_OBJECT && !apply_tool_patterns(&g->tools[t], props))
+            return false;
+    }
+    return true;
 }
 
 tgj_state *tgj_state_clone(const tgj_state *st) {
@@ -470,8 +576,14 @@ void tgj_state_copy(tgj_state *dst, const tgj_state *src) {
 
 void tgj_state_free(tgj_state *st) { free(st); }
 
+void tgj_set_think_close_token(tgj_state *st) {
+    if (st) st->think_close_token = true;
+}
+
 void tgj_reasoning_end(tgj_state *st) {
-    if (st) st->reasoning_ended = true;
+    if (!st) return;
+    st->reasoning_ended = true;
+    reasoned_reply_end(&st->reply);
 }
 
 /* ── phase helpers ── */
@@ -508,6 +620,8 @@ static void enter_args_open(tgj_state *st) {
     memset(st->key_done, 0, sizeof(st->key_done));
     st->required_left = (st->cur_tool >= 0)
                             ? st->g->tools[st->cur_tool].n_required : 0;
+    if (st->cur_tool >= 0 && st->owes_reasoned_keys)
+        st->required_left += st->g->tools[st->cur_tool].n_required_if_reasoned;
     enter_expect(st, TGJ_ARGS_OPEN, '{');
 }
 
@@ -540,6 +654,103 @@ static void enter_value(tgj_state *st, tgj_vtype vt) {
     st->quote_opened = false;
     st->esc = false;
     st->acc_len = 0;
+    if (st->val_pattern) {
+        st->pat_live = fp_start(st->val_pattern);
+        st->pat_hex_left = 0;
+        st->pat_unit = st->pat_high = 0;
+    }
+}
+
+/* ── field pattern over a decoded string value ── */
+
+/* Feed one decoded byte; false when no matching value can follow. */
+static bool string_pattern_byte(tgj_state *st, unsigned char byte) {
+    return fp_step(st->val_pattern, &st->pat_live, byte);
+}
+
+/* Feed a code point as UTF-8 (a lone surrogate as its 3-byte form). */
+static bool string_pattern_code_point(tgj_state *st, unsigned cp) {
+    unsigned char bytes[4];
+    int n;
+    if (cp < 0x80) { bytes[0] = (unsigned char)cp; n = 1; }
+    else if (cp < 0x800) {
+        bytes[0] = (unsigned char)(0xC0 | (cp >> 6));
+        bytes[1] = (unsigned char)(0x80 | (cp & 0x3F)); n = 2;
+    } else if (cp < 0x10000) {
+        bytes[0] = (unsigned char)(0xE0 | (cp >> 12));
+        bytes[1] = (unsigned char)(0x80 | ((cp >> 6) & 0x3F));
+        bytes[2] = (unsigned char)(0x80 | (cp & 0x3F)); n = 3;
+    } else {
+        bytes[0] = (unsigned char)(0xF0 | (cp >> 18));
+        bytes[1] = (unsigned char)(0x80 | ((cp >> 12) & 0x3F));
+        bytes[2] = (unsigned char)(0x80 | ((cp >> 6) & 0x3F));
+        bytes[3] = (unsigned char)(0x80 | (cp & 0x3F)); n = 4;
+    }
+    for (int i = 0; i < n; i++)
+        if (!string_pattern_byte(st, bytes[i])) return false;
+    return true;
+}
+
+/* A high surrogate not followed by its low half stands alone. */
+static bool string_pattern_flush_high(tgj_state *st) {
+    unsigned high = st->pat_high;
+    st->pat_high = 0;
+    return !high || string_pattern_code_point(st, high);
+}
+
+/* A finished \uXXXX code unit: pair a surrogate, else feed it. */
+static bool string_pattern_unit(tgj_state *st, unsigned unit) {
+    if (st->pat_high && unit >= 0xDC00 && unit <= 0xDFFF) {
+        unsigned cp = 0x10000 + ((st->pat_high - 0xD800) << 10) + (unit - 0xDC00);
+        st->pat_high = 0;
+        return string_pattern_code_point(st, cp);
+    }
+    if (!string_pattern_flush_high(st)) return false;
+    if (unit >= 0xD800 && unit <= 0xDBFF) { st->pat_high = unit; return true; }
+    return string_pattern_code_point(st, unit);
+}
+
+static int hex_digit_value(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if ((c | 0x20) >= 'a' && (c | 0x20) <= 'f') return (c | 0x20) - 'a' + 10;
+    return -1;
+}
+
+/* The byte a one-char JSON escape decodes to; -2 for 'u', -1 if invalid. */
+static int json_escape_byte(char c) {
+    switch (c) {
+    case '"': case '\\': case '/': return (unsigned char)c;
+    case 'b': return '\b';
+    case 'f': return '\f';
+    case 'n': return '\n';
+    case 'r': return '\r';
+    case 't': return '\t';
+    case 'u': return -2;
+    default:  return -1;
+    }
+}
+
+/* One char inside the quotes of a string value that has a field pattern, seen
+ * BEFORE the value walk below consumes it.  False = off-grammar: an invalid
+ * escape, a non-hex \u digit, a decoded byte no matching value can follow, or
+ * the closing quote on a non-matching value. */
+static bool string_pattern_char(tgj_state *st, char c) {
+    if (st->pat_hex_left > 0) {
+        int v = hex_digit_value(c);
+        if (v < 0) return false;
+        st->pat_unit = st->pat_unit * 16 + (unsigned)v;
+        return --st->pat_hex_left > 0 || string_pattern_unit(st, st->pat_unit);
+    }
+    if (st->esc) {
+        int byte = json_escape_byte(c);
+        if (byte == -2) { st->pat_hex_left = 4; st->pat_unit = 0; return true; }
+        return byte >= 0 && string_pattern_flush_high(st) &&
+               string_pattern_byte(st, (unsigned char)byte);
+    }
+    if (c == '\\') return true;   /* the escaped char decides */
+    if (!string_pattern_flush_high(st)) return false;
+    if (c == '"') return fp_accepting(st->val_pattern, &st->pat_live);
+    return string_pattern_byte(st, (unsigned char)c);
 }
 
 /* ── the quoted-key / quoted-name / quoted-string steppers ── */
@@ -594,6 +805,49 @@ static int step_quoted_alts(tgj_state *st, char c) {
     return -1;
 }
 
+/* May arg key `i` still be written in this call?  One past the tracked set is
+ * always open (TGJ_MAX_ARGS degrades, never rejects). */
+static bool arg_key_open(const tgj_state *st, int i) {
+    return i >= TGJ_MAX_ARGS || !st->key_done[i];
+}
+
+/* Has the current call an arg key left to write? */
+static bool call_has_open_key(const tgj_state *st) {
+    const tgj_set *keys = &st->g->tools[st->cur_tool].keys;
+    for (int i = 0; i < keys->n; i++)
+        if (arg_key_open(st, i)) return true;
+    return false;
+}
+
+/* Does an arg key still open continue acc[0..acc_len) with `c`?  The whole
+ * prefix is matched, not just position acc_len: with a written key out of the
+ * set, a per-position check could spell that key and leave no way on. */
+static bool arg_key_char_live(const tgj_state *st, const tgj_set *keys, char c) {
+    int pos = st->acc_len;
+    size_t cmp = (size_t)(pos < TGJ_NAME_MAX - 1 ? pos : TGJ_NAME_MAX - 1);
+    for (int i = 0; i < keys->n; i++) {
+        const char *m = keys->items[i];
+        if (arg_key_open(st, i) && (int)strlen(m) > pos && m[pos] == c &&
+            strncmp(m, st->acc, cmp) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* Step a quoted arg KEY: like step_quoted_set over `keys`, restricted to the
+ * keys this call has not written.  Returns the matched index or -1. */
+static int step_quoted_arg_key(tgj_state *st, char c, const tgj_set *keys) {
+    if (st->quote_opened && c != '"') {
+        if (!arg_key_char_live(st, keys, c)) { st->phase = TGJ_DEAD; return -1; }
+        if (st->acc_len < TGJ_NAME_MAX - 1) st->acc[st->acc_len] = c;
+        st->acc_len++;
+        return -1;
+    }
+    int idx = step_quoted_set(st, c, keys, -1);
+    if (idx >= 0 && !arg_key_open(st, idx)) { st->phase = TGJ_DEAD; return -1; }
+    return idx;
+}
+
 /* Step a typed VALUE.  Returns 1 when the value is COMPLETE (caller transitions
  * to the separator), 0 while still mid-value, -1 DEAD.  On completion the char
  * that terminated the value has NOT been consumed for strings (the closing '"'
@@ -610,6 +864,7 @@ static int step_value(tgj_state *st, char c, bool *reconsume) {
             if (c == '"') { st->quote_opened = true; return 0; }
             st->phase = TGJ_DEAD; return -1;
         }
+        if (st->val_pattern && !string_pattern_char(st, c)) { st->phase = TGJ_DEAD; return -1; }
         if (st->esc) {
             /* The escape's DECODED value decides whether this counts as content:
              * \n \t \r \f are whitespace and must not satisfy the guard.  (\b is
@@ -736,23 +991,25 @@ static int step_value(tgj_state *st, char c, bool *reconsume) {
 /* Forward declaration: transition into the function-key phase after '{'. */
 static void enter_first_fn(tgj_state *st);
 
+/* The model closed its reasoning: compel the opener from the next TOKEN. */
+static void think_closed(tgj_state *st) {
+    st->reasoning_ended = true;
+    st->forced_pending = true;
+    st->think_term = 0;
+    st->free_fence = 0;
+    st->free_brace = false;
+}
+
 /* Consume one char while FREE.  Handles the reasoning grace, the </think> self-
  * detect, the forced budget, and the ```json-fence / bare-'{' opener trackers.
  * Sets phase past FREE once an opener completes. */
 static void step_free(tgj_state *st, char c) {
     bool opener_progress = (st->free_fence > 0 || st->free_brace);
+    reasoned_reply_char(&st->reply, c, st->think_close_token);
 
     if (st->think_gated && !st->reasoning_ended) {
-        if (THINK_CLOSE[st->think_term] == c) {
-            st->think_term++;
-            if (THINK_CLOSE[st->think_term] == '\0') {
-                st->reasoning_ended = true;
-                st->forced_pending  = true;   /* compelled from the next TOKEN */
-                st->think_term = 0;
-            }
-        } else {
-            st->think_term = (c == THINK_CLOSE[0]) ? 1 : 0;
-        }
+        if (think_close_text_step(&st->think_term, c, st->think_close_token))
+            think_closed(st);   /* compelled from the next TOKEN */
         return;
     }
 
@@ -763,19 +1020,12 @@ static void step_free(tgj_state *st, char c) {
             st->forced_pending  = true;
             st->think_term = 0;
             st->free_fence = 0; st->free_brace = false;
+            reasoned_reply_end(&st->reply);
             return;                              /* armed; next TOKEN masked */
         }
-        if (THINK_CLOSE[st->think_term] == c) {
-            st->think_term++;
-            if (THINK_CLOSE[st->think_term] == '\0') {
-                st->reasoning_ended = true;
-                st->forced_pending  = true;   /* … from the next TOKEN */
-                st->think_term = 0;
-                st->free_fence = 0; st->free_brace = false;
-                return;
-            }
-        } else {
-            st->think_term = (c == THINK_CLOSE[0]) ? 1 : 0;
+        if (think_close_text_step(&st->think_term, c, st->think_close_token)) {
+            think_closed(st);   /* … from the next TOKEN */
+            return;
         }
         /* fall through to the opener tracker so a call opened mid-reasoning
          * (no </think>) still engages the skeleton */
@@ -787,7 +1037,13 @@ static void step_free(tgj_state *st, char c) {
     /* Forced grace: leading whitespace before the opener is tolerated so the
      * model's "</think>\n```json" separator survives (mirrors the XML grammar).
      * Only before any opener progress. */
-    if (forced && !opener_progress && is_ws(c)) return;
+    if (forced && !opener_progress && is_ws(c)) {
+        /* Bounded, as in the XML grammar (TG_OPENER_WS_MAX): unbounded, a model
+         * that wants prose takes whitespace to max_tokens and makes no call. */
+        if (st->opener_ws >= TGJ_OPENER_WS_MAX) { st->phase = TGJ_DEAD; return; }
+        st->opener_ws++;
+        return;
+    }
 
     /* Try to extend the ```json fence match. */
     if (st->free_fence >= 0 && !st->free_brace) {
@@ -795,6 +1051,7 @@ static void step_free(tgj_state *st, char c) {
             st->free_fence++;
             if (FENCE_OPEN[st->free_fence] == '\0') {
                 /* fence body matched; consume the trailing newline(s) then '{' */
+                reasoned_reply_call_opened(&st->reply, (int)strlen(FENCE_OPEN));
                 st->fenced = true;
                 st->free_fence = 0; st->free_brace = false;
                 enter_expect(st, TGJ_OBJ_OPEN, '{');
@@ -803,6 +1060,7 @@ static void step_free(tgj_state *st, char c) {
         }
         /* Not extending the fence.  A bare '{' opener is also valid. */
         if (st->free_fence == 0 && c == '{') {
+            reasoned_reply_call_opened(&st->reply, 1);
             st->fenced = false;
             st->free_brace = false; st->free_fence = 0;
             enter_first_fn(st);                  /* fwd-declared below */
@@ -845,7 +1103,11 @@ static void step_char(tgj_state *st, char c) {
 
     case TGJ_FN_NAME: {
         int idx = step_quoted_set(st, c, &st->g->names, st->forced_tool);
-        if (idx >= 0) { st->cur_tool = idx; enter_expect(st, TGJ_FN_COMMA, ','); }
+        if (idx >= 0) {
+            st->cur_tool = idx;
+            st->owes_reasoned_keys = reasoned_reply_call_named(&st->reply);
+            enter_expect(st, TGJ_FN_COMMA, ',');
+        }
         return;
     }
 
@@ -879,19 +1141,19 @@ static void step_char(tgj_state *st, char c) {
 
     case TGJ_ARG_KEY: {
         const tgj_tool *t = &st->g->tools[st->cur_tool];
-        int idx = step_quoted_set(st, c, &t->keys, -1);
+        int idx = step_quoted_arg_key(st, c, &t->keys);
         if (idx >= 0) {
-            /* Reject a duplicate key (a completed call can't set one twice). */
-            if (idx < TGJ_MAX_ARGS) {
-                if (st->key_done[idx]) { st->phase = TGJ_DEAD; return; }
-                st->key_done[idx] = true;
-            }
-            if (t->required[idx] && st->required_left > 0) st->required_left--;
+            if (idx < TGJ_MAX_ARGS) st->key_done[idx] = true;
+            bool owed = t->required[idx] ||
+                        (st->owes_reasoned_keys && t->required_if_reasoned &&
+                         t->required_if_reasoned[idx]);
+            if (owed && st->required_left > 0) st->required_left--;
             enter_expect(st, TGJ_ARG_COLON, ':');
             /* stash the type (and its closed value set, if any) for enter_value */
             st->vtype = t->types[idx];
             st->enum_set = (t->enums && t->enums[idx].n > 0) ? &t->enums[idx] : NULL;
             st->val_floor = t->forbids_empty ? t->forbids_empty[idx] : false;
+            st->val_pattern = t->patterns ? t->patterns[idx] : NULL;
         }
         return;
     }
@@ -916,7 +1178,9 @@ static void step_char(tgj_state *st, char c) {
     case TGJ_ARG_SEP:
         if (is_ws(c)) return;
         if (c == ',') {
-            /* another key required */
+            /* Another key — only while one is left to write; once every key is
+             * written '}' is the only way on (no repeated key, no dead end). */
+            if (!call_has_open_key(st)) { st->phase = TGJ_DEAD; return; }
             enter_quote(st, TGJ_ARG_KEY);
             return;
         }
@@ -967,8 +1231,65 @@ static void enter_first_fn(tgj_state *st) {
     st->n_alts = 2;
 }
 
+/* step_char behind a pending steer literal: a char off the literal is DEAD. */
+static void step_steered(tgj_state *st, char c) {
+    if (st->steer_pos < st->steer_len) {
+        if (c != st->steer_lit[st->steer_pos]) { st->phase = TGJ_DEAD; return; }
+        st->steer_pos++;
+    }
+    step_char(st, c);
+}
+
 static void walk(tgj_state *st, const char *text) {
-    for (const char *p = text; *p; p++) step_char(st, *p);
+    if (st->phase == TGJ_FREE && think_close_token_piece(text, st->think_close_token))
+        reasoned_reply_close(&st->reply);
+    /* Only FREE in forced mode, still reasoning, watches for the close. */
+    if (think_close_token_piece(text, st->think_close_token) && st->phase == TGJ_FREE &&
+        st->mode == TGJ_MODE_FORCED && !st->reasoning_ended) {
+        think_closed(st);
+        return;
+    }
+    for (const char *p = text; *p; p++) step_steered(st, *p);
+}
+
+/* Inside the quotes of a patterned string value, between chars (no escape or
+ * \u digits owed, no high surrogate waiting)? */
+static bool in_patterned_string(const tgj_state *st) {
+    return st->phase == TGJ_ARG_VALUE && st->vtype == TGJ_T_STRING && st->val_pattern &&
+           st->quote_opened && !st->esc && st->pat_hex_left == 0 && !st->pat_high;
+}
+
+bool tgj_steer(tgj_state *st, const char *token_text) {
+    if (!st || !token_text || !*token_text || !in_patterned_string(st)) return false;
+    /* Not on an empty value (nothing to continue), not while a steer is pending. */
+    if (!st->val_content || st->steer_pos < st->steer_len) return false;
+    /* Refused at an unescaped closing quote = the pattern refused the close (the
+     * floor is met: val_content). */
+    tgj_state probe = *st;
+    bool refused = false;
+    for (const char *p = token_text; *p; p++) {
+        tgj_state before = probe;
+        step_steered(&probe, *p);
+        if (probe.phase == TGJ_DEAD) {
+            refused = *p == '"' && in_patterned_string(&before);
+            break;
+        }
+        if (probe.phase != TGJ_ARG_VALUE) return false;   /* left the value legally */
+    }
+    if (!refused) return false;
+    char lit[TGJ_STEER_MAX];
+    int n = fp_forced_continuation(st->val_pattern, &st->pat_live, lit, (int)sizeof(lit));
+    /* Only bytes a JSON string carries unescaped (the literal is spelled as is). */
+    for (int i = 0; i < n; i++)
+        if ((unsigned char)lit[i] < 0x20 || lit[i] == '"' || lit[i] == '\\') { n = i; break; }
+    if (n <= 0) return false;
+    tgj_state check = *st;
+    for (int i = 0; i < n && check.phase == TGJ_ARG_VALUE; i++) step_char(&check, lit[i]);
+    if (check.phase != TGJ_ARG_VALUE) return false;
+    memcpy(st->steer_lit, lit, (size_t)n);
+    st->steer_len = (unsigned char)n;
+    st->steer_pos = 0;
+    return true;
 }
 
 bool tgj_token_allowed(const tgj_state *st, const char *token_text) {
@@ -1021,6 +1342,14 @@ bool tgj_in_call(const tgj_state *st) {
 
 bool tgj_is_dead(const tgj_state *st) {
     return st && st->phase == TGJ_DEAD;
+}
+
+bool tgj_reply_reasoned(const tgj_state *st) {
+    return st && reasoned_reply_reasoned(&st->reply);
+}
+
+int tgj_calls_named(const tgj_state *st) {
+    return st ? st->reply.calls_named : 0;
 }
 
 int tgj_debug_reason_chars(const tgj_state *st) {

@@ -64,6 +64,8 @@ typedef struct pn_qwen35moe_mv {
 typedef struct {
     int n_layer;                 /* block_count (40) */
     int full_attention_interval; /* attn layer when (i+1) % interval == 0 (4) */
+    int bench_extra_layer;       /* QWEN35_BENCH_EXTRA_LAYER_FROM: index of the kept MTP block as an extra attn layer, -1 = none (bench only) */
+    int mtp_layer;               /* QWEN35_MTP=1: GGUF block of the kept MTP draft head (outside the trunk), -1 = none */
     int n_embd;                  /* embedding_length (2048) */
     int n_head;                  /* attention.head_count (16) */
     int n_head_kv;               /* attention.head_count_kv (2) */
@@ -134,7 +136,8 @@ typedef struct {
     pn_qweight ffn_gate_shexp;     /* shared-expert gate */
     pn_qweight ffn_up_shexp;       /* shared-expert up */
     pn_qweight ffn_down_shexp;     /* shared-expert down */
-    pn_qweight ffn_gate_inp_shexp; /* shared-expert scalar gate [n_embd] */
+    pn_qweight ffn_gate_inp_shexp; /* shared-expert scalar gate [n_embd] F32 */
+    float *gate_inp_shexp_f32;     /* owned F32 widening of a BF16 gate (MTP head), or NULL */
 } pn_qwen35moe_moe;
 
 /* SSM (Gated-Delta-Net) layer: norms + 4 projections + conv + recurrence params
@@ -167,6 +170,22 @@ typedef struct {
     float *post_attention_norm; /* pre-MoE RMSNorm [n_embd] (F32, owned) */
     pn_qwen35moe_moe moe;
 } pn_qwen35moe_attn_layer;
+
+/* The trailing MTP / NextN draft head (QWEN35_MTP=1). It is NOT
+ * a trunk layer: the trunk's n_layer excludes it and no trunk loop visits it. Its forward
+ * (llama.cpp graph_mtp): x = eh_proj([enorm(embed(next)) | hnorm(h)]), one attention + MoE
+ * block over its own KV cache, then shared_head_norm -> the trunk's LM head. eh_proj is kept
+ * as its two column halves so neither half needs a concatenated input row. */
+typedef struct {
+    pn_qwen35moe_attn_layer layer; /* blk.N attention + MoE (trunk attention shapes) */
+    pn_qweight eh_e;               /* eh_proj columns [0, n_embd): the embedding half */
+    pn_qweight eh_h;               /* eh_proj columns [n_embd, 2 n_embd): the hidden half */
+    void *eh_bytes;                /* owned storage behind eh_e and eh_h */
+    float *enorm;                  /* [n_embd] RMSNorm of the next token's embedding */
+    float *hnorm;                  /* [n_embd] RMSNorm of the trunk's normed hidden */
+    float *head_norm;              /* [n_embd] shared_head_norm before the LM head */
+    int block;                     /* its GGUF block index */
+} pn_qwen35moe_mtp_head;
 
 /* ============================================================
  * Full-attention block (A3) — implemented in qwen35moe_attn.c
@@ -426,6 +445,11 @@ void pn_qwen35moe_gated_norm(const pn_qwen35moe_ssm_layer *layer,
  *  card phase nor a norm, exported so the two arms cannot spell it differently. */
 void pn_qwen35moe_beta_sigmoid(const float *beta_raw, int n_v_heads, float *beta_out);
 
+/** The TT host gates, libm: `beta = sigmoid(beta_raw)`, `decay = exp(decay_gate(alpha))` per
+ *  V-head. The ONE body the prefill's host gates and the exact card gates' tables both call. */
+void pn_qwen35moe_gdn_gates(const pn_qwen35moe_ssm_layer *layer, const float *alpha,
+                            const float *beta_raw, int n_v_heads, float *decay, float *beta);
+
 /**
  * `conv_out = SiLU(conv1d(qkv))` over the whole `conv_dim` stream, and ROLLS `state->conv_state`.
  *
@@ -600,8 +624,8 @@ int pn_qwen35moe_spec_commit_cuda(pn_qwen35moe_model *m, int n_accept);
  * token and position; each user's logits land in sts[u]->logits. Bit-exact
  * per user vs decoding alone. Returns 0 on success. */
 int pn_qwen35moe_decode_slot_bind_cuda(pn_qwen35moe_model *m,
-                                       pn_qwen35moe_state *s, int slot,
-                                       int n_slots);
+                                       pn_qwen35moe_state *s, int pos,
+                                       int slot, int n_slots);
 /* Rung 2 (reactive ladder): the current memory-pressure-capped decode
  * concurrency ceiling (full PN_QWEN35MOE_GPU_MAX_SLOTS at level OK, halved at
  * TIGHT, 1 at CRITICAL). A batched-decode scheduler should size its slot count
@@ -610,7 +634,8 @@ int pn_qwen35moe_gpu_ladder_max_slots(void);
 int pn_qwen35moe_decode_slots_tokens_cuda(pn_qwen35moe_model *m,
                                           const uint32_t *tokens,
                                           pn_qwen35moe_state *const *sts,
-                                          const int *pos, int nslots);
+                                          const int *pos, const int *rows,
+                                          int nslots);
 
 /* Session-state lifetime hook. The GPU layers hold raw back-pointers into a
  * session's state (per-slot kv_slot_kv / kv_slot_host_id, per-SSM-layer
@@ -628,6 +653,9 @@ void pn_qwen35moe_gpu_forget_state_cuda(const pn_qwen35moe_state *s);
  * only and never dereferences, so it is valid to pass the (already freed)
  * range of a state's kv array. Must be 0 after that state is freed. */
 int pn_qwen35moe_gpu_slot_kv_refs_cuda(const void *base, size_t bytes);
+/* Test hook: one-slot fused descriptors built on the slots path across the
+ * live GPU models; *possible gets how many there are to build. */
+int pn_qwen35moe_gpu_slots_fused_count_cuda(int *possible);
 #endif
 
 /* Accessors into the opaque model, used by qwen35moe_forward.c (it needs the
@@ -653,8 +681,14 @@ const float *pn_qwen35moe_model_token_embd(const pn_qwen35moe_model *m);
  * (tied/fallback), else dequantizes the row on demand from the mmap (A2c). */
 void pn_qwen35moe_model_embed_row(const pn_qwen35moe_model *m, uint32_t token,
                                   float *dst);
+/* Fault the on-demand embedding table into the page cache now (MADV_WILLNEED + one read a
+ * page). A decode token's embedding row is a host read on the critical path; a cold row is a
+ * page fault from disk. Same bytes either way. Returns the bytes touched (0: heap table). */
+size_t pn_qwen35moe_model_embed_prefault(const pn_qwen35moe_model *m);
 const float *pn_qwen35moe_model_output_norm(const pn_qwen35moe_model *m);
 const pn_qweight *pn_qwen35moe_model_output(const pn_qwen35moe_model *m);
+/* The kept MTP draft head (QWEN35_MTP=1 and the GGUF has one), else NULL. */
+const pn_qwen35moe_mtp_head *pn_qwen35moe_model_mtp(const pn_qwen35moe_model *m);
 
 /* MUTABLE weight accessors. A GPU backend has to WRITE one field of every
  * weight (pn_qweight.gpu, its device-buffer handle), which the const accessors

@@ -49,6 +49,7 @@ for f in $files; do
 
 	case "$f" in
 	tests/*|*/tests/*) continue ;;
+	lib/*) continue ;;   # vendored third-party code (lib/<name>/ + its LICENSE)
 	*_ptx.h|*_ptx.cuh) continue ;;
 	esac
 

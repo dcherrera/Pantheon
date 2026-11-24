@@ -62,12 +62,23 @@ int main(int argc, char **argv)
           "mode 2 takes lookup only when the first drafts agree");
     sg_spec_lookup_free(&lookup);
     unsetenv("PN_TT_SPEC_LOOKUP");
-    CHECK(sg_spec_lookup_init(&lookup, prompt, 14, 1) == 0 && !lookup.on, "off by default");
+    CHECK(sg_spec_lookup_init(&lookup, prompt, 14, 1) == 0 && lookup.on && lookup.mode == 2,
+          "mode 2 by default (David 2026-10-07)");
     sg_spec_lookup_free(&lookup);
     setenv("PN_TT_SPEC_LOOKUP", "0", 1);
     CHECK(sg_spec_lookup_init(&lookup, prompt, 14, 1) == 0 && !lookup.on, "off by env");
     CHECK(sg_spec_lookup_draft(&lookup, 15, drafts) == 0, "off drafts nothing");
     sg_spec_lookup_free(&lookup);
+    unsetenv("PN_TT_SPEC_LOOKUP");
+    /* The CUDA cycle's lookup: its own env, off by default, <= 4 drafts, suffix >= 5. */
+    CHECK(sg_spec_lookup_init_cuda(&lookup, prompt, 14, 1) == 0 && !lookup.on, "cuda: off by default");
+    setenv("QWEN35_MTP_LOOKUP", "1", 1);
+    setenv("QWEN35_MTP_LOOKUP_K", "9", 1);
+    CHECK(sg_spec_lookup_init_cuda(&lookup, prompt, 14, 1) == 0 && lookup.on && lookup.mode == 1 &&
+          lookup.k == 4 && lookup.min_ngram == 5, "cuda: mode 1, k clamped to 4, min 5");
+    sg_spec_lookup_free(&lookup);
+    unsetenv("QWEN35_MTP_LOOKUP");
+    unsetenv("QWEN35_MTP_LOOKUP_K");
     if (g_failed) {
         printf("=== %d FAILED ===\n", g_failed);
         return 1;

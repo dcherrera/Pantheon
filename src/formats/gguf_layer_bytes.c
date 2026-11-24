@@ -140,3 +140,73 @@ uint64_t pn_gguf_layer_range_bytes(pn_gguf_file *gf, int lo, int hi)
     }
     return total;
 }
+
+uint64_t pn_gguf_layer_range_upload_bytes(pn_gguf_file *gf, int lo, int hi)
+{
+    if (lo < 0)
+        lo = 0;
+    if (!gf || !gf->tensors || hi <= lo)
+        return 0;
+    uint64_t total = 0;
+    for (uint64_t i = 0; i < gf->n_tensors; i++) {
+        const pn_gguf_tensor_info *t = &gf->tensors[i];
+        if (!t->name.data)
+            continue;
+        int layer = blk_layer_index(t->name.data);
+        if (layer < lo || layer >= hi)
+            continue;
+        uint64_t numel = tensor_numel(t);
+        if (numel == 0)
+            continue;
+        uint64_t bytes;
+        /* Q8_0 on-die layout: (cols/32)*36 B per row, only when cols % 32 == 0.
+         * All other types count at their file size. */
+        if (t->type == GGUF_QUANT_Q8_0 && t->n_dims >= 2 && t->dims[0] % 32 == 0) {
+            bytes = numel / 32 * 36;
+        } else {
+            bytes = (uint64_t)pn_gguf_type_size(t->type, (size_t)numel);
+        }
+        if (bytes == 0) {
+            char qn[32];
+            fprintf(stderr, "[gguf] layer range: no size for quant %s (%d) on "
+                    "'%s' — refusing to project this range\n",
+                    pn_gguf_quant_name(t->type, qn, sizeof(qn)), (int)t->type,
+                    t->name.data);
+            return 0;
+        }
+        total += bytes;
+    }
+    return total;
+}
+
+/* `<arch>.<suffix>` as a u32, 0 when absent. */
+static uint32_t arch_u32(pn_gguf_file *gf, const char *suffix)
+{
+    const char *arch = pn_gguf_get_str(gf, "general.architecture");
+    if (!arch)
+        return 0;
+    char key[96];
+    snprintf(key, sizeof(key), "%s.%s", arch, suffix);
+    return pn_gguf_get_u32(gf, key, 0);
+}
+
+uint64_t pn_gguf_cpu_forward_bytes(pn_gguf_file *gf)
+{
+    if (!gf || !gf->tensors)
+        return 0;
+    uint32_t n_expert = arch_u32(gf, "expert_count");
+    uint32_t n_used = arch_u32(gf, "expert_used_count");
+    bool routed = n_expert > 0 && n_used > 0 && n_used < n_expert;
+    uint64_t total = 0;
+    for (uint64_t i = 0; i < gf->n_tensors; i++) {
+        const pn_gguf_tensor_info *t = &gf->tensors[i];
+        uint64_t numel = tensor_numel(t);
+        uint64_t bytes = numel ? (uint64_t)pn_gguf_type_size(t->type, (size_t)numel) : 0;
+        if (bytes == 0)
+            return 0;   /* a tensor we cannot size: "don't know", never "free" */
+        if (routed && t->name.data && strstr(t->name.data, "_exps."))
+            bytes = bytes / n_expert * n_used;
+        total += bytes;
+    }
+    return total;
+}

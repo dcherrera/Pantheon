@@ -66,6 +66,13 @@ uint64_t pn_tt_reader_post_rows_gated(pn_tt_device *device, uint32_t bank, uint3
                                       uint32_t tiles, uint32_t rows, float *dst,
                                       uint32_t count, const pn_tt_reader_gate *gate);
 
+/** As pn_tt_reader_post_rows_gated(), with only the first `live` columns wanted (0 = all): the
+ *  last tile's right faces are not read when `live` leaves them empty (Qwen3.8's alpha/beta,
+ *  48 of 64 columns), and the columns past `live` land as 0. Exact for the live columns. */
+uint64_t pn_tt_reader_post_rows_live(pn_tt_device *device, uint32_t bank, uint32_t address,
+                                     uint32_t tiles, uint32_t rows, float *dst, uint32_t count,
+                                     uint32_t live, const pn_tt_reader_gate *gate);
+
 /** Wait until `ticket` is done. @return 0, or -1 when that read failed (dst is unspecified). */
 int pn_tt_reader_wait(pn_tt_device *device, uint64_t ticket);
 

@@ -12,6 +12,7 @@
 #ifdef USE_TT
 
 #include "pn_tt_reader.h"
+#include "pn_tt_reader_runs.h"
 
 #include <pthread.h>
 #include <sched.h>
@@ -34,7 +35,7 @@
 
 typedef struct reader_job {
     uint16_t x, y;
-    uint32_t address, tiles, rows, count;
+    uint32_t address, tiles, rows, count, live;
     float *dst;
     pn_tt_reader_gate gate; /**< target 0 = none */
 } reader_job;
@@ -104,25 +105,29 @@ static int reader_gate_wait(reader_worker *w, const pn_tt_reader_gate *gate)
 static int reader_run_job(reader_worker *w, const reader_job *job)
 {
     uint32_t tile, row, column;
+    const uint32_t width = job->live ? job->live : job->tiles * PN_TT_TILE_DIM;
 
     if (reader_gate_wait(w, &job->gate) != 0)
         return -1;
-    if (job->rows <= 16u) {
-        /* rows <= 16 live in faces 0-1: two 64 B-rounded runs a tile (PN_TT_ROWS_FACES's
-         * shape, pn_tt_activation_download_rows()) instead of the whole 2 KiB. */
-        const size_t run = ((size_t)job->rows * 32u + 63u) & ~(size_t)63u;
+    if (job->rows > 16u && job->live == 0u) {
+        /* The whole strip band in one read, as shipped. */
+        if (w->access.read(w->access.user, job->x, job->y, job->address, w->stage,
+                           (size_t)job->tiles * PN_TT_TILE_BF16) != FT_TT_OK)
+            return -1;
+    } else {
+        for (tile = 0; tile < job->tiles; tile++) {
+            uint32_t offset[2], length[2];
+            const uint32_t runs =
+                pn_tt_reader_tile_runs(tile, job->tiles, job->rows, job->live,
+                                       PN_TT_TILE_BF16, offset, length);
 
-        for (tile = 0; tile < job->tiles; tile++)
-            if (w->access.read(w->access.user, job->x, job->y,
-                               job->address + tile * PN_TT_TILE_BF16,
-                               w->stage + (size_t)tile * PN_TT_TILE_BF16, run) != FT_TT_OK ||
-                w->access.read(w->access.user, job->x, job->y,
-                               job->address + tile * PN_TT_TILE_BF16 + 512u,
-                               w->stage + (size_t)tile * PN_TT_TILE_BF16 + 512u, run) != FT_TT_OK)
-                return -1;
-    } else if (w->access.read(w->access.user, job->x, job->y, job->address, w->stage,
-                              (size_t)job->tiles * PN_TT_TILE_BF16) != FT_TT_OK) {
-        return -1;
+            for (uint32_t r = 0; r < runs; r++)
+                if (w->access.read(w->access.user, job->x, job->y,
+                                   job->address + tile * PN_TT_TILE_BF16 + offset[r],
+                                   w->stage + (size_t)tile * PN_TT_TILE_BF16 + offset[r],
+                                   length[r]) != FT_TT_OK)
+                    return -1;
+        }
     }
     for (tile = 0; tile < job->tiles; tile++) {
         const uint16_t *base = (const uint16_t *)w->stage + (size_t)tile * (PN_TT_TILE_BF16 / 2u);
@@ -130,7 +135,9 @@ static int reader_run_job(reader_worker *w, const reader_job *job)
         for (row = 0; row < job->rows; row++)
             for (column = 0; column < PN_TT_TILE_DIM; column++)
                 job->dst[(size_t)row * job->count + tile * PN_TT_TILE_DIM + column] =
-                    ft_float_from_bf16(base[ft_tt_tile_face_index(row, column)]);
+                    tile * PN_TT_TILE_DIM + column < width
+                        ? ft_float_from_bf16(base[ft_tt_tile_face_index(row, column)])
+                        : 0.0f;
     }
     return 0;
 }
@@ -233,6 +240,13 @@ uint64_t pn_tt_reader_post_rows_gated(pn_tt_device *device, uint32_t bank, uint3
                                       uint32_t tiles, uint32_t rows, float *dst,
                                       uint32_t count, const pn_tt_reader_gate *gate)
 {
+    return pn_tt_reader_post_rows_live(device, bank, address, tiles, rows, dst, count, 0u, gate);
+}
+
+uint64_t pn_tt_reader_post_rows_live(pn_tt_device *device, uint32_t bank, uint32_t address,
+                                     uint32_t tiles, uint32_t rows, float *dst, uint32_t count,
+                                     uint32_t live, const pn_tt_reader_gate *gate)
+{
     struct pn_tt_reader *r;
     reader_worker *w;
     uint64_t posted;
@@ -240,8 +254,11 @@ uint64_t pn_tt_reader_post_rows_gated(pn_tt_device *device, uint32_t bank, uint3
 
     if (!pn_tt_reader_available(device) || !dst || tiles == 0u || tiles > READER_MAX_TILES ||
         rows == 0u || rows > PN_TT_TILE_DIM || count < tiles * PN_TT_TILE_DIM ||
-        bank >= device->dram_bank_count)
+        live > tiles * PN_TT_TILE_DIM || bank >= device->dram_bank_count)
         return 0u;
+    /* Only a live count that empties the last tile's right faces changes what is read. */
+    if (live != 0u && live - (tiles - 1u) * PN_TT_TILE_DIM > PN_TT_TILE_DIM / 2u)
+        live = 0u;
     r = device->reader;
     w = &r->worker[r->tickets % r->workers];
     posted = atomic_load_explicit(&w->posted, memory_order_relaxed);
@@ -255,6 +272,7 @@ uint64_t pn_tt_reader_post_rows_gated(pn_tt_device *device, uint32_t bank, uint3
     job->tiles = tiles;
     job->rows = rows;
     job->count = count;
+    job->live = live;
     job->dst = dst;
     if (gate)
         job->gate = *gate;

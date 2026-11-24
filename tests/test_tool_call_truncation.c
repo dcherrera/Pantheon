@@ -340,9 +340,11 @@ static void test_close_returns_the_walk_to_the_skeleton(void) {
         ASSERT_TRUE(tg_in_call(st));
         /* At a body boundary: prose is off-grammar… */
         ASSERT_FALSE(tg_token_allowed(st, "The bash tool seems to be stale"));
-        /* …and the two real continuations are not. */
+        /* …and the real continuations are not.  `path` is read's only key and
+         * is written, so reopening it is refused (each key once per call). */
         ASSERT_TRUE(tg_token_allowed(st, "</function>"));
-        ASSERT_TRUE(tg_token_allowed(st, "\n<parameter=path>"));
+        ASSERT_TRUE(tg_token_allowed(st, "\n</function>"));
+        ASSERT_FALSE(tg_token_allowed(st, "\n<parameter=path>"));
         ASSERT_FALSE(tg_complete(st));   /* the CALL is still open */
         tg_state_free(st);
     }

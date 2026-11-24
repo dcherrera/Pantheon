@@ -67,10 +67,12 @@ header, and a per-file list of names becomes unmaintainable fast. `git log` and
 
 ## Getting Started
 
-Pantheon builds on Foundry, a git submodule at `./foundry`. Clone with
+Pantheon builds on Foundry. In the public repository it is a git submodule at
+`./foundry`; clone with
 `git clone --recursive https://git.teamide.dev/David/Pantheon.git`, or run
 `git submodule update --init` in an existing clone. The Makefile uses, in order,
-`FOUNDRY=<path>`, then `./foundry` (the submodule or a symlink), then `../foundry`
+`FOUNDRY=<path>`, then `./foundry` (the submodule, or a symlink in a development
+checkout), then `../foundry`
 (a sibling checkout).
 
 ```bash
@@ -89,7 +91,7 @@ make clean
 
 ## Code Style
 
-- **C11** (`-std=c11`); no dependencies beyond Foundry, libc, libm, pthreads and libdl
+- **C11** (`-std=c11`); no dependencies beyond Foundry, libc, libm, pthreads and libdl, plus vendored Monocypher (`lib/monocypher/`, BSD-2-Clause, Pantheon Local catalog signatures; see NOTICE). Pantheon Local also runs the system `curl` at runtime for model downloads (not linked or bundled)
   (BLAS and accelerator frameworks are opt-in build flags)
 - **`pn_` prefix** on all Pantheon symbols
 - Errors: return `NULL` or an error code — no `exit()` in library code

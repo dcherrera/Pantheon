@@ -93,6 +93,24 @@ rfg_state *rfg_state_new(rfg_format format, bool reasoning_grace);
 void rfg_state_free(rfg_state *st);
 
 /**
+ * End reasoning only on the "</think>" TOKEN: an rfg_advance whose whole text is
+ * "</think>".  The same text spelled out of ordinary tokens stays reasoning
+ * (think_close_rule.h).  Set it when the model's close is one token; leave it off
+ * otherwise.  Call before the first rfg_advance.
+ *
+ * Thread-safe: no (mutates st)
+ * Reentrant: yes
+ * Signal-safe: no
+ */
+void rfg_set_think_close_token(rfg_state *st);
+
+/** A new walk at the same position as `st` (NULL on OOM / NULL input). */
+rfg_state *rfg_state_clone(const rfg_state *st);
+
+/** Overwrite `dst` with `src`'s position (both non-NULL). */
+void rfg_state_copy(rfg_state *dst, const rfg_state *src);
+
+/**
  * Signal that the reasoning phase has ended — the JSON object is required from
  * here on.  Idempotent, and a no-op once reasoning has already ended.  The
  * grammar ALSO self-detects "</think>" in its own token stream, so a caller that

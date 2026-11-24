@@ -28,15 +28,17 @@
 #include <string.h>
 
 static int g_failed = 0;
+static int g_checks = 0;
 
 #define CHECK(cond, msg) do { \
+    g_checks++; \
     if (!(cond)) { \
         fprintf(stderr, "  FAIL: %s (%s:%d)\n", (msg), __FILE__, __LINE__); \
         g_failed++; \
     } \
 } while (0)
 
-#define MAX_T 256
+#define MAX_T 1024
 
 /* A synthetic GGUF whose tensor names own their storage, so name.data is the
  * NUL-terminated char* pn_gguf_find_tensor's strcmp expects. */
@@ -340,6 +342,205 @@ static void test_tied_head_sizing(void)
     CHECK(pn_gguf_tensor_numel(NULL, "token_embd.weight") == 0, "NULL -> 0");
 }
 
+/* ------------------------------------------------------------------ */
+/* Qwen3.8-27B admission: Q8_0 layers at repacked (on-die) size       */
+/* ------------------------------------------------------------------ */
+
+static inline uint64_t q8_upload(uint64_t rows, uint64_t cols)
+{
+    return rows * cols / 32 * 36;
+}
+
+/* Parse "blk.<i>." → i, or -1 on mismatch. */
+static int my_blk_layer_index(const char *name)
+{
+    if (!name || strncmp(name, "blk.", 4) != 0)
+        return -1;
+    const char *p = name + 4;
+    if (*p < '0' || *p > '9')
+        return -1;
+    long idx = 0;
+    while (*p >= '0' && *p <= '9') {
+        idx = idx * 10 + (*p - '0');
+        if (idx > 1000000)
+            return -1;
+        p++;
+    }
+    if (*p != '.')
+        return -1;
+    return (int)idx;
+}
+
+/* Build a 64-layer Qwen3.8-27B model in the fake table.
+ * Layers 0..63: (i+1)%4==0 → attention, else GDN.
+ * token_embd and output are outside the layer range. */
+static void build_qwen38(fake_gguf *f)
+{
+    fg_init(f);
+    /* token_embd: Q8_0, 248320 × 5120 */
+    fg_add(f, "token_embd.weight", GGUF_QUANT_Q8_0, 248320, 5120);
+
+    int gdn_count = 0, att_count = 0, norm_count = 0;
+    for (int i = 0; i < 64; i++) {
+        char buf[128];
+
+        if ((i + 1) % 4 == 0) {
+            /* Attention layer: attn_q/k/v/output + ffn_gate/up/down */
+            snprintf(buf, sizeof(buf), "blk.%d.attn_q.weight", i);
+            fg_add(f, buf, GGUF_QUANT_Q8_0, 12288, 5120);
+            snprintf(buf, sizeof(buf), "blk.%d.attn_k.weight", i);
+            fg_add(f, buf, GGUF_QUANT_Q8_0, 1024, 5120);
+            snprintf(buf, sizeof(buf), "blk.%d.attn_v.weight", i);
+            fg_add(f, buf, GGUF_QUANT_Q8_0, 1024, 5120);
+            snprintf(buf, sizeof(buf), "blk.%d.attn_output.weight", i);
+            fg_add(f, buf, GGUF_QUANT_Q8_0, 5120, 6144);
+            snprintf(buf, sizeof(buf), "blk.%d.ffn_gate.weight", i);
+            fg_add(f, buf, GGUF_QUANT_Q8_0, 17408, 5120);
+            snprintf(buf, sizeof(buf), "blk.%d.ffn_up.weight", i);
+            fg_add(f, buf, GGUF_QUANT_Q8_0, 17408, 5120);
+            snprintf(buf, sizeof(buf), "blk.%d.ffn_down.weight", i);
+            fg_add(f, buf, GGUF_QUANT_Q8_0, 5120, 17408);
+            att_count++;
+        } else {
+            /* GDN layer: qkv + gate + ssm_alpha/beta/out + ffn_gate/up/down */
+            snprintf(buf, sizeof(buf), "blk.%d.attn_qkv.weight", i);
+            fg_add(f, buf, GGUF_QUANT_Q8_0, 10240, 5120);
+            snprintf(buf, sizeof(buf), "blk.%d.attn_gate.weight", i);
+            fg_add(f, buf, GGUF_QUANT_Q8_0, 6144, 5120);
+            snprintf(buf, sizeof(buf), "blk.%d.ssm_alpha.weight", i);
+            fg_add(f, buf, GGUF_QUANT_Q8_0, 48, 5120);
+            snprintf(buf, sizeof(buf), "blk.%d.ssm_beta.weight", i);
+            fg_add(f, buf, GGUF_QUANT_Q8_0, 48, 5120);
+            snprintf(buf, sizeof(buf), "blk.%d.ssm_out.weight", i);
+            fg_add(f, buf, GGUF_QUANT_Q8_0, 5120, 6144);
+            snprintf(buf, sizeof(buf), "blk.%d.ffn_gate.weight", i);
+            fg_add(f, buf, GGUF_QUANT_Q8_0, 17408, 5120);
+            snprintf(buf, sizeof(buf), "blk.%d.ffn_up.weight", i);
+            fg_add(f, buf, GGUF_QUANT_Q8_0, 17408, 5120);
+            snprintf(buf, sizeof(buf), "blk.%d.ffn_down.weight", i);
+            fg_add(f, buf, GGUF_QUANT_Q8_0, 5120, 17408);
+            gdn_count++;
+        }
+        /* F32 norms in every layer */
+        snprintf(buf, sizeof(buf), "blk.%d.attn_norm.weight", i);
+        fg_add(f, buf, GGUF_QUANT_F32, 1, 5120);
+        snprintf(buf, sizeof(buf), "blk.%d.post_attention_norm.weight", i);
+        fg_add(f, buf, GGUF_QUANT_F32, 1, 5120);
+        norm_count++;
+    }
+
+    /* output_norm: F32 1 × 5120 */
+    fg_add(f, "output_norm.weight", GGUF_QUANT_F32, 1, 5120);
+    /* output: Q8_0 248320 × 5120 */
+    fg_add(f, "output.weight", GGUF_QUANT_Q8_0, 248320, 5120);
+
+    fprintf(stderr, "build_qwen38: gdn=%d att=%d norm=%d n_tensors=%lu\n",
+            gdn_count, att_count, norm_count, (unsigned long)f->file.n_tensors);
+}
+/* Per-die upload: [0,16), [16,32), [32,48), [48,64) all equal 6849249280 */
+/* Per-die upload: [0,16), [16,32), [32,48), [48,64) all equal 6849249280 */
+static void test_qwen38_upload_per_die(void)
+{
+    printf("qwen38_upload_per_die:\n");
+    fake_gguf f;
+    build_qwen38(&f);
+
+    /* The hand-worked constant for one die (16 layers) */
+    uint64_t expected_upload = 6849249280ULL;
+    uint64_t expected_file   = 6468771840ULL;
+
+    int die;
+    for (die = 0; die < 4; die++) {
+        int lo = die * 16;
+        int hi = lo + 16;
+
+        uint64_t upload = pn_gguf_layer_range_upload_bytes(&f.file, lo, hi);
+        uint64_t file   = pn_gguf_layer_range_bytes(&f.file, lo, hi);
+
+        if (die == 0) {
+            fprintf(stderr, "die0: upload=%lu file=%lu expected_upload=%lu expected_file=%lu\n",
+                    (unsigned long)upload, (unsigned long)file,
+                    (unsigned long)expected_upload, (unsigned long)expected_file);
+            fprintf(stderr, "die0: n_tensors=%lu\n", (unsigned long)f.file.n_tensors);
+        }
+
+        CHECK(upload == expected_upload,
+              "upload bytes == hand-worked constant");
+        CHECK(file == expected_file,
+              "file bytes == hand-worked constant");
+
+        /* Also verify upload matches the shape-sum computed in the test */
+        uint64_t shape_sum = 0;
+        uint64_t t;
+        for (t = 0; t < f.file.n_tensors; t++) {
+            const pn_gguf_tensor_info *info = &f.file.tensors[t];
+            int layer = my_blk_layer_index(info->name.data);
+            if (layer < lo || layer >= hi)
+                continue;
+            if (info->type == GGUF_QUANT_Q8_0 && info->dims[0] % 32 == 0)
+                shape_sum += info->dims[0] * info->dims[1] / 32 * 36;
+            else
+                shape_sum += (uint64_t)pn_gguf_type_size(info->type,
+                                                         (size_t)(info->dims[0] * info->dims[1]));
+        }
+        CHECK(upload == shape_sum,
+              "upload == shape-sum for die");
+    }
+
+    /* Old function unchanged: all 64 layers file bytes */
+    uint64_t all_file = pn_gguf_layer_range_bytes(&f.file, 0, 64);
+    CHECK(all_file == 6468771840ULL * 4,
+          "old function file bytes for all 64 layers");
+}
+
+/* Non-Q8_0 ranges: new and old must be identical */
+static void test_non_q8_unchanged(void)
+{
+    printf("non_q8_unchanged:\n");
+    fake_gguf f;
+    build_model(&f);
+
+    uint64_t old_04 = pn_gguf_layer_range_bytes(&f.file, 0, 4);
+    uint64_t new_04 = pn_gguf_layer_range_upload_bytes(&f.file, 0, 4);
+    CHECK(new_04 == old_04, "new == old for [0,4)");
+
+    uint64_t old_48 = pn_gguf_layer_range_bytes(&f.file, 4, 8);
+    uint64_t new_48 = pn_gguf_layer_range_upload_bytes(&f.file, 4, 8);
+    CHECK(new_48 == old_48, "new == old for [4,8)");
+
+    uint64_t old_08 = pn_gguf_layer_range_bytes(&f.file, 0, 8);
+    uint64_t new_08 = pn_gguf_layer_range_upload_bytes(&f.file, 0, 8);
+    CHECK(new_08 == old_08, "new == old for [0,8)");
+}
+
+/* 3-D Q8_0 tensor (MoE expert) counts at numel/32*36 */
+static void test_q8_3d(void)
+{
+    printf("q8_3d:\n");
+    fake_gguf f;
+    fg_init(&f);
+    /* blk.0.ffn_down_exps.weight: Q8_0, n_dims=3, dims{512, 2048, 8} */
+    uint64_t i = f.file.n_tensors;
+    snprintf(f.names[i], sizeof(f.names[i]), "blk.0.ffn_down_exps.weight");
+    f.t[i].name.data = f.names[i];
+    f.t[i].name.len  = strlen(f.names[i]);
+    f.t[i].type = GGUF_QUANT_Q8_0;
+    f.t[i].n_dims = 3;
+    f.t[i].dims[0] = 512;
+    f.t[i].dims[1] = 2048;
+    f.t[i].dims[2] = 8;
+    f.file.n_tensors = i + 1;
+
+    uint64_t expected = 512 * 2048 * 8 / 32 * 36;
+    uint64_t got = pn_gguf_layer_range_upload_bytes(&f.file, 0, 1);
+    CHECK(got == expected, "3-D Q8_0 MoE tensor at repacked size");
+
+    /* Old function should use file bytes (34 B per 32) */
+    uint64_t file_bytes = 512 * 2048 * 8 / 32 * 34;
+    uint64_t got_file = pn_gguf_layer_range_bytes(&f.file, 0, 1);
+    CHECK(got_file == file_bytes, "3-D Q8_0 MoE tensor at file bytes");
+}
+
 int main(void)
 {
     printf("test_gguf_layer_bytes\n");
@@ -350,11 +551,14 @@ int main(void)
     test_degenerate_inputs();
     test_layer_count();
     test_tied_head_sizing();
+    test_qwen38_upload_per_die();
+    test_non_q8_unchanged();
+    test_q8_3d();
 
     if (g_failed) {
         printf("FAILED: %d check(s)\n", g_failed);
         return 1;
     }
-    printf("ALL PASS\n");
+    printf("ALL PASS\nchecks: %d\n", g_checks);
     return 0;
 }

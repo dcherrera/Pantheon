@@ -8,8 +8,9 @@ engine and OpenAI-compatible model server built for that case: a small host, old
 mixed cards, several models per process.
 
 It is pure C11 on top of [Foundry](https://git.teamide.dev/David/Foundry.git), its
-companion tensor library (included as a git submodule). Beyond Foundry it needs only
-libc, libm, pthreads and libdl; BLAS (Accelerate on macOS, OpenBLAS on Linux) is
+companion tensor library (a git submodule in the public repository). Beyond Foundry it needs only
+libc, libm, pthreads and libdl, plus vendored Monocypher (BSD-2-Clause, see NOTICE);
+Pantheon Local also runs the system `curl` for model downloads. BLAS (Accelerate on macOS, OpenBLAS on Linux) is
 optional, and the optional Metal backend links Apple's frameworks. Each backend builds
 to a single binary.
 
@@ -31,6 +32,16 @@ Admission is checked before every load *and* every turn, against live host-RAM a
 pressure, so the engine refuses work it cannot finish instead of accepting it and
 falling over halfway. That layer (`src/core/mem/`) is about 2,100 lines of the codebase,
 which is a fair measure of how central it is.
+
+**Host RAM is admitted, not hoped for** (`src/core/mem/pn_host_admission.h`). Every large
+host allocation — session KV rings, scheduler slots, snapshots, anonymous weight copies —
+asks first, against `MemAvailable` minus what the process has already admitted, minus a
+reserve. A default context window that does not fit is capped with a log line; an
+explicit `--ctx-cap` / `PN_SESSION_MAX_CTX` that does not fit is refused at load with the
+numbers; a new session the host cannot hold gets a 503 `server_memory_constrained`.
+`PN_HOST_RESERVE_MB` sets the reserve (default 1536), `PN_HOST_ADMIT=0` disables it.
+For an ad-hoc job on a shared box, a kernel-enforced backstop on top:
+`systemd-run --user --scope -p MemoryMax=5G ./pantheon ...`.
 
 **It tells the client the truth.** A prompt past the context cap is refused with a typed
 `context_over_budget` carrying the actual KV numbers, so the caller can compact and
@@ -60,7 +71,8 @@ The CUDA backend targets **`sm_37` — Kepler, 2014**. Measured by the author on
 K80 (both GK210 dies) in a 2-core / 8 GB host: a **35B-A3B hybrid MoE served at 32K–128K
 context**: Qwen3.6-35B-A3B and Nex-N2-mini (Q3_K_M) both decode at ~21 tok/s and prefill
 ~110-120 tok/s up to ~8k tokens ([K80 quick start](#qwen36-and-nex-n2-mini-on-a-tesla-k80),
-[supported models](docs/reference/supported-models.md)).
+[supported models](docs/reference/supported-models.md)). On two K80s, Qwen3.6-35B-A3B at **Q8_0** decodes at
+**~33 tok/s at 8k** and ~29 tok/s at 25k ([two-K80 numbers](#qwen36-35b-a3b-q8_0-on-two-k80s)).
 
 Correctness on that path, stated precisely:
 
@@ -152,6 +164,24 @@ measured 9 s instead of 170 s. One session id may carry several conversations (o
 request shares it); each keeps its own cache slot.
 **Not good for:** pasting long documents or codebases every request; prefill is the K80's weak
 spot. Options are in each script's header.
+
+### Qwen3.6-35B-A3B Q8_0 on two K80s
+
+Pantheon Local profile `k80-two-boards`: Qwen3.6-35B-A3B at Q8_0, tensor-parallel across two K80 cards (four dies), in the
+same 2-core / 8 GB host. Measured 2026-11-23 on real agent traffic (tool-call turns, one user, live server):
+
+| prompt | decode |
+|---|---|
+| 6-9k tokens | 32.9 tok/s |
+| 10-13.5k tokens | 32.0 tok/s |
+| 14-17k tokens | 31.1 tok/s |
+| 18-21.5k tokens | 30.3 tok/s |
+| 22-25.7k tokens | 29.4 tok/s |
+
+- First token on a fresh prompt: 5k tokens in 23 s, 19k tokens in 101 s (~190-220 tok/s prefill). Follow-up turns only
+  prefill what's new (measured 146-183 tok/s).
+- Requests without a tool grammar use the model's MTP head: 36-39 tok/s at a 3.7k-token prompt (2026-11-19).
+- Four users decoding together: 40-44 tok/s total, 10-11 tok/s each, at 6-29k tokens (2026-11-19).
 
 ## Serving
 
@@ -327,10 +357,10 @@ Being clear about this saves everyone time:
 Pantheon uses **Foundry** for tensor compute, safetensors, tokenization, quantization,
 attention primitives and the CUDA layer. Same author, same license.
 
-Foundry is a git submodule at `foundry/`
+In the public repository Foundry is a git submodule at `foundry/`
 ([`https://git.teamide.dev/David/Foundry.git`](https://git.teamide.dev/David/Foundry.git)).
 The Makefile resolves it as `FOUNDRY=/path`, then `./foundry` (the submodule, or a
-symlink), then `../foundry` (a sibling checkout); if none exists it stops with a message
+symlink in a development checkout), then `../foundry` (a sibling checkout); if none exists it stops with a message
 saying so rather than a wall of missing headers.
 
 ## License

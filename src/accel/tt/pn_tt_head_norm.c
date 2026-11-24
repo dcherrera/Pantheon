@@ -20,6 +20,7 @@
 
 #include "pn_tt_device_internal.h"
 #include "pn_tt_fp32_strip.h"
+#include "pn_tt_group_pull.h"
 
 /**
  * Which enabled Tensix each slot drives.
@@ -131,6 +132,11 @@ static bool pn_tt_arm_head_norm_slot(pn_tt_device *device, uint32_t index)
                         "per-head norms stay on the host\n", slot->tile_cols);
         return false;
     }
+    /* P3: the schedule decides CB_IN's rows and the scratch depth, so it is fixed with the
+     * slot's placement and every member and descriptor of the slot uses it. */
+    pn_tt_norm_schedule_head(pn_tt_env_u32(PN_TT_NORM_FAST_ENV, 1u) != 0u, slot->tile_cols,
+                             &slot->schedule);
+    pn_tt_norm_schedule_fit(&slot->schedule, &residency, "head-norm");
     if (!pn_tt_prepare_family(device, &slot->residency,
                               pn_tt_head_norm_program_for(slot->tile_bytes), "head-norm",
                               core_env, core_default, PN_TT_ONCARD_TRIAD_MASK))
@@ -158,6 +164,9 @@ static bool pn_tt_arm_head_norm_member(pn_tt_device *device, uint32_t index, uin
     if (ft_tt_op_reduce_residency_for(g_head_norm_members, PN_TT_HEAD_NORM_MEMBER_COUNT,
                                       slot->tile_cols, slot->tile_bytes, &shape) != FT_TT_OK)
         return false;
+    /* P3: member 0's placement (pn_tt_arm_head_norm_slot fixed the schedule). */
+    shape.stage_pages = slot->schedule.stage_pages;
+    shape.input_rows = slot->schedule.input_rows;
     if (!pn_tt_prepare_family_on_core(device, residency,
                                       pn_tt_head_norm_program_for(slot->tile_bytes),
                                       "head-norm-member", PN_TT_HEAD_NORM_MEMBER_CORE_ENV,
@@ -307,6 +316,32 @@ int pn_tt_head_norm_constants_upload(pn_tt_device *device, ft_tt_op_reduce_funct
 }
 
 /**
+ * Finish one head-norm descriptor's words: the probe bits, the P3 RED arm, and the half tile.
+ *
+ * THE HALF TILE (word 3 bit 23, the model norm's M3) under the P3 schedule: a single-token
+ * forward's live row is row 0, a verify's rows 0..15, so the elementwise passes run on faces
+ * 0-1 and — with the schedule's half reads — the reader lands only those faces. Rows 0..15 of
+ * the output are bit-identical; rows 16..31 come out zero instead of normed padding.
+ * `PN_TT_HEAD_NORM_HALF` 0 off, 1 (default) honour the row promise, 2 RED: every descriptor.
+ */
+static void pn_tt_head_norm_words_finish(const pn_tt_device *device,
+                                         const pn_tt_head_norm_residency *slot, uint32_t *words)
+{
+    static int half_mode = -1;
+
+    pn_tt_vec_probe_apply(words);
+    pn_tt_norm_schedule_words(&slot->schedule, words);
+    if (half_mode < 0)
+        half_mode = (int)pn_tt_env_u32("PN_TT_HEAD_NORM_HALF", 1u);
+    if (!slot->schedule.half_read)
+        return;
+    if (half_mode == 2 ||
+        (half_mode == 1 &&
+         (device->single_row || (device->verify_rows && device->verify_rows <= 16u))))
+        words[FT_TT_OP_VECTOR_DEPTH] |= 1u << 23;
+}
+
+/**
  * THE HEAD SPLIT: member m reduces heads [m*per, (m+1)*per) — the same descriptor with
  * `row_blocks = per` and the input and output bases moved by `m*per*Wt` tiles. Gamma is
  * shared by every head, so the constants operand is not moved. Enqueue all, then await all;
@@ -323,6 +358,7 @@ static int pn_tt_head_norm_submit_split(pn_tt_device *device, pn_tt_head_norm_re
     pn_tt_residency *set[PN_TT_HEAD_NORM_MAX_MEMBERS];
     bool bad[PN_TT_HEAD_NORM_MAX_MEMBERS];
     double started = pn_tt_now_seconds();
+    bool pulled;
     int failed = 0;
     uint32_t m;
 
@@ -335,20 +371,16 @@ static int pn_tt_head_norm_submit_split(pn_tt_device *device, pn_tt_head_norm_re
         sliced.output.address += m * step;
         if (ft_tt_op_reduce_parameters(&sliced, words[m]) != FT_TT_OK)
             return -1;
-        pn_tt_vec_probe_apply(words[m]);
+        pn_tt_head_norm_words_finish(device, slot, words[m]);
         set[m] = m == 0u ? &slot->residency : &slot->member[m - 1u];
     }
-    for (m = 0; m < members; m++)
-        if (pn_tt_residency_enqueue(set[m], FT_TT_QUEUE_OP_REDUCE, words[m], 1u) != 0)
-            failed = bad[m] = 1;
+    /* S1: member 0 posts only once every member has (pn_tt_group_pull.h); one await. */
+    pulled = pn_tt_group_pull_decide(&slot->pull, pn_tt_group_pull_decode(device), set, members,
+                                     members, "head-norm");
+    (void)pn_tt_group_pull_enqueue(&slot->pull, pulled, set, members, FT_TT_QUEUE_OP_REDUCE,
+                                   words[0], bad);
     set[0]->seconds += pn_tt_now_seconds() - started;
-    for (m = 0; m < members; m++) {
-        const double at = pn_tt_now_seconds();
-
-        if (pn_tt_residency_await(set[m], PN_TT_OP_TIMEOUT_MS) != 0)
-            failed = bad[m] = 1;
-        set[m]->seconds += pn_tt_now_seconds() - at;
-    }
+    failed = pn_tt_group_pull_await(&slot->pull, pulled, set, members, bad, NULL) != 0;
     if (!failed)
         return 0;
     for (m = 0; m < members; m++) {
@@ -429,6 +461,11 @@ static int pn_tt_head_norm_submit(pn_tt_device *device, ft_tt_op_reduce_function
     request.row_blocks = heads;
     request.tile_cols = constants->tile_cols;
     request.prefetch_tiles = constants->tile_cols;
+    /* P3 (pn_tt_norm_schedule.h): one block a head, streamed up to four heads ahead, half
+     * reads, the chain in runs of a whole head. All zero is the pre-P3 schedule. */
+    request.chain_chunk = pn_tt_norm_schedule_chunk_for(&slot->schedule, constants->tile_cols);
+    request.stream_input = slot->schedule.stream_input;
+    request.half_read = slot->schedule.half_read;
     request.input = input;
     request.constants.x = (uint16_t)device->dram[constants->bank].x;
     request.constants.y = (uint16_t)device->dram[constants->bank].y;
@@ -437,7 +474,7 @@ static int pn_tt_head_norm_submit(pn_tt_device *device, ft_tt_op_reduce_function
     request.output = output;
     if (ft_tt_op_reduce_parameters(&request, words) != FT_TT_OK)
         return -1;
-    pn_tt_vec_probe_apply(words);
+    pn_tt_head_norm_words_finish(device, slot, words);
 
     started = pn_tt_now_seconds();
     index = (uint32_t)(slot - &device->head_norm[0]);
@@ -517,15 +554,16 @@ void pn_tt_head_norm_defer(pn_tt_device *device, uint32_t tile_cols, bool on)
 int pn_tt_head_norm_settle(pn_tt_device *device, uint32_t tile_cols)
 {
     pn_tt_head_norm_residency *slot = device ? pn_tt_head_norm_slot(device, tile_cols) : NULL;
-    int rc;
+    pn_tt_residency *set[PN_TT_HEAD_NORM_MAX_MEMBERS];
+    uint32_t members;
 
     if (!slot)
         return 0;
-    rc = pn_tt_residency_settle(&slot->residency, PN_TT_OP_TIMEOUT_MS);
-    for (uint32_t member = 1u; member < slot->members; member++)
-        if (pn_tt_residency_settle(&slot->member[member - 1u], PN_TT_OP_TIMEOUT_MS) != 0)
-            rc = -1;
-    return rc;
+    members = slot->members < 1u ? 1u : slot->members;
+    for (uint32_t member = 0u; member < members; member++)
+        set[member] = member == 0u ? &slot->residency : &slot->member[member - 1u];
+    /* A member a pulled split covered is settled by member 0's completion (S1). */
+    return pn_tt_group_pull_settle(&slot->pull, set, members, PN_TT_OP_TIMEOUT_MS);
 }
 
 #endif /* USE_TT */

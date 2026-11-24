@@ -12,6 +12,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "think_close_rule.h"
+
 static void tc_append(text_channel *tc, const char *s, size_t n)
 {
     if (n == 0) return;
@@ -28,7 +30,6 @@ static void tc_append(text_channel *tc, const char *s, size_t n)
     tc->data[tc->len] = '\0';
 }
 
-static const char THINK_CLOSE[] = "</think>";
 static const char TOOL_OPEN[]   = "<tool_call>";
 static const char FN_OPEN[]     = "<function=";
 /* MiniCPM5's bare opener: an attribute-style function tag "<function name=...>"
@@ -52,6 +53,11 @@ void em_init(emitter *em, sg_delta_fn cb, void *ud,
     em->ud = ud;
     em->stops = stops;
     em->n_stop = n_stop;
+}
+
+void em_set_think_close_token(emitter *em)
+{
+    em->think_close_token = true;
 }
 
 void em_set_tool_tap(emitter *em, em_tool_tap_fn tap, void *ud)
@@ -347,6 +353,16 @@ void em_feed(emitter *em, const char *piece)
 {
     if (em->stopped) return;
 
+    /* Token mode: the close is a whole piece, so nothing in <think> is held back
+     * and a "</think>" spelled out of ordinary tokens is reasoning text. */
+    if (em->in_think && em->think_close_token) {
+        if (think_close_token_piece(piece, true))
+            em->in_think = 0;
+        else
+            em_emit(em, 1, piece, strlen(piece));
+        return;
+    }
+
     /* Combine carry + new piece into a working buffer. */
     size_t plen = strlen(piece);
     size_t wlen = em->carry_len + plen;
@@ -360,15 +376,15 @@ void em_feed(emitter *em, const char *piece)
     while (pos < wlen && !em->stopped) {
         if (em->in_think) {
             char *marker = memmem(work + pos, wlen - pos,
-                                  THINK_CLOSE, strlen(THINK_CLOSE));
+                                  THINK_CLOSE_TEXT, strlen(THINK_CLOSE_TEXT));
             if (marker) {
                 size_t idx = (size_t)(marker - work);
                 em_emit(em, 1, work + pos, idx - pos);
-                pos = idx + strlen(THINK_CLOSE);
+                pos = idx + strlen(THINK_CLOSE_TEXT);
                 em->in_think = 0;
                 continue;
             }
-            size_t hold = suffix_prefix_overlap(work + pos, wlen - pos, THINK_CLOSE);
+            size_t hold = suffix_prefix_overlap(work + pos, wlen - pos, THINK_CLOSE_TEXT);
             em_emit(em, 1, work + pos, (wlen - pos) - hold);
             em_carry_set(em, work + wlen - hold, hold);
             pos = wlen;

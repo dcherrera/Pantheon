@@ -41,9 +41,12 @@ void oai_handle_models(int client_fd, mr_registry *reg);
  *        body overrides it. NULL/empty → anonymous (byte-identical full-prefill
  *        behaviour; no caching). Backward-compatible: existing clients that
  *        send neither are unaffected.
+ * @param replica_header  X-Pantheon-Replica request header (may be NULL); a
+ *        "replica" body field wins. A new session binds to that copy only;
+ *        every response after routing carries X-Pantheon-Replica (replica_pin.h).
  */
 void oai_handle_chat(int client_fd, mr_registry *reg, const char *body,
-                     const char *session_id);
+                     const char *session_id, const char *replica_header);
 
 /**
  * Handle POST /session/restore — session warm-tier import (K80 serving-ops
@@ -53,10 +56,12 @@ void oai_handle_chat(int client_fd, mr_registry *reg, const char *body,
  * `tokens` history, and positions the state so the next chat turn append-resumes
  * off it. A weights mismatch / corrupt blob / dim mismatch is a clean error
  * (the client falls back to replaying the message history). `session_id` is the
- * X-Session-Id header fallback when the body omits it.
+ * X-Session-Id header fallback when the body omits it. `replica_header` (or a
+ * "replica" body field, which wins) picks the copy a new session binds to.
  */
 void oai_handle_session_restore(int client_fd, mr_registry *reg,
-                                const char *body, const char *session_id);
+                                const char *body, const char *session_id,
+                                const char *replica_header);
 
 /**
  * Handle POST /session/release {name, session_id} — free a session's serve slot on

@@ -24,6 +24,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 /* 3. System / platform headers */
 #ifdef USE_THREADS
@@ -32,6 +33,7 @@
 
 /* 4. Project headers */
 #include "../accel/simd.h"
+#include "../core/act_stats.h"
 #include "../core/qweight.h"
 #include "../memory/arena.h"
 #include "qwen35moe_internal.h"
@@ -206,31 +208,69 @@ static size_t qwen35moe_ssm_state_bytes(const pn_qwen35moe_ssm_state *st)
            sizeof(float);
 }
 
-/* Allocate one attention layer's KV cache, zero-primed. Returns 0 on success.
- * Under QWEN35_KV_Q4 the cache is stored as ggml-Q4_0 rows (~4-7x smaller);
- * otherwise fp32 (the A/B baseline). */
-static int qwen35moe_kv_init(pn_qwen35moe_kv *kv, const pn_qwen35moe_config *cfg)
+/* An explicit fp32 KV cache that rung 4a would switch to Q4: the pressure a load's
+ * own disk reads raise (host PSI) decays within seconds, so wait for it to fall below
+ * the rung (PN_KV_FP32_SETTLE_MS, default 30000) before refusing. Returns true when
+ * the cache may be fp32; false (reason recorded per thread) to refuse it. */
+static bool qwen35moe_kv_fp32_settles(void)
 {
+    const char *env = getenv("PN_KV_FP32_SETTLE_MS");
+    long budget_ms = (env && *env) ? atol(env) : 30000;
+    pn_mem_state st;
+
+    for (long waited = 0;; waited += 250) {
+        pn_memwatch_read(&st);
+        if (pn_ladder_kv_action_for(st.level, true) == PN_LADDER_KV_KEEP)
+            return true;
+        if (waited >= budget_ms)
+            break;
+        usleep(250 * 1000);
+    }
+    char why[192];
+    snprintf(why, sizeof(why), "host memory pressure (%s) would switch the fp32 KV cache "
+             "this load asked for to Q4; not switched, load refused (choose the standard "
+             "Q4 KV, or retry when the host is idle)", pn_mem_level_name(st.level));
+    pn_ladder_kv_refusal_set(why);
+    fprintf(stderr, "[ladder] %s\n", why);
+    return false;
+}
+
+/* Allocate one attention layer's KV cache, zero-primed. Returns 0 on success.
+ * Under Q4 the cache is stored as ggml-Q4_0 rows (~4-7x smaller); otherwise fp32.
+ * The format is the load's choice (pn_qwen35moe_model_kv_q4: explicit, else
+ * QWEN35_KV_Q4). */
+static int qwen35moe_kv_init(pn_qwen35moe_kv *kv, const pn_qwen35moe_config *cfg,
+                             const pn_qwen35moe_model *m)
+{
+    const int fmt = pn_qwen35moe_model_kv_format(m);
+
     kv->n_head_kv = cfg->n_head_kv;
     kv->head_dim = cfg->head_dim;
     kv->max_seq = qwen35moe_max_seq_cfg(cfg);
-    kv->q4 = pn_qwen35moe_kv_q4_on();
+    kv->q4 = pn_qwen35moe_model_kv_q4(m);
 
-    /* Rung 4a of the reactive ladder (MemoryAware.md §7): a KV cache allocated
-     * while the box is under memory pressure defaults to the ~4-7x-smaller Q4
-     * format even if the operator did not set QWEN35_KV_Q4 — the cheapest VRAM
-     * win, engaged from WATCH up. KV format is fixed at allocation, so this acts
-     * at init time (not retroactively on a live fp32 cache). At level OK the
-     * plan mirrors the config, so an unpressured init is unchanged. */
+    /* Rung 4a of the reactive ladder (MemoryAware.md §7): a default-format KV
+     * cache allocated while the box is under memory pressure is switched to the
+     * ~4-7x-smaller Q4 format — the cheapest VRAM win, engaged from WATCH up. A
+     * format the load chose explicitly is never switched: an explicit fp32 cache
+     * the rung would switch is refused (qwen35moe_kv_fp32_settles). KV format is
+     * fixed at allocation, so this acts at init time only. */
     if (!kv->q4 && pn_memwatch_running()) {
         pn_mem_state st;
         pn_memwatch_read(&st);
-        pn_ladder_plan lp;
-        pn_ladder_plan_from_state(&st, 1, 0, false, &lp);
-        if (lp.force_kv_q4) {
+        pn_ladder_kv_action act = pn_ladder_kv_action_for(st.level, fmt == PN_KV_FORMAT_FP32);
+        if (act == PN_LADDER_KV_TO_Q4) {
+            pn_ladder_plan lp;
+            pn_ladder_plan_from_state(&st, 1, 0, false, &lp);
             kv->q4 = 1;
             fprintf(stderr, "[ladder] %s -> forcing Q4 KV cache at init (%s)\n",
                     pn_mem_level_name(st.level), lp.note);
+        } else if (act == PN_LADDER_KV_REFUSE && !qwen35moe_kv_fp32_settles()) {
+            /* Separate statements: kq/vq are byte pointers, k/v float (GCC 14+ refuses the chain). */
+            kv->k = kv->v = NULL;
+            kv->kq = kv->vq = NULL;
+            kv->k_sink = kv->v_sink = kv->k_win = kv->v_win = NULL;
+            return -1;
         }
     }
     kv->k = kv->v = NULL;
@@ -296,7 +336,7 @@ void *pn_qwen35moe_state_new(void *weights)
         if (qwen35moe_ssm_init(&s->ssm[i], cfg) < 0)
             goto fail;
     for (int i = 0; i < s->n_attn; i++)
-        if (qwen35moe_kv_init(&s->kv[i], cfg) < 0)
+        if (qwen35moe_kv_init(&s->kv[i], cfg, m) < 0)
             goto fail;
 
     s->arena = pn_arena_new(PN_QWEN35MOE_ARENA_BYTES);
@@ -465,6 +505,83 @@ static int qwen35moe_layer_forward(pn_qwen35moe_model *m, int layer, float *x,
     return 0;
 }
 
+/* Split oracle (a host whose disk cannot hold the whole artifact runs the stack in
+ * two passes, each with only its half of the weights present):
+ *   PN_SPLIT_LAYERS=a:b     run layers [a, b) only (others are skipped, state untouched)
+ *   PN_SPLIT_RESID_OUT=f    append the residual after layer b-1 (n_embd f32) a token
+ *   PN_SPLIT_RESID_IN=f     replace the embedding with the next n_embd f32 record
+ * Unset = the normal forward. The layers are parsed once; the two files are resolved at the
+ * first forward and at every sequence start (position 0), and reopened when their path
+ * changed, so a runner that sets a path per sequence (qwen36_oracle_dump expands a `%s`
+ * template) gets one file each. An unchanged path keeps its open file (records of successive
+ * sequences follow each other, as before). */
+static struct {
+    int parsed, first, last;
+    FILE *in, *out;
+    char *in_path, *out_path;
+} qwen35moe_split;
+
+/* Open `path` (mode) as the split file `*file` unless it is already the open one. */
+static void qwen35moe_split_file(const char *name, const char *path, const char *mode,
+                                 FILE **file, char **open_path)
+{
+    if (!path || !path[0]) {
+        if (*file)
+            fclose(*file);
+        *file = NULL;
+        free(*open_path);
+        *open_path = NULL;
+        return;
+    }
+    if (*open_path && strcmp(*open_path, path) == 0)
+        return;
+    if (strstr(path, "%s")) {
+        fprintf(stderr, "qwen35moe: %s '%s' is a template; qwen36_oracle_dump expands it per "
+                        "sequence, nothing else does\n", name, path);
+        abort();
+    }
+    if (*file)
+        fclose(*file);
+    free(*open_path);
+    *open_path = strdup(path);
+    if (!*open_path || !(*file = fopen(path, mode))) {
+        perror(path);
+        abort();
+    }
+    fprintf(stderr, "qwen35moe: SPLIT %s -> %s\n", name, path);
+}
+
+static void qwen35moe_split_parse(int n_layer)
+{
+    const char *r = getenv("PN_SPLIT_LAYERS");
+
+    qwen35moe_split.parsed = 1;
+    qwen35moe_split.first = 0;
+    qwen35moe_split.last = n_layer;
+    if (r && r[0] && sscanf(r, "%d:%d", &qwen35moe_split.first, &qwen35moe_split.last) != 2) {
+        fprintf(stderr, "qwen35moe: PN_SPLIT_LAYERS '%s' is not a:b\n", r);
+        abort();
+    }
+    if (qwen35moe_split.first < 0 || qwen35moe_split.last > n_layer ||
+        qwen35moe_split.first >= qwen35moe_split.last) {
+        fprintf(stderr, "qwen35moe: PN_SPLIT_LAYERS %d:%d out of 0:%d\n", qwen35moe_split.first,
+                qwen35moe_split.last, n_layer);
+        abort();
+    }
+    if (r)
+        fprintf(stderr, "qwen35moe: SPLIT layers [%d, %d)\n", qwen35moe_split.first,
+                qwen35moe_split.last);
+}
+
+/* A sequence starts: (re)resolve the residual files from the environment. */
+static void qwen35moe_split_sequence_start(void)
+{
+    qwen35moe_split_file("PN_SPLIT_RESID_IN", getenv("PN_SPLIT_RESID_IN"), "rb",
+                         &qwen35moe_split.in, &qwen35moe_split.in_path);
+    qwen35moe_split_file("PN_SPLIT_RESID_OUT", getenv("PN_SPLIT_RESID_OUT"), "wb",
+                         &qwen35moe_split.out, &qwen35moe_split.out_path);
+}
+
 /* Internal forward with an explicit thread pool (the public entry point's pool
  * comes from the model; the per-block kernels accept it for parallel sections). */
 static float *qwen35moe_forward_with_pool(pn_qwen35moe_model *m, uint32_t token,
@@ -483,21 +600,46 @@ static float *qwen35moe_forward_with_pool(pn_qwen35moe_model *m, uint32_t token,
     float *hidden = calloc((size_t)c, sizeof(float));
     if (!hidden)
         return NULL;
-    pn_qwen35moe_model_embed_row(m, token, hidden);
+    if (!qwen35moe_split.parsed) {
+        qwen35moe_split_parse(n_layer);
+        qwen35moe_split_sequence_start();
+    } else if (pos == 0) {
+        qwen35moe_split_sequence_start();
+    }
+    if (qwen35moe_split.in) {
+        if (fread(hidden, sizeof(float), (size_t)c, qwen35moe_split.in) != (size_t)c) {
+            fprintf(stderr, "qwen35moe: PN_SPLIT_RESID_IN ran out at pos %d\n", pos);
+            free(hidden);
+            return NULL;
+        }
+    } else {
+        pn_qwen35moe_model_embed_row(m, token, hidden);
+    }
     qwen35moe_dbg("input_embed", -1, hidden, c);
 
-    for (int layer = 0; layer < n_layer; layer++) {
+    for (int layer = qwen35moe_split.first; layer < qwen35moe_split.last; layer++) {
         if (qwen35moe_layer_forward(m, layer, hidden, s, pos, pool) < 0) {
             free(hidden);
             return NULL;
         }
+    }
+    if (qwen35moe_split.out) {
+        fwrite(hidden, sizeof(float), (size_t)c, qwen35moe_split.out);
+        fflush(qwen35moe_split.out);
     }
 
     /* Final norm + LM head. */
     pn_vrms_norm_f32(hidden, pn_qwen35moe_model_output_norm(m), s->x_norm, c,
                      cfg->rms_norm_eps);
     qwen35moe_dbg("result_norm", -1, s->x_norm, c);
+    /* A split half that stops short of the last layer feeds the LM head a mid-stack
+     * residual: its logits are discarded and PN_ACT_STATS must not record that input. */
+    int head_is_partial = qwen35moe_split.last < n_layer;
+    if (head_is_partial)
+        pn_act_stats_set_paused(1);
     qwen35moe_mv(cfg, pn_qwen35moe_model_output(m), s->x_norm, s->logits);
+    if (head_is_partial)
+        pn_act_stats_set_paused(0);
     qwen35moe_dbg("result_output", -1, s->logits, cfg->n_vocab);
 
     free(hidden);

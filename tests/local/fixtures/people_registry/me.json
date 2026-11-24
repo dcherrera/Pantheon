@@ -1,0 +1,7 @@
+{"endpoint":"GET /local/me","class":"device",
+ "request":null,
+ "status":200,
+ "response":{"person":{"id":"p1a2b3c4d","handle":"david","name":"David","admin":true,"may_load":true,"created":1793000000},
+             "device":{"key_id":"k1a2b3c4d","device_id":"d0123456789abcdef","device_name":"mac-studio"}},
+ "errors":[{"when":"no key or an unknown key","status":401,"type":"unauthorized"},
+           {"when":"an inference key","status":403,"type":"forbidden"}]}

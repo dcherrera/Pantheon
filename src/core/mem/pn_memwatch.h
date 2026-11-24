@@ -43,6 +43,13 @@ extern "C" {
  * PN_DIE_RESERVE_BYTES. The budget the GPU side reports is total - reserve. */
 #define PN_DIE_RESERVE_BYTES        (1024ULL * 1024 * 1024)  /* ~1 GiB          */
 
+/* Fragmentation slack the qwen35moe CUDA model-load gate holds back on top of a
+ * projection that already counts the die's runtime scratch
+ * (qwen35moe_die_projection.h). Holding the whole PN_DIE_RESERVE_BYTES there
+ * charged that scratch twice: a K80 die of the shipped 65,536-token q8 profile
+ * really serves with ~660 MiB free. Env override PN_DIE_LOAD_MARGIN_BYTES. */
+#define PN_DIE_LOAD_MARGIN_BYTES    (256ULL * 1024 * 1024)   /* 256 MiB         */
+
 /* Poll cadence for the host-signal loop. */
 #define PN_MEMWATCH_POLL_MS         250
 
@@ -89,6 +96,10 @@ uint64_t pn_host_reserve_bytes(uint64_t host_total_bytes);
 /* Compute the effective per-die reserve in bytes, honoring the
  * PN_DIE_RESERVE_BYTES env override. Pure. */
 uint64_t pn_die_reserve_bytes(void);
+
+/* The effective model-load margin per die (PN_DIE_LOAD_MARGIN_BYTES env
+ * override). Pure. */
+uint64_t pn_die_load_margin_bytes(void);
 
 /* The effective PSI-full avg10 percentage at/above which admission rejects new
  * work, honoring the PN_PSI_FULL_REJECT env override (values <= 0 or garbage

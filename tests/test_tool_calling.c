@@ -470,6 +470,27 @@ static void test_minicpm_preamble(void) {
     jr_free(tools);
 }
 
+/* The Qwen preamble renders each tool like the HF template's `tool | tojson`
+ * (json.dumps separators ", " and ": "); Qwen3.8 fixture 03_tools, jinja2 render. */
+static void test_qwen_preamble_tojson_separators(void) {
+    jr_value *tools = jr_parse(
+        "[{\"type\":\"function\",\"function\":{\"name\":\"get_weather\","
+        "\"description\":\"Get the current weather for a city.\",\"parameters\":"
+        "{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\","
+        "\"description\":\"City name\"},\"unit\":{\"type\":\"string\",\"enum\":"
+        "[\"celsius\",\"fahrenheit\"]}},\"required\":[\"city\"]}}}]");
+    char *pre = tc_render_tools_system(tools, NULL);
+    ASSERT_NOT_NULL(pre);
+    ASSERT_TRUE(strstr(pre,
+        "<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", "
+        "\"description\": \"Get the current weather for a city.\", \"parameters\": "
+        "{\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", "
+        "\"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"enum\": "
+        "[\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n</tools>") != NULL);
+    free(pre);
+    jr_free(tools);
+}
+
 /* ============================================================
  * Grammar-forced dialect: the body-style <function=NAME> / <parameter=KEY>
  * (like the bare Qwen form) but with an extra <value>…</value> wrapper around
@@ -808,6 +829,57 @@ static void test_ornith_render_roundtrip(void) {
     jr_free(tools);
 }
 
+/* Render one history tool_calls array (content empty) and compare the text. */
+static char *render_history_calls(const char *calls_json, tc_dialect dialect) {
+    jr_value *tc = jr_parse(calls_json);
+    char *rendered = tc_render_assistant_tool_calls(tc, true, dialect);
+    jr_free(tc);
+    return rendered;
+}
+
+/* History `arguments` sent as a JSON object (HF style) must render exactly like
+ * the OpenAI string form: one <parameter=KEY> block per key, in order. The
+ * string form is checked first so a failure isolates the object path. */
+static void test_history_object_arguments_xml(void) {
+    const char *paris_xml =
+        "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n"
+        "<parameter=unit>\ncelsius\n</parameter>\n</function>\n</tool_call>";
+
+    char *from_string = render_history_calls(
+        "[{\"type\":\"function\",\"function\":{\"name\":\"get_weather\","
+        "\"arguments\":\"{\\\"city\\\":\\\"Paris\\\",\\\"unit\\\":\\\"celsius\\\"}\"}}]",
+        TC_DIALECT_QWEN_XML);
+    ASSERT_STR_EQ(from_string, paris_xml);
+    free(from_string);
+
+    char *from_object = render_history_calls(
+        "[{\"type\":\"function\",\"function\":{\"name\":\"get_weather\","
+        "\"arguments\":{\"city\":\"Paris\",\"unit\":\"celsius\"}}}]",
+        TC_DIALECT_QWEN_XML);
+    ASSERT_STR_EQ(from_object, paris_xml);
+    free(from_object);
+
+    char *with_number = render_history_calls(
+        "[{\"type\":\"function\",\"function\":{\"name\":\"get_weather\","
+        "\"arguments\":{\"city\":\"Paris\",\"days\":3}}}]",
+        TC_DIALECT_QWEN_XML);
+    ASSERT_STR_EQ(with_number,
+        "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n"
+        "<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>");
+    free(with_number);
+}
+
+/* Ornith writes an object `arguments` as compact JSON inside the fenced block. */
+static void test_history_object_arguments_ornith(void) {
+    char *rendered = render_history_calls(
+        "[{\"type\":\"function\",\"function\":{\"name\":\"read\","
+        "\"arguments\":{\"path\":\"/etc/hostname\"}}}]",
+        TC_DIALECT_ORNITH_JSON);
+    ASSERT_STR_EQ(rendered,
+        "```json\n{\"function\": \"read\", \"arguments\": {\"path\":\"/etc/hostname\"}}\n```");
+    free(rendered);
+}
+
 /* A bare "{" in a QWEN_XML request must NOT be parsed as a call (dialect gate:
  * the JSON parser only runs for ORNITH_JSON). */
 static void test_json_ignored_under_xml_dialect(void) {
@@ -1064,6 +1136,8 @@ int main(void) {
     RUN_TEST(ornith_truncated_zero);
     RUN_TEST(ornith_prose_only);
     RUN_TEST(ornith_render_roundtrip);
+    RUN_TEST(history_object_arguments_xml);
+    RUN_TEST(history_object_arguments_ornith);
     RUN_TEST(json_ignored_under_xml_dialect);
     RUN_TEST(dialect_resolver);
 
@@ -1075,6 +1149,7 @@ int main(void) {
     RUN_TEST(abandoned_neighbour_no_opener_untouched);
     RUN_TEST(abandoned_unclosed_but_valued_is_a_call);
     RUN_TEST(abandoned_after_a_good_call);
+    RUN_TEST(qwen_preamble_tojson_separators);
 
     TEST_REPORT();
     return __ft_failed > 0 ? 1 : 0;

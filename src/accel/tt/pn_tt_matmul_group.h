@@ -93,12 +93,14 @@
 
 #ifdef USE_TT
 
+#include "pn_tt_grid_marks.h"
 #include <stdbool.h>
 #include <stdint.h>
 
 #include "pn_tt_column_runs.h"
 #include "pn_tt_device.h"
 #include "pn_tt_issue.h"
+#include "pn_tt_matmul_pull.h"
 
 #include "tt/ft_tt_dram_stripe.h"
 #include "tt/ft_tt_fttw.h"
@@ -152,6 +154,16 @@ typedef struct pn_tt_matmul_group {
      */
     ft_tt_dram_endpoint activation_door[FT_TT_MAX_DRAM_BANKS][PN_TT_MATMUL_MAX_CORES];
     uint32_t activation_bank_count;
+    /**
+     * WEIGHT BANK MAP (tt-place lane, `PN_TT_WEIGHT_BANKS`): 0 = the rotation (bank
+     * `(cursor + m) % 8`, the shipped placement), 1 = `near` (each member's panels in the
+     * bank and door nearest it on its reader NoC, 2 members a bank, ft_tt_dram_nearest.h),
+     * 2 = `nearbank` (nearest banks, doors by the stripe chooser). Same bytes either way.
+     */
+    uint32_t weight_bank_mode;
+    bool weight_near_ready;
+    uint32_t weight_near_bank[PN_TT_MATMUL_MAX_CORES];
+    uint32_t weight_near_port[PN_TT_MATMUL_MAX_CORES];
     bool activation_doors; /**< PN_TT_ACTIVATION_DOORS; the control arm, default on */
 
     /** Reported, never refused: pairs of doors in one plan that share a NoC row, worst over
@@ -312,7 +324,18 @@ typedef struct pn_tt_matmul_group {
         double busy_await;  /**< awaits that had to poll more than once */
         uint64_t busy_count;
         uint64_t polls;
+        /* CLASS CLOCK (tt-place, `PN_TT_MATMUL_CLASS_CLOCK=1`, host-issued decode only): the
+         * members' own card-busy counters (writer word 13) read after every flush, so a
+         * flush's card time per member is a difference of two card clocks — the host
+         * span above is not a card clock under dispatch. Units: 16 AICLK cycles. */
+        uint64_t card_busy_max;
+        uint64_t card_busy_sum;
+        uint64_t card_pull_wait; /**< member 0's pull wait (writer word 61), same units */
+        uint64_t card_busy_member[PN_TT_MATMUL_MAX_CORES];
     } flush_census[32];
+    uint32_t class_clock_last[PN_TT_MATMUL_MAX_CORES];
+    uint32_t class_clock_pull_last;
+    int class_clock; /**< -1 unread, 0 off, 1 on */
     uint64_t flush_census_dropped;
     double member_wait_seconds[PN_TT_MATMUL_MAX_CORES];
     uint64_t poll_reads; /**< 4-byte control reads the completion polls spent */
@@ -389,11 +412,32 @@ typedef struct pn_tt_matmul_group {
     uint32_t chain_pull_members;
     uint32_t chain_pull_target;
     uint64_t pulled_flushes;
+    /** L2 (pn_tt_matmul_pull.h): `PN_TT_MATMUL_PULL_DEFER` holds member 0's descriptor until
+     *  the next projection of its chain (published with no pull) or the flush (published with
+     *  the pull); `PN_TT_MATMUL_PULL_SWEEP=0` asks the writer for the one-at-a-time walk. */
+    bool pull_defer;
+    bool pull_serial;
+    bool m0_held;
+    ft_tt_queue_descriptor m0_held_descriptor;
+    uint64_t pulls_deferred; /**< member-0 descriptors published without the pull they had */
     /** PHASE G0: the descriptor word a1 every issue carries (0 = the shipped path; bit 31 =
      *  B stash at L1 address (a1 & 0xFFFFFF) << 4, bit 30 = RED skip the stash load) and the
      *  stash CB's placed address (`PN_TT_G0_STASH_TILES` > 0 at arm). */
     uint32_t g0_a1;
     uint32_t stash_address;
+    /** S3b: while non-NULL, pn_tt_group_issue() writes FUSED gate/up descriptors — the up
+     *  weight's shard in a1/a2 and `swiglu_bits` over word 15 (pn_tt_swiglu_fuse.h). Set and
+     *  cleared around one issue by pn_tt_matmul_group_enqueue_swiglu() only. */
+    const pn_tt_weight *swiglu_up;
+    uint32_t swiglu_bits;
+    uint64_t swiglu_issues; /**< fused projections issued (each one replaces gate + up + silu_mul) */
+    /** S3a: while non-NULL, pn_tt_group_issue() writes RESADD descriptors — this residual at
+     *  the member's first column in a1/a2 and `resadd_bits` over word 15
+     *  (pn_tt_resadd_fuse.h). Set and cleared around one issue by
+     *  pn_tt_matmul_group_enqueue_resadd() only. */
+    const pn_tt_activation *resadd_residual;
+    uint32_t resadd_bits;
+    uint64_t resadd_issues; /**< projections issued with the residual add fused */
 
     /* ------------------------------------------------------------------
      * PHASE G — the PREFILL GRID: `PN_TT_PREFILL_GRID` resident matmul triads (default 0 =
@@ -406,12 +450,27 @@ typedef struct pn_tt_matmul_group {
     uint32_t grid_count;
     uint32_t grid_pieces;
     uint32_t grid_stash_tiles;
+    uint64_t grid_msplit_pieces; /**< row-split pieces issued (pn_tt_grid_msplit.h) */
+    uint64_t grid_unsplit_projections; /**< unsplit weights cut by rows (O.0) */
+    pn_tt_grid_marks grid_marks;       /**< G.2: a mark per detached projection */
+    uint32_t grid_last_mark;           /**< the mark of the last detached projection */
+    uint64_t grid_mark_waits, grid_mark_full; /**< waits by mark / that fell back to a full wait */
+    bool grid_unsplit_ok; /**< pn_tt_matmul_grid_unsplit_allow() */
     uint32_t grid_stash_address;
     uint32_t grid_tile_bytes, grid_depth;
     bool grid_booted;
     bool grid_running;
+    /** L1a.3: decode members 1.. serve as grid cores past `grid_lent_base` for this prompt
+     *  (pn_tt_matmul_grid_extend); the decode group refuses to arm while set. */
+    bool grid_lent;
+    uint32_t grid_lent_base;
+    /** L1a: decode members 1.. are parked and their cores lent to another role for this
+     *  prompt (pn_tt_matmul_members_lend); same refusals as `grid_lent`. */
+    bool members_lent;
     bool grid_pending[64];
     uint32_t grid_detached;   /**< PHASE W2: detached projections outstanding on the grid */
+    uint32_t grid_ring;       /**< descriptors the busiest grid core holds since the last grid
+                                   flush (stash chunks: more than one a projection) */
     uint64_t grid_projections, grid_stashed, grid_fallbacks;
     double grid_seconds;
 
@@ -542,6 +601,12 @@ typedef struct pn_tt_matmul_group {
      *  idle bound sent its first projection into a half-exited triad. Set at arm and after
      *  every completed flush; checked before an enqueue with nothing outstanding. */
     double last_alive_seconds;
+    /** PER MEMBER (2026-10-27): when each member last completed work. `last_alive_seconds`
+     *  is the OLDEST running member's: a flush that ran only member 0 (the solo alpha / beta)
+     *  no longer reads as the whole group alive. With the out-projections on the grid, members
+     *  1..15 sat idle through a whole 14.6k prefill while member 0 kept the group "alive", went
+     *  past their own idle exit, and the tail forward's first projection hung. */
+    double member_alive_seconds[PN_TT_MATMUL_MAX_CORES];
     uint64_t idle_retires;
 } pn_tt_matmul_group;
 
@@ -655,6 +720,48 @@ int pn_tt_matmul_group_g0(pn_tt_device *device, const pn_tt_weight *weight);
  *  prefill, and retire it after. Multi-row projections of sharded weights then run on it. */
 int pn_tt_matmul_grid_begin(pn_tt_device *device);
 void pn_tt_matmul_grid_end(pn_tt_device *device);
+
+/**
+ * L1a.3 (prefill rework spec §4): grow the RUNNING grid by the decode group's members 1..N-1
+ * (stopped; same firmware and program, so no boot) plus `extra_core` (a free core: the grid's
+ * firmware is booted on it) — 48 + 15 + 1 = 64 cores, 4 column pieces a shard. Exact: an N
+ * split only. While extended the decode group refuses to arm and to split a projection.
+ * Call with nothing issued to the grid since it started.
+ * @return grid cores added (0: nothing changed)
+ */
+uint32_t pn_tt_matmul_grid_extend(pn_tt_device *device, uint32_t extra_core);
+
+/**
+ * L1a: stop decode members 1..N-1 and hold their RISCs in reset, so another role's firmware can
+ * boot on their cores for this prompt. While lent the decode group refuses to arm or split.
+ * @return cores written to `cores` (0: nothing lent; a member that did not exit stops it)
+ */
+uint32_t pn_tt_matmul_members_lend(pn_tt_device *device, uint32_t *cores, uint32_t max);
+
+/**
+ * L1a: boot the matmul firmware on every lent member core again (skipping `stuck` ones, whose
+ * borrower did not exit) and re-arm the decode group whole.
+ * @return 0, or -1 (named) when a core did not boot or the group did not re-arm
+ */
+int pn_tt_matmul_members_return(pn_tt_device *device, const uint32_t *stuck, uint32_t stuck_count);
+
+/**
+ * L1a.3: shrink the grid back (flush, stop the added cores, park `extra_core`) and re-arm the
+ * decode group whole. `*extra_parked` (may be NULL) says whether the extra core exited and is
+ * held in reset — false means nothing may boot on it.
+ * @return 0, or -1 (named) when a core did not exit or the decode group did not re-arm
+ */
+int pn_tt_matmul_grid_retract(pn_tt_device *device, bool *extra_parked);
+
+/**
+ * C: flush and stop the running grid, park every core, and
+ * write their indexes to `cores` so another program may borrow them. pn_tt_matmul_grid_begin()
+ * boots the grid again once the borrower has parked them.
+ *
+ * @return the cores lent (the whole grid), or 0 when the grid is not running or not every core
+ *         parked (then nothing may boot on any of them; grid_begin restores the grid)
+ */
+uint32_t pn_tt_matmul_grid_lend(pn_tt_device *device, uint32_t *cores, uint32_t max);
 void pn_tt_matmul_grid_close(pn_tt_device *device);
 
 /** PHASE W2: issue a grid projection OUTSIDE the matvec chain (the chain's flushes never wait
@@ -675,8 +782,66 @@ bool pn_tt_matmul_group_member0_completion(const pn_tt_device *device, uint16_t 
                                            uint32_t *out_issued);
 /** Is the prefill grid running (a detached issue would be accepted)? */
 bool pn_tt_matmul_grid_is_running(const pn_tt_device *device);
+/**
+ * O.0: may a multi-row projection of an UNSPLIT weight go to the grid cut by rows? Off by
+ * default; the caller turns it on only where nothing gates on the decode member's completion
+ * count (the wavefront's alpha/beta reader gate is member 0's) — then back off.
+ */
+void pn_tt_matmul_grid_unsplit_allow(pn_tt_device *device, bool allow);
+/** G.2: the mark of the last detached grid projection (PN_TT_GRID_MARK_NONE before any). */
+uint32_t pn_tt_matmul_grid_last_mark(const pn_tt_device *device);
+/**
+ * G.2: wait for the detached grid projection marked `mark` (and everything issued before it),
+ * not for the projections issued after it. Streamed: puller AWAITs on each grid core's count at
+ * the mark. Unstreamed, or a mark the FIFO no longer holds: a full detached wait.
+ * `PN_TT_GRID_MARKS=0` always waits for everything. RED `grid_mark_early`: waits for the
+ * previous mark — must DIFFER.
+ */
+int pn_tt_matmul_grid_wait_mark(pn_tt_device *device, uint32_t mark);
 
 int pn_tt_matmul_group_flush(pn_tt_device *device);
+
+/**
+ * S3b: ISSUE one fused SwiGLU projection — one descriptor per member carrying `gate`'s and
+ * `up`'s panels of the member's columns, writing silu(gate) * up into `output` (and its
+ * mirrors, through the members' replica table) — and DO NOT WAIT, as
+ * pn_tt_matmul_group_enqueue().
+ *
+ * Only the shape the fused kernel serves is accepted: the fused program armed
+ * (PN_TT_FUSE_SWIGLU), gate and up split on one shard map over the group, one tile row, the
+ * pipelined reader, no cooperation, no G0 stash, MB = 1, and an output whose mirrors the
+ * members' table covers. Anything else is refused BEFORE anything is written, and the caller
+ * runs the unfused gate, up and silu_mul.
+ *
+ * @return FT_TT_OK issued; FT_TT_EINVAL refused (nothing issued); another foundry error code
+ *         if the issue itself failed
+ *
+ * Thread-safe: no    Reentrant: no    Signal-safe: no
+ */
+int pn_tt_matmul_group_enqueue_swiglu(pn_tt_device *device, const pn_tt_weight *gate,
+                                      const pn_tt_weight *up, const pn_tt_activation *input,
+                                      const pn_tt_activation *output);
+
+/**
+ * S3a: ISSUE one projection with the residual add fused — one descriptor per member writing
+ * `residual` + bf16(`input` . `weight`) into `output` at the member's columns — and DO NOT
+ * WAIT, as pn_tt_matmul_group_enqueue().
+ *
+ * Only the shape the RESADD kernel serves is accepted: the fused program armed with
+ * PN_TT_FUSE_RESADD, `weight` split over the group, one tile row, the pipelined reader, no
+ * cooperation, no G0 stash, MB = 1, and `residual` / `output` distinct, unmirrored and wide
+ * enough (pn_tt_resadd_strips_pair()). Anything else is refused BEFORE anything is written,
+ * and the caller runs the projection and pn_tt_add() unfused.
+ *
+ * @return FT_TT_OK issued; FT_TT_EINVAL refused (nothing issued); another foundry error code
+ *         if the issue itself failed
+ *
+ * Thread-safe: no    Reentrant: no    Signal-safe: no
+ */
+int pn_tt_matmul_group_enqueue_resadd(pn_tt_device *device, const pn_tt_weight *weight,
+                                      const pn_tt_activation *input,
+                                      const pn_tt_activation *residual,
+                                      const pn_tt_activation *output);
 
 /** Whether the one-shot escape can read this weight at all — false once it is sharded. */
 bool pn_tt_matmul_group_can_fall_back(const pn_tt_device *device, const pn_tt_weight *weight);
@@ -717,6 +882,9 @@ void pn_tt_matmul_group_read_report(const pn_tt_device *device, double tokens);
  * The caller guarantees nothing is in flight.
  */
 void pn_tt_matmul_group_param_cache_reset(pn_tt_device *device);
+
+/** Diagnostics: members whose completion count is short of what was issued to them now. */
+uint32_t pn_tt_matmul_group_incomplete(pn_tt_device *device);
 
 #endif /* USE_TT */
 #endif /* PN_TT_MATMUL_GROUP_H */

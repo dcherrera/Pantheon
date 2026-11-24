@@ -76,7 +76,8 @@ used before any `--model` the server exits with an error.
 | `--name` | `<id>` | basename of path | Served model id (the `model` field clients send in requests). Used for routing in multi-model mode. |
 | `--dies` | `<a[,b,...]>` | none (auto-place) | Pin to accelerator dies (CUDA or Tenstorrent builds). CUDA ordinals are relative to `CUDA_VISIBLE_DEVICES`, not physical device numbers. Max `PN_MODEL_MAX_DIES=8`. N dies split the layers N ways (VRAM headroom, not speed). A `--dies` naming dies this binary has no backend for refuses to start; omit it to serve on the CPU. |
 | `--ctx-cap` | `<n>` | `0` = engine default | Per-session context cap in tokens (the KV window). A longer prompt is refused with `context_over_budget`; nothing is silently dropped. Max 2^20. |
-| `--reasoning-budget` | `<n>` | `0` = unbounded | After `<n>` tokens inside `<think>` without closing it, force `</think>` so the model answers. |
+| `--reasoning-budget` | `<n>` | `0` = unbounded | After `<n>` tokens inside `<think>` without closing it, force `</think>` so the model answers. The cap run is lowered to keep `--reasoning-reserve` of `max_tokens` for the answer; in the last `min(256, cap/8)` tokens before it, the close fires on the first line end (`PN_REASONING_LINE_GRACE=0` closes exactly at the cap). |
+| `--reasoning-reserve` | `<n>` | `0` = 3072 | Tokens of `max_tokens` kept for the answer / tool call after a forced close: the cap run is `min(budget, max_tokens - n)`, with `n` at most `max_tokens/2`. |
 | `--max-sessions` | `<n>` | `0` = default 8 (`BS_MAX_USERS`) | Cap on live prefix-cache sessions; a new session over the cap is refused 429/503. |
 | `--max-concurrent` | `<n>` | `0` = the resolved `--max-sessions` | Cap on simultaneous decode slots; surplus requests queue, then get 429/503. |
 

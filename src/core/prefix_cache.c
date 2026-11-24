@@ -19,13 +19,14 @@
  *         plain-KV (llama-family) arches resume at the longest common prefix
  *         on history divergence (no snapshot needed — pure causal KV rows are
  *         position-invariant, so pos is simply truncated). MULTI-CONVO: one
- *         id holds an entry per conversation it carries; max_sessions still
- *         counts ids. Content dedup is follow-up.
+ *         id holds an entry per conversation it carries; max_sessions counts
+ *         session families (session_family.h). Content dedup is follow-up.
  * @issues None
  * @todo Increment 2: content-addressed cross-session prefix dedup.
  */
 
 #include "prefix_cache.h"
+#include "session_family.h"
 #include "session_snapshot.h"
 #include "../models/qwen35moe.h"
 
@@ -55,6 +56,14 @@ typedef struct {
     void     *sys_snap;
     uint32_t *sys_tokens;
     int       sys_len;
+    /* TURN — the recurrent snapshot at the start of the last turn that carried
+     * think_history (pn_qwen35moe_state_snapshot_recurrent: SSM images + q4
+     * shadows, no KV rows); turn_tokens[0..turn_n) are the request tokens it
+     * covers. A drop_last request restores it over the KV rows the state still
+     * holds, so it is valid only while no row below turn_n is rewritten. */
+    void     *turn_snap;
+    uint32_t *turn_tokens;
+    int       turn_n;
 } pn_prefix_entry;
 
 struct pn_prefix_cache {
@@ -70,6 +79,10 @@ struct pn_prefix_cache {
      * whose base session is still watched. NULL = no watch protection. */
     pn_session_watched_fn watch_fn;
     void                 *watch_ctx;
+    /* Session families holding entries, republished after every change to an
+     * entry's state/sid (publish_session_count) so pn_prefix_cache_session_count
+     * reads it without the cache's lock. */
+    int                   session_count;
 };
 
 /* Length of the longest common prefix of two token runs. */
@@ -225,16 +238,19 @@ static int entry_set_tokens(pn_prefix_entry *e, const uint32_t *tokens, int n)
  * output of a resumed turn is the output of a cold prefill of the same prompt, and it covers the
  * re-rendered history (lcp < n_tok) the append tier cannot. Then the append tier, but only when
  * the card still holds this session's sequence: another session's forwards since then left its
- * own K/V and state there. Returns 1 (resumed, *delta set), 0 (fall through to the append
- * tier), -1 (full reset). */
+ * own K/V and state there. The checkpoint is never used past `ceiling`. Returns 1 (resumed,
+ * *delta set), 0 (fall through to the append tier), -1 (full reset). */
 static int tt_card_tier(pn_prefix_cache *c, pn_prefix_entry *e, const uint32_t *tokens,
-                        int n_ctx, int lcp, int *delta)
+                        int n_ctx, int lcp, int ceiling, int *delta)
 {
     int p;
 
     if (!kv_is_off_host(c))
         return 0;
-    p = pn_qwen35moe_tt_checkpoint_resume(c->model, e->state, tokens, n_ctx);
+    /* The checkpoint resumes only when its position is below the token count it is given, so
+     * passing ceiling + 1 keeps it at or below the resume ceiling (think_history as_sent). */
+    p = pn_qwen35moe_tt_checkpoint_resume(c->model, e->state, tokens,
+                                          ceiling < n_ctx ? ceiling + 1 : n_ctx);
     if (p > 0) {
         fprintf(stderr, "[prefix_cache] card checkpoint sid=%s: resume at %d, prefill %d of %d "
                 "tokens [lcp=%d n_tok=%d]\n", e->sid, p, n_ctx - p, n_ctx, lcp, e->n_tok);
@@ -261,6 +277,21 @@ static void sys_snap_drop(pn_prefix_entry *e)
     e->sys_len = 0;
 }
 
+/* Drop an entry's turn snapshot (keeps the tokens buffer for reuse). */
+static void turn_snap_drop(pn_prefix_entry *e)
+{
+    pn_qwen35moe_state_snapshot_free(e->turn_snap);
+    e->turn_snap = NULL;
+    e->turn_n = 0;
+}
+
+/* The entry's state was replaced or reset: neither snapshot describes it. */
+static void entry_snaps_drop(pn_prefix_entry *e)
+{
+    sys_snap_drop(e);
+    turn_snap_drop(e);
+}
+
 void pn_prefix_cache_free(pn_prefix_cache *c)
 {
     if (!c)
@@ -271,6 +302,8 @@ void pn_prefix_cache_free(pn_prefix_cache *c)
         free(c->ents[i].tokens);
         pn_qwen35moe_state_snapshot_free(c->ents[i].sys_snap);
         free(c->ents[i].sys_tokens);
+        pn_qwen35moe_state_snapshot_free(c->ents[i].turn_snap);
+        free(c->ents[i].turn_tokens);
     }
     free(c->ents);
     free(c);
@@ -295,27 +328,50 @@ static pn_prefix_entry *find_entry(pn_prefix_cache *c, const char *sid)
     return best;
 }
 
-static int sid_entry_count(const pn_prefix_cache *c, const char *sid)
+/* Does a live entry belong to `sid`'s session family? */
+static int entry_in_family(const pn_prefix_entry *e, const char *sid)
+{
+    return e->state && pn_session_same_family(e->sid, sid);
+}
+
+/* Live entries in `sid`'s session family. */
+static int family_entry_count(const pn_prefix_cache *c, const char *sid)
 {
     int n = 0;
     for (int i = 0; i < c->cap; i++)
-        n += entry_has_sid(&c->ents[i], sid);
+        n += entry_in_family(&c->ents[i], sid);
     return n;
 }
 
-/* Distinct session ids holding at least one entry (what max_sessions counts). */
-static int live_sid_count(const pn_prefix_cache *c)
+/* Distinct session families holding at least one entry (what max_sessions
+ * counts — the batched scheduler counts the same way). */
+static int live_family_count(const pn_prefix_cache *c)
 {
     int n = 0;
     for (int i = 0; i < c->cap; i++) {
         const pn_prefix_entry *e = &c->ents[i];
         int first = e->state != NULL;
         for (int j = 0; j < i && first; j++)
-            if (entry_has_sid(&c->ents[j], e->sid))
+            if (entry_in_family(&c->ents[j], e->sid))
                 first = 0;
         n += first;
     }
     return n;
+}
+
+static void publish_session_count(pn_prefix_cache *c)
+{
+    __atomic_store_n(&c->session_count, live_family_count(c), __ATOMIC_RELEASE);
+}
+
+int pn_prefix_cache_session_count(const pn_prefix_cache *c)
+{
+    return c ? __atomic_load_n(&c->session_count, __ATOMIC_ACQUIRE) : 0;
+}
+
+int pn_prefix_cache_max_sessions(const pn_prefix_cache *c)
+{
+    return c ? c->cap : 0;
 }
 
 /* Free a single live slot in place (frees its pn_state + snapshot, keeps the
@@ -331,7 +387,8 @@ static void free_slot(pn_prefix_cache *c, pn_prefix_entry *e)
     e->n_tok = 0;
     e->sid[0] = '\0';
     e->last_active_ms = 0;
-    sys_snap_drop(e);
+    entry_snaps_drop(e);
+    publish_session_count(c);
 }
 
 pn_session_admit pn_prefix_cache_admit(pn_prefix_cache *c, const char *sid,
@@ -371,24 +428,28 @@ pn_session_admit pn_prefix_cache_admit(pn_prefix_cache *c, const char *sid,
         }
     }
 
-    /* Step 2: an existing session always resumes. */
+    /* Step 2: an existing session always resumes — and so does a new id of
+     * its family ("<id>-<more>"), which shares its seat. */
     pn_prefix_entry *mine = find_entry(c, sid);
     if (mine) {
         if (restart_tokens_out)
             *restart_tokens_out = mine->n_tok;
         return PN_SESSION_ADMIT_OK;
     }
+    if (family_entry_count(c, sid) > 0)
+        return PN_SESSION_ADMIT_OK;
 
     /* Step 3: a free slot (fresh or just-reaped) admits the new session, and
-     * so does a full pool holding fewer than max_sessions ids: some id then
-     * holds a second conversation, which alloc_entry gives up for this one. */
+     * so does a full pool holding fewer than max_sessions families: some
+     * family then holds a second conversation, which alloc_entry gives up for
+     * this one. */
     for (int i = 0; i < c->cap; i++)
         if (!c->ents[i].state)
             return PN_SESSION_ADMIT_OK;
-    if (live_sid_count(c) < c->cap)
+    if (live_family_count(c) < c->cap)
         return PN_SESSION_ADMIT_OK;
 
-    /* Step 4: max_sessions live, non-idle ids → refuse the new one. */
+    /* Step 4: max_sessions live, non-idle families → refuse the new one. */
     return PN_SESSION_ADMIT_AT_CAPACITY;
 }
 
@@ -402,11 +463,11 @@ void pn_prefix_cache_touch(pn_prefix_cache *c, const char *sid, uint64_t now_ms)
 }
 
 /* The entry a full pool gives up for a new conversation of `sid`: the least
- * recently used among `sid`'s own entries and every id's second-and-later
- * conversations, so one id's extra conversation never costs another id its
- * only one.  Only when every entry is some other id's only conversation (a new
- * id at max_sessions, which admission refuses before this) does it fall back to
- * the plain LRU. */
+ * recently used among `sid`'s own family's entries and every family's
+ * second-and-later conversations, so one family's extra conversation never
+ * costs another family its only one.  Only when every entry is some other
+ * family's only conversation (a new family at max_sessions, which admission
+ * refuses before this) does it fall back to the plain LRU. */
 static pn_prefix_entry *eviction_victim(pn_prefix_cache *c, const char *sid)
 {
     pn_prefix_entry *lru = NULL, *any = NULL;
@@ -414,7 +475,7 @@ static pn_prefix_entry *eviction_victim(pn_prefix_cache *c, const char *sid)
         pn_prefix_entry *e = &c->ents[i];
         if (!any || e->stamp < any->stamp)
             any = e;
-        if ((entry_has_sid(e, sid) || sid_entry_count(c, e->sid) > 1) &&
+        if ((entry_in_family(e, sid) || family_entry_count(c, e->sid) > 1) &&
             (!lru || e->stamp < lru->stamp))
             lru = e;
     }
@@ -438,16 +499,19 @@ static pn_prefix_entry *alloc_entry(pn_prefix_cache *c, const char *sid)
         pn_state_free(lru->state);
         lru->state = NULL;
         lru->n_tok = 0;                 /* keep tokens buffer for reuse */
-        sys_snap_drop(lru);
+        entry_snaps_drop(lru);
         slot = lru;
     }
 
     slot->state = pn_state_new(c->model);
-    if (!slot->state)
+    if (!slot->state) {
+        publish_session_count(c);
         return NULL;
+    }
     pn_state_reset(slot->state);
     snprintf(slot->sid, PN_PREFIX_SID_MAX, "%s", sid);
     slot->n_tok = 0;
+    publish_session_count(c);
     return slot;
 }
 
@@ -530,127 +594,183 @@ static int sys_snap_restore(pn_prefix_cache *c, pn_prefix_entry *e, int sys_len)
     return 0;
 }
 
-pn_state *pn_prefix_cache_acquire_sys(pn_prefix_cache *c, const char *sid,
-                                      const uint32_t *tokens, int n_ctx,
-                                      int sys_len, int *delta_start,
-                                      int *capture_sys)
+/* TURN tier (think_history drop_last): when `tokens` start with the entry's
+ * turn snapshot tokens and the state still holds those KV rows (committed
+ * history agrees that far and pos is at or past it), put the recurrent state
+ * back at the turn start and resume there. Same re-seed protocol as SYS1; the
+ * MTP head's backlog restarts at the restored position. 1 resumed (*delta). */
+static int turn_snap_resume(pn_prefix_cache *c, pn_prefix_entry *e,
+                            const char *sid, const uint32_t *tokens, int n_ctx,
+                            int *delta)
 {
-    if (!c || !sid || !tokens || n_ctx <= 0 || !delta_start || !capture_sys)
+    int n = e->turn_n;
+    if (!e->turn_snap || n <= 0 || n >= n_ctx || e->state->pos < n ||
+        lcp_len(e->tokens, e->n_tok, tokens, n_ctx) < n ||
+        memcmp(e->turn_tokens, tokens, (size_t)n * sizeof(uint32_t)) != 0)
+        return 0;
+    if (pn_qwen35moe_state_restore(e->state->kv_cache, e->turn_snap) != 0) {
+        turn_snap_drop(e);
+        return 0;
+    }
+    e->state->pos = n;
+#ifdef USE_CUDA
+    pn_qwen35moe_gpu_forget_state(c->model, e->state);
+    (void)pn_qwen35moe_mtp_rewind(c->model, e->state);
+#else
+    (void)c;
+#endif
+    e->n_tok = n;   /* committed history truncated to the turn start */
+    *delta = n;
+    fprintf(stderr, "[prefix_cache] turn snapshot sid=%s: resume at %d, "
+            "prefill %d of %d tokens\n", sid, n, n_ctx - n, n_ctx);
+    return 1;
+}
+
+/* DIAG — the tokens straddling a divergence at `l`: `committed` is what we
+ * generated and cached, `incoming` what the client sent back for the same span.
+ * Printing from their first difference shows a re-render mismatch directly
+ * instead of inferring it from lengths. */
+static void log_divergence(const pn_prefix_entry *e, const uint32_t *tokens,
+                           int n_ctx, int l, int width)
+{
+    if (l >= e->n_tok)
+        return;
+    fprintf(stderr, "[prefix_cache]   committed[%d..%d]:", l, e->n_tok - 1);
+    for (int i = l; i < e->n_tok && i < l + width; i++)
+        fprintf(stderr, " %u", e->tokens[i]);
+    fprintf(stderr, "\n[prefix_cache]   incoming [%d..%d]:", l, n_ctx - 1);
+    for (int i = l; i < n_ctx && i < l + width; i++)
+        fprintf(stderr, " %u", tokens[i]);
+    fprintf(stderr, "\n");
+}
+
+/* LCP-REWIND tier: rewind a plain-KV entry to the longest common prefix `l`
+ * and prefill only from there. This is what makes a warmed prefix pay off on
+ * these arches — the next turn's prompt shares the (large) system prefix but
+ * diverges right after it (assistant opener / No-Think think block / a fresh
+ * conversation), which the exact-prefix append check can never hit. Clamps:
+ * never past the state's own position (rows beyond pos were never filled),
+ * never past `ceiling`, and leave at least one prompt token to prefill so the
+ * next-token logits are recovered. Returns the resume position (0: reset). */
+static int lcp_rewind(pn_prefix_entry *e, const char *sid, int l, int n_ctx,
+                      int ceiling)
+{
+    int l2 = l;
+    if (l2 > e->state->pos)
+        l2 = e->state->pos;
+    if (l2 >= n_ctx)
+        l2 = n_ctx - 1;
+    if (l2 > ceiling)
+        l2 = ceiling;
+    if (l2 <= 0) {
+        pn_state_reset(e->state);
+        e->n_tok = 0;
+        return 0;
+    }
+    e->state->pos = l2;
+    e->n_tok = l2;   /* committed history truncated to the LCP */
+    fprintf(stderr, "[prefix_cache] lcp rewind sid=%s: resume at %d, prefill "
+            "%d of %d tokens\n", sid, l2, n_ctx - l2, n_ctx);
+    return l2;
+}
+
+/* The acquire ladder over an existing entry: the turn snapshot (drop_last),
+ * then card checkpoint (TT), append, system prefix, LCP rewind, full reset —
+ * none of those resuming past the ceiling.
+ * Returns the tier that ran and sets *delta. */
+static pn_resume_kind resume_entry(pn_prefix_cache *c, pn_prefix_entry *e,
+                                   const char *sid, const uint32_t *tokens,
+                                   int n_ctx,
+                                   const pn_prefix_acquire_opts *opts,
+                                   int *delta)
+{
+    int sys_len = opts->sys_len, ceiling = opts->resume_ceiling;
+    if (opts->drop_last && turn_snap_resume(c, e, sid, tokens, n_ctx, delta))
+        return PN_RESUME_TURN_CKPT;
+    int sys_ok = sys_len > 0 && sys_len < n_ctx && sys_len <= ceiling;
+    int l = lcp_len(e->tokens, e->n_tok, tokens, n_ctx);
+    int card = 0;
+#ifdef USE_TT
+    card = tt_card_tier(c, e, tokens, n_ctx, l, ceiling, delta);
+#endif
+    if (card == 1)
+        return PN_RESUME_TURN_CKPT;   /* resumed from the card's checkpoint */
+    if (card == 0 && l == e->n_tok && e->state->pos == e->n_tok &&
+        l <= ceiling) {
+        /* Append case (the agentic turn): the whole cached history is a
+         * prefix of the new context and the state sits exactly at its end. */
+        *delta = l;
+        return PN_RESUME_EXACT;
+    }
+    if (sys_ok && sys_snap_matches(e, tokens, sys_len) &&
+        sys_snap_restore(c, e, sys_len) == 0) {
+        /* Divergent history but identical system prefix (the reasoning-model
+         * turn): resume at the system boundary, prefill only the
+         * conversation; commit rebuilds the history at end of turn. DIAG:
+         * `lcp` is how far the new context agrees with the committed history:
+         * lcp == n_tok means `pos` disqualified the append (state left
+         * mid-turn); lcp < n_tok means the client re-rendered the conversation
+         * and `lcp - sys_len` is re-prefilled because this arch has no
+         * lcp-rewind. Read the FIRST of these after a fresh turn — later ones
+         * follow the n_tok = 0 below and only report the reset. */
+        fprintf(stderr, "[prefix_cache] sys-prefix reuse sid=%s: resume at "
+                "%d, prefill %d of %d tokens "
+                "[diag lcp=%d n_tok=%d pos=%d wasted=%d ceiling=%d]\n",
+                sid, sys_len, n_ctx - sys_len, n_ctx, l, e->n_tok,
+                e->state->pos, l > sys_len ? l - sys_len : 0, ceiling);
+        log_divergence(e, tokens, n_ctx, l, 32);
+        e->n_tok = 0;
+        *delta = sys_len;
+        return PN_RESUME_SYS_PREFIX;
+    }
+    if (lcp_rewind_supported(c)) {
+        *delta = lcp_rewind(e, sid, l, n_ctx, ceiling);
+        return *delta > 0 ? PN_RESUME_PARTIAL : PN_RESUME_COLD;
+    }
+    /* DIAG — a session that MISSED every tier re-prefills in full; say why,
+     * or a client re-rendering its history differently is invisible. */
+    fprintf(stderr, "[prefix_cache] full reset sid=%s: lcp=%d n_tok=%d pos=%d "
+            "ceiling=%d (no tier: append needs lcp == n_tok == pos <= "
+            "ceiling)\n", sid, l, e->n_tok, e->state->pos, ceiling);
+    log_divergence(e, tokens, n_ctx, l, 16);
+    pn_state_reset(e->state);
+    e->n_tok = 0;
+    *delta = 0;
+    return PN_RESUME_COLD;
+}
+
+pn_state *pn_prefix_cache_acquire_bounded(pn_prefix_cache *c, const char *sid,
+                                          const uint32_t *tokens, int n_ctx,
+                                          const pn_prefix_acquire_opts *opts,
+                                          pn_prefix_acquire_result *out)
+{
+    if (!c || !sid || !tokens || n_ctx <= 0 || !opts || !out)
         return NULL;
+    int sys_len = opts->sys_len;
     /* A system prefix is only usable when a conversation follows it. */
     int sys_ok = sys_len > 0 && sys_len < n_ctx;
-    *capture_sys = 0;
+    out->delta_start = 0;
+    out->capture_sys = 0;
+    out->kind = PN_RESUME_COLD;
 
     pn_prefix_entry *e = find_conversation(c, sid, tokens, n_ctx, sys_len);
     int delta = 0;
+    pn_resume_kind kind = PN_RESUME_COLD;
 
     if (e) {
-        int l = lcp_len(e->tokens, e->n_tok, tokens, n_ctx);
-        int card = 0;
-#ifdef USE_TT
-        card = tt_card_tier(c, e, tokens, n_ctx, l, &delta);
-#endif
-        if (card == 1) {
-            /* resumed from the card's checkpoint (delta set) */
-        } else if (card == 0 && l == e->n_tok && e->state->pos == e->n_tok) {
-            /* Append case (the agentic turn): the whole cached history is a
-             * prefix of the new context and the state sits exactly at its
-             * end. Resume from there. */
-            delta = l;
-        } else if (sys_ok && sys_snap_matches(e, tokens, sys_len) &&
-                   sys_snap_restore(c, e, sys_len) == 0) {
-            /* Divergent history but identical system prefix (the reasoning-
-             * model turn): resume at the system boundary, prefill only the
-             * conversation. The stale committed history is dropped; commit
-             * rebuilds it at end of turn. */
-            delta = sys_len;
-            /* DIAG — why tier 1 (append) was missed, and what the collapse to
-             * the system boundary costs. `lcp` is how far the new context
-             * actually agrees with the committed history: if lcp == n_tok the
-             * histories match and it was `pos` that disqualified the append
-             * (state left mid-turn); if lcp < n_tok the client re-rendered the
-             * conversation and `lcp - sys_len` is the prefix we are re-prefilling
-             * for no reason, because this arch has no lcp-rewind to resume from.
-             * Read the FIRST of these after a fresh turn — later ones follow the
-             * n_tok = 0 below and only report the reset. */
-            fprintf(stderr, "[prefix_cache] sys-prefix reuse sid=%s: resume at "
-                    "%d, prefill %d of %d tokens "
-                    "[diag lcp=%d n_tok=%d pos=%d wasted=%d]\n",
-                    sid, sys_len, n_ctx - sys_len, n_ctx,
-                    l, e->n_tok, e->state->pos,
-                    l > sys_len ? l - sys_len : 0);
-            /* DIAG — the tokens straddling the divergence. `committed` is what
-             * we generated and cached; `incoming` is what the client sent back
-             * for the same span. Their first difference is at index `l`, so
-             * printing from there shows the re-render mismatch directly instead
-             * of inferring it from lengths. */
-            if (l < e->n_tok) {
-                fprintf(stderr, "[prefix_cache]   committed[%d..%d]:", l, e->n_tok - 1);
-                for (int i = l; i < e->n_tok && i < l + 32; i++)
-                    fprintf(stderr, " %u", e->tokens[i]);
-                fprintf(stderr, "\n[prefix_cache]   incoming [%d..%d]:", l, n_ctx - 1);
-                for (int i = l; i < n_ctx && i < l + 32; i++)
-                    fprintf(stderr, " %u", tokens[i]);
-                fprintf(stderr, "\n");
-            }
-            e->n_tok = 0;
-        } else if (lcp_rewind_supported(c)) {
-            /* Divergent history on a plain-KV arch: rewind to the longest
-             * common prefix and prefill only from there. This is what makes
-             * a warmed prefix pay off on these arches — the next turn's
-             * prompt shares the (large) system prefix but diverges right
-             * after it (assistant opener / No-Think think block / a fresh
-             * conversation), which the exact-prefix append check above can
-             * never hit. Clamps: never past the state's own position (rows
-             * beyond pos were never filled), and leave at least one prompt
-             * token to prefill so the next-token logits are recovered. */
-            int l2 = l;
-            if (l2 > e->state->pos)
-                l2 = e->state->pos;
-            if (l2 >= n_ctx)
-                l2 = n_ctx - 1;
-            if (l2 > 0) {
-                e->state->pos = l2;
-                e->n_tok = l2;   /* committed history truncated to the LCP */
-                delta = l2;
-                fprintf(stderr, "[prefix_cache] lcp rewind sid=%s: resume at "
-                        "%d, prefill %d of %d tokens\n",
-                        sid, l2, n_ctx - l2, n_ctx);
-            } else {
-                pn_state_reset(e->state);
-                e->n_tok = 0;
-                delta = 0;
-            }
-        } else {
-            /* DIAG — a session that MISSED every tier re-prefills in full; say why (the
-             * same straddle print as the system-prefix tier), or a client re-rendering its
-             * history differently is invisible. */
-            fprintf(stderr, "[prefix_cache] full reset sid=%s: lcp=%d n_tok=%d pos=%d "
-                    "(no tier: append needs lcp == n_tok == pos)\n",
-                    sid, l, e->n_tok, e->state->pos);
-            if (l < e->n_tok) {
-                fprintf(stderr, "[prefix_cache]   committed[%d..]:", l);
-                for (int i = l; i < e->n_tok && i < l + 16; i++)
-                    fprintf(stderr, " %u", e->tokens[i]);
-                fprintf(stderr, "\n[prefix_cache]   incoming [%d..]:", l);
-                for (int i = l; i < n_ctx && i < l + 16; i++)
-                    fprintf(stderr, " %u", tokens[i]);
-                fprintf(stderr, "\n");
-            }
-            pn_state_reset(e->state);
-            e->n_tok = 0;
-            delta = 0;
-        }
+        kind = resume_entry(c, e, sid, tokens, n_ctx, opts, &delta);
+        /* KV rows from the resume point on are rewritten by this prefill. */
+        if (e->turn_snap && delta < e->turn_n)
+            turn_snap_drop(e);
     } else {
         /* A new session, or a new conversation of this one: its own entry, so
          * the conversations it already holds keep their caches. */
         if (find_entry(c, sid))
             fprintf(stderr, "[prefix_cache] new conversation sid=%s (%d held)\n",
-                    sid, sid_entry_count(c, sid));
+                    sid, family_entry_count(c, sid));
         e = alloc_entry(c, sid);
         if (!e)
             return NULL;
-        delta = 0;
     }
 
     /* Full prefill ahead + no snapshot covering these exact system tokens →
@@ -658,7 +778,7 @@ pn_state *pn_prefix_cache_acquire_sys(pn_prefix_cache *c, const char *sid,
      * from a changed system prompt). */
     if (delta == 0 && sys_ok && sys_snapshot_supported(c) &&
         !sys_snap_matches(e, tokens, sys_len))
-        *capture_sys = 1;
+        out->capture_sys = 1;
 
     /* Any forward the caller now runs re-seeds/re-syncs this session's GPU
      * state (host_state / KV host-id mismatch), overwriting whatever session
@@ -668,8 +788,26 @@ pn_state *pn_prefix_cache_acquire_sys(pn_prefix_cache *c, const char *sid,
     c->live = e->state;
 
     e->stamp = ++c->clock;
-    *delta_start = delta;
+    out->delta_start = delta;
+    out->kind = delta > 0 ? kind : PN_RESUME_COLD;
     return e->state;
+}
+
+pn_state *pn_prefix_cache_acquire_sys(pn_prefix_cache *c, const char *sid,
+                                      const uint32_t *tokens, int n_ctx,
+                                      int sys_len, int *delta_start,
+                                      int *capture_sys)
+{
+    if (!delta_start || !capture_sys)
+        return NULL;
+    pn_prefix_acquire_result out = { 0, 0, PN_RESUME_COLD };
+    pn_prefix_acquire_opts opts = { sys_len, n_ctx, false };
+    pn_state *st = pn_prefix_cache_acquire_bounded(c, sid, tokens, n_ctx,
+                                                   &opts, &out);
+    *capture_sys = out.capture_sys;
+    if (st)
+        *delta_start = out.delta_start;
+    return st;
 }
 
 pn_state *pn_prefix_cache_acquire(pn_prefix_cache *c, const char *sid,
@@ -717,6 +855,53 @@ int pn_prefix_cache_capture_sys(pn_prefix_cache *c, const char *sid,
     e->sys_len = sys_len;
     fprintf(stderr, "[prefix_cache] sys-prefix captured sid=%s: %d tokens\n",
             sid, sys_len);
+    return 0;
+}
+
+bool pn_prefix_cache_turn_snapshot_supported(const pn_prefix_cache *c)
+{
+    return c && sys_snapshot_supported(c);
+}
+
+bool pn_prefix_cache_drop_last_supported(const pn_prefix_cache *c)
+{
+    if (!c)
+        return false;
+#ifdef USE_TT
+    if (kv_is_off_host(c))
+        return pn_qwen35moe_tt_checkpoint_available(c->model) != 0;
+#endif
+    return pn_prefix_cache_turn_snapshot_supported(c);
+}
+
+int pn_prefix_cache_capture_turn(pn_prefix_cache *c, const char *sid,
+                                 const uint32_t *tokens, int cut)
+{
+    if (!pn_prefix_cache_turn_snapshot_supported(c) || !sid || !tokens ||
+        cut <= 0)
+        return -1;
+    pn_prefix_entry *e = find_entry(c, sid);
+    if (!e || e->state->pos != cut)
+        return -1;
+#ifdef USE_CUDA
+    /* Same as the system-prefix capture: the host mirror must hold the SSM
+     * image and the KV rows [0, cut) the restore will resume over. */
+    if (pn_qwen35moe_gpu_state_to_host(c->model, e->state) != 0)
+        return -1;
+#endif
+    void *snap = pn_qwen35moe_state_snapshot_recurrent(e->state->kv_cache, cut);
+    if (!snap)
+        return -1;
+    uint32_t *tt = realloc(e->turn_tokens, (size_t)cut * sizeof(uint32_t));
+    if (!tt) {
+        pn_qwen35moe_state_snapshot_free(snap);
+        return -1;
+    }
+    memcpy(tt, tokens, (size_t)cut * sizeof(uint32_t));
+    pn_qwen35moe_state_snapshot_free(e->turn_snap);
+    e->turn_snap = snap;
+    e->turn_tokens = tt;
+    e->turn_n = cut;
     return 0;
 }
 
@@ -853,7 +1038,7 @@ int pn_prefix_cache_import_snapshot(pn_prefix_cache *c, const char *sid,
     }
     memcpy(e->tokens, tokens, (size_t)n_tok * sizeof(uint32_t));
     e->n_tok = n_tok;
-    sys_snap_drop(e);            /* the restored state is the new truth */
+    entry_snaps_drop(e);         /* the restored state is the new truth */
     e->stamp = ++c->clock;
     return 0;
 }
@@ -867,7 +1052,7 @@ void pn_prefix_cache_reset_session(pn_prefix_cache *c, const char *sid)
         return;
     pn_state_reset(e->state);   /* drop the (partial) KV/SSM state */
     e->n_tok = 0;               /* no committed history → next acquire full-prefills */
-    sys_snap_drop(e);           /* invalidate any system-prefix snapshot */
+    entry_snaps_drop(e);        /* invalidate the system-prefix and turn snapshots */
 }
 
 void pn_prefix_cache_release_session(pn_prefix_cache *c, const char *sid)

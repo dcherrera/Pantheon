@@ -44,6 +44,8 @@
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
+#include <unistd.h>
 
 #include "../src/core/prefix_cache.h"
 #include "../src/core/session_snapshot.h"
@@ -886,28 +888,42 @@ static void test_batched_sys_flow(void)
           "changed system prompt under a live sid is REPORTED as a conflict");
     bs_prefill_abort(bs, sa);
 
-    /* ── Slot takeover: session C claims A's slot (both free, C matches
-     * neither) — append-miss + sid-guarded sys-miss -> full prefill; C's
-     * capture then replaces the resident snapshot. ── */
+    /* ── A new session never takes a slot another session holds: both are
+     * held (A's snapshot, B), so C gets none and nothing of A's or B's is
+     * touched.  (This used to evict the least recently active one.) ── */
+    CHECK(bs_slot_acquire_biased(bs, "C") == -1,
+          "C gets no slot: every slot is held by another session");
+    CHECK(strcmp(bs->slots[0].sys_sid, "A") == 0 &&
+          strcmp(bs->slots[1].sys_sid, "B") == 0,
+          "...and A's and B's snapshots stay where they were");
+
+    /* ── Takeover within one family: "A-side" may take A's slot — append-miss
+     * + sid-guarded sys-miss -> full prefill; its capture then replaces the
+     * resident snapshot. ── */
     uint32_t pc1[20];
     mk_prompt(pc1, SYS_A, 7000, 20);   /* same SYS_A bytes as A's snapshot! */
-    int sc = bs_slot_acquire_biased(bs, "C");
-    bs_prefill_resume_sys(bs, sc, "C", pc1, 20, 8, &delta, &cap);
+    int sc = bs_slot_acquire_biased(bs, "A-side");
+    CHECK(sc == 0, "takeover: A-side (A's family) takes A's slot");
+    bs_prefill_resume_sys(bs, sc, "A-side", pc1, 20, 8, &delta, &cap);
     CHECK(delta == 0 && cap == 1,
-          "takeover: C never reuses A's snapshot (sid guard) even on "
+          "takeover: A-side never reuses A's snapshot (sid guard) even on "
           "identical prefix bytes");
     pn_qwen35moe_state *qc = (pn_qwen35moe_state *)bs->slots[sc].state->kv_cache;
     fill_ssm(qc, 3.0f);
     fill_kv_rows(qc, 0, 8, 3.0f);
     bs->slots[sc].state->pos = 8;
-    CHECK(bs_prefill_capture_sys(bs, sc, "C", pc1, 8) == 0,
-          "takeover: C's capture replaces the slot's snapshot");
-    CHECK(strcmp(bs->slots[sc].sys_sid, "C") == 0,
-          "takeover: snapshot ownership moved to C");
+    CHECK(bs_prefill_capture_sys(bs, sc, "A-side", pc1, 8) == 0,
+          "takeover: A-side's capture replaces the slot's snapshot");
+    CHECK(strcmp(bs->slots[sc].sys_sid, "A-side") == 0,
+          "takeover: snapshot ownership moved to A-side");
     bs_prefill_abort(bs, sc);
 
-    /* ── No session id / no sys prefix -> byte-identical legacy behavior. ── */
+    /* ── No session id / no sys prefix -> byte-identical legacy behavior, on
+     * a slot nobody holds (none while A-side and B hold both). ── */
+    CHECK(bs_slot_acquire(bs) == -1, "NULL sid: no slot while all are held");
+    bs_session_release(bs, "B");
     int sn = bs_slot_acquire(bs);
+    CHECK(sn == 1, "NULL sid takes the slot B's release freed");
     bs_prefill_resume_sys(bs, sn, NULL, pc1, 20, 8, &delta, &cap);
     CHECK(delta == 0 && cap == 0, "NULL sid: full prefill, no capture");
     bs_prefill_abort(bs, sn);
@@ -917,6 +933,107 @@ static void test_batched_sys_flow(void)
     bs_prefill_abort(bs, sn);
 
     bs_destroy(bs);   /* also frees the per-slot snapshots (leak gate) */
+}
+
+/* ============================================================
+ * Test 5b — NO DUPLICATE SLOTS: a session whose own slot is busy never takes a
+ * second slot that a new session needs.
+ *
+ * The incident (K80 bank, 2026-11-10): 4 slots, max_sessions 4.  An agent's
+ * next request arrived while its own slot was busy and took the free slot;
+ * once its warm state landed there it held two.  New sessions then got 429
+ * while sessions_used read 3/4.  The same happened through bs_slot_reroute
+ * (a new conversation under the id moves to a cold slot).
+ *
+ * Red: drop bs_family_may_take_extra_locked from try_claim_idle or
+ * bs_reroute_target_locked and the matching checks fail.
+ * ============================================================ */
+
+static const uint32_t DUP_HIST[4] = { 11, 12, 13, 14 };
+
+/* Seat `sid` on a slot, give it warm state there, end its turn.  The slot. */
+static int dup_seat_warm(pn_batch_sched *bs, const char *sid)
+{
+    int s = -1;
+
+    if (bs_slot_acquire_or_wait(bs, 0, &s, NULL, sid) != BS_ACQUIRE_OK || s < 0)
+        return -1;
+    publish_warm(&bs->slots[s], sid, DUP_HIST, 4);
+    bs_slot_release(bs, s);
+    return s;
+}
+
+static void test_no_duplicate_slots(void)
+{
+    printf("test: a busy session never takes a seat a new session needs\n");
+    g_make_q4 = 0;
+    pn_model model = {0};
+    model.config.arch = PN_ARCH_QWEN35MOE;
+    bs_occupancy occ;
+
+    /* ── Busy turn, then another request of the same session. ── */
+    pn_batch_sched *bs = mk_sched(&model, 4);
+    bs_set_session_admission(bs, 4, 0);
+    CHECK(dup_seat_warm(bs, "agent-a") == 0 && dup_seat_warm(bs, "agent-b") == 1 &&
+          dup_seat_warm(bs, "agent-c") == 2, "three sessions warm on slots 0-2");
+    int a1 = -1, a2 = -1;
+    CHECK(bs_slot_acquire_or_wait(bs, 0, &a1, NULL, "agent-a") == BS_ACQUIRE_OK &&
+          a1 == 0, "agent-a's turn runs on its own slot 0");
+    bs_acquire_result r = bs_slot_acquire_or_wait(bs, 0, &a2, NULL, "agent-a");
+    CHECK(r != BS_ACQUIRE_OK && a2 < 0,
+          "agent-a's next request, slot 0 busy: waits, does not take slot 3");
+    if (a2 >= 0) {   /* the old rule: its warm state lands on slot 3 too */
+        publish_warm(&bs->slots[a2], "agent-a", DUP_HIST, 4);
+        bs_slot_release(bs, a2);
+    }
+    bs_slot_release(bs, a1);
+    bs_session_occupancy(bs, &occ);
+    CHECK(occ.families == 3 && occ.slots_held == 3 && occ.slots_free == 1 &&
+          occ.seat_free, "3 sessions hold 3 slots; a seat is free");
+    int d = -1;
+    CHECK(bs_slot_acquire_or_wait(bs, 0, &d, NULL, "agent-d") == BS_ACQUIRE_OK &&
+          d == 3, "a 4th session is admitted on slot 3");
+    if (d >= 0)
+        bs_slot_release(bs, d);
+    bs_destroy(bs);
+
+    /* ── Reroute: a new conversation under a held id stays on its slot. ── */
+    static const uint32_t other[6] = { 90, 91, 92, 93, 94, 95 };
+    bs = mk_sched(&model, 4);
+    bs_set_session_admission(bs, 4, 0);
+    dup_seat_warm(bs, "agent-a");
+    dup_seat_warm(bs, "agent-b");
+    dup_seat_warm(bs, "agent-c");
+    a1 = -1;
+    bs_slot_acquire_or_wait(bs, 0, &a1, NULL, "agent-a");
+    int to = bs_slot_reroute(bs, a1, "agent-a", other, 6, 0);
+    CHECK(a1 == 0 && to == 0,
+          "reroute of a new conversation keeps agent-a on slot 0 (slot 3 is "
+          "the 4th session's seat)");
+    publish_warm(&bs->slots[to], "agent-a", other, 5);
+    bs_slot_release(bs, to);
+    d = -1;
+    CHECK(bs_slot_acquire_or_wait(bs, 0, &d, NULL, "agent-d") == BS_ACQUIRE_OK &&
+          d == 3, "...and the 4th session is admitted after it");
+    if (d >= 0)
+        bs_slot_release(bs, d);
+    bs_destroy(bs);
+
+    /* ── With room to spare (max_sessions 2 of 4 slots) a second copy is still
+     * allowed: it costs no session a seat. ── */
+    bs = mk_sched(&model, 4);
+    bs_set_session_admission(bs, 2, 0);
+    dup_seat_warm(bs, "agent-a");
+    a1 = a2 = -1;
+    bs_slot_acquire_or_wait(bs, 0, &a1, NULL, "agent-a");
+    CHECK(bs_slot_acquire_or_wait(bs, 0, &a2, NULL, "agent-a") == BS_ACQUIRE_OK &&
+          a2 > 0, "room to spare: agent-a's second request takes a free slot");
+    to = bs_slot_reroute(bs, a1, "agent-a", other, 6, 0);
+    CHECK(to != a1 && to != a2,
+          "room to spare: reroute still moves a new conversation to a cold slot");
+    bs_slot_release(bs, a2);
+    bs_slot_release(bs, to);
+    bs_destroy(bs);
 }
 
 /* ============================================================
@@ -1136,6 +1253,9 @@ static void test_two_convos_concurrent_title(void)
     pn_model model = {0};
     model.config.arch = PN_ARCH_QWEN35MOE;
     pn_batch_sched *bs = mk_sched(&model, 2);
+    /* One session on both slots: a second copy is allowed only while no
+     * other session could need that seat (max_sessions 1 of 2 slots). */
+    bs_set_session_admission(bs, 1, 0);
     uint32_t t1[16], ht[20], m1[24], hm[28], m2[30];
     int delta = -1;
 
@@ -1167,6 +1287,9 @@ static void test_two_convos_interleaved(void)
     pn_model model = {0};
     model.config.arch = PN_ARCH_QWEN35MOE;
     pn_batch_sched *bs = mk_sched(&model, 2);
+    /* One session on both slots: a second copy is allowed only while no
+     * other session could need that seat (max_sessions 1 of 2 slots). */
+    bs_set_session_admission(bs, 1, 0);
     uint32_t t1[16], ht[20], t2[22], ht2[26];
     uint32_t m1[24], hm[28], m2[30], hm2[34], m3[40];
     int delta = -1;
@@ -1608,15 +1731,16 @@ static void test_reasoning_bearing_resume(void)
     bs_prefill_abort(bs, slot);
 
     /* 4. COLD MUST STILL BE CORRECT, and the sharp version of cold is a NEW
-     *    session landing on the slot an evicted one left warm — its tokens then
-     *    byte-MATCH a projection that describes somebody else's KV.  Force it:
-     *    reserve the spare slot so "NEW" has to take slot 0. */
+     *    session id landing on the slot another one left warm — its tokens then
+     *    byte-MATCH a projection that describes somebody else's KV.  Only A's
+     *    own family may take A's slot now, so force it with "A-new": reserve
+     *    the spare slot so it has to take slot 0. */
     int busy = bs_slot_acquire(bs);
     CHECK(busy == 1, "the spare slot is reserved so the cold session must take 0");
-    int cold = bs_slot_acquire_biased(bs, "NEW");
+    int cold = bs_slot_acquire_biased(bs, "A-new");
     CHECK(cold == 0 && bs->slots[0].vis_think_n == 17,
           "the cold session takes the slot still holding A's projection");
-    bs_prefill_resume_sys(bs, cold, "NEW", with_reasoning, 21, 4, &delta,
+    bs_prefill_resume_sys(bs, cold, "A-new", with_reasoning, 21, 4, &delta,
                           &cap_req);
     CHECK(delta == 0,
           "a first turn carrying reasoning is a cold full prefill even when it "
@@ -2095,8 +2219,682 @@ static void test_session_admission(void)
     pn_prefix_cache_free(c);
 }
 
+/* ============================================================
+ * Test 7b — BATCHED session admission: the scheduler is the authority
+ *
+ * The 2026-11-05 bug (K80 bank): the batched path admitted against the prefix
+ * cache, which holds nothing there, so max_sessions was never enforced, and a
+ * new session took the least recently active idle slot — bs_prefill_begin then
+ * erased that user's KV.  Now an instance with max_sessions N seats at most N
+ * session families, the next new one is refused at once, and no slot another
+ * family holds is ever handed out.
+ * ============================================================ */
+
+/* Session `sid` finished a turn on slot `idx`: 24 committed tokens, its KV rows
+ * stamped with `seed`, the slot idle and recently active. */
+static void seat_warm(pn_batch_sched *bs, int idx, const char *sid, float seed)
+{
+    uint32_t h[24];
+    mk_prompt(h, SYS_A, 1000 + 100 * (int)seed, 24);
+    publish_warm(&bs->slots[idx], sid, h, 24);
+    fill_kv_rows((pn_qwen35moe_state *)bs->slots[idx].state->kv_cache, 0, 24,
+                 seed);
+    bs->slots[idx].status = BS_SLOT_IDLE;
+    bs->slots[idx].last_active_ms = 1e15;   /* never idle past any TTL */
+}
+
+/* Does slot `idx` still hold `sid`'s warm turn exactly as seat_warm left it? */
+static int still_warm(pn_batch_sched *bs, int idx, const char *sid, float seed)
+{
+    const bs_slot *sl = &bs->slots[idx];
+    return strcmp(sl->sid, sid) == 0 && sl->hist_n == 24 &&
+           check_kv_rows((const pn_qwen35moe_state *)sl->state->kv_cache, 0, 24,
+                         seed);
+}
+
+/* The serve's non-blocking acquire (what a 0 ms queue wait does). */
+static bs_acquire_result acquire_now(pn_batch_sched *bs, const char *sid,
+                                     int *slot)
+{
+    *slot = -1;
+    return bs_slot_acquire_or_wait(bs, 0, slot, NULL, sid);
+}
+
+static void test_batched_admission_one_seat(void)
+{
+    printf("test: batched admission, max_sessions 1\n");
+    pn_model model = {0};
+    model.config.arch = PN_ARCH_QWEN35MOE;
+    pn_batch_sched *bs = mk_sched(&model, 1);
+    bs_set_session_admission(bs, 1, 0);
+    int s = -1;
+
+    seat_warm(bs, 0, "user-a", 3.0f);
+    CHECK(acquire_now(bs, "user-b", &s) == BS_ACQUIRE_AT_CAPACITY && s < 0,
+          "a second session is refused at once (429 model_at_session_capacity)");
+    CHECK(still_warm(bs, 0, "user-a", 3.0f),
+          "A keeps its slot, its sid and its KV");
+    CHECK(acquire_now(bs, "user-a-act", &s) == BS_ACQUIRE_OK && s == 0,
+          "A's own family (user-a-act) is admitted");
+    bs_slot_release(bs, s);
+    CHECK(bs_session_count(bs) == 1, "one session family holds a seat");
+    bs_session_release(bs, "user-a");
+    CHECK(bs_session_count(bs) == 0, "A's release frees its seat");
+    CHECK(acquire_now(bs, "user-b", &s) == BS_ACQUIRE_OK && s == 0,
+          "after A's release B is admitted");
+    bs_slot_release(bs, s);
+    bs_destroy(bs);
+
+    /* More decode slots than seats (max_concurrent > max_sessions): a cold
+     * slot is no seat. */
+    bs = mk_sched(&model, 2);
+    bs_set_session_admission(bs, 1, 0);
+    seat_warm(bs, 0, "user-a", 3.0f);
+    CHECK(acquire_now(bs, "user-b", &s) == BS_ACQUIRE_AT_CAPACITY,
+          "2 slots, 1 seat: B is refused although slot 1 is cold");
+    CHECK(bs->slots[1].status == BS_SLOT_IDLE, "...and slot 1 was not claimed");
+    bs_session_release(bs, "user-a");
+    CHECK(acquire_now(bs, "user-a2", &s) == BS_ACQUIRE_OK, "A2 claims a slot");
+    CHECK(bs->slots[s].sid[0] == '\0' &&
+          strcmp(bs->slots[s].claim_sid, "user-a2") == 0,
+          "mid first turn: no warm sid yet, the claim names A2");
+    int s2 = -1;
+    CHECK(acquire_now(bs, "user-b", &s2) == BS_ACQUIRE_AT_CAPACITY,
+          "an in-flight first turn holds its seat: B refused");
+    bs_slot_release(bs, s);
+    bs_destroy(bs);
+}
+
+static void test_batched_admission_four_seats(void)
+{
+    printf("test: batched admission, max_sessions 4 (the default: one per slot)\n");
+    pn_model model = {0};
+    model.config.arch = PN_ARCH_QWEN35MOE;
+    pn_batch_sched *bs = mk_sched(&model, 4);   /* no setter: max = slots */
+    static const char *const sids[4] = { "t-1", "t-2", "t-3", "t-4" };
+    int s = -1;
+
+    for (int i = 0; i < 4; i++)
+        seat_warm(bs, i, sids[i], 1.0f + (float)i);
+    CHECK(acquire_now(bs, "t-5", &s) == BS_ACQUIRE_AT_CAPACITY && s < 0,
+          "a 5th session family is refused");
+    int kept = 1;
+    for (int i = 0; i < 4; i++)
+        kept &= still_warm(bs, i, sids[i], 1.0f + (float)i);
+    CHECK(kept, "the four keep their slots and KV");
+    CHECK(bs_session_count(bs) == 4, "four families hold seats");
+    CHECK(acquire_now(bs, "t-3", &s) == BS_ACQUIRE_OK && s == 2,
+          "a seated session still resumes on its own slot");
+    bs_slot_release(bs, s);
+    CHECK(bs_slot_acquire_biased(bs, "t-5") == -1,
+          "the non-blocking acquire never hands out another family's slot");
+    bs_destroy(bs);
+}
+
+static void test_batched_admission_no_session_id(void)
+{
+    printf("test: batched admission, request without a session id\n");
+    pn_model model = {0};
+    model.config.arch = PN_ARCH_QWEN35MOE;
+    pn_batch_sched *bs = mk_sched(&model, 2);
+    int s = -1;
+
+    seat_warm(bs, 0, "user-a", 3.0f);
+    CHECK(acquire_now(bs, NULL, &s) == BS_ACQUIRE_OK && s == 1,
+          "no session id: takes the cold slot");
+    bs_slot_release(bs, s);
+    seat_warm(bs, 1, "user-b", 4.0f);
+    CHECK(acquire_now(bs, NULL, &s) == BS_ACQUIRE_AT_CAPACITY && s < 0,
+          "no session id and no cold slot: refused");
+    CHECK(still_warm(bs, 0, "user-a", 3.0f) && still_warm(bs, 1, "user-b", 4.0f),
+          "...and neither session lost its KV");
+    CHECK(bs_slot_acquire(bs) == -1, "bs_slot_acquire: no cold slot, none");
+    bs_destroy(bs);
+}
+
+/* Watch hook for the reaper test: the base id `ctx` (a client's watch) covers
+ * its own id and every "<base>-<more>". */
+static int watched_base(const char *sid, void *ctx)
+{
+    const char *base = ctx;
+    size_t n = strlen(base);
+    return n > 0 && strncmp(sid, base, n) == 0 &&
+           (sid[n] == '\0' || sid[n] == '-');
+}
+
+static void test_batched_admission_idle_reaper(void)
+{
+    printf("test: batched admission, idle reaper for unwatched seats\n");
+    pn_model model = {0};
+    model.config.arch = PN_ARCH_QWEN35MOE;
+    pn_batch_sched *bs = mk_sched(&model, 1);
+    char watch[32] = "user-a";
+    int s = -1;
+
+    bs_set_session_admission(bs, 1, 1000);   /* 1 s idle TTL */
+    bs_set_watch_hook(bs, watched_base, watch);
+    seat_warm(bs, 0, "user-a-act", 3.0f);
+    CHECK(acquire_now(bs, "user-b", &s) == BS_ACQUIRE_AT_CAPACITY,
+          "a recently active seat is not reaped");
+    bs->slots[0].last_active_ms = 1.0;        /* idle far past the TTL */
+    CHECK(acquire_now(bs, "user-b", &s) == BS_ACQUIRE_AT_CAPACITY,
+          "a watched idle seat is not reaped (its watch owns the release)");
+    CHECK(still_warm(bs, 0, "user-a-act", 3.0f), "...and keeps its KV");
+    watch[0] = '\0';                          /* the client died, no watch */
+    CHECK(acquire_now(bs, "user-b", &s) == BS_ACQUIRE_OK && s == 0,
+          "an unwatched seat idle past the TTL is reaped; B is admitted");
+    CHECK(bs->slots[0].sid[0] == '\0', "the reaped session's warm state is gone");
+    bs_slot_release(bs, s);
+    bs_destroy(bs);
+}
+
+static void test_batched_admission_restore(void)
+{
+    printf("test: batched admission, session restore\n");
+    g_make_q4 = 0;
+    pn_model model = {0};
+    model.config.arch = PN_ARCH_QWEN35MOE;
+    pn_batch_sched *bs = mk_sched(&model, 1);
+    pn_qwen35moe_state *src = make_state();
+    uint32_t toks[8];
+
+    bs_set_session_admission(bs, 1, 0);
+    fill_ssm(src, 7.0f);
+    fill_kv_rows(src, 0, 8, 7.0f);
+    void *snap = pn_qwen35moe_state_snapshot(src, 8);
+    mk_prompt(toks, SYS_A, 1000, 8);
+    seat_warm(bs, 0, "user-a", 3.0f);
+    CHECK(bs_session_restore(bs, "user-b", snap, toks, 8) == BS_SESSION_BUSY,
+          "restoring a new session at capacity is refused");
+    CHECK(still_warm(bs, 0, "user-a", 3.0f), "...and does not overwrite A");
+    bs_session_release(bs, "user-a");
+    CHECK(bs_session_restore(bs, "user-b", snap, toks, 8) == BS_SESSION_OK &&
+          strcmp(bs->slots[0].sid, "user-b") == 0,
+          "with A released the restore seats B");
+    pn_qwen35moe_state_snapshot_free(snap);
+    free_state(src);
+    bs_destroy(bs);
+}
+
+/* The single-user path counts families too: a side id shares its seat, and a
+ * full pool gives up a family's second conversation, never another family's
+ * only one. */
+static void test_single_user_family_admission(void)
+{
+    printf("test: single-user cache, max_sessions counts session families\n");
+    g_make_q4 = 0;
+    pn_model model = {0};
+    model.config.arch = PN_ARCH_QWEN35MOE;
+    pn_prefix_cache *c = pn_prefix_cache_new(&model, 3);
+    uint32_t p[20], h[24], w2[26], hw[24];
+    int delta = -1;
+
+    mk_prompt(p, SYS_A, 1000, 20);
+    pn_state *st = su_turn(c, "u", p, 20, 1.0f, &delta);
+    su_commit(c, st, "u", p, 20, h, 1);
+    mk_prompt(p, SYS_B, 2000, 20);
+    st = su_turn(c, "u-side", p, 20, 2.0f, &delta);
+    su_commit(c, st, "u-side", p, 20, h, 2);
+    mk_prompt(p, SYS_A, 3000, 20);
+    pn_state *sw = su_turn(c, "w", p, 20, 3.0f, &delta);
+    int hw_n = su_commit(c, sw, "w", p, 20, hw, 3);
+    CHECK(pn_prefix_cache_session_count(c) == 2,
+          "u, u-side and w hold 3 entries but 2 session families");
+    CHECK(pn_prefix_cache_admit(c, "v", 1000, 0, NULL) == PN_SESSION_ADMIT_OK,
+          "2 families < max_sessions 3: new session v is admitted");
+    mk_prompt(p, SYS_B, 4000, 20);
+    st = su_turn(c, "v", p, 20, 4.0f, &delta);
+    su_commit(c, st, "v", p, 20, h, 4);
+    int n = convo_append(w2, hw, hw_n, 3);
+    st = su_turn(c, "w", w2, n, 0.0f, &delta);
+    CHECK(st == sw && delta == hw_n,
+          "v took one of u's two entries; w's only one survived");
+    CHECK(pn_prefix_cache_admit(c, "x", 1000, 0, NULL) ==
+          PN_SESSION_ADMIT_AT_CAPACITY, "3 families: a 4th is refused");
+    CHECK(pn_prefix_cache_admit(c, "u-side-x", 1000, 0, NULL) ==
+          PN_SESSION_ADMIT_OK, "a new id of a seated family is admitted");
+    pn_prefix_cache_free(c);
+}
+
+/* ============================================================
+ * Test 9 — TURN-START CHECKPOINT (rung 1c)
+ *
+ * The three cases that used to fall to the system-prefix rung and re-prefill
+ * the whole conversation: a reasoning-only turn (nothing projected, Argus
+ * drops the turn), an interrupted turn (a partial reply the client never
+ * resends) and an aborted prefill (the slot was reset). Each must now resume
+ * at the turn start. Card work is CUDA-only; these are the ladder's decisions
+ * and bookkeeping (the non-CUDA arm only moves state->pos).
+ * ============================================================ */
+
+/* A 20-token turn-1 prompt: 8 system + 9 conversation + a 3-token assistant
+ * opener (turn_start 17). */
+#define TC_N1   20
+#define TC_CUT1 17
+
+/* Turn 1 on slot `slot`: cold prefill to the cut, checkpoint, finish the
+ * prompt, decode `n_gen` tokens with NO projection (a reasoning-only or
+ * interrupted reply), publish the warm history. */
+static void tc_turn1(pn_batch_sched *bs, int slot, const char *sid,
+                     const uint32_t *p1)
+{
+    int delta = -1, cap = -1;
+    bs_prefill_resume_sys(bs, slot, sid, p1, TC_N1, 8, &delta, &cap);
+    CHECK(delta == 0, "turn 1: cold full prefill");
+    bs_slot *sl = &bs->slots[slot];
+    sl->state->pos = TC_CUT1;
+    CHECK(bs_turn_ckpt_capture(bs, slot, sid, p1, TC_CUT1) == 0,
+          "turn 1: checkpoint saved at the turn start");
+    sl->state->pos = TC_N1;
+    uint32_t gen[5] = { 900, 901, 902, 903, 904 };   /* reasoning only */
+    seed_committed_log(sl, p1, TC_N1, gen, 5);
+    bs_slot_note_visible(bs, slot, p1, TC_N1, 2, NULL, 0, NULL, 0);
+    publish_vis(sl);
+    publish_warm(sl, sid, sl->ct, TC_N1 + 5);
+    bs_prefill_abort(bs, slot);
+}
+
+/* The next request after a dropped reply: turn 1's messages + a 6-token note
+ * + the 3-token opener. */
+static void tc_next(uint32_t *out, const uint32_t *p1)
+{
+    memcpy(out, p1, TC_CUT1 * sizeof(uint32_t));
+    for (int i = TC_CUT1; i < TC_CUT1 + 9; i++)
+        out[i] = (uint32_t)(5000 + i);
+}
+
+static void test_turn_checkpoint_resume(void)
+{
+    printf("test: turn-start checkpoint (rung 1c)\n");
+    g_make_q4 = 0;
+    pn_model model = {0};
+    model.config.arch = PN_ARCH_QWEN35MOE;
+    pn_batch_sched *bs = mk_sched(&model, 2);
+    uint32_t p1[TC_N1], p2[TC_CUT1 + 9];
+    mk_prompt(p1, SYS_A, 1000, TC_N1);
+    tc_next(p2, p1);
+    int delta = -1, cap = -1;
+
+    /* Reasoning-only turn, then the rescue note: resumes at the turn start. */
+    int s = bs_slot_acquire_biased(bs, "A");
+    tc_turn1(bs, s, "A", p1);
+    s = bs_slot_acquire_biased(bs, "A");
+    bs_prefill_resume_sys(bs, s, "A", p2, TC_CUT1 + 9, 8, &delta, &cap);
+    bs_slot *sl = &bs->slots[s];
+    CHECK(delta == TC_CUT1, "dropped reply: rung 1c resumes at the turn start");
+    CHECK((int)sl->state->pos == TC_CUT1 && sl->hist_n == TC_CUT1,
+          "the state and history are back at the checkpoint");
+    CHECK(sl->ct_keep == TC_CUT1 && sl->ct_prompt_from == TC_CUT1,
+          "committed-log seeding joins the request at the cut");
+    CHECK(cap == 0, "no system-prefix capture requested");
+    bs_prefill_abort(bs, s);
+
+    /* NEGATIVE CONTROL: an earlier message changed — no checkpoint resume. */
+    uint32_t p3[TC_CUT1 + 9];
+    memcpy(p3, p2, sizeof(p3));
+    p3[12] ^= 1u;
+    s = bs_slot_acquire_biased(bs, "A");
+    bs_prefill_resume_sys(bs, s, "A", p3, TC_CUT1 + 9, 8, &delta, &cap);
+    CHECK(delta == 0, "a rewritten earlier message re-prefills (no rung 1c)");
+    CHECK(!bs->slots[s].ckpt.valid, "the full reset dropped the checkpoint");
+    bs_prefill_abort(bs, s);
+    bs_destroy(bs);
+}
+
+static void test_turn_checkpoint_think_elided_kv(void)
+{
+    printf("test: turn-start checkpoint over a think-elided KV\n");
+    g_make_q4 = 0;
+    pn_model model = {0};
+    model.config.arch = PN_ARCH_QWEN35MOE;
+    pn_batch_sched *bs = mk_sched(&model, 2);
+    /* The slot's KV holds 4 more tokens than the client sends (an earlier
+     * think block rung 1b kept): hist = client[0,12) + think(4) + ... */
+    uint32_t client[TC_N1];
+    mk_prompt(client, SYS_A, 1000, TC_N1);
+    uint32_t hist[16];
+    memcpy(hist, client, 12 * sizeof(uint32_t));
+    for (int i = 12; i < 16; i++) hist[i] = (uint32_t)(7000 + i);
+    int s = bs_slot_acquire_biased(bs, "A");
+    bs_slot *sl = &bs->slots[s];
+    publish_warm(sl, "A", hist, 16);
+    /* This turn resumed by projection at client 12: KV = hist ++ client[12..). */
+    sl->ct_keep = 16;
+    sl->ct_prompt_from = 12;
+    sl->state->pos = 16 + (TC_CUT1 - 12);
+    CHECK(bs_turn_ckpt_capture(bs, s, "A", client, TC_CUT1) == 0,
+          "checkpoint saved over the elided KV");
+    CHECK(sl->ckpt.kv_n == 21 && sl->ckpt.client_n == TC_CUT1,
+          "it records the KV position (21) and the client position (17)");
+    CHECK(sl->ckpt.kv[13] == 7013 && sl->ckpt.kv[16] == client[12],
+          "its KV tokens are hist[0,16) then the request from 12");
+    /* A wrong position is refused, and leaves the checkpoint alone. */
+    sl->state->pos = 20;
+    CHECK(bs_turn_ckpt_capture(bs, s, "A", client, TC_CUT1) == -1,
+          "capture refuses a state that is not at the cut");
+    CHECK(sl->ckpt.valid && sl->ckpt.kv_n == 21, "the old checkpoint survives");
+    bs_slot_release(bs, s);   /* no GPU turn was taken in this part */
+
+    uint32_t next[TC_CUT1 + 9];
+    tc_next(next, client);
+    int delta = -1, cap = -1;
+    s = bs_slot_acquire_biased(bs, "A");
+    bs_prefill_resume_sys(bs, s, "A", next, TC_CUT1 + 9, 8, &delta, &cap);
+    CHECK(delta == TC_CUT1 && (int)sl->state->pos == 21,
+          "resume: prefill from client 17 at KV position 21");
+    CHECK(sl->ct_keep == 21 && sl->ct_prompt_from == TC_CUT1 &&
+          sl->hist_n == 21 && sl->hist[14] == 7014,
+          "history is the checkpoint's KV tokens");
+    bs_prefill_abort(bs, s);
+    bs_destroy(bs);
+}
+
+static void test_turn_checkpoint_prefill_abort(void)
+{
+    printf("test: an aborted prefill keeps the turn checkpoint\n");
+    g_make_q4 = 0;
+    pn_model model = {0};
+    model.config.arch = PN_ARCH_QWEN35MOE;
+    pn_batch_sched *bs = mk_sched(&model, 2);
+    uint32_t p1[TC_N1], p2[TC_CUT1 + 9];
+    mk_prompt(p1, SYS_A, 1000, TC_N1);
+    tc_next(p2, p1);
+    int delta = -1, cap = -1;
+    int s = bs_slot_acquire_biased(bs, "A");
+    tc_turn1(bs, s, "A", p1);
+
+    /* Turn 2 starts, resumes at the checkpoint, and is aborted mid-prefill. */
+    s = bs_slot_acquire_biased(bs, "A");
+    bs_prefill_resume_sys(bs, s, "A", p2, TC_CUT1 + 9, 8, &delta, &cap);
+    bs->slots[s].state->pos = TC_CUT1 + 4;   /* stopped part-way */
+    bs_prefill_abort_keep(bs, s, "A", p2, TC_CUT1 + 9, 8);
+    bs_slot *sl = &bs->slots[s];
+    CHECK(sl->status == BS_SLOT_IDLE, "the slot is released");
+    CHECK(sl->ckpt.valid && strcmp(sl->sid, "A") == 0,
+          "it keeps the session and the checkpoint");
+    CHECK(sl->partial.valid && sl->partial.client_n == TC_CUT1 + 4,
+          "and the 4 prompt tokens prefilled past the checkpoint");
+    CHECK(sl->hist_n == 0, "the half-written state has no history");
+
+    /* The retry (same request) is routed back and resumes where it stopped. */
+    s = bs_slot_acquire_biased(bs, "A");
+    CHECK(s == 0, "the retry lands on the same slot");
+    bs_prefill_resume_sys(bs, s, "A", p2, TC_CUT1 + 9, 8, &delta, &cap);
+    CHECK(delta == TC_CUT1 + 4 && (int)bs->slots[s].state->pos == TC_CUT1 + 4,
+          "the retry resumes where the abort stopped, not cold");
+    CHECK(!bs->slots[s].partial.valid && bs->slots[s].ckpt.valid,
+          "the kept prefix is used up; the checkpoint stays");
+    /* Aborted again; this time the retry differs inside the kept prefix
+     * (but after the turn start): back to the checkpoint. */
+    bs->slots[s].state->pos = TC_CUT1 + 6;
+    bs_prefill_abort_keep(bs, s, "A", p2, TC_CUT1 + 9, 8);
+    uint32_t p2b[TC_CUT1 + 9];
+    memcpy(p2b, p2, sizeof(p2b));
+    p2b[TC_CUT1 + 1] ^= 1u;
+    s = bs_slot_acquire_biased(bs, "A");
+    bs_prefill_resume_sys(bs, s, "A", p2b, TC_CUT1 + 9, 8, &delta, &cap);
+    CHECK(delta == TC_CUT1 && (int)bs->slots[s].state->pos == TC_CUT1,
+          "a retry that differs past the turn start resumes at the checkpoint");
+    CHECK(!bs->slots[s].partial.valid, "the stale kept prefix is dropped");
+    bs_prefill_abort(bs, s);
+
+    /* Without a checkpoint, an abort inside the system prefix still resets. */
+    int t = bs_slot_acquire_biased(bs, "B");
+    uint32_t pb[TC_N1];
+    mk_prompt(pb, SYS_B, 3000, TC_N1);
+    bs_prefill_resume_sys(bs, t, "B", pb, TC_N1, 8, &delta, &cap);
+    bs->slots[t].state->pos = 5;
+    bs_prefill_abort_keep(bs, t, "B", pb, TC_N1, 8);
+    CHECK(bs->slots[t].sid[0] == '\0' && !bs->slots[t].ckpt.valid &&
+          !bs->slots[t].partial.valid,
+          "abort below the system prefix, no checkpoint: the slot resets");
+
+    /* A session release drops the checkpoint with the rest. */
+    bs_session_release(bs, "A");
+    CHECK(!bs->slots[0].ckpt.valid, "session release drops the checkpoint");
+    bs_destroy(bs);
+}
+
+/* A session's FIRST prefill is aborted (no checkpoint exists yet): the slot
+ * keeps the computed prefix and the resent request resumes there. */
+static void test_first_prefill_abort_keeps_prefix(void)
+{
+    printf("test: an aborted first prefill keeps its prefix\n");
+    g_make_q4 = 0;
+    pn_model model = {0};
+    model.config.arch = PN_ARCH_QWEN35MOE;
+    pn_batch_sched *bs = mk_sched(&model, 2);
+    uint32_t p1[TC_N1];
+    mk_prompt(p1, SYS_A, 1000, TC_N1);
+    int delta = -1, cap = -1;
+    int s = bs_slot_acquire_biased(bs, "A");
+    bs_prefill_resume_sys(bs, s, "A", p1, TC_N1, 8, &delta, &cap);
+    CHECK(delta == 0, "first turn: cold");
+    bs_slot *sl = &bs->slots[s];
+    sl->state->pos = 12;                     /* past the system prefix */
+    bs_prefill_abort_keep(bs, s, "A", p1, TC_N1, 8);
+    CHECK(sl->status == BS_SLOT_IDLE && strcmp(sl->sid, "A") == 0 &&
+          !sl->ckpt.valid && sl->partial.valid && sl->partial.client_n == 12,
+          "no checkpoint, but the slot keeps the session and 12 tokens");
+
+    /* NEGATIVE CONTROL: a resend that differs inside those 12 tokens. */
+    uint32_t px[TC_N1];
+    memcpy(px, p1, sizeof(px));
+    px[10] ^= 1u;
+    int r = bs_slot_reroute(bs, bs_slot_acquire_biased(bs, "A"), "A", px,
+                            TC_N1, 8);
+    s = r >= 0 ? r : 0;
+    bs_prefill_resume_sys(bs, s, "A", px, TC_N1, 8, &delta, &cap);
+    CHECK(delta != 12, "a changed prefix does not resume at the kept prefix");
+    CHECK(!bs->slots[s].partial.valid, "and drops it");
+    bs_prefill_abort(bs, s);
+    bs_destroy(bs);
+
+    /* The resend of the same request (plus a new message) resumes at 12. */
+    bs = mk_sched(&model, 2);
+    s = bs_slot_acquire_biased(bs, "A");
+    bs_prefill_resume_sys(bs, s, "A", p1, TC_N1, 8, &delta, &cap);
+    bs->slots[s].state->pos = 12;
+    bs_prefill_abort_keep(bs, s, "A", p1, TC_N1, 8);
+    uint32_t p2[TC_N1 + 4];
+    memcpy(p2, p1, TC_CUT1 * sizeof(uint32_t));
+    for (int i = TC_CUT1; i < TC_N1 + 4; i++)
+        p2[i] = (uint32_t)(6000 + i);
+    s = bs_slot_acquire_biased(bs, "A");
+    r = bs_slot_reroute(bs, s, "A", p2, TC_N1 + 4, 8);
+    CHECK(r == s, "the resend is routed to the slot that kept the prefix");
+    bs_prefill_resume_sys(bs, s, "A", p2, TC_N1 + 4, 8, &delta, &cap);
+    sl = &bs->slots[s];
+    CHECK(delta == 12 && (int)sl->state->pos == 12,
+          "the resend prefills only from token 12");
+    CHECK(sl->hist_n == 12 && sl->hist[11] == p1[11] &&
+          sl->ct_keep == 12 && sl->ct_prompt_from == 12,
+          "history and committed-log seeding describe the kept prefix");
+    CHECK(cap == 0, "no system-prefix capture requested");
+    bs_prefill_abort(bs, s);
+
+    /* A session release drops a kept prefix. */
+    s = bs_slot_acquire_biased(bs, "A");
+    bs_prefill_resume_sys(bs, s, "A", p1, TC_N1, 8, &delta, &cap);
+    bs->slots[s].state->pos = 13;
+    bs_prefill_abort_keep(bs, s, "A", p1, TC_N1, 8);
+    bs_session_release(bs, "A");
+    CHECK(!bs->slots[s].partial.valid, "session release drops the kept prefix");
+    bs_destroy(bs);
+}
+
+static void test_turn_checkpoint_reroute(void)
+{
+    printf("test: reroute prefers the slot holding the checkpoint\n");
+    g_make_q4 = 0;
+    pn_model model = {0};
+    model.config.arch = PN_ARCH_QWEN35MOE;
+    pn_batch_sched *bs = mk_sched(&model, 2);
+    uint32_t p1[TC_N1], p2[TC_CUT1 + 9];
+    mk_prompt(p1, SYS_A, 1000, TC_N1);
+    tc_next(p2, p1);
+    /* Slot 1 holds the checkpoint; the session's sid points nowhere else. */
+    bs->slots[0].status = BS_SLOT_PREFILL;   /* keep slot 0 out of the claim */
+    int s = bs_slot_acquire_biased(bs, "A");
+    CHECK(s == 1, "turn 1 runs on slot 1");
+    tc_turn1(bs, s, "A", p1);
+    bs->slots[0].status = BS_SLOT_IDLE;
+    /* Hide slot 1's warm sid so only the checkpoint can attract the turn. */
+    bs->slots[1].sid[0] = '\0';
+    int idx = bs_slot_acquire_biased(bs, "A");
+    int r = bs_slot_reroute(bs, idx, "A", p2, TC_CUT1 + 9, 8);
+    CHECK(r == 1, "the reroute picks the slot whose checkpoint fits");
+    pthread_mutex_lock(&bs->mu);
+    bs->slots[0].status = BS_SLOT_IDLE;
+    bs->slots[1].status = BS_SLOT_IDLE;
+    pthread_mutex_unlock(&bs->mu);
+    bs_destroy(bs);
+}
+
+/* ============================================================
+ * SAME-SESSION RESEND — a client hangs up mid-prefill and resends before the
+ * old request notices (K80 bank, 2026-11-11: `prefill aborted at 25326 of
+ * 25333 ... keeping that prefix` on slot 0, then the resend re-prefilled 22044
+ * tokens on slot 2). The resend must wait for the slot still prefilling its
+ * session and resume the prefix kept there, even with free slots to spare.
+ *
+ * Red: drop the hold in bs_slot_acquire_or_wait and the resend claims slot 1
+ * at once ("waits for its own slot" and "resumes at 12" fail).
+ * ============================================================ */
+
+typedef struct {
+    pn_batch_sched *bs;
+    int wait_ms;
+    int slot;
+    volatile int done;
+} resend_arg;
+
+static void *resend_thread(void *p)
+{
+    resend_arg *a = p;
+    a->slot = -1;
+    bs_slot_acquire_or_wait(a->bs, a->wait_ms, &a->slot, NULL, "A");
+    a->done = 1;
+    return NULL;
+}
+
+/* Slot 0 prefills session A's first request up to 12 tokens. */
+static pn_batch_sched *resend_setup(pn_model *model, const uint32_t *p1)
+{
+    pn_batch_sched *bs = mk_sched(model, 4);
+    bs_set_session_admission(bs, 1, 0);   /* room to spare: an extra is allowed */
+    bs->queue_cap = BS_QUEUE_DEPTH_DEFAULT;   /* as bs_create sets it */
+    int s = -1, delta = -1, cap = -1;
+    bs_slot_acquire_or_wait(bs, 0, &s, NULL, "A");
+    bs_prefill_resume_sys(bs, s, "A", p1, TC_N1, 8, &delta, &cap);
+    bs->slots[s].state->pos = 12;
+    return bs;
+}
+
+static void test_same_session_resend_waits(void)
+{
+    printf("test: a same-session resend waits for its prefilling slot\n");
+    g_make_q4 = 0;
+    pn_model model = {0};
+    model.config.arch = PN_ARCH_QWEN35MOE;
+    uint32_t p1[TC_N1], p2[TC_N1 + 4];
+    mk_prompt(p1, SYS_A, 1000, TC_N1);
+    memcpy(p2, p1, sizeof(p1));
+    for (int i = TC_N1; i < TC_N1 + 4; i++)
+        p2[i] = (uint32_t)(7000 + i);
+    int delta = -1, cap = -1;
+
+    /* ── The resend arrives while slot 0 is still prefilling A. ── */
+    unsetenv("PN_SAME_SESSION_WAIT_MS");
+    pn_batch_sched *bs = resend_setup(&model, p1);
+    resend_arg a = { bs, 5000, -1, 0 };
+    pthread_t th;
+    pthread_create(&th, NULL, resend_thread, &a);
+    usleep(150 * 1000);
+    CHECK(!a.done, "the resend waits for its own slot (slots 1-3 are free)");
+    bs_prefill_abort_keep(bs, 0, "A", p1, TC_N1, 8);   /* old request notices */
+    pthread_join(th, NULL);
+    CHECK(a.slot == 0, "the resend lands on the slot that kept the prefix");
+    int s = a.slot >= 0 ? bs_slot_reroute(bs, a.slot, "A", p2, TC_N1 + 4, 8) : 0;
+    bs_prefill_resume_sys(bs, s, "A", p2, TC_N1 + 4, 8, &delta, &cap);
+    CHECK(delta == 12, "the resend resumes at 12, not cold");
+    bs_prefill_abort(bs, s);
+    bs_destroy(bs);
+
+    /* ── Forced miss (red arm): the wait off, the resend runs elsewhere and
+     * re-prefills — the harness can fail. ── */
+    setenv("PN_SAME_SESSION_WAIT_MS", "0", 1);
+    bs = resend_setup(&model, p1);
+    int s2 = -1;
+    CHECK(bs_slot_acquire_or_wait(bs, 5000, &s2, NULL, "A") == BS_ACQUIRE_OK &&
+          s2 > 0, "wait off: the resend takes a free slot at once");
+    bs_prefill_abort_keep(bs, 0, "A", p1, TC_N1, 8);
+    if (s2 >= 0) {
+        bs_prefill_resume_sys(bs, s2, "A", p2, TC_N1 + 4, 8, &delta, &cap);
+        CHECK(delta < 12, "wait off: the resend re-prefills (the miss)");
+        bs_prefill_abort(bs, s2);
+    }
+    bs_destroy(bs);
+
+    /* ── Bounded: an old request that never ends holds the resend only for
+     * PN_SAME_SESSION_WAIT_MS, then it claims as before. ── */
+    setenv("PN_SAME_SESSION_WAIT_MS", "200", 1);
+    bs = resend_setup(&model, p1);
+    s2 = -1;
+    CHECK(bs_slot_acquire_or_wait(bs, 5000, &s2, NULL, "A") == BS_ACQUIRE_OK &&
+          s2 > 0, "after the bounded wait the resend claims a free slot");
+    if (s2 >= 0)
+        bs_slot_release(bs, s2);
+    bs_prefill_abort(bs, 0);
+    bs_destroy(bs);
+    unsetenv("PN_SAME_SESSION_WAIT_MS");
+
+    /* ── Another session never waits on A. ── */
+    bs = resend_setup(&model, p1);
+    bs_set_session_admission(bs, 4, 0);
+    s2 = -1;
+    CHECK(bs_slot_acquire_or_wait(bs, 5000, &s2, NULL, "B") == BS_ACQUIRE_OK &&
+          s2 > 0, "session B is seated at once while A prefills");
+    if (s2 >= 0)
+        bs_slot_release(bs, s2);
+    bs_prefill_abort(bs, 0);
+    bs_destroy(bs);
+}
+
+/* An abort exactly at the system boundary keeps nothing (the SYS1 snapshot
+ * resumes there; the live serve logged `prefill aborted at 3320 of 15871`
+ * then `partial-prefill resume refused ... the block no longer holds it`). */
+static void test_abort_at_sys_boundary_keeps_nothing(void)
+{
+    printf("test: an abort at the system boundary keeps no prefix\n");
+    g_make_q4 = 0;
+    pn_model model = {0};
+    model.config.arch = PN_ARCH_QWEN35MOE;
+    pn_batch_sched *bs = mk_sched(&model, 2);
+    uint32_t p1[TC_N1];
+    mk_prompt(p1, SYS_A, 1000, TC_N1);
+    int delta = -1, cap = -1;
+    int s = bs_slot_acquire_biased(bs, "A");
+    bs_prefill_resume_sys(bs, s, "A", p1, TC_N1, 8, &delta, &cap);
+    bs->slots[s].state->pos = 8;   /* exactly the system prefix */
+    bs_prefill_abort_keep(bs, s, "A", p1, TC_N1, 8);
+    CHECK(!bs->slots[s].partial.valid, "nothing kept at the boundary");
+    /* One token past it is kept as before. */
+    s = bs_slot_acquire_biased(bs, "A");
+    bs_prefill_resume_sys(bs, s, "A", p1, TC_N1, 8, &delta, &cap);
+    bs->slots[s].state->pos = 9;
+    bs_prefill_abort_keep(bs, s, "A", p1, TC_N1, 8);
+    CHECK(bs->slots[s].partial.valid && bs->slots[s].partial.client_n == 9,
+          "one token past the boundary is kept");
+    bs_destroy(bs);
+}
+
 int main(void)
 {
+    /* Rung 1c is gated; the gate is read once, so set it before any test.
+     * Nothing else here captures a checkpoint, so the other tests run the
+     * ladder exactly as before. */
+    setenv("QWEN35_TURN_CHECKPOINT", "1", 1);
     printf("=== test_prefix_cache_sys (SYS1) ===\n");
     test_snapshot_roundtrip_fp32();
     test_snapshot_roundtrip_q4();
@@ -2106,6 +2904,7 @@ int main(void)
     test_unsupported_arch();
     test_lcp_rewind();
     test_batched_sys_flow();
+    test_no_duplicate_slots();
     test_session_substitution();
     test_two_convos_concurrent_title();
     test_two_convos_interleaved();
@@ -2117,6 +2916,19 @@ int main(void)
     test_reasoning_convention_switch();
     test_cached_tokens_tracks_resume_rungs();
     test_session_admission();
+    test_batched_admission_one_seat();
+    test_batched_admission_four_seats();
+    test_batched_admission_no_session_id();
+    test_batched_admission_idle_reaper();
+    test_batched_admission_restore();
+    test_single_user_family_admission();
+    test_turn_checkpoint_resume();
+    test_turn_checkpoint_think_elided_kv();
+    test_turn_checkpoint_prefill_abort();
+    test_first_prefill_abort_keeps_prefix();
+    test_turn_checkpoint_reroute();
+    test_same_session_resend_waits();
+    test_abort_at_sys_boundary_keeps_nothing();
     if (failures) {
         printf("=== %d FAILURE(S) ===\n", failures);
         return 1;

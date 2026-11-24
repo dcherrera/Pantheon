@@ -30,6 +30,7 @@
 /* 4. Project headers */
 #include "../accel/simd.h"
 #include "../core/qweight.h"
+#include "qwen35moe_routing_dump.h"
 
 /* Hard cap on top-k experts — sized for the on-stack selection scratch. The
  * Qwen3.5-MoE configs use 8; Mixtral uses 2. */
@@ -130,6 +131,7 @@ static int qwen35moe_routed(const pn_qwen35moe_moe *moe,
     int top_idx[PN_QWEN35MOE_MAX_TOPK];
     float top_wt[PN_QWEN35MOE_MAX_TOPK];
     float wt_sum = qwen35moe_select_topk(logits, n_expert, k, top_idx, top_wt);
+    pn_qwen35moe_routing_dump(logits, n_expert, top_idx, k);
 
     /* norm_topk_prob: renormalize the selected weights to sum to 1, then apply
      * the routed-weight scale (1.0 unless the GGUF carries the key). */

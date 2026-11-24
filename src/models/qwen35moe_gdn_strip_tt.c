@@ -313,6 +313,17 @@ uint32_t pn_qwen35_tt_gdn_gate_sub_rows(void)
     return sub == 0 ? 32u : (uint32_t)sub;
 }
 
+static bool gdn_strip_env_red(const char *name);
+
+/** The band the exact card gates read: the one the alpha/beta strips are seeked to. RED
+ *  `gdn_table_band_stale`: the band before it — must DIFFER. */
+static uint32_t gdn_table_band(const pn_qwen35_tt *g)
+{
+    const uint32_t band = g->card.ssm_alpha.row_offset;
+
+    return gdn_strip_env_red("gdn_table_band_stale") && band > 0u ? band - 1u : band;
+}
+
 /** PM 7 ITEM 5: the band's DELTA descriptors on the card-built gate blocks — the same split
  *  as below (`ftgg_sub_live_rows()` is that split), nothing staged. */
 static int gdn_delta_card_gate(pn_qwen35_tt *g, int ssm_index, int rows)
@@ -324,12 +335,23 @@ static int gdn_delta_card_gate(pn_qwen35_tt *g, int ssm_index, int rows)
 
         if (live == 0u)
             continue;
-        if (pn_tt_gdnc_delta_oncard_card_gate(
-                g->device, (uint32_t)ssm_index, sub * sub_rows, live,
-                pn_tt_gdngate_block_address(g->device, (uint32_t)ssm_index,
-                                            g->gdn_card_gate_band, sub)) != 0)
+        /* PIPE 2: sub-chunk 1 is queued behind sub-chunk 0 with no await between, so its reader
+         * waits for sub-chunk 0's published state (kGdncFlagSerialize). */
+        pn_tt_gdnc_serialize_next(g->device, g->gdn_pipe2 && sub > 0u);
+        /* THE EXACT CARD GATES: the reader looks this sub-chunk's gates up from the band the
+         * alpha/beta strips are seeked to — the band the host path would have read. */
+        if (g->gdn_table_gate
+                ? pn_tt_gdnc_delta_oncard_table(g->device, (uint32_t)ssm_index, sub * sub_rows,
+                                                live, gdn_table_band(g)) != 0
+                : pn_tt_gdnc_delta_oncard_card_gate(
+                      g->device, (uint32_t)ssm_index, sub * sub_rows, live,
+                      pn_tt_gdngate_block_address(g->device, (uint32_t)ssm_index,
+                                                  g->gdn_card_gate_band, sub)) != 0) {
+            pn_tt_gdnc_serialize_next(g->device, false);
             return -1;
+        }
     }
+    pn_tt_gdnc_serialize_next(g->device, false);
     return 0;
 }
 
@@ -651,10 +673,7 @@ static void gdn_gate_host(const pn_qwen35_tt *g, const pn_qwen35moe_ssm_layer *l
     int head;
 
     if (!g->gdn_det_gates) {
-        pn_qwen35moe_beta_sigmoid(beta_raw, v_heads, beta);
-        pn_qwen35moe_decay_gate(l, alpha, v_heads, decay);
-        for (head = 0; head < v_heads; head++)
-            decay[head] = expf(decay[head]);
+        pn_qwen35moe_gdn_gates(l, alpha, beta_raw, v_heads, decay, beta);
         return;
     }
     for (head = 0; head < v_heads; head++) {
@@ -669,6 +688,30 @@ static void gdn_gate_host(const pn_qwen35_tt *g, const pn_qwen35moe_ssm_layer *l
         out = ft_det_gdn_beta(b);
         memcpy(&beta[head], &out, sizeof(out));
     }
+}
+
+bool pn_qwen35_tt_table_decode_gates(pn_qwen35_tt *g, int ssm_index)
+{
+    static int cached = -1;
+    uint32_t bank, address;
+
+    if (cached < 0) {
+        const char *env = getenv("PN_TT_GDN_TABLE_DECODE");
+
+        cached = (env && *env) ? (atoi(env) != 0) : 1;
+    }
+    if (!cached || !g || g->gdn_det_gates || ssm_index < 0 ||
+        !pn_tt_gdnc_table_ready(g->device) ||
+        pn_tt_gdnc_table_decode_block(g->device, (uint32_t)ssm_index, &g->card.ssm_alpha,
+                                      &g->card.ssm_beta, &bank, &address) != 0)
+        return false;
+    pn_tt_gdn_table_gate(g->device, bank, address);
+    return true;
+}
+
+static void gdn_table_gate_off(pn_qwen35_tt *g)
+{
+    pn_tt_gdn_table_gate(g->device, 0u, 0u);
 }
 
 /** ITEM 6: this many rows' gates straight into the gate buffer the next DELTA reads, computed
@@ -694,8 +737,10 @@ int pn_qwen35_tt_gdn_strip_layer(pn_qwen35_tt *g, const pn_qwen35moe_ssm_layer *
     const uint32_t value_tiles = pn_tt_gdn_value_tiles(g->device);
     ft_tt_op_operand stream;
 
-    /* ITEM 6: `alpha == beta_raw == NULL` asks for the gates ON THE CARD (det gates only). */
-    const bool card = !alpha && !beta_raw && g && g->gdn_det_gates;
+    /* ITEM 6: `alpha == beta_raw == NULL` asks for the gates ON THE CARD (det gates, or the
+     * exact table gates). */
+    const bool card = !alpha && !beta_raw && g;
+    const bool table = card && !g->gdn_det_gates; /* bound by the caller */
 
     if (!g || !l || !cfg || !qkv || !z || (!card && (!beta_raw || !alpha)) || !gated)
         return -1;
@@ -736,11 +781,18 @@ int pn_qwen35_tt_gdn_strip_layer(pn_qwen35_tt *g, const pn_qwen35moe_ssm_layer *
 
     /* 5. PHASE DELTA over that same buffer, plus 256 B of gate block (ITEM 6: written by the
      * card, not uploaded). */
-    if (card ? (gdn_gate_card(g, ssm_index, 1u) != 0 ||
-                pn_tt_gdn_delta_descriptor_only(g->device, (uint32_t)ssm_index) != 0)
-             : pn_tt_gdn_delta_oncard(g->device, (uint32_t)ssm_index, g->gdn_decay,
-                                      g->gdn_beta) != 0)
+    if (table) {
+        const int rc = pn_tt_gdn_delta_descriptor_only(g->device, (uint32_t)ssm_index);
+
+        gdn_table_gate_off(g);
+        if (rc != 0)
+            return -1;
+    } else if (card ? (gdn_gate_card(g, ssm_index, 1u) != 0 ||
+                       pn_tt_gdn_delta_descriptor_only(g->device, (uint32_t)ssm_index) != 0)
+                    : pn_tt_gdn_delta_oncard(g->device, (uint32_t)ssm_index, g->gdn_decay,
+                                             g->gdn_beta) != 0) {
         return -1;
+    }
 
     /* 6. The gated norm, in two halves at two formats: the RMS in the Float32 reduce family
      * where the recurrence's precision lives, then the render, then `silu(z) *` on the SHIPPED
@@ -851,10 +903,10 @@ int pn_qwen35_tt_gdn_strip_rows(pn_qwen35_tt *g, const pn_qwen35moe_ssm_layer *l
     (void)pn_tt_gdn_defer(g->device, defer);
     for (; rc == 0 && r < conv_rows; r++)
         rc = (pn_tt_gdn_set_row(g->device, (uint32_t)r) != 0 ||
-              pn_tt_gdn_state_out(g->device, r) != 0 ||
+              pn_tt_gdn_verify_row_out(g->device, (uint32_t)rows, (uint32_t)r) != 0 ||
               pn_tt_gdn_conv_oncard(g->device, (uint32_t)ssm_index) != 0 ||
-              pn_tt_gdn_layer_swap_part(g->device, (uint32_t)ssm_index, (uint32_t)r, true,
-                                        false) != 0)
+              pn_tt_gdn_verify_row_trade(g->device, (uint32_t)ssm_index, (uint32_t)rows,
+                                         (uint32_t)r, true, false) != 0)
                  ? -1 : 0;
     (void)pn_tt_gdn_defer(g->device, false);
     if (pn_tt_gdn_await_deferred(g->device) != 0)
@@ -877,9 +929,13 @@ int pn_qwen35_tt_gdn_strip_rows(pn_qwen35_tt *g, const pn_qwen35moe_ssm_layer *l
     /* PM 6: the alpha/beta reads (reader thread) land before the host math needs them.
      * ITEM 6: with det gates on a deferred verify there are no reads — the card writes every
      * row's gate block itself. */
-    if (defer && g->gdn_det_gates && !alpha && !beta_raw) {
+    if (defer && !alpha && !beta_raw) {
+        /* THE EXACT TABLE GATES (bound by the caller): no gate block is written at all —
+         * every DELTA below names the layer's table block and the reader builds its rows'. */
+        const bool table = !g->gdn_det_gates;
+
         (void)pn_tt_gdn_defer(g->device, true);
-        rc = gdn_gate_card(g, ssm_index, (uint32_t)rows);
+        rc = table ? 0 : gdn_gate_card(g, ssm_index, (uint32_t)rows);
         if (rc == 0 && rows > 1 && delta_rows == rows && delta_multi_row_enabled()) {
             (void)pn_tt_gdn_defer(g->device, false);
             rc = pn_tt_gdn_delta_rows_oncard(g->device, (uint32_t)ssm_index, (uint32_t)rows);
@@ -887,11 +943,13 @@ int pn_qwen35_tt_gdn_strip_rows(pn_qwen35_tt *g, const pn_qwen35moe_ssm_layer *l
         }
         for (r = 0; rc == 0 && r < delta_rows; r++)
             rc = (pn_tt_gdn_set_row(g->device, (uint32_t)r) != 0 ||
-                  pn_tt_gdn_state_out(g->device, r) != 0 ||
+                  pn_tt_gdn_verify_row_out(g->device, (uint32_t)rows, (uint32_t)r) != 0 ||
                   pn_tt_gdn_delta_descriptor_only(g->device, (uint32_t)ssm_index) != 0 ||
-                  pn_tt_gdn_layer_swap_part(g->device, (uint32_t)ssm_index, (uint32_t)r, false,
-                                            true) != 0)
+                  pn_tt_gdn_verify_row_trade(g->device, (uint32_t)ssm_index, (uint32_t)rows,
+                                         (uint32_t)r, false, true) != 0)
                      ? -1 : 0;
+        if (table)
+            gdn_table_gate_off(g);
     } else if (pn_qwen35_tt_ab_verify_wait(g) != 0) {
         return -1;
     } else if (defer) {
@@ -914,21 +972,21 @@ int pn_qwen35_tt_gdn_strip_rows(pn_qwen35_tt *g, const pn_qwen35moe_ssm_layer *l
         }
         for (r = 0; rc == 0 && r < delta_rows; r++)
             rc = (pn_tt_gdn_set_row(g->device, (uint32_t)r) != 0 ||
-                  pn_tt_gdn_state_out(g->device, r) != 0 ||
+                  pn_tt_gdn_verify_row_out(g->device, (uint32_t)rows, (uint32_t)r) != 0 ||
                   pn_tt_gdn_delta_descriptor_only(g->device, (uint32_t)ssm_index) != 0 ||
-                  pn_tt_gdn_layer_swap_part(g->device, (uint32_t)ssm_index, (uint32_t)r, false,
-                                            true) != 0)
+                  pn_tt_gdn_verify_row_trade(g->device, (uint32_t)ssm_index, (uint32_t)rows,
+                                         (uint32_t)r, false, true) != 0)
                      ? -1 : 0;
     } else
     for (r = 0; rc == 0 && r < rows; r++) {
         gdn_gate_host(g, l, alpha + (size_t)r * alpha_stride, beta_raw + (size_t)r * beta_stride,
                       v_heads, g->gdn_decay, g->gdn_beta);
         rc = (pn_tt_gdn_set_row(g->device, (uint32_t)r) != 0 ||
-              pn_tt_gdn_state_out(g->device, r) != 0 ||
+              pn_tt_gdn_verify_row_out(g->device, (uint32_t)rows, (uint32_t)r) != 0 ||
               pn_tt_gdn_delta_oncard(g->device, (uint32_t)ssm_index, g->gdn_decay,
                                      g->gdn_beta) != 0 ||
-              pn_tt_gdn_layer_swap_part(g->device, (uint32_t)ssm_index, (uint32_t)r, false,
-                                        true) != 0)
+              pn_tt_gdn_verify_row_trade(g->device, (uint32_t)ssm_index, (uint32_t)rows,
+                                         (uint32_t)r, false, true) != 0)
                  ? -1 : 0;
     }
     (void)pn_tt_gdn_defer(g->device, false);
@@ -1251,7 +1309,44 @@ static int gdn_pipe_rms(pn_qwen35_tt *g, int ssm_index, int v_heads, uint32_t va
     return rc;
 }
 
+/* PIPE 2's in-flight band, finished: its DELTA settled, the band before it fully drained, its
+ * own RMS issued (stage 1) — the caller drains that tail. */
+static int gdn_pipe2_land(pn_qwen35_tt *g)
+{
+    const uint32_t value_tiles = pn_tt_gdn_value_tiles(g->device);
+    int rc = 0;
+
+    if (!g->gdn_pipe2_inflight)
+        return 0;
+    g->gdn_pipe2_inflight = false;
+    if (pn_tt_gdnc_settle(g->device) != 0)
+        rc = -1;
+    if (rc == 0 && pn_qwen35_tt_gdn_pipe_drain_tail(g) != 0)
+        rc = -1;
+    if (rc == 0 && pn_tt_gdnc_set_parity(g->device, g->gdn_pipe2_parity) != 0)
+        rc = -1;
+    if (rc == 0)
+        rc = gdn_pipe_rms(g, g->gdn_pipe2_layer, g->gdn_pipe2_vheads, value_tiles,
+                          &g->gdn_pipe2_z, &g->gdn_pipe2_gated);
+    return rc;
+}
+
 int pn_qwen35_tt_gdn_pipe_drain(pn_qwen35_tt *g)
+{
+    int rc;
+
+    if (!g)
+        return 0;
+    rc = gdn_pipe2_land(g);
+    if (pn_qwen35_tt_gdn_pipe_drain_tail(g) != 0)
+        rc = -1;
+    /* Everything above is settled: the primaries go back for decode and the next prefill. */
+    if (pn_tt_gdnc_set_parity(g->device, 0u) != 0)
+        rc = -1;
+    return rc;
+}
+
+int pn_qwen35_tt_gdn_pipe_drain_tail(pn_qwen35_tt *g)
 {
     int rc = 0;
 
@@ -1313,6 +1408,84 @@ static int gdn_strip_chunk_piped(pn_qwen35_tt *g, const pn_qwen35moe_config *cfg
     return gdn_pipe_rms(g, ssm_index, cfg->ssm_dt_rank, value_tiles, z, gated);
 }
 
+/**
+ * PREFILL LANE PIPE 2 (`PN_TT_GDN_PIPE=2`). Band b (parity b % 2):
+ *     widen(b) | CONV(b) queued behind DELTA(b-1) | narrow(b-2) | settle gdnc | L2(b) |
+ *     gate(b-2) | RMS(b-1) | DELTA(b) left IN FLIGHT (sub-chunk 1 serialized behind 0)
+ * so the gdnc members run DELTA(b-1) and CONV(b) back to back while the puller does band b's
+ * widen, and the tail trails by two bands. Two buffer parities keep every write off a buffer
+ * a queued op still reads: widen(b) / CONV(b) / L2(b) / DELTA(b) use parity b%2, RMS(b-1) reads
+ * y of parity (b-1)%2. Every op is the one PIPE 1 runs, on the same bytes: bit-exact.
+ */
+static int gdn_strip_chunk_pipe2(pn_qwen35_tt *g, const pn_qwen35moe_config *cfg, int ssm_index,
+                                 const pn_tt_activation *qkv, const pn_tt_activation *z,
+                                 int rows, const pn_tt_activation *gated)
+{
+    const uint32_t stream_tiles = pn_tt_gdn_stream_tiles(g->device);
+    const uint32_t value_tiles = pn_tt_gdn_value_tiles(g->device);
+    ft_tt_op_operand stream;
+    bool inflight;
+    uint32_t parity;
+    int rc;
+
+    /* A band of another layer must not inherit this one's chain. */
+    if (g->gdn_pipe2_inflight && g->gdn_pipe2_layer != ssm_index &&
+        pn_qwen35_tt_gdn_pipe_drain(g) != 0)
+        return -1;
+    inflight = g->gdn_pipe2_inflight;
+    parity = inflight ? (g->gdn_pipe2_parity ^ 1u) : 0u;
+    if (pn_tt_gdnc_set_parity(g->device, parity) != 0)
+        return -1;
+    if (pn_tt_render_widen(g->device, pn_tt_operand(g->device, qkv),
+                           pn_tt_gdn_stream_in_operand(g->device), stream_tiles) != 0)
+        return -1;
+    pn_tt_gdnc_defer(g->device, inflight);
+    rc = gdn_probe_skips("conv") ? 0
+                                 : pn_tt_gdnc_conv_oncard(g->device, (uint32_t)ssm_index,
+                                                          (uint32_t)rows);
+    pn_tt_gdnc_defer(g->device, false);
+    if (rc != 0)
+        return -1;
+    if (g->gdn_pipe_stage == 1 && gdn_pipe_narrow(g, value_tiles) != 0)
+        return -1;
+    if (inflight) {
+        g->gdn_pipe2_inflight = false;
+        if (pn_tt_gdnc_settle(g->device) != 0)
+            return -1;
+    }
+    stream = pn_tt_gdn_stream_operand(g->device);
+    if (pn_tt_head_norm_operands(g->device, FT_TT_OP_REDUCE_FN_L2_NORM, &g->gdn_l2,
+                                 (uint32_t)(2 * cfg->ssm_n_group), stream, stream,
+                                 stream_tiles, stream_tiles) != 0)
+        return -1;
+    if (g->gdn_pipe_stage == 1 && !gdn_strip_env_red("gdn_pipe_gate_skip") &&
+        gdn_pipe_gate(g) != 0)
+        return -1;
+    /* RED `gdn_pipe2_rms_parity`: band b-1's RMS reads y of band b's parity — band b-2's DELTA
+     * output — must DIFFER. */
+    if (inflight) {
+        if (pn_tt_gdnc_set_parity(g->device,
+                                  gdn_strip_env_red("gdn_pipe2_rms_parity") ? parity
+                                                                            : parity ^ 1u) != 0 ||
+            gdn_pipe_rms(g, g->gdn_pipe2_layer, cfg->ssm_dt_rank, value_tiles, &g->gdn_pipe2_z,
+                         &g->gdn_pipe2_gated) != 0 ||
+            pn_tt_gdnc_set_parity(g->device, parity) != 0)
+            return -1;
+    }
+    pn_tt_gdnc_defer(g->device, true);
+    rc = gdn_probe_skips("delta") ? 0 : gdn_delta_card_gate(g, ssm_index, rows);
+    pn_tt_gdnc_defer(g->device, false);
+    if (rc != 0)
+        return -1;
+    g->gdn_pipe2_inflight = true;
+    g->gdn_pipe2_parity = parity;
+    g->gdn_pipe2_layer = ssm_index;
+    g->gdn_pipe2_vheads = cfg->ssm_dt_rank;
+    g->gdn_pipe2_z = *z;
+    g->gdn_pipe2_gated = *gated;
+    return 0;
+}
+
 int pn_qwen35_tt_gdn_strip_chunk(pn_qwen35_tt *g, const pn_qwen35moe_ssm_layer *l,
                                  const pn_qwen35moe_config *cfg, int ssm_index,
                                  const pn_tt_activation *qkv, const pn_tt_activation *z,
@@ -1358,7 +1531,8 @@ int pn_qwen35_tt_gdn_strip_chunk(pn_qwen35_tt *g, const pn_qwen35moe_ssm_layer *
     }
 
     if (g->gdn_pipe && g->gdn_card_gate)
-        return gdn_strip_chunk_piped(g, cfg, ssm_index, qkv, z, rows, gated);
+        return g->gdn_pipe2 ? gdn_strip_chunk_pipe2(g, cfg, ssm_index, qkv, z, rows, gated)
+                            : gdn_strip_chunk_piped(g, cfg, ssm_index, qkv, z, rows, gated);
 
     /* 3. The bf16 projection becomes the fp32 stream, WHOLE TILES — the render is per tile, so
      * all 32 rows cross in the same descriptor one row used to. Rows at and above the chunk are

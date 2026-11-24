@@ -354,6 +354,8 @@ static void test_required_with_thinking_policy(void)
     char *body = capture_response(oai_handle_models, &reg);
     CHECK(body && strstr(body, "\"tool_choice_required_with_thinking\":true"),
           "/v1/models: ornith advertises required-with-thinking");
+    CHECK(body && strstr(body, "\"think_history\":[\"as_sent\"]"),
+          "/v1/models: think_history lists as_sent (no scheduler: no drop_last)");
     free(body);
     setenv("PANTHEON_TOOL_GRAMMAR", "0", 1);
     body = capture_response(oai_handle_models, &reg);

@@ -94,6 +94,9 @@ uint32_t pn_tt_residency_queue_capacity(void);
 #define PN_TT_RESIDENCY_DEFER_SLOTS 16u
 #define PN_TT_RESIDENCY_DEFER_TIMEOUT_MS 60000u
 
+/** Runtime args a data mover may take past the queue's ten (the arg block holds 32). */
+#define PN_TT_RESIDENCY_TAIL_ARGS 22u
+
 /** Longest program name held; for logs only. */
 #define PN_TT_RESIDENCY_NAME_BYTES 32u
 
@@ -195,6 +198,14 @@ typedef struct pn_tt_residency {
     uint32_t group_address; /**< 0 = post nothing */
     uint32_t group_member;  /**< this residency's slot in the block */
 
+    /** RUNTIME-ARG TAILS past the queue's ten, for the two data movers only (index 0 = DM0,
+     *  the reader; 1 = DM1, the writer): the resident matmul's cooperative + MoE tail
+     *  (resident_matmul_multicast_protocol.h, resident_matmul_moe_protocol.h) and the router
+     *  writer's routing tail. Set by the caller after pn_tt_residency_load() and before
+     *  pn_tt_residency_start(); `tail_count` 0 plants exactly the ten, as every family did. */
+    uint32_t tail_args[2][PN_TT_RESIDENCY_TAIL_ARGS];
+    uint32_t tail_count[2];
+
     uint64_t ops;     /**< descriptors this residency has executed */
     double seconds;   /**< wall time inside pn_tt_residency_submit() */
 
@@ -281,6 +292,23 @@ int pn_tt_residency_bind_core(pn_tt_residency *residency, uint32_t core_index);
 int pn_tt_residency_start(pn_tt_residency *residency);
 
 /**
+ * S2: zero a queue's WAIT SIDECAR and its reader's precondition words (control + 0x900 ..
+ * 0xE20, foundry kernels/resident_precondition_protocol.h) before its kernel launches.
+ *
+ * Every arm and re-arm does it, whatever `PN_TT_ONCARD_COMPLETION` says: the region survives
+ * the process, a re-armed queue counts its descriptors from 0 again, and an entry an earlier
+ * run left at the same index would make the new reader wait on a producer that is gone
+ * (refused only at its spin bound). Zeroed, every slot parses as "no entry".
+ *
+ * @return FT_TT_OK or the accessor's error
+ *
+ * Thread-safe: no (the caller owns the core)
+ * Reentrant:   yes
+ * Signal-safe: no
+ */
+int pn_tt_residency_clear_precondition(const ft_tt_noc_access *noc, uint16_t x, uint16_t y);
+
+/**
  * Retire the residency by ASKING, and wait for all five processors to say EXIT.
  *
  * Never a reset and never a park. The control block's own `state` cannot answer this — it
@@ -364,8 +392,42 @@ int pn_tt_residency_enqueue(pn_tt_residency *residency, uint32_t opcode,
                             const uint32_t *parameters, uint32_t repeat);
 int pn_tt_residency_await(pn_tt_residency *residency, uint32_t timeout_ms);
 
+/**
+ * Enqueue ONE descriptor whose parameter block is already on the card (a parameter-cache
+ * block the caller wrote with ft_tt_queue_write_param_cache(), which never moves): the ring
+ * slot and the head bump only, so a replayed token carries two entries for it instead of
+ * three. `a1` is the reader's word (the MoE LIST word), `a2` the writer's destination row
+ * pitch, `a3` / `a4` the matmul writer's PULL words (0 = no pull), `a5` the group sequence
+ * the writer records as its done-sequence (0 = none).
+ * @return 0, or -1 with the reason on stderr (the idle retire may have stopped it: re-arm)
+ */
+int pn_tt_residency_enqueue_cached(pn_tt_residency *residency, uint32_t opcode,
+                                   uint32_t param_address, uint32_t a1, uint32_t a2, uint32_t a3,
+                                   uint32_t a4, uint32_t a5);
+
+/**
+ * The same with the sixteen parameter words written first into this residency's rotating
+ * slot `param_slot` (descriptors the parameter cache must not hold, e.g. a batched prefill's,
+ * whose words move with the pass and would crowd out the decode blocks).
+ */
+int pn_tt_residency_enqueue_words(pn_tt_residency *residency, uint32_t opcode,
+                                  const uint32_t *parameters, uint32_t a1, uint32_t a2,
+                                  uint32_t a3, uint32_t a4, uint32_t a5);
+
+/**
+ * Record that everything issued to this residency completed, proven by ANOTHER core's
+ * completion (a PULL: member 0 posted only after this one reached its done-sequence). Clears
+ * the unawaited count and restarts the idle clock as a host await would.
+ */
+void pn_tt_residency_mark_settled(pn_tt_residency *residency);
+
 /** The await a `defer_await` window skipped, now (0 when none is pending). */
 int pn_tt_residency_settle(pn_tt_residency *residency, uint32_t timeout_ms);
+
+/** Await everything issued NOW, whether or not an await was recorded or `defer_await` is on (a
+ *  settle with nothing recorded returns at once — the deep attention queue's flow control must
+ *  not depend on that bookkeeping; pn_tt_attn_deep.h). */
+int pn_tt_residency_await_now(pn_tt_residency *residency, uint32_t timeout_ms);
 
 /**
  * Write sixteen words into the parameter slot `offset` slots AFTER this residency's current
@@ -412,6 +474,27 @@ int pn_tt_residency_keepalive_all(double min_idle_seconds);
 int pn_tt_residency_enqueue_group(pn_tt_residency *residency, uint32_t opcode,
                                   const uint32_t *parameters, uint32_t repeat,
                                   uint32_t sequence, uint32_t *out_token);
+
+/**
+ * Would an enqueue go through right now? Runs the enqueue's own idle retire first (asking a
+ * residency idle past `PN_TT_RESIDENCY_IDLE_RETIRE_MS` to stop), so a caller can learn that a
+ * set will refuse BEFORE it sends any of it — the S1 group pull must not send member 0 a pull
+ * of a member whose enqueue is about to fail.
+ * @return true when the residency is running and was not retired here
+ */
+bool pn_tt_residency_enqueue_ready(pn_tt_residency *residency);
+
+/**
+ * One descriptor with its a3 / a4 / a5 set: the S1 GROUP PULL of a split vector family
+ * (pn_tt_group_pull.h). On member 0 `a3` is the pulled member count and `a4` the sequence
+ * every pulled member must reach; on every member `a5` is the group sequence its writer stores
+ * as its done-sequence. All three 0 is exactly `pn_tt_residency_enqueue()` with `repeat` 1.
+ * Honours `defer_await` and its rotating parameter slots, as that enqueue does.
+ * @return 0, or -1 with the reason on stderr
+ */
+int pn_tt_residency_enqueue_pull(pn_tt_residency *residency, uint32_t opcode,
+                                 const uint32_t *parameters, uint32_t a3, uint32_t a4,
+                                 uint32_t a5);
 
 /**
  * Bind this residency to a group completion block. Call BEFORE `pn_tt_residency_start()`;

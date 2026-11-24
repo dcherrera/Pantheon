@@ -1,0 +1,13 @@
+<|im_start|>system
+Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.
+
+You are a coding agent working in potluck/.
+Be precise.<|im_end|>
+<|im_start|>user
+What seeds pl_rng?<|im_end|>
+<|im_start|>assistant
+time(NULL), in pl_seed.c.<|im_end|>
+<|im_start|>user
+Is that deterministic?<|im_end|>
+<|im_start|>assistant
+<think>

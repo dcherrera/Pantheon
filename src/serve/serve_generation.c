@@ -45,15 +45,15 @@
  *         AUTO mode, i.e. without the tool grammar) still gets a "<tool_call>"
  *         wrapper on re-render that it never generated, so that turn cannot
  *         append-resume — it fails safe to a full prefill, never a wrong one.
- *         "<tool_response>" on a re-fed tool result is still byte-encoded text
- *         rather than its special id; both sides render it identically so the
- *         cache is unaffected, but it is not what the model was trained on.
  * @todo None
  */
 
 #include "serve_generation.h"
+#include "context_over_budget.h"
 
 #include "request_profile.h"
+#include "request_timing_line.h"
+#include "../core/host_stage_timer.h"
 
 #include <math.h>
 #include <stdbool.h>
@@ -67,13 +67,21 @@
 #include "../core/chat.h"
 #include "../core/engine.h"
 #include "../core/sampling_modifiers.h"
+#include "../core/sampler_topn_surgery.h"
+#include "../core/mem/pn_host_admission.h"
 #include "../core/mem/pn_memwatch.h"
 #include "batch_sched.h"
+#include "batch_sched_watchdog.h"
+#include "reasoning_budget.h"
 #include "repetition_loop_detector.h"
+#include "serve_dump_reqlog.h"
 #include "serve_emitter.h"
 #include "serve_prompt_tokens.h"
 #include "serve_spec_lookup.h"
+#include "serve_spec_census.h"
+#include "serve_spec_mtp_cuda.h"
 #include "grammar_spec_chooser.h"
+#include "../core/spec_sampling_chooser.h"
 #include "tool_grammar.h"
 #include "tool_grammar_json.h"
 #include "response_format_grammar.h"
@@ -158,6 +166,20 @@ static char *decode_token(pn_model *model, uint32_t token_id)
     return raw;
 }
 
+/* Is this model's reasoning close ONE token whose text is "</think>"?  Then that
+ * token is the close, and the emitter and grammars run in token mode
+ * (think_close_rule.h): the same text spelled out of ordinary tokens — a model
+ * writing a C string with "</think>" in it — stays reasoning. */
+static bool sg_think_close_is_token(pn_model *model)
+{
+    int id = ft_token_to_id(model->tokenizer, "</think>");
+    if (id < 0) return false;
+    char *text = decode_token(model, (uint32_t)id);
+    bool whole = text && strcmp(text, "</think>") == 0;
+    free(text);
+    return whole;
+}
+
 /* ============================================================
  * Reasoning-budget force-close (AUTO / non-forced path)
  *
@@ -201,6 +223,23 @@ static int sg_encode_think_close(pn_model *model, uint32_t *out, int cap)
         if (ids[i] >= 0) out[m++] = (uint32_t)ids[i];
     free(ids);
     return m;
+}
+
+/* The single-user resume ceiling for the request's `think_history`
+ * (core/think_history.h): with as_sent the prefix cache must not resume past
+ * the request's first history think block (the forced generation prefill
+ * excluded). drop_last tries the turn snapshot first (pn_prefix_acquire_opts)
+ * and otherwise takes the same ceiling. KEEP: no ceiling. */
+static int sg_think_history_ceiling(pn_model *model, const uint32_t *prompt,
+                                    int n_prompt, int think_prefill_len,
+                                    pn_think_history think_history)
+{
+    if (think_history == PN_THINK_HISTORY_KEEP)
+        return n_prompt;
+    int n_history = n_prompt - think_prefill_len;
+    return pn_think_history_first_think(prompt, n_history,
+                                        ft_token_to_id(model->tokenizer,
+                                                       "<think>"));
 }
 
 /* Push one force-decoded token into the repeat-penalty window (same order the
@@ -311,15 +350,30 @@ bool sg_tool_grammar_arms(const sg_gen_params *params)
     return params->tool_choice == SG_TOOL_CHOICE_REQUIRED;
 }
 
-/* "required" is the one armed shape that speculates under the grammar on the
- * Tenstorrent loop (grammar_spec_chooser.h): its mask is off for the whole
- * think block, so the turn keeps the top-N rows and the drafts, and the masked
- * steps refill the dense row.  Every other armed shape keeps the dense row and
- * plain decode, exactly as before. */
+/* Which armed grammars speculate on the Tenstorrent loop (grammar_spec_chooser.h):
+ * the turn keeps the top-N rows and the drafts, every verify row is chosen as plain
+ * constrained decoding chooses it, and a masked step the top-N cannot decide refills
+ * the dense row (row 0) or ends the cycle (a later row).  "required" since
+ * 2026-10-13; `PN_TT_SPEC_GRAMMAR` (default 1) extends it to every armed shape — an
+ * AUTO or named-function tool grammar (PANTHEON_TOOL_GRAMMAR=1) and response_format
+ * json_object.  `PN_TT_SPEC_GRAMMAR=0`: only "required"; the others keep the dense row
+ * and plain decode, exactly as before. */
 #ifdef USE_TT
+static bool sg_spec_grammar_all(void)
+{
+    const char *env = getenv("PN_TT_SPEC_GRAMMAR");
+    return !(env && atoi(env) == 0);
+}
+
 static bool sg_tool_grammar_speculates(const sg_gen_params *params)
 {
-    return sg_tool_grammar_arms(params) && params->tool_choice == SG_TOOL_CHOICE_REQUIRED;
+    return sg_tool_grammar_arms(params) &&
+           (params->tool_choice == SG_TOOL_CHOICE_REQUIRED || sg_spec_grammar_all());
+}
+
+static bool sg_response_format_speculates(const sg_gen_params *params)
+{
+    return params->response_format == SG_RESPONSE_FORMAT_JSON_OBJECT && sg_spec_grammar_all();
 }
 #endif
 
@@ -378,6 +432,7 @@ typedef struct {
     unsigned long fl_mask_steps0;
     unsigned long fl_sparse_rows0;
     unsigned long fl_shortlist_steps0;
+    unsigned long fl_bound_steps0;
     unsigned long fl_chunk_steps0;
     unsigned long fl_fullscan_steps0;
     double fl_mask_seconds0;
@@ -399,6 +454,15 @@ static int sg_tg_allowed(void *st, const char *text) {
 }
 static int sg_tg_allowed_json(void *st, const char *text) {
     return tgj_token_allowed((const tgj_state *)st, text) ? 1 : 0;
+}
+/* pn_tool_grammar_hook.steer, armed only when the request sent field_patterns:
+ * a refused close on a patterned value becomes its forced continuation
+ * (tg_steer / tgj_steer). */
+static int sg_tg_steer(void *st, const char *text) {
+    return tg_steer((tg_state *)st, text) ? 1 : 0;
+}
+static int sg_tg_steer_json(void *st, const char *text) {
+    return tgj_steer((tgj_state *)st, text) ? 1 : 0;
 }
 
 /* Driver-side callbacks (batched path).  The batched driver samples per-slot in
@@ -427,6 +491,13 @@ static int sg_tg_complete_cb_json(void *st) {
 static int sg_tg_in_call_cb(void *st) {
     return tg_in_call((const tg_state *)st) ? 1 : 0;
 }
+/* pn_tool_grammar_hook.clone / clone_free (the batched MTP driver's look-ahead). On the
+ * batched path only the sampler (and the driver's injected close) moves a tool walk, so a
+ * clone advanced over the drafts predicts the mask exactly, FORCED walks included. */
+static void *sg_tg_clone_cb(void *st) { return tg_state_clone((const tg_state *)st); }
+static void sg_tg_clone_free_cb(void *st) { tg_state_free((tg_state *)st); }
+static void *sg_tg_clone_cb_json(void *st) { return tgj_state_clone((const tgj_state *)st); }
+static void sg_tg_clone_free_cb_json(void *st) { tgj_state_free((tgj_state *)st); }
 /* Batched-driver callback (pn_tool_grammar_hook.reasoning_end_injected): the
  * driver finished decoding the reasoning-budget's injected "</think>" and must
  * tell the grammar that close was NOT the model's, so the opener is not compelled
@@ -434,6 +505,14 @@ static int sg_tg_in_call_cb(void *st) {
  * sg_tg_reasoning_ended_injected for why the JSON dialect has no window. */
 static void sg_tg_reasoning_end_injected_cb(void *st) {
     tg_reasoning_end_injected((tg_state *)st);
+}
+/* pn_tool_grammar_hook.reasoning_ended: sg_tg_forced_ended for the batched driver, which
+ * records where it first holds (bs_slot_reasoning_ended). */
+static int sg_tg_reasoning_ended_cb(void *st) {
+    return tg_forced_reasoning_ended((const tg_state *)st) ? 1 : 0;
+}
+static int sg_tg_reasoning_ended_cb_json(void *st) {
+    return tgj_forced_reasoning_ended((const tgj_state *)st) ? 1 : 0;
 }
 static int sg_tg_end_allowed_json(void *st) {
     return tgj_end_allowed((const tgj_state *)st) ? 1 : 0;
@@ -467,13 +546,19 @@ static bool sg_tg_build_json(sg_tg_ctx *c, pn_model *model, const sg_gen_params 
                              bool *forced_out) {
     c->grammar_json = tgj_build((const jr_value *)params->tools);
     if (!c->grammar_json) return false;
+    if (!tgj_require_if_reasoned(c->grammar_json,
+                                 (const jr_value *)params->required_if_reasoned))
+        fprintf(stderr, "[tool_grammar] required_if_reasoned: OOM, keys left optional\n");
+    if (!tgj_apply_field_patterns(c->grammar_json, (const jr_value *)params->field_patterns))
+        fprintf(stderr, "[tool_grammar] field_patterns: a pattern did not build, "
+                "some fields left unconstrained\n");
     bool forced = false;
+    bool think_open = sg_chat_style_is_think(model->chat_style) &&
+                      !sg_thinking_suppressed(params->thinking);
     if (params->tool_choice == SG_TOOL_CHOICE_REQUIRED) {
         /* THINK-GATED: the think block the prompt opened is never constrained;
          * the call is compelled from the token after the model's "</think>"
          * (or from token 0 when no block was opened). */
-        bool think_open = sg_chat_style_is_think(model->chat_style) &&
-                          !sg_thinking_suppressed(params->thinking);
         c->state_json = tgj_state_new_required(c->grammar_json, think_open);
         forced = (c->state_json != NULL);
     } else if (params->tool_choice == SG_TOOL_CHOICE_FUNCTION) {
@@ -487,9 +572,14 @@ static bool sg_tg_build_json(sg_tg_ctx *c, pn_model *model, const sg_gen_params 
     if (!c->state_json) {
         tgj_free(c->grammar_json); c->grammar_json = NULL; return false;
     }
+    /* AUTO / named function: watch the open think block too, so `reasoned` is
+     * known for required_if_reasoned (the walk is otherwise unchanged). */
+    if (think_open && params->tool_choice != SG_TOOL_CHOICE_REQUIRED)
+        tgj_watch_reasoning(c->state_json);
     c->kind = SG_GRAMMAR_TOOL_JSON;
     c->hook.st      = c->state_json;
     c->hook.allowed = sg_tg_allowed_json;
+    if (params->field_patterns) c->hook.steer = sg_tg_steer_json;
     *forced_out = forced;
     return true;
 }
@@ -500,10 +590,14 @@ static bool sg_tg_build_xml(sg_tg_ctx *c, pn_model *model, const sg_gen_params *
                             bool *forced_out) {
     c->grammar = tg_build((const jr_value *)params->tools);
     if (!c->grammar) return false;
+    tg_require_if_reasoned(c->grammar, (const jr_value *)params->required_if_reasoned);
+    if (!tg_apply_field_patterns(c->grammar, (const jr_value *)params->field_patterns))
+        fprintf(stderr, "[tool_grammar] field_patterns: a pattern did not build, "
+                "some fields left unconstrained\n");
     bool forced = false;
+    bool think_open = sg_chat_style_is_think(model->chat_style) &&
+                      !sg_thinking_suppressed(params->thinking);
     if (params->tool_choice == SG_TOOL_CHOICE_REQUIRED) {
-        bool think_open = sg_chat_style_is_think(model->chat_style) &&
-                          !sg_thinking_suppressed(params->thinking);
         c->state = tg_state_new_required(c->grammar, think_open);
         forced = (c->state != NULL);
     } else if (params->tool_choice == SG_TOOL_CHOICE_FUNCTION) {
@@ -515,9 +609,12 @@ static bool sg_tg_build_xml(sg_tg_ctx *c, pn_model *model, const sg_gen_params *
     if (!c->state && params->tool_choice == SG_TOOL_CHOICE_FUNCTION)
         c->state = tg_state_new(c->grammar);
     if (!c->state) { tg_free(c->grammar); c->grammar = NULL; return false; }
+    if (think_open && params->tool_choice != SG_TOOL_CHOICE_REQUIRED)
+        tg_watch_reasoning(c->state);
     c->kind = SG_GRAMMAR_TOOL_XML;
     c->hook.st      = c->state;
     c->hook.allowed = sg_tg_allowed;
+    if (params->field_patterns) c->hook.steer = sg_tg_steer;
     *forced_out = forced;
     return true;
 }
@@ -670,6 +767,12 @@ static void sg_tg_setup(sg_tg_ctx *c, pn_model *model,
         c->hook.end_allowed = (c->kind == SG_GRAMMAR_TOOL_JSON) ? sg_tg_end_allowed_json
                                                                 : sg_tg_end_allowed_xml;
         sg_tg_blank_end_tokens(c, model);
+    }
+
+    if (sg_think_close_is_token(model)) {
+        tg_set_think_close_token(c->state);
+        tgj_set_think_close_token(c->state_json);
+        rfg_set_think_close_token(c->state_rf);
     }
 
     c->hook.token_text = sg_tg_token_text;
@@ -901,12 +1004,27 @@ static bool sg_full_logits_always(const sg_gen_params *params)
 }
 
 #ifdef USE_TT
+/* A logit bias on the TT top-N rows: the sampler decides from the row when no biased outside
+ * token can reach the pick and refills the dense row when one can (sampler_topn_surgery.h).
+ * A SAMPLED request with a positive bias keeps the dense row (it would refill every row). */
+static bool sg_tt_bias_on_topn(const sg_gen_params *params)
+{
+    pn_sampling_params bias = { 0 };
+
+    bias.logit_bias = params->logit_bias;
+    bias.n_logit_bias = params->n_logit_bias;
+    return params->logit_bias && params->n_logit_bias > 0 && pn_topn_surgery_enabled() &&
+           (params->temperature <= 0.0f || !pn_topn_surgery_raising_bias(&bias));
+}
+
 /* Before sg_tg_setup has run: could this request arm a grammar, or need the whole row? */
 static bool sg_may_need_full_logits(const sg_gen_params *params)
 {
-    return sg_full_logits_always(params) ||
+    return params->logprobs ||
+           (params->logit_bias && params->n_logit_bias > 0 && !sg_tt_bias_on_topn(params)) ||
            (sg_tool_grammar_arms(params) && !sg_tool_grammar_speculates(params)) ||
-           params->response_format == SG_RESPONSE_FORMAT_JSON_OBJECT;
+           (params->response_format == SG_RESPONSE_FORMAT_JSON_OBJECT &&
+            !sg_response_format_speculates(params));
 }
 #endif
 
@@ -1065,6 +1183,7 @@ static void sg_tg_mark_mask_density(sg_tg_ctx *c) {
     c->fl_mask_steps0  = pn_sampler_grammar_mask_steps();
     c->fl_sparse_rows0 = pn_sampler_grammar_sparse_rows();
     c->fl_shortlist_steps0 = pn_sampler_grammar_shortlist_steps();
+    c->fl_bound_steps0 = pn_sampler_grammar_bound_steps();
     c->fl_chunk_steps0 = pn_sampler_grammar_chunk_steps();
     c->fl_fullscan_steps0 = pn_sampler_grammar_fullscan_steps();
     c->fl_mask_seconds0 = pn_sampler_grammar_mask_seconds();
@@ -1088,10 +1207,11 @@ static void sg_tg_report_mask_density(const sg_tg_ctx *c) {
     unsigned long masked = pn_sampler_grammar_mask_steps() - c->fl_mask_steps0;
     unsigned long sparse = pn_sampler_grammar_sparse_rows() - c->fl_sparse_rows0;
     fprintf(stderr, "[tool_grammar] turn mask density: masked_steps=%lu "
-            "sparse_rows=%lu shortlist=%lu chunks=%lu fullscan=%lu mask_ms=%.1f%s\n", masked,
-            sparse, pn_sampler_grammar_shortlist_steps() - c->fl_shortlist_steps0,
+            "sparse_rows=%lu shortlist=%lu chunks=%lu fullscan=%lu bound=%lu mask_ms=%.1f%s\n",
+            masked, sparse, pn_sampler_grammar_shortlist_steps() - c->fl_shortlist_steps0,
             pn_sampler_grammar_chunk_steps() - c->fl_chunk_steps0,
             pn_sampler_grammar_fullscan_steps() - c->fl_fullscan_steps0,
+            pn_sampler_grammar_bound_steps() - c->fl_bound_steps0,
             (pn_sampler_grammar_mask_seconds() - c->fl_mask_seconds0) * 1000.0,
             sparse ? "  <-- INVARIANT VIOLATED" : "");
 }
@@ -1124,6 +1244,36 @@ static void sg_log_reasoning_channel_flip(const sg_tg_ctx *c, int generated)
             generated, c->forced ? "FORCED" : "AUTO", ++flips);
 }
 
+/* pn_sampling_params.dense_row for a row that is ALREADY dense: nothing to
+ * fetch.  Setting it lets the sampler decide the mask from a shortlist
+ * (grammar_mask_shortlist.h), which it does only for rows a backend can refill. */
+static int sg_gs_row_already_dense(void *ctx, float *logits, int n_vocab)
+{
+    (void)ctx; (void)logits; (void)n_vocab;
+    return 0;
+}
+
+/* The batched (CUDA) path hands a grammar slot the FULL logits row on every step
+ * (sg_require_full_logits arms it for the turn), so the row is already dense and the
+ * sampler may judge a shortlist of its top GMS_MAX instead of all 248k tokens: the
+ * same masked row, hence the same token (tests/test_grammar_dense_shortlist.c).
+ * No dense_chunks / tail_counts: nothing to fetch, no device counts.
+ * Not with PN_GRAMMAR_ARM_WINDOW=1: unmasked steps then carry the sparse top-k row,
+ * which a refill callback would make the sampler treat as a top-N row.
+ * TT builds wire their own callbacks (sg_serve TT block). */
+static void sg_tg_wire_dense_row(const sg_tg_ctx *c, pn_sampling_params *sp)
+{
+#ifndef USE_TT
+    if (!c->enabled || sg_grammar_arm_window_on()) return;
+    sp->dense_row = sg_gs_row_already_dense;
+    sp->dense_ctx = NULL;
+    sp->tail_counts = NULL;
+    sp->dense_chunks = NULL;
+#else
+    (void)c; (void)sp;
+#endif
+}
+
 /* Point the sampling params at the hook (no-op when disabled). */
 static void sg_tg_attach(sg_tg_ctx *c, pn_sampling_params *sp) {
     sp->tool_grammar = c->enabled ? &c->hook : NULL;
@@ -1141,6 +1291,9 @@ static void sg_tg_attach_batched(sg_tg_ctx *c, pn_sampling_params *sp) {
         c->hook.refresh  = sg_tg_refresh_cb_json;
         c->hook.complete = sg_tg_complete_cb_json;
         c->hook.in_call  = sg_tg_in_call_cb_json;
+        c->hook.reasoning_ended = sg_tg_reasoning_ended_cb_json;
+        c->hook.clone      = sg_tg_clone_cb_json;
+        c->hook.clone_free = sg_tg_clone_free_cb_json;
         break;
     case SG_GRAMMAR_TOOL_XML:
         c->hook.advance  = sg_tg_advance_cb;
@@ -1150,6 +1303,9 @@ static void sg_tg_attach_batched(sg_tg_ctx *c, pn_sampling_params *sp) {
         /* Only the XML dialect gets a landing window (the JSON dialect's model
          * runs reasoning_budget 0, so its close is never injected). */
         c->hook.reasoning_end_injected = sg_tg_reasoning_end_injected_cb;
+        c->hook.reasoning_ended = sg_tg_reasoning_ended_cb;
+        c->hook.clone      = sg_tg_clone_cb;
+        c->hook.clone_free = sg_tg_clone_free_cb;
         break;
     case SG_GRAMMAR_RESPONSE_JSON:
         c->hook.advance  = sg_tg_advance_cb_rf;
@@ -1162,6 +1318,7 @@ static void sg_tg_attach_batched(sg_tg_ctx *c, pn_sampling_params *sp) {
         break;
     }
     sp->tool_grammar = c->enabled ? &c->hook : NULL;
+    sg_tg_wire_dense_row(c, sp);
 }
 
 /* Refresh the mask's active flag before each sampling step.  AUTO: mask only
@@ -1338,7 +1495,8 @@ static void sg_tg_reasoning_ended(sg_tg_ctx *c) {
 /* Reasoning-end trigger for an INJECTED close — the reasoning-budget force-close
  * decoded "</think>" itself rather than the model choosing it.  Grants the XML
  * grammar's landing window so the opener is not compelled around an unfinished
- * thought (see tg_reasoning_end_injected).
+ * thought (see tg_reasoning_end_injected).  A "required" walk gets no window:
+ * its opener is compelled from the next token, as after the model's own close.
  *
  * The JSON dialect (ornith) is deliberately NOT given a window here: it runs
  * reasoning_budget 0, so the serve never injects a close for it and this path is
@@ -1529,12 +1687,25 @@ static int sg_prefill_chunk(void)
  *
  * Only engaged for the qwen35moe CUDA batched prefill; any refusal from the
  * model falls back to the ordinary chunk call, which is always correct. ── */
+#ifdef USE_CUDA
+/* Does this model run the qwen35moe CUDA batched prefill? The MoE forward
+ * always does; a dense-FFN model (Ornith, Qwen3.8) runs pn_bonsai_forward_cuda
+ * and does when every weight has a batched kernel (Bonsai's ternary Q2_0 has
+ * none). The 9b/9c pipelines below run that same batched layer path, so they
+ * take the same gate: keying them on the MoE forward pointer alone left Qwen3.8
+ * prefilling one die at a time (8,404 tokens: 900 s). */
+static int sg_qwen35_batch_prefill_model(pn_model *model)
+{
+    return model && (model->forward == pn_qwen35moe_forward_cuda ||
+                     pn_qwen35moe_dense_batch_prefill_ok(model));
+}
+#endif
+
 static int sg_prefill_pipeline_ready(pn_model *model)
 {
 #ifdef USE_CUDA
     return pn_qwen35moe_prefill_pipeline_enabled() &&
-           sg_prefill_batch_enabled() &&
-           model && model->forward == pn_qwen35moe_forward_cuda;
+           sg_prefill_batch_enabled() && sg_qwen35_batch_prefill_model(model);
 #else
     (void)model;
     return 0;
@@ -1579,8 +1750,7 @@ static int sg_prefill_wide_ready(pn_model *model)
 {
 #ifdef USE_CUDA
     return pn_qwen35moe_prefill_pipeline_wide_enabled() &&
-           sg_prefill_batch_enabled() &&
-           model && model->forward == pn_qwen35moe_forward_cuda;
+           sg_prefill_batch_enabled() && sg_qwen35_batch_prefill_model(model);
 #else
     (void)model;
     return 0;
@@ -1780,12 +1950,12 @@ static tm_tensor *sg_prompt_chunk(pn_model *model, pn_state *state,
                                   const uint32_t *toks, int n)
 {
 #ifdef USE_CUDA
-    /* Bonsai (PN_ARCH_BONSAI) selects pn_bonsai_forward_cuda, not this pointer,
-     * so it skips batched prefill and runs the per-token loop below (dense-FFN
-     * has no batched q2_0 kernel yet) — byte-identical to sequential forwards.
-     * The shipped Nex-N2 MoE path (pn_qwen35moe_forward_cuda) is unchanged. */
+    /* A dense-FFN model (Ornith, Bonsai) runs pn_bonsai_forward_cuda, not this
+     * pointer. It takes the batched prefill when every weight has a batched
+     * kernel (Ornith Q8_0); Bonsai's native ternary Q2_0 has none and keeps the
+     * per-token loop below — byte-identical to sequential forwards. */
     if (n > 1 && sg_prefill_batch_enabled() &&
-        model->forward == pn_qwen35moe_forward_cuda)
+        sg_qwen35_batch_prefill_model(model))
         return pn_qwen35moe_forward_batch_cuda(model, toks, n, state, NULL);
 #endif
 #ifdef USE_TT
@@ -1811,7 +1981,9 @@ static tm_tensor *sg_prompt_chunk(pn_model *model, pn_state *state,
     if (n > 1 && model->forward == pn_qwen35moe_forward_tt) {
         tm_tensor *batched = pn_qwen35moe_prefill_tt(model, toks, n, state);
 
-        if (batched)
+        /* An ABORT invalidated the session (its card state is half written): fail, never
+         * replay per token over it. */
+        if (batched || pn_qwen35moe_prefill_tt_aborted(model))
             return batched;
     }
 #endif
@@ -1830,13 +2002,32 @@ static tm_tensor *sg_prompt_chunk(pn_model *model, pn_state *state,
  * boundaries never change the result (the batched prefill is bit-exact vs
  * sequential forwards), so splitting a prefill at the system boundary (SYS1)
  * is bit-faithful to one uninterrupted pass. Returns NULL when from >= to. */
+/* The CUDA MTP head's backlog follows every trunk batch of the prompt (serve_spec_mtp_cuda.h).
+ * A failure only costs drafts (logged once): the verify still decides every token. */
+static void sg_mtp_feed_chunk(pn_model *model, pn_state *state, const uint32_t *toks, int n)
+{
+#ifdef USE_CUDA
+    static int warned;
+
+    if (!sg_mtp_cuda_available(model) ||
+        pn_qwen35moe_mtp_push_rows(model, state, toks, n) == 0 || warned)
+        return;
+    warned = 1;
+    fprintf(stderr, "serve: MTP head backlog push failed (chunk %d tokens at pos %d); drafts "
+                    "restart after the next verify\n", n, state->pos);
+#else
+    (void)model; (void)state; (void)toks; (void)n;
+#endif
+}
+
 static tm_tensor *sg_prefill_range(pn_model *model, pn_state *state,
                                    const uint32_t *prompt, int from, int to,
                                    sg_should_abort_fn should_abort, void *ud)
 {
     tm_tensor *logits = NULL;
     /* 9c first: it owns the whole range when it takes it, and refuses cleanly
-     * (nothing advanced) when it cannot, leaving the 9b loop below untouched. */
+     * (nothing advanced) when it cannot, leaving the 9b loop below untouched.
+     * With the MTP head on, 9c feeds the head's backlog itself. */
     if (sg_prefill_range_wide(model, state, prompt, from, to, should_abort, ud,
                               &logits))
         return logits;
@@ -1869,6 +2060,7 @@ static tm_tensor *sg_prefill_range(pn_model *model, pn_state *state,
          * except on the share of boundaries the duty serialises (drain). */
         if (pipeline && m > 1 && off + m < to &&
             sg_prompt_chunk_nologits(model, state, prompt + off, m) == 0) {
+            sg_mtp_feed_chunk(model, state, prompt + off, m);
             if (!sg_prefill_duty_overlap(&duty))
                 sg_prefill_pipeline_drain(model);
             continue;
@@ -1878,11 +2070,144 @@ static tm_tensor *sg_prefill_range(pn_model *model, pn_state *state,
             if (pipeline) sg_prefill_pipeline_drain(model);
             return NULL;
         }
+        sg_mtp_feed_chunk(model, state, prompt + off, m);
     }
     /* The last chunk always runs the ordinary path, which syncs die B, so the
      * pipeline is drained on the success return by construction. */
     sg_prefill_pipeline_report(&duty, to - from);
     return logits;
+}
+
+/* QWEN35_BS_PREFILL_WIDE_SUB=<tokens> (default 1024 since 2026-11-02; 0 = off):
+ * while other sessions are decoding, prefill in sub-ranges of this many tokens
+ * through the N-die wide pipeline (bit-exact with the chunk loop; every die
+ * busy instead of one) and yield to the decode driver between sub-ranges,
+ * instead of one sequential 128-token chunk per yield. Process-constant. */
+#define SG_PREFILL_WIDE_SUB_DEFAULT 1024
+
+static int sg_prefill_wide_sub(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("QWEN35_BS_PREFILL_WIDE_SUB");
+        v = e ? atoi(e) : SG_PREFILL_WIDE_SUB_DEFAULT;
+        if (v < 0)
+            v = 0;
+    }
+    return v;
+}
+
+/* Prefill prompt[*from_io, to) in wide-pipelined sub-ranges of `sub` tokens,
+ * yielding the GPU turn to the decode driver between sub-ranges (never after
+ * the last, for the same reason as sg_prefill_range_sched). Returns 1 when it
+ * handled the range: *out holds the last position's logits, or NULL on an abort
+ * (the caller classifies via should_abort). Returns 0 when the wide path
+ * refused; *from_io then says how far it got, and the caller's chunk loop
+ * prefills the rest. */
+static int sg_prefill_range_wide_yielding(pn_model *model, pn_batch_sched *sched,
+                                          int slot, pn_state *state,
+                                          const uint32_t *prompt, int *from_io,
+                                          int to, int sub,
+                                          sg_should_abort_fn should_abort, void *ud,
+                                          tm_tensor **out)
+{
+    *out = NULL;
+    if (!sg_prefill_wide_ready(model))
+        return 0;
+    for (int off = *from_io; off < to; off += sub) {
+        const int end = to - off <= sub ? to : off + sub;
+        tm_tensor *logits = NULL;
+        *from_io = off;
+        if (!sg_prefill_range_wide(model, state, prompt, off, end, should_abort, ud,
+                                   &logits))
+            return 0;
+        if (!logits)
+            return 1;                    /* aborted and drained */
+        if (end == to) {
+            *out = logits;
+            return 1;
+        }
+        tm_free(logits);
+        bs_prefill_yield(sched, slot);
+    }
+    return 1;
+}
+
+/* Ranges shorter than this skip the overlap: the cursor would spread their two
+ * stages' 40 layers over several decode steps, where the ordinary path runs a
+ * 5-token checkpoint tail or a short tool reply in a fraction of a second. */
+#define SG_PD_OVERLAP_MIN_TOKENS 256
+
+/* QWEN35_BS_PD_OVERLAP: prefill prompt[from, to) through the prefill cursor
+ * while other sessions decode — each decode step (bs_pd_cycle, the driver's
+ * very step run by this thread) carries prefill pieces in the boards' idle
+ * halves; with nobody decoding the cursor runs alone, a chunk at a time. A
+ * queued finalize, or a waiting prefill clearly shorter than what is left
+ * (shortest-prefill-first), gets the turn at a quiet point (cursor quiesced,
+ * prefill saved) while chunks are left to inject; after the last one the range
+ * ends under this turn (bs_pd_may_yield). Returns 1 when it handled the range: *out holds the last position's
+ * logits, or NULL on an abort or an error (the caller classifies via
+ * should_abort; on an error the state is undefined and the caller resets).
+ * Returns 0 when the cursor refused (nothing touched). Bit-exact with the wide
+ * path. */
+static int sg_prefill_range_overlap(pn_model *model, pn_batch_sched *sched, int slot,
+                                    pn_state *state, const uint32_t *prompt, int from,
+                                    int to, sg_should_abort_fn should_abort, void *ud,
+                                    tm_tensor **out)
+{
+    *out = NULL;
+#ifdef USE_CUDA
+    int chunk = sg_prefill_chunk();
+    if (chunk <= 0)
+        chunk = to - from;
+    pn_qwen35moe_pd_cursor *cur =
+        pn_qwen35moe_pd_begin_cuda(model, state, prompt + from, to - from, chunk);
+    if (!cur)
+        return 0;
+    int cycles = 0, alone = 0, yields = 0, held = 0;
+    while (!pn_qwen35moe_pd_issued_all(cur)) {
+        if (should_abort && should_abort(ud)) {
+            (void)pn_qwen35moe_pd_abort_cuda(cur);
+            fprintf(stderr, "[prefill_overlap] aborted and drained\n");
+            return 1;
+        }
+        const int finalizers = bs_pd_finalize_waiting(sched);
+        const bool shorter = finalizers == 0 &&
+            bs_pd_shorter_waiting(sched, pn_qwen35moe_pd_remaining(cur));
+        if (bs_pd_may_yield(pn_qwen35moe_pd_injected_all(cur), finalizers, shorter)) {
+            if (pn_qwen35moe_pd_quiesce_cuda(cur) < 0)
+                break;
+            bs_pd_yield(sched, slot);
+            yields++;
+        } else if (finalizers > 0 || shorter) {
+            held++;   /* last chunk in: the range ends under this turn */
+        }
+        int r = bs_pd_cycle(sched, cur);
+        if (r < 0)
+            break;
+        if (r == 1 && pn_qwen35moe_pd_advance_cuda(cur, 1) < 0)
+            break;
+        cycles += r == 0;
+        alone += r == 1;
+    }
+    if (!pn_qwen35moe_pd_issued_all(cur)) {
+        (void)pn_qwen35moe_pd_abort_cuda(cur);
+        fprintf(stderr, "[prefill_overlap] failed after %d cycles\n", cycles);
+        return 1;
+    }
+    if (pn_qwen35moe_pd_finish_cuda(cur, out) < 0) {
+        fprintf(stderr, "[prefill_overlap] head failed\n");
+        return 1;
+    }
+    fprintf(stderr, "[prefill_overlap] ON: %d tokens in %d-token chunks, %d overlap "
+            "cycles, %d chunks alone, %d yields, %d tail cycles held\n", to - from, chunk,
+            cycles, alone, yields, held);
+    return 1;
+#else
+    (void)model; (void)sched; (void)slot; (void)state; (void)prompt; (void)from; (void)to;
+    (void)should_abort; (void)ud;
+    return 0;
+#endif
 }
 
 /* Batch-scheduled twin of sg_prefill_range: prefill prompt[from, to) in
@@ -1914,6 +2239,16 @@ static tm_tensor *sg_prefill_range_sched(pn_model *model,
         sg_prefill_range_wide(model, state, prompt, from, to, should_abort, ud,
                               &logits))
         return logits;
+    if (sched && load.active_slots > 1 && to - from >= SG_PD_OVERLAP_MIN_TOKENS &&
+        bs_pd_overlap_on(sched) &&
+        sg_prefill_range_overlap(model, sched, slot, state, prompt, from, to, should_abort,
+                                 ud, &logits))
+        return logits;
+    if (sched && sg_prefill_wide_sub() > 0 &&
+        sg_prefill_range_wide_yielding(model, sched, slot, state, prompt, &from, to,
+                                       sg_prefill_wide_sub(), should_abort, ud,
+                                       &logits))
+        return logits;
     int chunk = sg_prefill_chunk();
     if (chunk <= 0) chunk = to - from;
     int pipeline = sg_prefill_pipeline_ready(model);
@@ -1943,6 +2278,7 @@ static tm_tensor *sg_prefill_range_sched(pn_model *model,
          * single-session case this optimises never pays for it. */
         if (pipeline && m > 1 && off + m < to) {
             if (sg_prompt_chunk_nologits(model, state, prompt + off, m) == 0) {
+                sg_mtp_feed_chunk(model, state, prompt + off, m);
                 if (!sg_prefill_duty_overlap(&duty))
                     sg_prefill_pipeline_drain(model);
                 bs_prefill_yield(sched, slot);
@@ -1954,10 +2290,69 @@ static tm_tensor *sg_prefill_range_sched(pn_model *model,
             if (pipeline) sg_prefill_pipeline_drain(model);
             return NULL;
         }
+        sg_mtp_feed_chunk(model, state, prompt + off, m);
         if (off + m < to)
             bs_prefill_yield(sched, slot);   /* L2: let decode interleave */
     }
     sg_prefill_pipeline_report(&duty, to - from);
+    return logits;
+}
+
+/* Prefill prompt[from, to) on the batched path, stopping at up to three cuts
+ * to save the state there:
+ *   sys_cut   the SYS1 system-prefix boundary snapshot (-1: none);
+ *   ckpt_cut  the turn-start checkpoint, rung 1c (-1: none);
+ *   div_cut   the divergence checkpoint, rung 1d (-1: none).
+ * At a cut the GPU turn is still held (the range helper never yields after its
+ * last chunk), so the state sits exactly there. Splitting is bit-faithful to
+ * one uninterrupted pass (the batched prefill is bit-exact vs sequential
+ * forwards at any chunking). A failed save is benign: the turn continues
+ * without it. Returns the last position's logits, or NULL on abort/error. */
+static tm_tensor *sg_prefill_turn_sched(pn_model *model, pn_batch_sched *sched,
+                                        int slot, pn_state *state,
+                                        const uint32_t *prompt, int from,
+                                        int to, int sys_cut, int ckpt_cut,
+                                        int div_cut, const char *sid,
+                                        const sg_gen_params *params)
+{
+    int cuts[3];
+    int n_cuts = 0;
+    const int wanted[3] = { sys_cut, ckpt_cut, div_cut };
+    for (int w = 0; w < 3; w++) {
+        int c = wanted[w];
+        bool dup = false;
+        for (int k = 0; k < n_cuts; k++)
+            dup = dup || cuts[k] == c;
+        if (c <= from || c >= to || dup)
+            continue;
+        int k = n_cuts++;                    /* insertion sort, ascending */
+        while (k > 0 && cuts[k - 1] > c) {
+            cuts[k] = cuts[k - 1];
+            k--;
+        }
+        cuts[k] = c;
+    }
+    tm_tensor *logits = NULL;
+    int at = from;
+    for (int i = 0; i <= n_cuts; i++) {
+        int end = i < n_cuts ? cuts[i] : to;
+        if (logits)
+            tm_free(logits);
+        logits = sg_prefill_range_sched(model, sched, slot, state, prompt, at,
+                                        end, params->should_abort,
+                                        params->abort_ud);
+        if (!logits)
+            return NULL;
+        if (end == sys_cut &&
+            bs_prefill_capture_sys(sched, slot, sid, prompt, sys_cut) != 0)
+            fprintf(stderr, "[batch_sched] sys-prefix capture failed slot=%d "
+                    "sid=%s (continuing uncached)\n", slot, sid);
+        if (end == ckpt_cut && end < to)
+            (void)bs_turn_ckpt_capture(sched, slot, sid, prompt, ckpt_cut);
+        if (end == div_cut && end < to)
+            (void)bs_div_ckpt_capture(sched, slot, sid, prompt, div_cut);
+        at = end;
+    }
     return logits;
 }
 
@@ -1979,9 +2374,16 @@ static int sg_seed_recent(uint32_t *recent, int max_recent,
  * Completion driver
  * ============================================================ */
 
-#ifdef USE_TT
+/* The single-user speculative loop runs on Tenstorrent (the TT step) and CUDA (the MTP step in
+ * serve_spec_mtp_cuda.h); everything else decodes plain. */
+#if defined(USE_TT) || defined(USE_CUDA)
+#define SG_SPEC 1
+#endif
+
+#ifdef SG_SPEC
 /* ---------------------------------------------------------------------------
- * MTP speculative decode on the single-user completion (Tenstorrent qwen35).
+ * MTP speculative decode on the single-user completion (Tenstorrent qwen35, and CUDA
+ * qwen35moe with the MTP head: serve_spec_mtp_cuda.h, exact for sampled requests too).
  *
  * The loop's shape is kept: every token is emitted by the same code; only the
  * forward that follows an emitted token changes. After the seed (the token just
@@ -2010,10 +2412,20 @@ typedef struct sg_spec {
                                 * RNG state for a cycle and hands it back after */
     gsc_chooser gsc;
     void *gsc_walk;            /* the chooser's scratch walk (a clone of the live one) */
+    sg_grammar_kind gsc_kind;  /* which grammar gsc_walk is */
     const sg_tg_ctx *tg;
     pn_model *model;
     float *dense;              /* n_vocab: the row a masked pick samples */
+    sg_spec_census census;     /* where the request's tokens came from (serve_spec_census.h) */
+    sg_plain_reason why_plain; /* why the last sg_spec_cycle returned false */
+#ifdef USE_CUDA
+    bool cuda;                 /* the CUDA MTP backend runs this request */
+    sg_mtp_cuda mtp;
+#endif
 } sg_spec;
+#endif /* SG_SPEC */
+
+#ifdef USE_TT
 
 /* The grammar walk behind gsc_grammar_ops, per dialect. */
 static void sg_gs_copy_json(void *d, const void *s) { tgj_state_copy(d, s); }
@@ -2042,6 +2454,17 @@ static const gsc_grammar_ops SG_GS_OPS_JSON_RED = {
 static const gsc_grammar_ops SG_GS_OPS_XML_RED = {
     sg_gs_copy_xml, sg_gs_allowed_xml, sg_gs_advance_xml, sg_gs_mask_never, sg_gs_complete_xml,
 };
+static void sg_gs_copy_rf(void *d, const void *s) { rfg_state_copy(d, s); }
+static bool sg_gs_allowed_rf(const void *st, const char *t) { return rfg_token_allowed(st, t); }
+static void sg_gs_advance_rf(void *st, const char *t) { rfg_advance(st, t); }
+static bool sg_gs_mask_rf(const void *st) { return rfg_mask_active(st); }
+static bool sg_gs_complete_rf(const void *st) { return rfg_complete(st); }
+static const gsc_grammar_ops SG_GS_OPS_RF = {
+    sg_gs_copy_rf, sg_gs_allowed_rf, sg_gs_advance_rf, sg_gs_mask_rf, sg_gs_complete_rf,
+};
+static const gsc_grammar_ops SG_GS_OPS_RF_RED = {
+    sg_gs_copy_rf, sg_gs_allowed_rf, sg_gs_advance_rf, sg_gs_mask_never, sg_gs_complete_rf,
+};
 
 /* A verify row the mask does not touch: the plain speculative-sampling draw. */
 static uint32_t sg_gs_base_sample(void *ctx, int row, const uint32_t *index, const float *value,
@@ -2051,15 +2474,6 @@ static uint32_t sg_gs_base_sample(void *ctx, int row, const uint32_t *index, con
 
     choose->row_index = row;
     return pn_spec_sample_choose(choose, index, value, count);
-}
-
-/* pn_sampling_params.dense_row for a row that is ALREADY dense: nothing to
- * fetch.  Setting it lets the sampler decide the mask from a shortlist
- * (grammar_mask_shortlist.h), which it does only for rows a backend can refill. */
-static int sg_gs_row_already_dense(void *ctx, float *logits, int n_vocab)
-{
-    (void)ctx; (void)logits; (void)n_vocab;
-    return 0;
 }
 
 /* Push a draw onto the cycle's repeat window, as pn_spec_sample_choose does. */
@@ -2082,8 +2496,9 @@ static void sg_gs_push_recent(pn_spec_sample_ctx *choose, uint32_t token)
  *            verify IS the card's logits row 0, so the shortlist / chunk fetch /
  *            dense refill it falls through are the plain step's own.
  *   row > 0: only the shortlist decision (the card's logits buffer holds row 0,
- *            not this row); decided → the same draw on the same rewritten row,
- *            else defer — the next cycle meets this position as its row 0. */
+ *            not this row); decided → the same draw on the same rewritten row
+ *            (pn_sample_decided_row: final, as row 0's own mask leaves it), else
+ *            defer — the next cycle meets this position as its row 0. */
 static uint32_t sg_gs_masked_pick(void *ctx, void *walk, int row, const uint32_t *index,
                                   const float *value, uint32_t count)
 {
@@ -2101,12 +2516,16 @@ static uint32_t sg_gs_masked_pick(void *ctx, void *walk, int row, const uint32_t
     hook.refresh = NULL;
     hook.advance = NULL;
     params.tool_grammar = &hook;
+    /* A masked row: no repetition penalty, as in plain decode's sample_token.
+     * Set here too because row > 0 is decided with the hook detached. */
+    params.repeat_penalty = 1.0f;
     memcpy(&neg_inf, &neg_inf_bits, sizeof(neg_inf));
     for (i = 0; i < (uint32_t)n_vocab; i++) sp->dense[i] = neg_inf;
     for (i = 0; i < count; i++)
         if (index[i] < (uint32_t)n_vocab) sp->dense[index[i]] = value[i];
     if (row > 0) {
         params.dense_row = sg_gs_row_already_dense;   /* never row 0's logits here */
+        params.tail_counts = NULL;
         params.dense_chunks = NULL;
         params.dense_ctx = NULL;
         if (!pn_sampler_grammar_shortlist(sp->dense, n_vocab, &params, choose->recent,
@@ -2115,11 +2534,16 @@ static uint32_t sg_gs_masked_pick(void *ctx, void *walk, int row, const uint32_t
         params.tool_grammar = NULL;
     } else {
         params.dense_row = pn_qwen35moe_tt_dense_row;
+        params.tail_counts = pn_qwen35moe_tt_tail_counts;
         params.dense_chunks = pn_qwen35moe_tt_dense_chunks;
         params.dense_ctx = sp->model;
     }
-    token = pn_sample_next_token(sp->dense, n_vocab, &params, choose->recent, choose->n_recent);
+    token = row > 0 ? pn_sample_decided_row(sp->dense, n_vocab, &params, choose->recent,
+                                            choose->n_recent)
+                    : pn_sample_next_token(sp->dense, n_vocab, &params, choose->recent,
+                                           choose->n_recent);
     sp->plain.rng_state = params.rng_state;
+    sp->plain.carried_uniform_set = params.carried_uniform_set;
     sg_gs_push_recent(choose, token);
     return token;
 }
@@ -2129,12 +2553,35 @@ static uint32_t sg_gs_masked_pick(void *ctx, void *walk, int row, const uint32_t
 static bool sg_spec_init_grammar(sg_spec *sp, pn_model *model, const sg_tg_ctx *tg,
                                  int max_recent)
 {
-    const bool json = tg->kind == SG_GRAMMAR_TOOL_JSON;
+    const bool red = getenv("PN_TT_RED") && strcmp(getenv("PN_TT_RED"), "gspec_ignore_mask") == 0;
 
     if (!pn_qwen35moe_tt_spec_can_sample(model))
         return false;
-    sp->gsc.ops = json ? &SG_GS_OPS_JSON : &SG_GS_OPS_XML;   /* also tells sg_spec_free the walk's type */
-    sp->gsc_walk = json ? (void *)tgj_state_clone(tg->state_json) : (void *)tg_state_clone(tg->state);
+    /* A field_patterns steer moves the walk from inside the sampler, which the
+     * verify rows > 0 (decided by the shortlist alone) would not see: plain
+     * constrained decoding only. */
+    if (tg->hook.steer)
+        return false;
+    sp->gsc_kind = tg->kind;   /* tells sg_spec_free the walk's type */
+    switch (tg->kind) {
+    case SG_GRAMMAR_TOOL_JSON:
+        sp->gsc.ops = red ? &SG_GS_OPS_JSON_RED : &SG_GS_OPS_JSON;
+        sp->gsc_walk = tgj_state_clone(tg->state_json);
+        sp->gsc.live = tg->state_json;
+        break;
+    case SG_GRAMMAR_TOOL_XML:
+        sp->gsc.ops = red ? &SG_GS_OPS_XML_RED : &SG_GS_OPS_XML;
+        sp->gsc_walk = tg_state_clone(tg->state);
+        sp->gsc.live = tg->state;
+        break;
+    case SG_GRAMMAR_RESPONSE_JSON:
+        sp->gsc.ops = red ? &SG_GS_OPS_RF_RED : &SG_GS_OPS_RF;
+        sp->gsc_walk = rfg_state_clone(tg->state_rf);
+        sp->gsc.live = tg->state_rf;
+        break;
+    default:
+        return false;
+    }
     sp->dense = malloc((size_t)model->config.n_vocab * sizeof(float));
     if (!sp->choose.recent) {
         sp->choose.recent = malloc((size_t)(max_recent > 0 ? max_recent : 1) * sizeof(uint32_t));
@@ -2145,11 +2592,8 @@ static bool sg_spec_init_grammar(sg_spec *sp, pn_model *model, const sg_tg_ctx *
     sp->grammar = true;
     sp->tg = tg;
     sp->model = model;
-    if (getenv("PN_TT_RED") && strcmp(getenv("PN_TT_RED"), "gspec_ignore_mask") == 0) {
+    if (red)
         fprintf(stderr, "serve: RED gspec_ignore_mask — drafts are NOT checked against the grammar\n");
-        sp->gsc.ops = json ? &SG_GS_OPS_JSON_RED : &SG_GS_OPS_XML_RED;
-    }
-    sp->gsc.live = json ? (const void *)tg->state_json : (const void *)tg->state;
     sp->gsc.walk = sp->gsc_walk;
     sp->gsc.text = sg_tg_token_text;
     sp->gsc.text_ctx = (void *)tg;
@@ -2160,17 +2604,41 @@ static bool sg_spec_init_grammar(sg_spec *sp, pn_model *model, const sg_tg_ctx *
     return true;
 }
 
+/* One line per sampled request that drew on top-N rows past the top-k gate: how the tail
+ * planner decided (sampler_topn_tail.h) and how many dense rows the request downloaded. */
+static void sg_report_sampled_rows(const unsigned long tail0[4], unsigned long refills0)
+{
+    unsigned long t[3];
+
+    pn_sampler_tail_counts(&t[0], &t[1], &t[2]);
+    if (t[0] == tail0[0] && t[1] == tail0[1] && t[2] == tail0[2])
+        return;
+    fprintf(stderr, "[sampled rows] tail planner: from top-N %lu, residual %lu, dense %lu; "
+                    "card tail counts %lu; dense refills %lu\n", t[0] - tail0[0],
+            t[1] - tail0[1], t[2] - tail0[2], pn_sampler_tail_count_calls() - tail0[3],
+            pn_sampler_topn_refills() - refills0);
+}
+
+#endif /* USE_TT */
+
+#ifdef SG_SPEC
 static void sg_spec_free(sg_spec *sp)
 {
+#ifdef USE_CUDA
+    if (sp->cuda)
+        sg_mtp_cuda_end(&sp->mtp);
+    sp->cuda = false;
+#endif
+    pn_spec_sample_rule_free(&sp->choose);
     sg_spec_lookup_free(&sp->lookup);
     free(sp->choose.row);
     free(sp->choose.recent);
     sp->choose.row = NULL;
     sp->choose.recent = NULL;
     if (sp->gsc_walk) {
-        if (sp->gsc.ops != &SG_GS_OPS_XML && sp->gsc.ops != &SG_GS_OPS_XML_RED)
-            tgj_state_free(sp->gsc_walk);
-        else                                tg_state_free(sp->gsc_walk);
+        if (sp->gsc_kind == SG_GRAMMAR_TOOL_JSON)      tgj_state_free(sp->gsc_walk);
+        else if (sp->gsc_kind == SG_GRAMMAR_TOOL_XML)  tg_state_free(sp->gsc_walk);
+        else                                           rfg_state_free(sp->gsc_walk);
     }
     sp->gsc_walk = NULL;
     free(sp->dense);
@@ -2185,29 +2653,65 @@ static void sg_spec_report_grammar(const sg_spec *sp)
             "deferred=%lu drafts_cut=%lu\n", sp->gsc.rows_masked, sp->gsc.rows_deferred,
             sp->gsc.drafts_cut);
 }
+#endif /* SG_SPEC */
+
+#ifdef USE_TT
+/* Why this request needs the dense row on every step (and so cannot speculate: a verify's
+ * rows are top-N), or NULL. Same conditions sg_run_completion always used, now named. */
+static const char *sg_spec_full_row_reason(const sg_tg_ctx *tg, const sg_gen_params *params,
+                                           bool spec_under_grammar)
+{
+    if (params->logprobs)
+        return "off:logprobs";
+    if (params->logit_bias && params->n_logit_bias > 0 && !sg_tt_bias_on_topn(params))
+        return "off:logit-bias";
+    if (!spec_under_grammar && tg->enabled)
+        return sg_tg_is_tool(tg) ? "off:tool-grammar" : "off:response-format";
+    return NULL;
+}
 
 /* Greedy speculation when the request's pick IS the argmax; speculative SAMPLING when the
  * rows are top-N (pn_qwen35moe_tt_select_rows chose them) and nothing needs the dense row. */
-static void sg_spec_init(sg_spec *sp, pn_model *model, pn_sampling_params *samp,
-                         bool needs_full_logits, int max_recent, const uint32_t *prompt,
-                         int n_prompt, int max_tokens, const sg_tg_ctx *tg,
-                         bool grammar_speculates)
+static void sg_spec_init_tt(sg_spec *sp, pn_model *model, pn_sampling_params *samp,
+                            const char *full_row_reason, int max_recent,
+                            const uint32_t *prompt, int n_prompt, int max_tokens,
+                            const sg_tg_ctx *tg, bool grammar_speculates)
 {
     const char *env = getenv("PN_TT_SPEC");
     const bool grammar = grammar_speculates && samp->tool_grammar;
 
     memset(sp, 0, sizeof(*sp));
-    if (model->forward != pn_qwen35moe_forward_tt || needs_full_logits ||
-        (getenv("PN_TT_SERVE_SPEC") && atoi(getenv("PN_TT_SERVE_SPEC")) == 0))
+    sg_spec_census_begin(&sp->census, "off:not-tt");
+    if (model->forward != pn_qwen35moe_forward_tt)
         return;
+    if (full_row_reason) {
+        sp->census.mode = full_row_reason;
+        return;
+    }
+    if (getenv("PN_TT_SERVE_SPEC") && atoi(getenv("PN_TT_SERVE_SPEC")) == 0) {
+        sp->census.mode = "off:env";
+        return;
+    }
     /* Under the grammar the rows are judged by the chooser, so exactness is
      * asked of the request's params WITHOUT the hook. */
     sp->plain = *samp;
     sp->loop = samp;
     if (grammar)
         sp->plain.tool_grammar = NULL;
+    sp->census.mode = grammar ? "grammar-greedy" : "greedy";
     if (!pn_qwen35moe_tt_greedy_exact_on_topn(&sp->plain)) {
-        if (sp->plain.temperature <= 0.0f || sp->plain.tool_grammar ||
+        /* Greedy under client surgery takes the chooser too: each verify row's pick is the
+         * sampler's own (surgery over the cycle's window, dense refill / deferral when the
+         * row cannot decide it). `PN_TT_TOPN_SURGERY=0`: plain decode, as before. */
+        const bool greedy_surgery = sp->plain.temperature <= 0.0f &&
+                                    pn_topn_surgery_enabled() &&
+                                    pn_topn_surgery_present(&sp->plain);
+
+        sp->census.mode = sp->plain.temperature <= 0.0f && !greedy_surgery ? "off:greedy-penalized"
+                        : sp->plain.tool_grammar        ? "off:grammar"
+                        : !pn_qwen35moe_tt_spec_can_sample(model) ? "off:dense-rows"
+                        : "off:env-sample";
+        if ((sp->plain.temperature <= 0.0f && !greedy_surgery) || sp->plain.tool_grammar ||
             !pn_qwen35moe_tt_spec_can_sample(model) ||
             (getenv("PN_TT_SPEC_SAMPLE") && atoi(getenv("PN_TT_SPEC_SAMPLE")) == 0))
             return;
@@ -2220,44 +2724,74 @@ static void sg_spec_init(sg_spec *sp, pn_model *model, pn_sampling_params *samp,
             free(sp->choose.row);
             free(sp->choose.recent);
             memset(sp, 0, sizeof(*sp));
+            sg_spec_census_begin(&sp->census, "off:no-memory");
             return;
         }
         sp->sampling = true;
+        sp->census.mode = greedy_surgery ? (grammar ? "grammar-greedy-surgery" : "greedy-surgery")
+                        : (grammar ? "grammar-sampled" : "sampled");
+        /* TRUE SPECULATIVE SAMPLING outside the tool grammar (spec_sampling_chooser.h):
+         * drafts drawn from the MTP head's q, rows decided by min(1, p/q) + residual.
+         * Opt-in (`PN_TT_SPEC_SAMPLE_RULE=1`/`2`); off (or a grammar): argmax drafts, the
+         * shared-randomness rule. */
+        if (!grammar && pn_spec_rule_applies(sp->choose.params) &&
+            pn_spec_sample_rule_arm(&sp->choose) != 0)
+            fprintf(stderr, "serve: true speculative sampling off (no memory)\n");
     }
     if (grammar && !sg_spec_init_grammar(sp, model, tg, max_recent)) {
         fprintf(stderr, "serve: speculation under the tool grammar unavailable; plain decode\n");
         sg_spec_free(sp);
         memset(sp, 0, sizeof(*sp));
+        sg_spec_census_begin(&sp->census, "off:grammar-unavailable");
         return;
     }
     sp->k = env ? atoi(env) : 3;
     if (sp->k > 15) sp->k = 15;
     if (sp->k < 0) sp->k = 0;
+    if (sp->k == 0)
+        sp->census.mode = "off:k0";
     if (sp->k > 0 && sg_spec_lookup_init(&sp->lookup, prompt, n_prompt, max_tokens) != 0)
         fprintf(stderr, "serve: prompt-lookup drafts off (no memory for the history)\n");
 }
 
 
-/* One cycle with `seed` as the next token. `cap` bounds the drafts (token / reasoning
- * budget). @return true when the verify committed the seed (no plain forward owed). */
-static bool sg_spec_cycle(sg_spec *sp, pn_model *model, pn_state *state, uint32_t seed,
-                          int cap, int eos_id, int im_end, const uint32_t *recent,
-                          int n_recent)
+/* The Tenstorrent cycle behind sg_spec_cycle. */
+static bool sg_spec_cycle_tt(sg_spec *sp, pn_model *model, pn_state *state, uint32_t seed,
+                             int cap, int eos_id, int im_end, const uint32_t *recent,
+                             int n_recent)
 {
     uint32_t drafts[16], looked[16];
     int nd, nl, i, ne;
 
+    sp->why_plain = sp->k > 0 ? SG_PLAIN_CAP
+                  : sp->census.plain[SG_PLAIN_FAILED] ? SG_PLAIN_FAILED : SG_PLAIN_OFF;
     if (sp->k <= 0 || cap <= 0)
         return false;
+    sp->why_plain = SG_PLAIN_NODRAFT;
     /* Prompt lookup: when the context's suffix recurs, its continuation replaces the MTP
      * head's drafts — in mode 2 only when both agree on the first draft. The head always
      * drafts first (one streamed segment, as without lookup): a cycle the lookup does not
      * take costs exactly what it costs without it. */
     nl = sg_spec_lookup_draft(&sp->lookup, cap, looked);
-    nd = pn_qwen35moe_tt_mtp_draft(model, state, seed, sp->k < cap ? sp->k : cap, drafts);
+    if (sp->choose.q) {
+        /* SAMPLED drafts: the window they are drawn under starts at the seed; stop tokens are
+         * never drafted (a drawn draft cut by its value would bias the output). */
+        memcpy(sp->choose.recent, recent, (size_t)n_recent * sizeof(uint32_t));
+        sp->choose.n_recent = n_recent;
+        sp->choose.n_no_draft = 0;
+        if (eos_id >= 0) sp->choose.no_draft[sp->choose.n_no_draft++] = (uint32_t)eos_id;
+        if (im_end >= 0) sp->choose.no_draft[sp->choose.n_no_draft++] = (uint32_t)im_end;
+        pn_spec_sample_begin_drafts(&sp->choose);
+        nd = pn_qwen35moe_tt_mtp_draft_ex(model, state, seed, sp->k < cap ? sp->k : cap, drafts,
+                                          pn_spec_sample_draft, &sp->choose);
+    } else {
+        nd = pn_qwen35moe_tt_mtp_draft(model, state, seed, sp->k < cap ? sp->k : cap, drafts);
+    }
     if (nl > 0 && nd >= 1 && sg_spec_lookup_agrees(&sp->lookup, looked[0], drafts[0])) {
         memcpy(drafts, looked, (size_t)nl * sizeof(*drafts));
         nd = nl;
+        /* Draft 0 is the same token either way (drawn from q); the rest are point masses. */
+        pn_spec_sample_point_drafts(&sp->choose, 1, drafts, nd);
         if (getenv("PN_TT_RED") && strcmp(getenv("PN_TT_RED"), "spec_lookup_unverified") == 0)
             pn_qwen35moe_tt_red_accept_next_cycle();
     } else {
@@ -2269,6 +2803,7 @@ static bool sg_spec_cycle(sg_spec *sp, pn_model *model, pn_state *state, uint32_
     nd = i;
     if (sp->grammar)
         nd = gsc_truncate_drafts(&sp->gsc, drafts, nd);
+    pn_spec_sample_cut_drafts(&sp->choose, nd);
     if (nd < 1)
         return false;
     if (sp->grammar) {
@@ -2278,9 +2813,13 @@ static bool sg_spec_cycle(sg_spec *sp, pn_model *model, pn_state *state, uint32_
         gsc_begin_cycle(&sp->gsc);
         /* One RNG stream: the cycle's draws continue the loop's (OpenAI `seed`). */
         sp->plain.rng_state = sp->loop->rng_state;
+        sp->plain.carried_uniform_set = sp->loop->carried_uniform_set;
+        sp->plain.carried_uniform = sp->loop->carried_uniform;
         ne = pn_qwen35moe_tt_spec_step_ex(model, state, seed, drafts, nd, sp->emit, gsc_choose,
                                           &sp->gsc);
         sp->loop->rng_state = sp->plain.rng_state;
+        sp->loop->carried_uniform_set = sp->plain.carried_uniform_set;
+        sp->loop->carried_uniform = sp->plain.carried_uniform;
     } else if (sp->sampling) {
         memcpy(sp->choose.recent, recent, (size_t)n_recent * sizeof(uint32_t));
         sp->choose.n_recent = n_recent;
@@ -2293,6 +2832,7 @@ static bool sg_spec_cycle(sg_spec *sp, pn_model *model, pn_state *state, uint32_
     if (ne < 1) {
         fprintf(stderr, "serve: speculative step failed; plain decode from here\n");
         sp->k = 0;
+        sp->why_plain = SG_PLAIN_FAILED;
         return false;
     }
     if (nl > 0)
@@ -2301,7 +2841,225 @@ static bool sg_spec_cycle(sg_spec *sp, pn_model *model, pn_state *state, uint32_
     sp->at = 0;
     return true;
 }
+#endif /* USE_TT */
+
+#ifdef SG_SPEC
+#ifdef USE_CUDA
+/* An AUTO tool grammar under the arming window: its mask is live inside a call only and the
+ * rows outside it are the plain top-k rows, so a cycle may speculate up to the first row the
+ * mask would touch (sg_spec_cuda_grammar_cut). FORCED walks and response_format stay plain. */
+static bool sg_spec_cuda_grammar_lookahead(const sg_tg_ctx *tg)
+{
+    return sg_tg_is_tool(tg) && !tg->forced && sg_grammar_arm_window_on();
+}
+
+/* sg_mtp_cut_fn for the single-user loop: advance a clone of the live walk over the drafts'
+ * text (the same decode_token text sg_tg_step feeds it) and keep those after which the next
+ * row is still unmasked. */
+static int sg_spec_cuda_grammar_cut(void *ctx, const uint32_t *drafts, int nd)
+{
+    const sg_spec *sp = (const sg_spec *)ctx;
+    const sg_tg_ctx *tg = sp->tg;
+    const bool json = tg->kind == SG_GRAMMAR_TOOL_JSON;
+    void *walk = json ? (void *)tgj_state_clone(tg->state_json) : (void *)tg_state_clone(tg->state);
+    int keep = 0;
+
+    if (!walk)
+        return 0;
+    for (; keep < nd; keep++) {
+        char *piece = decode_token(sp->model, drafts[keep]);
+        if (piece) {
+            if (json) tgj_advance((tgj_state *)walk, piece);
+            else      tg_advance((tg_state *)walk, piece);
+            free(piece);
+        }
+        if (json ? tgj_mask_active((const tgj_state *)walk) : tg_mask_active((const tg_state *)walk))
+            break;
+    }
+    if (json) tgj_state_free((tgj_state *)walk);
+    else      tg_state_free((tg_state *)walk);
+    return keep;
+}
+
+/* Why a CUDA request decodes plain (spec §3.5): anything that needs the dense row — the
+ * verify rows carry the plain step's top-k pairs only — or no MTP head. NULL = speculate.
+ * Penalties need no fallback: a verify row is the plain step's row byte for byte, so any
+ * sampler surgery over it draws the same token. */
+static const char *sg_spec_cuda_plain_reason(pn_model *model, const sg_tg_ctx *tg,
+                                             const sg_gen_params *params)
+{
+    if (params->logprobs)
+        return "off:logprobs";
+    if (params->logit_bias && params->n_logit_bias > 0)
+        return "off:logit-bias";
+    if (tg->enabled && !sg_spec_cuda_grammar_lookahead(tg))
+        return sg_tg_is_tool(tg) ? "off:tool-grammar" : "off:response-format";
+    if (!pn_qwen35moe_mtp_ready(model))
+        return "off:no-mtp-head";
+    if (getenv("PN_MTP_SERVE_SPEC") && atoi(getenv("PN_MTP_SERVE_SPEC")) == 0)
+        return "off:env";
+    return NULL;
+}
+
+static void sg_spec_init_cuda(sg_spec *sp, pn_model *model, pn_sampling_params *samp,
+                              const sg_tg_ctx *tg, const sg_gen_params *params, int max_recent,
+                              const uint32_t *prompt, int n_prompt, int max_tokens)
+{
+    const char *why = sg_spec_cuda_plain_reason(model, tg, params);
+
+    sg_spec_census_begin(&sp->census, why ? why : samp->temperature > 0.0f ? "mtp-sampled"
+                                                                             : "mtp-greedy");
+    if (why)
+        return;
+    if (sg_mtp_cuda_begin(&sp->mtp, model, max_recent) != 0) {
+        sp->census.mode = "off:no-memory";
+        return;
+    }
+    sp->cuda = true;
+    sp->k = PN_SPEC_DEPTH_MAX;
+    sp->tg = tg;
+    sp->model = model;
+    if (sg_spec_lookup_init_cuda(&sp->lookup, prompt, n_prompt, max_tokens) != 0)
+        fprintf(stderr, "serve: prompt-lookup drafts off (no memory for the history)\n");
+    sp->mtp.lookup = sp->lookup.on ? &sp->lookup : NULL;
+}
+
+/* One CUDA MTP cycle (sg_spec_cycle's contract). A failed verify ends speculation for the
+ * request: the state is then exactly where it was (nothing committed). */
+static bool sg_spec_cycle_cuda(sg_spec *sp, pn_model *model, pn_state *state, uint32_t seed,
+                               int cap, int eos_id, int im_end, pn_sampling_params *samp,
+                               const uint32_t *recent, int n_recent)
+{
+    const bool grammar = sp->tg && sp->tg->enabled;
+    if (grammar && (sg_tg_mask_active(sp->tg) || sp->tg->fl_pending)) {
+        sp->why_plain = SG_PLAIN_NODRAFT;   /* the mask is live for this row */
+        return false;
+    }
+    /* Every row of the cycle lies outside the mask, where the sampler skips the hook. */
+    pn_sampling_params draw = *samp;
+    draw.tool_grammar = NULL;
+    int ne = sg_mtp_cuda_cycle(&sp->mtp, model, state, seed, -1, cap, eos_id, im_end,
+                               grammar ? sg_spec_cuda_grammar_cut : NULL, sp, &draw, recent,
+                               n_recent, sp->emit);
+    draw.tool_grammar = samp->tool_grammar;
+    *samp = draw;
+
+    if (ne < 1) {
+        fprintf(stderr, "serve: MTP speculative step failed; plain decode from here\n");
+        sg_mtp_cuda_end(&sp->mtp);
+        sp->cuda = false;
+        sp->k = 0;
+        sp->why_plain = SG_PLAIN_FAILED;
+        return false;
+    }
+    sp->n = ne;
+    sp->at = 0;
+    return true;
+}
+#endif /* USE_CUDA */
+
+/* Arm speculation for one request on whichever backend runs `model`. */
+static void sg_spec_init(sg_spec *sp, pn_model *model, pn_sampling_params *samp,
+                         const sg_tg_ctx *tg, const sg_gen_params *params, int max_recent,
+                         const uint32_t *prompt, int n_prompt, int max_tokens,
+                         bool spec_under_grammar)
+{
+    memset(sp, 0, sizeof(*sp));
+#ifdef USE_CUDA
+    if (sg_qwen35_cuda_forward(model)) {
+        sg_spec_init_cuda(sp, model, samp, tg, params, max_recent, prompt, n_prompt,
+                          max_tokens);
+        return;
+    }
 #endif
+#ifdef USE_TT
+    sg_spec_init_tt(sp, model, samp, sg_spec_full_row_reason(tg, params, spec_under_grammar),
+                    max_recent, prompt, n_prompt, max_tokens, tg, spec_under_grammar);
+#else
+    (void)prompt; (void)n_prompt; (void)max_tokens; (void)spec_under_grammar;
+    sg_spec_census_begin(&sp->census, "off:no-backend");
+#endif
+}
+
+/* One cycle with `seed` as the next token. `cap` bounds the drafts (token / reasoning
+ * budget). @return true when the verify committed the seed (no plain forward owed). */
+static bool sg_spec_cycle(sg_spec *sp, pn_model *model, pn_state *state, uint32_t seed,
+                          int cap, int eos_id, int im_end, pn_sampling_params *samp,
+                          const uint32_t *recent, int n_recent)
+{
+#ifdef USE_CUDA
+    if (sp->cuda)
+        return sg_spec_cycle_cuda(sp, model, state, seed, cap, eos_id, im_end, samp, recent,
+                                  n_recent);
+    sp->why_plain = sp->census.plain[SG_PLAIN_FAILED] ? SG_PLAIN_FAILED : SG_PLAIN_OFF;
+#endif
+#ifdef USE_TT
+    (void)samp;
+    return sg_spec_cycle_tt(sp, model, state, seed, cap, eos_id, im_end, recent, n_recent);
+#else
+    (void)model; (void)state; (void)seed; (void)cap; (void)eos_id; (void)im_end; (void)samp;
+    (void)recent; (void)n_recent;
+    return false;
+#endif
+}
+#endif /* SG_SPEC */
+
+/* Where this single-user turn saves its turn snapshot (think_history
+ * drop_last), or -1. Only a request that carries think_history pays for it
+ * (an SSM-image D2H + host copy per turn): a client that sends drop_last sends
+ * the flag on the turns before it too. QWEN35_TURN_CHECKPOINT=0 turns it off
+ * with the batched checkpoints. */
+static int sg_turn_snapshot_cut(const sg_prefix_ctx *pc,
+                                const sg_gen_params *params, int turn_start)
+{
+    if (params->think_history == PN_THINK_HISTORY_KEEP ||
+        !bs_turn_ckpt_enabled() ||
+        !pn_prefix_cache_turn_snapshot_supported(pc->cache))
+        return -1;
+    return turn_start;
+}
+
+/* Single-user prefill of prompt[from, to), stopping at up to two cuts to save
+ * the state there: the SYS1 system-prefix snapshot (sys_cut) and the turn
+ * snapshot (turn_cut); -1 or a cut outside (from, to) is skipped. Splitting is
+ * bit-faithful to one pass. A failed save is benign (logged; the turn just
+ * goes without it). Returns the last position's logits, or NULL. */
+static tm_tensor *sg_prefill_cuts(pn_model *model, pn_state *state,
+                                  const uint32_t *prompt, int from, int to,
+                                  int sys_cut, int turn_cut,
+                                  const sg_prefix_ctx *pc,
+                                  const sg_gen_params *params)
+{
+    int cuts[2] = { sys_cut, turn_cut };
+    if (cuts[0] > cuts[1]) {
+        cuts[0] = turn_cut;
+        cuts[1] = sys_cut;
+    }
+    tm_tensor *logits = NULL;
+    int at = from;
+    for (int i = 0; i <= 2; i++) {
+        int end = i < 2 ? cuts[i] : to;
+        if (i < 2 && (end <= at || end >= to))
+            continue;
+        if (logits)
+            tm_free(logits);
+        logits = sg_prefill_range(model, state, prompt, at, end,
+                                  params->should_abort, params->abort_ud);
+        if (!logits)
+            return NULL;
+        if (end == sys_cut &&
+            pn_prefix_cache_capture_sys(pc->cache, pc->sid, prompt, end) != 0)
+            fprintf(stderr, "[prefix_cache] sys-prefix capture failed sid=%s "
+                    "(continuing uncached)\n", pc->sid);
+        if (end == turn_cut && end < to &&
+            pn_prefix_cache_capture_turn(pc->cache, pc->sid, prompt, end) != 0)
+            fprintf(stderr, "[prefix_cache] turn snapshot failed sid=%s at %d "
+                    "(drop_last will resume at the system prefix)\n", pc->sid,
+                    end);
+        at = end;
+    }
+    return logits;
+}
 
 int sg_run_completion(pn_model *model, pn_state *state,
                       const sg_message *messages, int n_messages,
@@ -2319,10 +3077,13 @@ int sg_run_completion(pn_model *model, pn_state *state,
     int n_prompt = 0;
     int sys_len = 0;
     pn_reqprof_phase_start(PN_REQ_TOKENIZE);
-    int think_prefill_len = 0;
-    uint32_t *prompt = sg_build_prompt_tokens(model, messages, n_messages,
-                                    params->thinking, &n_prompt,
-                                    &sys_len, &think_prefill_len);
+    sg_prompt_bounds bounds;
+    uint32_t *prompt = sg_build_prompt_tokens_bounded(model, messages,
+                                                      n_messages,
+                                                      params->thinking,
+                                                      &n_prompt, &bounds);
+    sys_len = bounds.sys_len;
+    int think_prefill_len = bounds.think_prefill;
     pn_reqprof_phase_end(PN_REQ_TOKENIZE);
     if (!prompt || n_prompt == 0) { free(prompt); return -1; }
 
@@ -2349,10 +3110,11 @@ int sg_run_completion(pn_model *model, pn_state *state,
      * client. Instead REJECT with a distinct, machine-readable signal so the
      * client compacts its history and retries. Never allocate past budget,
      * never OOM, never drop-oldest. */
-    if (admit == PN_ADMIT_CAPPED && fit_tokens > 0 && fit_tokens < n_prompt) {
+    if (sg_context_over_budget(admit, n_prompt, fit_tokens, &result->kv_cap_tokens)) {
         result->kv_used_tokens = n_prompt;
         /* Report the EFFECTIVE cap that actually refused this prompt, not the
-         * configured one (Phase 10 — see the batched twin of this branch). */
+         * configured one (Phase 10 — see the batched twin of this branch). The
+         * 422 quotes the same number (H2c). */
         fprintf(stderr, "[admit] REJECT context_over_budget: prompt %d tokens > "
                 "effective cap %d (configured %d) — refusing (client must "
                 "compact + retry)\n",
@@ -2374,14 +3136,35 @@ int sg_run_completion(pn_model *model, pn_state *state,
      * asks this turn's full prefill to snapshot the boundary state. */
     int delta_start = 0;
     int capture_sys = 0;
+    pn_resume_kind resume_kind = PN_RESUME_COLD;
     pn_reqprof_phase_start(PN_REQ_CACHE_LOOKUP);
     if (use_cache) {
         if (pc->pc_lock) pthread_mutex_lock(pc->pc_lock);
-        pn_state *cs = pn_prefix_cache_acquire_sys(pc->cache, pc->sid, prompt,
-                                                   n_prompt, sys_len,
-                                                   &delta_start, &capture_sys);
+        uint64_t refusals = pn_host_admit_thread_refusals();
+        pn_prefix_acquire_result acq;
+        pn_prefix_acquire_opts opts = {
+            sys_len,
+            sg_think_history_ceiling(model, prompt, n_prompt, think_prefill_len,
+                                     params->think_history),
+            params->think_history == PN_THINK_HISTORY_DROP_LAST,
+        };
+        pn_state *cs = pn_prefix_cache_acquire_bounded(
+            pc->cache, pc->sid, prompt, n_prompt, &opts, &acq);
+        delta_start = acq.delta_start;
+        capture_sys = acq.capture_sys;
+        resume_kind = acq.kind;
         if (cs) {
             state = cs;   /* use the session's state; ignore the passed-in one */
+        } else if (pn_host_admit_thread_refusals() != refusals) {
+            /* The new session's state was refused by host-RAM admission: answer
+             * with the reason (503) rather than borrow the shared state, which
+             * would silently serve a session the host said it cannot hold. */
+            if (pc->pc_lock) pthread_mutex_unlock(pc->pc_lock);
+            pn_reqprof_phase_end(PN_REQ_CACHE_LOOKUP);
+            snprintf(result->admit_reason, sizeof(result->admit_reason), "%s",
+                     pn_host_admit_last_refusal());
+            free(prompt);
+            return SG_ADMIT_DENIED;
         } else {
             if (pc->pc_lock) pthread_mutex_unlock(pc->pc_lock);
             use_cache = false;
@@ -2392,6 +3175,7 @@ int sg_run_completion(pn_model *model, pn_state *state,
     if (!use_cache) {
         pn_state_reset(state);
         delta_start = 0;
+        resume_kind = PN_RESUME_COLD;
     }
 
     pn_sampling_params sp = pn_sampling_defaults();
@@ -2402,8 +3186,12 @@ int sg_run_completion(pn_model *model, pn_state *state,
 #ifdef USE_TT
     /* Greedy requests take the card's exact top-N row unless a grammar, logprobs or logit
      * surgery needs the dense one — decided BEFORE the prompt (its last row is token 1). */
+    unsigned long tail0[4], refills0 = pn_sampler_topn_refills();
+    pn_sampler_tail_counts(&tail0[0], &tail0[1], &tail0[2]);
+    tail0[3] = pn_sampler_tail_count_calls();
     if (pn_qwen35moe_tt_select_rows(model, &sp, sg_may_need_full_logits(params)) > 0u) {
         sp.dense_row = pn_qwen35moe_tt_dense_row;
+        sp.tail_counts = pn_qwen35moe_tt_tail_counts;
         sp.dense_chunks = pn_qwen35moe_tt_dense_chunks;
         sp.dense_ctx = model;
     }
@@ -2446,6 +3234,7 @@ int sg_run_completion(pn_model *model, pn_state *state,
     if (use_cache && delta_start >= n_prompt) {
         pn_state_reset(state);
         delta_start = 0;
+        resume_kind = PN_RESUME_COLD;
     }
     pn_reqprof_phase_end(PN_REQ_CACHE_LOOKUP);
     pn_reqprof_note_cache(use_cache, n_prompt, delta_start, sys_len);
@@ -2453,6 +3242,8 @@ int sg_run_completion(pn_model *model, pn_state *state,
      * degenerate-full-hit fallback above, so what the client is told is the
      * boundary this turn actually prefills from. */
     result->cached_prompt_tokens = pn_prefix_cached_tokens(delta_start, n_prompt);
+    result->resume_kind = resume_kind;
+    result->prefill_tokens = n_prompt - delta_start;
     tm_tensor *logits = NULL;
     int prefill_tokens = n_prompt - delta_start;   /* Phase 7 rate counter */
     pn_reqprof_phase_start(PN_REQ_PREFILL);
@@ -2465,25 +3256,20 @@ int sg_run_completion(pn_model *model, pn_state *state,
     tt_one_pass = model->forward == pn_qwen35moe_forward_tt;
     /* Checkpoint no higher than the history the next turn resends: the generation prompt
      * after the assistant header ("<think>\n") is not in it, and a checkpoint covering it
-     * cannot be resumed (the whole conversation re-prefills). */
+     * cannot be resumed (the whole conversation re-prefills). A think_history request keeps
+     * it at or below turn_start, so a drop_last request that rewrites this reply resumes it. */
     if (tt_one_pass && use_cache)
-        pn_qwen35moe_tt_checkpoint_ceiling(model, state, n_prompt - think_prefill_len);
+        pn_qwen35moe_tt_checkpoint_ceiling(
+            model, state,
+            pn_think_history_tt_ceiling(params->think_history, bounds.turn_start,
+                                        n_prompt - think_prefill_len));
 #endif
-    if (use_cache && capture_sys && !tt_one_pass && delta_start == 0 && sys_len < n_prompt) {
-        /* SYS1 two-stage prefill: run the system prefix, snapshot the boundary
-         * state for next-turn reuse, then run the conversation. A capture
-         * failure is benign (logged inside; this turn just stays uncached). */
-        logits = sg_prefill_range(model, state, prompt, 0, sys_len,
-                                  params->should_abort, params->abort_ud);
-        if (logits) {
-            if (pn_prefix_cache_capture_sys(pc->cache, pc->sid, prompt,
-                                            sys_len) != 0)
-                fprintf(stderr, "[prefix_cache] sys-prefix capture failed "
-                        "sid=%s (continuing uncached)\n", pc->sid);
-            tm_free(logits);
-            logits = sg_prefill_range(model, state, prompt, sys_len, n_prompt,
-                                      params->should_abort, params->abort_ud);
-        }
+    if (use_cache && !tt_one_pass) {
+        int sys_cut = (capture_sys && delta_start == 0 && sys_len < n_prompt)
+                          ? sys_len : -1;
+        int turn_cut = sg_turn_snapshot_cut(pc, params, bounds.turn_start);
+        logits = sg_prefill_cuts(model, state, prompt, delta_start, n_prompt,
+                                 sys_cut, turn_cut, pc, params);
     } else {
         logits = sg_prefill_range(model, state, prompt, delta_start, n_prompt,
                                   params->should_abort, params->abort_ud);
@@ -2496,15 +3282,15 @@ int sg_run_completion(pn_model *model, pn_state *state,
     pn_reqprof_phase_start(PN_REQ_DECODE);
     if (!logits) {
         /* Distinguish a client-disconnect abort from a real prefill error: the
-         * check is idempotent (a closed socket stays closed). On abort, reset the
+         * check is idempotent (a closed socket stays closed). Either way, reset the
          * session so the partial, uncommitted prefill can't corrupt next turn's
-         * append-resume. The session-watch owns slot release when the client's
-         * watch dies past grace; this path only cleans up the partial prefill.
-         * Then return a clean SG_ABORTED. */
+         * append-resume (a card prefill that aborted part way left its state half
+         * written). The session-watch owns slot release when the client's watch
+         * dies past grace; this path only cleans up the partial prefill. Then
+         * return a clean SG_ABORTED, or -1. */
         int aborted = params->should_abort && params->should_abort(params->abort_ud);
         if (use_cache) {
-            if (aborted)
-                pn_prefix_cache_reset_session(pc->cache, pc->sid);
+            pn_prefix_cache_reset_session(pc->cache, pc->sid);
             if (pc->pc_lock) pthread_mutex_unlock(pc->pc_lock);
         }
         free(prompt); free(recent); free(gen_toks);
@@ -2516,6 +3302,8 @@ int sg_run_completion(pn_model *model, pn_state *state,
     em_init(&em, delta_fn, delta_ud, params->stop, params->n_stop,
             params->has_tools, params->dialect);
     em_set_tool_tap(&em, params->tool_tap, params->tool_tap_ud);
+    if (sg_think_close_is_token(model))
+        em_set_think_close_token(&em);
     /* The emitter starts inside a think block only when the prompt left one OPEN:
      * a think-style template with thinking on.  No-Think prefills the block CLOSED,
      * and a non-think template (plain ChatML, Mistral, Phi-3) never opens one, so
@@ -2553,9 +3341,14 @@ int sg_run_completion(pn_model *model, pn_state *state,
      * tokens generated while inside <think>; once over budget without a self-emitted
      * "</think>", force-close reasoning so the model answers.  Disabled when
      * budget <= 0 (byte-identical to today) or the model is not think-style. */
-    int reason_budget = (params->reasoning_budget > 0 &&
-                         sg_chat_style_is_think(model->chat_style))
-                            ? params->reasoning_budget : 0;
+    pn_reasoning_plan reason_plan =
+        pn_reasoning_plan_for_turn((params->reasoning_budget > 0 &&
+                                    sg_chat_style_is_think(model->chat_style))
+                                       ? params->reasoning_budget : 0,
+                                   max_tokens, params->reasoning_reserve,
+                                   params->model_name);
+    int reason_budget = reason_plan.hard; /* the cap run: budget less the answer
+                                           * reserve (reasoning_budget.h) */
     int reason_tokens = 0;      /* tokens routed to the reasoning channel so far */
     bool reason_forced = false; /* force-close already applied this turn */
     bool reason_over_budget = false; /* latched: budget tripped this iteration
@@ -2571,17 +3364,23 @@ int sg_run_completion(pn_model *model, pn_state *state,
 
     const char *finish = "length";
     int generated = 0;
-#ifdef USE_TT
+#ifdef SG_SPEC
     sg_spec spec;
-    const bool spec_under_grammar = sg_tool_grammar_speculates(params) && tg.enabled &&
-                                    sg_tg_is_tool(&tg);
-    sg_spec_init(&spec, model, &sp,
-                 (spec_under_grammar ? sg_full_logits_always(params)
-                                     : sg_needs_full_logits(&tg, params)) || params->logprobs,
-                 max_recent, prompt, n_prompt, max_tokens, &tg, spec_under_grammar);
+    bool spec_under_grammar = false;
+#ifdef USE_TT
+    spec_under_grammar = tg.enabled &&
+                         (sg_tg_is_tool(&tg) ? sg_tool_grammar_speculates(params)
+                                             : sg_response_format_speculates(params));
+    uint64_t spec_c0 = 0, spec_d0 = 0, spec_a0 = 0;
+    (void)pn_qwen35moe_tt_spec_counts(model, &spec_c0, &spec_d0, &spec_a0);
+#endif
+    sg_spec_init(&spec, model, &sp, &tg, params, max_recent, prompt, n_prompt, max_tokens,
+                 spec_under_grammar);
+    double step_t0 = 0.0;   /* census: the decode-loop step clock */
+    int step_masked = 0;
 #endif
     for (int i = 0; i < max_tokens; i++) {
-#ifdef USE_TT
+#ifdef SG_SPEC
         if (!logits && spec.at >= spec.n) break;
 #else
         if (!logits) break;
@@ -2596,12 +3395,22 @@ int sg_run_completion(pn_model *model, pn_state *state,
         }
         sg_tg_refresh(&tg);   /* mask only inside a tool call; FREE unconstrained */
         uint32_t next;
-#ifdef USE_TT
+#ifdef SG_SPEC
+        {
+            /* The previous step's wall time, booked to the region it ran in. */
+            const double step_now = sg_prefill_now_ms();
+
+            if (i > 0)
+                sg_spec_census_step(&spec.census, step_masked, step_now - step_t0);
+            step_t0 = step_now;
+            step_masked = tg.enabled && tg.hook.active;
+        }
         if (spec.at < spec.n) {
             next = spec.emit[spec.at++];
         } else
 #endif
         {
+            pn_sampler_row_hint(logits); /* a backend's survivor list, this draw only */
             next = pn_sample_next_token((float *)logits->data, n_vocab,
                                         &sp, recent, n_recent);
             tm_free(logits);
@@ -2642,8 +3451,12 @@ int sg_run_completion(pn_model *model, pn_state *state,
              * cleanly whether or not this token already ended the block. */
             if (was_think) {
                 reason_tokens++;
+                /* At the cap, or on the first line end inside the window
+                 * just before it, so the thought ends on a whole line. */
                 if (reason_budget && !reason_forced &&
-                    reason_tokens >= reason_budget && !sg_tg_in_call(&tg)) {
+                    pn_reasoning_should_close(&reason_plan, reason_tokens,
+                                              pn_reasoning_piece_ends_line(piece)) &&
+                    !sg_tg_in_call(&tg)) {
                     reason_over_budget = true;
                     /* Arming-window latch.  The force-close block below runs
                      * AFTER the forward that fetches the row the next step
@@ -2673,7 +3486,7 @@ int sg_run_completion(pn_model *model, pn_state *state,
         if (gen_toks) gen_toks[generated] = next;
         generated++;
         (void)rld_feed(&reploop, next);
-#ifdef USE_TT
+#ifdef SG_SPEC
         sg_spec_lookup_push(&spec.lookup, next);
 #endif
 
@@ -2696,21 +3509,28 @@ int sg_run_completion(pn_model *model, pn_state *state,
          * arming here reads exactly the walk state the NEXT step's sampler will
          * refresh from — the whole point of the window. */
         sg_arm_full_logits(&tg, params, model, state);
-#ifdef USE_TT
+#ifdef SG_SPEC
         if (spec.at < spec.n) {
             /* `next` was an accepted draft: the verify already committed it. */
+            sg_spec_census_verified(&spec.census);
         } else {
             /* Drafts this cycle may emit: they and the next token must fit the token
              * budget, and must not reach the reasoning budget's trip (the trip token
              * takes a plain forward: the force-close needs its logits). */
             int cap = max_tokens - i - 2;
             if (reason_budget && !reason_forced && em.in_think &&
-                reason_budget - reason_tokens - 1 < cap)
-                cap = reason_budget - reason_tokens - 1;
-            if (reason_over_budget ||
-                !sg_spec_cycle(&spec, model, state, next, cap, eos_id, im_end, recent,
-                               n_recent))
+                pn_reasoning_draft_room(&reason_plan, reason_tokens) < cap)
+                cap = pn_reasoning_draft_room(&reason_plan, reason_tokens);
+            if (reason_over_budget) {
+                sg_spec_census_plain(&spec.census, SG_PLAIN_TRIP);
                 logits = sg_forward_step(model, state, next);
+            } else if (!sg_spec_cycle(&spec, model, state, next, cap, eos_id, im_end, &sp,
+                                      recent, n_recent)) {
+                sg_spec_census_plain(&spec.census, spec.why_plain);
+                logits = sg_forward_step(model, state, next);
+            } else {
+                sg_spec_census_verified(&spec.census);
+            }
         }
 #else
         logits = sg_forward_step(model, state, next);
@@ -2785,8 +3605,9 @@ int sg_run_completion(pn_model *model, pn_state *state,
                     }
                     if (gen_toks) gen_toks[generated] = close_toks[c];
                     generated++;
-#ifdef USE_TT
+#ifdef SG_SPEC
                     sg_spec_lookup_push(&spec.lookup, close_toks[c]);
+                    sg_spec_census_plain(&spec.census, SG_PLAIN_TRIP);
 #endif
                     /* Keep the detector's view of the stream faithful — these
                      * ids really are in the committed history.  A trip here is
@@ -2869,9 +3690,14 @@ int sg_run_completion(pn_model *model, pn_state *state,
          * emitted (emit[at..n-2]); the history names what the state really holds,
          * so next turn's LCP sees the divergence instead of trusting a stale state. */
         int extra = 0;
-#ifdef USE_TT
+#ifdef SG_SPEC
         extra = spec.n - 1 - spec.at;
         if (extra < 0) extra = 0;
+        /* RED `spec_stop_noextra` (PN_TT_RED): forget the committed-but-unemitted drafts of a
+         * mid-cycle stop — the resumed next turn then runs on a state the history misnames
+         * and MUST differ from the cold one. */
+        if (getenv("PN_TT_RED") && strcmp(getenv("PN_TT_RED"), "spec_stop_noextra") == 0)
+            extra = 0;
 #endif
         int hist_n = n_prompt + generated + extra;
         uint32_t *hist = malloc((size_t)hist_n * sizeof(uint32_t));
@@ -2880,7 +3706,7 @@ int sg_run_completion(pn_model *model, pn_state *state,
             if (generated > 0)
                 memcpy(hist + n_prompt, gen_toks,
                        (size_t)generated * sizeof(uint32_t));
-#ifdef USE_TT
+#ifdef SG_SPEC
             if (extra > 0)
                 memcpy(hist + n_prompt + generated, spec.emit + spec.at,
                        (size_t)extra * sizeof(uint32_t));
@@ -2890,8 +3716,49 @@ int sg_run_completion(pn_model *model, pn_state *state,
         }
         if (pc->pc_lock) pthread_mutex_unlock(pc->pc_lock);
     }
-#ifdef USE_TT
+#ifdef SG_SPEC
     sg_spec_report_grammar(&spec);
+    sg_spec_census_report(&spec.census, generated);
+#ifdef USE_CUDA
+    if (spec.cuda)
+        sg_mtp_cuda_report(&spec.mtp, generated);
+#endif
+#endif
+#ifdef USE_TT
+    pn_spec_rule_report(&spec.choose, "serve");
+    {
+        /* One line a speculating request: its own cycles and acceptance (both rules). */
+        uint64_t c1, d1, a1;
+
+        if (pn_qwen35moe_tt_spec_counts(model, &c1, &d1, &a1) == 0 && c1 > spec_c0)
+            fprintf(stderr, "[spec] request: %llu cycles, %llu drafts, %llu accepted (%.3f), "
+                            "%.2f tokens a cycle\n", (unsigned long long)(c1 - spec_c0),
+                    (unsigned long long)(d1 - spec_d0), (unsigned long long)(a1 - spec_a0),
+                    d1 > spec_d0 ? (double)(a1 - spec_a0) / (double)(d1 - spec_d0) : 0.0,
+                    (double)(c1 - spec_c0 + a1 - spec_a0) / (double)(c1 - spec_c0));
+    }
+    sg_report_sampled_rows(tail0, refills0);
+#endif
+    if (pn_dump_reqlog_enabled()) {
+        /* `PN_TT_DUMP_REQLOG`: this request's line, after its last dump record was flushed. */
+        pn_dump_reqlog_request rl = {
+            .prompt_tokens = n_prompt, .completion_tokens = generated, .max_tokens = max_tokens,
+            .top_k = sp.top_k, .temperature = sp.temperature, .top_p = sp.top_p,
+            .seed_set = params->seed_set, .seed = params->seed, .finish = finish,
+        };
+#ifdef USE_TT
+        uint64_t rc1, rd1, ra1;
+
+        if (pn_qwen35moe_tt_spec_counts(model, &rc1, &rd1, &ra1) == 0) {
+            rl.has_spec = true;
+            rl.spec_cycles = rc1 - spec_c0;
+            rl.spec_drafts = rd1 - spec_d0;
+            rl.spec_accepted = ra1 - spec_a0;
+        }
+#endif
+        (void)sg_dump_reqlog_request(&rl, prompt, n_prompt);
+    }
+#ifdef SG_SPEC
     sg_spec_free(&spec);
 #endif
     free(gen_toks);
@@ -2955,6 +3822,25 @@ void sg_result_free(sg_result *result)
  * lockstep logits/token exchange.
  * ============================================================ */
 
+/* PN_HOST_TIMING: the delta callback timed into the owner's accumulator (O_SSE). */
+typedef struct {
+    sg_delta_fn      fn;
+    void            *ud;
+    pn_host_timing  *acc;
+} sg_ht_delta;
+
+static void sg_ht_delta_shim(const char *text, int is_reasoning,
+                             const sg_token_logprob *const *logprobs, int n_logprobs,
+                             void *user_data)
+{
+    sg_ht_delta *d = user_data;
+    const uint64_t t0 = pn_ht_now();
+
+    if (d->fn)
+        d->fn(text, is_reasoning, logprobs, n_logprobs, d->ud);
+    pn_ht_add(d->acc, PN_HT_O_SSE, pn_ht_now() - t0);
+}
+
 int sg_run_completion_batched(pn_model *model, pn_batch_sched *sched,
                               int slot,
                               const sg_message *messages, int n_messages,
@@ -2965,6 +3851,21 @@ int sg_run_completion_batched(pn_model *model, pn_batch_sched *sched,
     if (!model || !sched || slot < 0 || !messages || !params || !result)
         return -1;
     memset(result, 0, sizeof(*result));
+
+    /* The [req] line (request_timing_line.h): TTFT runs from the request's
+     * arrival (slot wait included); a second choice of the same request, or a
+     * caller that never marked arrival, starts here. */
+    double t_req0 = sg_request_arrival_take();
+    if (t_req0 <= 0.0)
+        t_req0 = sg_request_timing_now_ms();
+    sg_request_timing rt = { .slot = slot };
+    bs_request_stats rstats = { 0 };
+    double t_first = 0.0, t_dec_end = 0.0;
+    /* PN_HOST_TIMING: owner-side stages and the decode window's ns stamps. */
+    pn_host_timing ht_own;
+    memset(&ht_own, 0, sizeof(ht_own));
+    uint64_t ht_first = 0, ht_dec_end = 0, ht_cpu0 = 0, ht_rd0 = 0, ht_cpu1 = 0, ht_rd1 = 0;
+    sg_ht_delta ht_delta = { delta_fn, delta_ud, &ht_own };
 
     /* PC-batched: caching is active only with a session id.  NULL/empty sid
      * → full-prefill on every turn, byte-identical to the pre-PC batched
@@ -2981,13 +3882,15 @@ int sg_run_completion_batched(pn_model *model, pn_batch_sched *sched,
      * leading tokens cover the first message's system turn, stable across a
      * session's turns — the batched per-slot snapshot point.) */
     int n_prompt = 0;
-    int sys_len = 0;
-    int think_prefill_len = 0;
+    sg_prompt_bounds bounds;
     pn_reqprof_phase_start(PN_REQ_TOKENIZE);
-    uint32_t *prompt = sg_build_prompt_tokens(model, messages, n_messages,
-                                    params->thinking, &n_prompt,
-                                    &sys_len, &think_prefill_len);
+    uint32_t *prompt = sg_build_prompt_tokens_bounded(model, messages,
+                                                      n_messages,
+                                                      params->thinking,
+                                                      &n_prompt, &bounds);
     pn_reqprof_phase_end(PN_REQ_TOKENIZE);
+    int sys_len = bounds.sys_len;
+    int think_prefill_len = bounds.think_prefill;
     if (!prompt || n_prompt == 0) {
         free(prompt);
         bs_slot_release(sched, slot);
@@ -3023,10 +3926,10 @@ int sg_run_completion_batched(pn_model *model, pn_batch_sched *sched,
     /* KV Phase 1: over the per-session context budget — REJECT with a distinct
      * signal instead of the old silent drop-oldest that shattered the prefix
      * cache and stalled the client. The client compacts + retries. */
-    if (admit == PN_ADMIT_CAPPED && fit_tokens > 0 && fit_tokens < n_prompt) {
+    if (sg_context_over_budget(admit, n_prompt, fit_tokens, &result->kv_cap_tokens)) {
         result->kv_used_tokens = n_prompt;
         /* Report the EFFECTIVE cap that actually refused this prompt, not the
-         * configured one. Printing ctx_cap alone produced self-contradictory
+         * configured one; the 422 quotes the same number (H2c). Printing ctx_cap alone produced self-contradictory
          * lines ("prompt 70000 > session cap 131072") whenever the memory
          * ladder had clamped the window underneath it — Phase 10. */
         fprintf(stderr, "[batch_sched] slot %d: REJECT context_over_budget: "
@@ -3111,58 +4014,42 @@ int sg_run_completion_batched(pn_model *model, pn_batch_sched *sched,
      * delta_start == 0 (full prefill).  Both resume cases guarantee
      * delta_start < n_prompt, so the prefill below always runs >=1 token and
      * recovers the next-token logits. */
-    int delta_start = 0;
-    int capture_sys = 0;
+    bs_resume_outcome resume = { 0, 0, PN_RESUME_COLD };
     pn_reqprof_phase_start(PN_REQ_CACHE_LOOKUP);
     if (use_cache)
-        bs_prefill_resume_sys(sched, slot, sid, prompt, n_prompt, sys_len,
-                              &delta_start, &capture_sys);
+        bs_prefill_resume_think(sched, slot, sid, prompt, n_prompt, sys_len,
+                                params->think_history, &resume);
     else
         bs_prefill_begin(sched, slot);
+    int delta_start = resume.delta_start;
+    int capture_sys = resume.capture_sys;
     pn_reqprof_phase_end(PN_REQ_CACHE_LOOKUP);
     pn_reqprof_note_cache(use_cache, n_prompt, delta_start, sys_len);
     /* Same wire report as the single-user twin.  bs_prefill_resume_sys funnels
-     * ALL four batched rungs (append, think-elided append, sys-prefix restore,
+     * EVERY batched rung (append, projection, checkpoints, sys-prefix restore,
      * full reset) through this one delta_start, so the batched path reports the
      * number honestly rather than guessing at it — and this is the path the
      * fleet runs, so a gap here is the gap that ships. */
     result->cached_prompt_tokens = pn_prefix_cached_tokens(delta_start, n_prompt);
+    result->resume_kind = resume.kind;
+    result->prefill_tokens = n_prompt - delta_start;
+    rt.prompt_tok = n_prompt;
+    rt.prefill_tok = n_prompt - delta_start;
     /* Report a session id that now carries a SECOND conversation: every rung
      * missed because the system block itself changed, so this turn and the
      * displaced conversation's next turn both re-prefill in full. */
     result->session_conflict = (use_cache && bs_slot_session_conflict(sched, slot))
                              ? 1 : 0;
 
-    tm_tensor *logits = NULL;
     pn_reqprof_phase_start(PN_REQ_PREFILL);
-    if (capture_sys && delta_start == 0 && sys_len < n_prompt) {
-        /* SYS1 two-stage prefill: run the system prefix, snapshot the boundary
-         * for next-turn reuse (still owning the GPU turn — the range helper
-         * never yields after its last chunk, so the state sits exactly at
-         * pos == sys_len), then run the conversation.  A capture failure is
-         * benign: this turn just stays uncached.  Splitting at the boundary is
-         * bit-faithful to one uninterrupted pass (the batched prefill is
-         * bit-exact vs sequential forwards at any chunking). */
-        logits = sg_prefill_range_sched(model, sched, slot, state, prompt,
-                                        0, sys_len,
-                                        params->should_abort,
-                                        params->abort_ud);
-        if (logits) {
-            if (bs_prefill_capture_sys(sched, slot, sid, prompt, sys_len) != 0)
-                fprintf(stderr, "[batch_sched] sys-prefix capture failed "
-                        "slot=%d sid=%s (continuing uncached)\n", slot, sid);
-            tm_free(logits);
-            logits = sg_prefill_range_sched(model, sched, slot, state, prompt,
-                                            sys_len, n_prompt,
-                                            params->should_abort,
-                                            params->abort_ud);
-        }
-    } else {
-        logits = sg_prefill_range_sched(model, sched, slot, state, prompt,
-                                        delta_start, n_prompt,
-                                        params->should_abort,
-                                        params->abort_ud);
-    }
+    int sys_cut = (capture_sys && delta_start == 0 && sys_len < n_prompt)
+                      ? sys_len : -1;
+    int ckpt_cut = (use_cache && bs_turn_ckpt_enabled()) ? bounds.turn_start
+                                                          : -1;
+    int div_cut = use_cache ? bs_div_ckpt_cut(sched, slot) : -1;
+    tm_tensor *logits = sg_prefill_turn_sched(model, sched, slot, state, prompt,
+                                              delta_start, n_prompt, sys_cut,
+                                              ckpt_cut, div_cut, sid, params);
     pn_reqprof_phase_end(PN_REQ_PREFILL);
     sg_prefill_logits_hash(logits, n_prompt - delta_start, state->pos);
     if (!logits) {
@@ -3173,9 +4060,15 @@ int sg_run_completion_batched(pn_model *model, pn_batch_sched *sched,
          * the next turn does not get steered back onto it. */
         int aborted = params->should_abort &&
                       params->should_abort(params->abort_ud);
+        /* A client abort keeps what can resume — the prefix already prefilled
+         * and the turn checkpoint (rung 1c); a real prefill error resets. */
+        if (aborted)
+            bs_prefill_abort_keep(sched, slot, use_cache ? sid : NULL, prompt,
+                                  n_prompt, sys_len);
+        else
+            bs_prefill_abort_reset(sched, slot);
         free(prompt);
         free(recent);
-        bs_prefill_abort_reset(sched, slot);
         sg_tg_free(&tg);
         sg_logprobs_free(&lpacc);
         if (aborted)
@@ -3202,6 +4095,12 @@ int sg_run_completion_batched(pn_model *model, pn_batch_sched *sched,
                                          model->config.n_vocab,
                                          &sp, recent, n_recent);
     pn_reqprof_phase_end(PN_REQ_FIRST_SAMPLE);
+    t_first = sg_request_timing_now_ms();
+    if (pn_ht_on()) {
+        ht_first = pn_ht_now();
+        ht_cpu0 = pn_ht_thread_cpu();
+        ht_rd0 = pn_ht_run_delay();
+    }
     /* Token #1 is sampled HERE, on the owner thread, and that sample advanced
      * the grammar (the batched hook carries advance).  The driver's first step
      * forwards `next` and its row is read before the driver has re-armed
@@ -3225,9 +4124,15 @@ int sg_run_completion_batched(pn_model *model, pn_batch_sched *sched,
      *   Legacy (QWEN35_BS_DRIVER_SAMPLE=0): the original lockstep
      *   logits/token exchange. ── */
     emitter em;
-    em_init(&em, delta_fn, delta_ud, params->stop, params->n_stop,
-            params->has_tools, params->dialect);
+    if (pn_ht_on())
+        em_init(&em, sg_ht_delta_shim, &ht_delta, params->stop, params->n_stop,
+                params->has_tools, params->dialect);
+    else
+        em_init(&em, delta_fn, delta_ud, params->stop, params->n_stop,
+                params->has_tools, params->dialect);
     em_set_tool_tap(&em, params->tool_tap, params->tool_tap_ud);
+    if (sg_think_close_is_token(model))
+        em_set_think_close_token(&em);
     /* No open think block (No-Think, or a non-think template) → start the emitter
      * in content mode (see the mirror at the other em_init site). */
     if (sg_thinking_suppressed(params->thinking) ||
@@ -3250,6 +4155,7 @@ int sg_run_completion_batched(pn_model *model, pn_batch_sched *sched,
     const char *finish = "length";
     bool reploop_stop = false;   /* keeps the post-loop em.stopped fixup from
                                   * overwriting the degeneration finish_reason */
+    bool stalled = false;        /* the decode watchdog fired (SG_STALLED) */
     int generated = 0;
 
     if (bs_driver_sampling(sched)) {
@@ -3291,9 +4197,13 @@ int sg_run_completion_batched(pn_model *model, pn_batch_sched *sched,
          * while the slot is BOUND (the driver rebuilds its map before the first
          * step, and the arm takes sched->mu, so this races nothing).  Budget
          * <= 0 or a non-think model → no-op (byte-identical decode). */
-        int reason_budget = (params->reasoning_budget > 0 &&
-                             sg_chat_style_is_think(model->chat_style))
-                                ? params->reasoning_budget : 0;
+        pn_reasoning_plan reason_plan =
+            pn_reasoning_plan_for_turn((params->reasoning_budget > 0 &&
+                                        sg_chat_style_is_think(model->chat_style))
+                                           ? params->reasoning_budget : 0,
+                                       max_tokens, params->reasoning_reserve,
+                                       params->model_name);
+        int reason_budget = reason_plan.hard;
         bool reason_in_think = reason_budget > 0 &&
                                !(sg_thinking_suppressed(params->thinking) &&
                                  sg_chat_style_is_think(model->chat_style));
@@ -3302,7 +4212,7 @@ int sg_run_completion_batched(pn_model *model, pn_batch_sched *sched,
             int n_close = sg_encode_think_close(model, close_toks,
                                                 (int)(sizeof(close_toks) /
                                                       sizeof(close_toks[0])));
-            bs_slot_arm_reasoning_budget(sched, slot, reason_budget,
+            bs_slot_arm_reasoning_budget(sched, slot, &reason_plan,
                                          reason_in_think, close_toks, n_close,
                                          next);
         }
@@ -3333,10 +4243,25 @@ int sg_run_completion_batched(pn_model *model, pn_batch_sched *sched,
                 finish = "stop";
                 break;
             }
+            /* Watched wait: a client that leaves while no token is flowing, or
+             * a slot the driver stopped feeding, hands control back here so
+             * the slot is released instead of held until restart. */
             uint32_t tok;
-            int prc = bs_slot_pop_token(sched, slot, &tok);
-            if (prc < 0) { finish = "stop"; break; }  /* step error/shutdown */
-            if (prc == 0) {
+            bs_pop_watch watch = { params->should_abort, params->abort_ud, 0,
+                                   bs_decode_stall_ms() };
+            pn_ht_bind(&ht_own);
+            uint64_t ht = pn_ht_now();
+            bs_pop_status prc = bs_slot_pop_token_watched(sched, slot, &tok, &watch);
+            ht = pn_ht_lap(PN_HT_O_POP_WAIT, ht);
+            if (prc == BS_POP_STALLED) {
+                fprintf(stderr, "[batch_sched] slot %d sid=%s: no token for %d ms after %d "
+                        "generated - stream stalled, slot released\n", slot,
+                        use_cache ? sid : "-", watch.stall_ms, generated);
+                stalled = true;
+                break;
+            }
+            if (prc < 0) { finish = "stop"; break; }  /* gone, step error, shutdown */
+            if (prc == BS_POP_FINISHED) {
                 /* The driver finishes a slot on EOS, on budget exhaustion, AND
                  * on grammar completion.  Only the middle one is "length" — a
                  * turn that stopped because the constrained object CLOSED is a
@@ -3353,18 +4278,23 @@ int sg_run_completion_batched(pn_model *model, pn_batch_sched *sched,
                 break;
             }
             char *piece = decode_token(model, tok);
+            ht = pn_ht_lap(PN_HT_O_DETOK, ht);
             const sg_token_logprob *lp = NULL;
             if (em.in_think) sg_logprobs_skip(&lpacc);
             else lp = sg_logprobs_take(&lpacc, result, model, piece);
             if (lp) em_note_token_logprob(&em, lp);
+            ht = pn_ht_lap(PN_HT_O_LOGPROB, ht);
             if (piece) { em_feed(&em, piece); }
             free(piece);
+            ht = pn_ht_lap(PN_HT_O_EMIT, ht);
             /* Reverse coupling (batched): the driver's sampler advances the grammar
              * in-thread; if it has decided forced-mode reasoning is over (</think>
              * or budget) but the emitter still routes to <think>, flip it to CONTENT
              * so the compelled call is parsed as a tool_call (mirror of the
-             * single-user loop). */
-            if (em.in_think && sg_tg_forced_ended(&tg)) {
+             * single-user loop).  Asked at THIS token's ring position: the live walk
+             * runs ahead by the ring backlog, and reading it flipped the channel a
+             * few tokens early, filing "\n</think>\n\n" as content. */
+            if (em.in_think && bs_slot_reasoning_ended(sched, slot)) {
                 em.in_think = 0;
                 sg_log_reasoning_channel_flip(&tg, generated);
             }
@@ -3373,15 +4303,31 @@ int sg_run_completion_batched(pn_model *model, pn_batch_sched *sched,
              * way the client-disconnect check above does — the driver drops it
              * from the next step's compaction and stops generating for it — so
              * the remaining budget is not spent re-emitting the same block. */
-            if (rld_feed(&reploop, tok)) {
+            const bool rld_tripped = rld_feed(&reploop, tok);
+            pn_ht_lap(PN_HT_O_RLD, ht);
+            if (rld_tripped) {
                 finish = SG_FINISH_REPETITION_LOOP;
                 reploop_stop = true;
                 break;
             }
         }
+        pn_ht_bind(NULL);
+        t_dec_end = sg_request_timing_now_ms();
+        ht_dec_end = pn_ht_now();
+        if (ht_dec_end) {
+            ht_cpu1 = pn_ht_thread_cpu();
+            ht_rd1 = pn_ht_run_delay();
+        }
         if (em.stopped && !reploop_stop)
             finish = "stop";
         em_flush(&em);
+        if (stalled) {
+            /* No finalize: it waits for the GPU turn, which a wedged step may
+             * never give back, and the turn did not complete. The next turn's
+             * resume checks the slot's block before trusting it. */
+            bs_slot_release_stats(sched, slot, &rstats);
+            goto out;
+        }
         /* Hand the slot this turn's CLIENT RE-RENDER — the reply put back
          * through the same render+tokenize path the next request will take —
          * BEFORE finalize publishes the committed log, so next turn's resume can
@@ -3411,9 +4357,12 @@ int sg_run_completion_batched(pn_model *model, pn_batch_sched *sched,
         /* PC-batched: snapshot the slot's warm SSM+KV into its pn_state and
          * publish this session's committed history BEFORE releasing, while the
          * slot's GPU decode state is still valid.  No-op when not caching. */
-        if (use_cache)
+        if (use_cache) {
+            const double t_fin = sg_request_timing_now_ms();
             bs_slot_finalize(sched, slot);
-        bs_slot_release(sched, slot);   /* driver drops the slot from the
+            rt.finalize_ms = sg_request_timing_now_ms() - t_fin;
+        }
+        bs_slot_release_stats(sched, slot, &rstats);   /* driver drops the slot from the
                                          * next step's compaction */
         goto out;
     }
@@ -3436,7 +4385,7 @@ int sg_run_completion_batched(pn_model *model, pn_batch_sched *sched,
     if (bs_slot_await_first(sched, slot, &slot_logits) != 0) {
         em_flush(&em);
         free(recent);
-        bs_slot_release(sched, slot);
+        bs_slot_release_stats(sched, slot, &rstats);
         goto out;
     }
 
@@ -3466,14 +4415,14 @@ int sg_run_completion_batched(pn_model *model, pn_batch_sched *sched,
             finish = "stop";
             em_flush(&em);
             free(recent);
-            bs_slot_release(sched, slot);
+            bs_slot_release_stats(sched, slot, &rstats);
             goto out;
         }
         if (em.stopped) {
             finish = "stop";
             em_flush(&em);
             free(recent);
-            bs_slot_release(sched, slot);
+            bs_slot_release_stats(sched, slot, &rstats);
             goto out;
         }
     }
@@ -3493,7 +4442,7 @@ int sg_run_completion_batched(pn_model *model, pn_batch_sched *sched,
             finish = "stop";
             em_flush(&em);
             free(recent);
-            bs_slot_release(sched, slot);
+            bs_slot_release_stats(sched, slot, &rstats);
             goto out;
         }
         /* Sample from slot logits deposited by driver. */
@@ -3505,7 +4454,7 @@ int sg_run_completion_batched(pn_model *model, pn_batch_sched *sched,
             finish = sg_tg_close_required_call(&tg, params, &em) ? "tool_calls" : "stop";
             em_flush(&em);
             free(recent);
-            bs_slot_release(sched, slot);
+            bs_slot_release_stats(sched, slot, &rstats);
             goto out;
         }
 
@@ -3534,7 +4483,7 @@ int sg_run_completion_batched(pn_model *model, pn_batch_sched *sched,
             finish = SG_FINISH_REPETITION_LOOP;
             em_flush(&em);
             free(recent);
-            bs_slot_release(sched, slot);
+            bs_slot_release_stats(sched, slot, &rstats);
             goto out;
         }
 
@@ -3542,7 +4491,7 @@ int sg_run_completion_batched(pn_model *model, pn_batch_sched *sched,
             finish = "stop";
             em_flush(&em);
             free(recent);
-            bs_slot_release(sched, slot);
+            bs_slot_release_stats(sched, slot, &rstats);
             goto out;
         }
 
@@ -3556,7 +4505,7 @@ int sg_run_completion_batched(pn_model *model, pn_batch_sched *sched,
 
     em_flush(&em);
     free(recent);
-    bs_slot_release(sched, slot);
+    bs_slot_release_stats(sched, slot, &rstats);
 
 out:
     /* The batched twin of the single-user [repetition] line.  The fleet runs
@@ -3587,6 +4536,25 @@ out:
     pn_reqprof_note_generated(generated);
     result->completion_tokens = generated;
     result->finish_reason     = finish;
+    if (t_dec_end <= 0.0)
+        t_dec_end = sg_request_timing_now_ms();   /* EOS first, legacy path */
+    rt.ttft_ms    = t_first - t_req0;
+    rt.generated  = generated;
+    rt.decode_ms  = t_dec_end - t_first;
+    rt.active_min = rstats.active_min;
+    rt.active_max = rstats.active_max;
+    rt.mtp_cycles = rstats.mtp_cycles;
+    rt.finish     = finish;
+    sg_request_timing_log(&rt);
+    if (ht_first && ht_dec_end) {
+        const pn_host_timing *hd = &rstats.host;
+        pn_ht_report(hd, &ht_own, slot, generated, rt.decode_ms,
+                     hd->first_launch_ns > ht_first
+                         ? (double)(hd->first_launch_ns - ht_first) / 1e6 : 0.0,
+                     ht_dec_end > hd->last_deposit_ns
+                         ? (double)(ht_dec_end - hd->last_deposit_ns) / 1e6 : 0.0,
+                     ht_cpu1 - ht_cpu0, ht_rd1 - ht_rd0);
+    }
     result->content    = em.content.data  ? em.content.data  : strdup("");
     result->reasoning  = em.reasoning.data;
     result->tool_raw   = em.tool.data;
@@ -3594,5 +4562,5 @@ out:
     em.reasoning.data  = NULL;
     em.tool.data       = NULL;
     em_free(&em);
-    return 0;
+    return stalled ? SG_STALLED : 0;
 }

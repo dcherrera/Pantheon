@@ -1,0 +1,7 @@
+{"endpoint":"POST /local/invites","class":"device",
+ "request":{"person":"p55aa66bb"},
+ "status":200,
+ "response":{"code":"12345678","person":{"id":"p55aa66bb","handle":"bob","name":"Bob"},"expires_in":600},
+ "errors":[{"when":"a non-admin invites for another person","status":403,"type":"forbidden"},
+           {"when":"no person with that id","status":404,"type":"not_found"},
+           {"when":"16 invites are live","status":429,"type":"invites_full"}]}

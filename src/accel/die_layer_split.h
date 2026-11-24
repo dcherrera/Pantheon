@@ -57,6 +57,10 @@ typedef struct {
  * remainder lands on the LATER dies, which is what makes that identity hold
  * (41 layers over 2 dies is 20 + 21, not 21 + 20).
  *
+ * PN_DIE_SPLIT_LAYERS=b1,...,b{N-1} (env) replaces the flat split at any
+ * width >= 2 when it names exactly N-1 increasing boundaries in (0, n_layer);
+ * pn_die_layer_range honours it too, so admission and upload agree.
+ *
  * @param n_layer            Total transformer layers (> 0)
  * @param n_die              Dies to split across (1 .. PN_DIE_LAYER_SPLIT_MAX_DIES)
  * @param override_boundary  Manual first boundary, or <= 0 for none. Honoured

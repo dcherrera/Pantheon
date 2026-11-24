@@ -32,7 +32,19 @@
 #include <unistd.h>
 
 #include "pn_tt_device_internal.h"
+#include "pn_tt_attention_grid.h"
 #include "pn_tt_core_boot_guard.h"
+#include "pn_tt_dispatch.h"
+#include "pn_tt_grid_marks.h"
+
+#include "pn_tt_core_list.h"
+#include "pn_tt_grid_msplit.h"
+#include "pn_tt_matmul_rows.h"
+#include "pn_tt_unmirrored_probe.h"
+#include "pn_tt_grid_probe.h"
+#include "pn_tt_weight_banks.h"
+#include "pn_tt_replica_map.h"
+#include "pn_tt_resadd_fuse.h"
 
 #include "tt/ft_tt_coord.h"
 #include "tt/ft_tt_op_dispatch.h"
@@ -42,6 +54,8 @@
 #include "tt/ft_tt_op_matmul_resident_multicast.h"
 #include "tt/ft_tt_program_resolve.h"
 #include "tt/kernels/resident_matmul_block_protocol.h"
+#include "tt/kernels/resident_matmul_swiglu_protocol.h"
+#include "tt/kernels/resident_matmul_resadd_protocol.h"
 
 /** How many Tensix one projection is split across. `PN_TT_MATMUL_CORES=1` is the pre-group
  *  path and the control arm. */
@@ -138,6 +152,16 @@
  *  which moved WITH it. Was 75, which caps the group at 8 below attention. */
 #define PN_TT_MATMUL_CORE_FIRST_ENV     "PN_TT_MATMUL_CORE_FIRST"
 #define PN_TT_MATMUL_CORE_FIRST_DEFAULT 96u
+
+/** OR an explicit list for members 1..N-1, "96-110,0-15" (pn_tt_core_list.h), which wins over
+ *  PN_TT_MATMUL_CORE_FIRST. Unset by default. Decode frontier F1.1: a 32-member arm on the
+ *  sixteen PX7 cores plus sixteen idle prefill-grid cores, which no single run reaches without
+ *  crossing the GDN / gdnc / head-norm families. Exact by construction: the members' columns
+ *  are the same N split whatever cores hold them. */
+#define PN_TT_MATMUL_CORE_LIST_ENV "PN_TT_MATMUL_CORE_LIST"
+/** The largest index the list may name (140 Tensix on a p150); a harvested part's missing
+ *  cores are refused later, by the coordinate lookup, as for PN_TT_MATMUL_CORE_FIRST. */
+#define PN_TT_MATMUL_CORE_INDEX_MAX 139u
 
 /**
  * THE SHARED ACTIVATION, MULTICAST ONCE INSTEAD OF READ N TIMES. Off by default.
@@ -1097,9 +1121,12 @@ static uint32_t pn_tt_matmul_group_dst_section_tiles(void)
 int pn_tt_matmul_group_configure(pn_tt_device *device)
 {
     pn_tt_matmul_group *group = &device->group;
+    uint32_t listed_cores[PN_TT_MATMUL_MAX_CORES];
     uint32_t first, member;
+    int listed;
 
     memset(group, 0, sizeof(*group));
+    group->class_clock = -1;
     group->member_count = pn_tt_env_u32(PN_TT_MATMUL_CORES_ENV, PN_TT_MATMUL_CORES_DEFAULT);
     device->poll_backoff_us = pn_tt_env_u32(PN_TT_POLL_BACKOFF_ENV, 0u);
     group->activation_doors = pn_tt_env_u32(PN_TT_ACTIVATION_DOORS_ENV, 1u) != 0u;
@@ -1289,6 +1316,21 @@ int pn_tt_matmul_group_configure(pn_tt_device *device)
         return -1;
     }
     first = pn_tt_env_u32(PN_TT_MATMUL_CORE_FIRST_ENV, PN_TT_MATMUL_CORE_FIRST_DEFAULT);
+    {
+        const char *list = getenv(PN_TT_MATMUL_CORE_LIST_ENV);
+
+        listed = pn_tt_core_list_parse(list, listed_cores, PN_TT_MATMUL_MAX_CORES,
+                                       PN_TT_MATMUL_CORE_INDEX_MAX);
+        if (listed < 0 || (listed > 0 && (uint32_t)listed < group->member_count - 1u)) {
+            fprintf(stderr, "pn_tt: %s=%s is not a list of %u distinct cores for members "
+                            "1..%u\n", PN_TT_MATMUL_CORE_LIST_ENV, list,
+                    group->member_count - 1u, group->member_count - 1u);
+            return -1;
+        }
+        if (listed > 0)
+            fprintf(stderr, "pn_tt: matmul members 1..%u from %s=%s\n",
+                    group->member_count - 1u, PN_TT_MATMUL_CORE_LIST_ENV, list);
+    }
 
     /* Member 0 is the core pn_tt_bring_up_core() already resolved and booted, and its queue
      * is the device's own. Nothing about it changes when the group is one member wide. */
@@ -1314,7 +1356,7 @@ int pn_tt_matmul_group_configure(pn_tt_device *device)
 
         slot->queue = &slot->own_queue;
         if (!group->cooperative_placed)
-            slot->core_index = first + member - 1u;
+            slot->core_index = listed > 0 ? listed_cores[member - 1u] : first + member - 1u;
         if (ft_tt_coord_tensix_by_index(&device->runtime.grid, slot->core_index,
                                         FT_TT_COORD_TRANSLATED, &core) != FT_TT_OK) {
             fprintf(stderr, "pn_tt: Tensix index %u is not on this part\n", slot->core_index);
@@ -1407,13 +1449,25 @@ static uint32_t g_stash_address;
  * Kt and MB == 1), so a projection of another Kt reads A as before. 128 = Ornith's hidden Kt:
  * gate/up (3 passes a member), qkv (2) and the LM head (61) read A once.
  */
+/* BYTES A-REUSE ring (pages): the kernel skips a pass's A read only when the ring is EXACTLY
+ * the descriptor's Kt, so the ring is a MODEL preference — its hidden Kt, the K of most of its
+ * bytes (pn_tt_device_prefer_a_reuse_tiles; Qwen3.5 sets n_embd / 32). Default 128 (Ornith's
+ * hidden Kt); `PN_TT_A_REUSE` overrides, 0 off. */
+static uint32_t g_a_reuse_preferred = 0u;
+
+void pn_tt_device_prefer_a_reuse_tiles(pn_tt_device *device, uint32_t tiles)
+{
+    (void)device;
+    g_a_reuse_preferred = tiles;
+}
+
 static uint32_t pn_tt_a_reuse_tiles(void)
 {
-    static int tiles = -1;
+    static int env = -2; /* -2 unread, -1 unset, else the override */
 
-    if (tiles < 0)
-        tiles = (int)pn_tt_env_u32("PN_TT_A_REUSE", 128u);
-    return (uint32_t)tiles;
+    if (env == -2)
+        env = getenv("PN_TT_A_REUSE") ? (int)pn_tt_env_u32("PN_TT_A_REUSE", 0u) : -1;
+    return pn_tt_a_reuse_ring(env >= 0, env >= 0 ? (uint32_t)env : 0u, g_a_reuse_preferred);
 }
 
 static int pn_tt_group_place_cbs(uint32_t weight_tile_bytes, uint32_t depth,
@@ -1421,8 +1475,9 @@ static int pn_tt_group_place_cbs(uint32_t weight_tile_bytes, uint32_t depth,
                                  unsigned char *cb_buffer, size_t cb_bytes,
                                  uint64_t *cb_mask, uint32_t stash_tiles)
 {
-    ft_tt_op_cb_request requests[4];
-    ft_tt_launch_cb_entry placed[4];
+    ft_tt_op_cb_request requests[7];
+    ft_tt_launch_cb_entry placed[7];
+    uint32_t count;
     int rc;
 
     /* THE ACTIVATION CB CARRIES THE WHOLE ROW BLOCK, exactly as CB_IN1 carries the whole
@@ -1462,8 +1517,29 @@ static int pn_tt_group_place_cbs(uint32_t weight_tile_bytes, uint32_t depth,
     requests[3].index = 7u;
     requests[3].page_bytes = weight_tile_bytes;
     requests[3].page_count = stash_tiles;
-    rc = ft_tt_op_cb_place(requests, stash_tiles ? 4u : 3u, placed, cb_buffer, cb_bytes,
-                           cb_mask);
+    count = stash_tiles ? 4u : 3u;
+    /* S3b: the fused SwiGLU program's STAGE and PANEL CBs (resident_matmul_swiglu_protocol.h),
+     * on a decode member only — a grid core never runs a fused descriptor and its stash keeps
+     * the L1. Placed after every other CB, so cb 0/1/16 land where they always have. */
+    if (pn_tt_fused_program_armed() && stash_tiles == 0u) {
+        requests[count].index = FT_TT_MATMUL_SWIGLU_CB_STAGE;
+        requests[count].page_bytes = PN_TT_TILE_BF16;
+        requests[count].page_count = FT_TT_MATMUL_SWIGLU_STAGE_PAGES;
+        count++;
+        requests[count].index = FT_TT_MATMUL_SWIGLU_CB_PANEL;
+        requests[count].page_bytes = PN_TT_TILE_BF16;
+        requests[count].page_count = ftsw_panel_pages(column_block);
+        count++;
+    }
+    /* S3a: the RESIDUAL CB the RESADD reader lands a column block's residual tiles in, two
+     * blocks deep (resident_matmul_resadd_protocol.h); decode members only, after the rest. */
+    if (pn_tt_fuse_resadd_mode() && stash_tiles == 0u) {
+        requests[count].index = FT_TT_MATMUL_RESADD_CB_RESIDUAL;
+        requests[count].page_bytes = PN_TT_TILE_BF16;
+        requests[count].page_count = ftra_residual_cb_pages(column_block);
+        count++;
+    }
+    rc = ft_tt_op_cb_place(requests, count, placed, cb_buffer, cb_bytes, cb_mask);
     if (rc == FT_TT_OK && stash_tiles)
         g_stash_address = placed[3].address;
     return rc;
@@ -1473,6 +1549,22 @@ static int pn_tt_group_place_cbs(uint32_t weight_tile_bytes, uint32_t depth,
  *  blocks, the launch message, GO — and then the host walks away. */
 static int pn_tt_slot_start(pn_tt_device *device, pn_tt_matmul_member *slot, uint32_t member,
                             uint32_t weight_tile_bytes, uint32_t depth, bool grid);
+/** Members that completed work (all of them when `all`) are alive at `now`; the group's
+ *  `last_alive_seconds` is then its OLDEST running member's (see the header). */
+static void pn_tt_group_mark_alive(pn_tt_matmul_group *group, double now, bool all)
+{
+    double oldest = now;
+    uint32_t member;
+
+    for (member = 0; member < group->member_count; member++) {
+        if (all || group->pending[member])
+            group->member_alive_seconds[member] = now;
+        if (group->member[member].running && group->member_alive_seconds[member] < oldest)
+            oldest = group->member_alive_seconds[member];
+    }
+    group->last_alive_seconds = oldest;
+}
+
 static int pn_tt_grid_flush(pn_tt_device *device);
 static void pn_tt_grid_stop(pn_tt_device *device);
 
@@ -1529,6 +1621,10 @@ static int pn_tt_slot_start(pn_tt_device *device, pn_tt_matmul_member *slot, uin
         if (rc != FT_TT_OK)
             return rc;
     }
+    /* S2: the wait sidecar, which a re-armed queue's indices would otherwise meet again. */
+    rc = pn_tt_residency_clear_precondition(&device->runtime.noc, slot->core_x, slot->core_y);
+    if (rc != FT_TT_OK)
+        return rc;
     /* THE ISSUE SHAPE, decided once per armed member and DEMOTED rather than refused if this
      * queue's blocks are not 16-byte addressable. Every member is placed at the same
      * `FT_TT_OP_QUEUE_BASE`, so they agree; taking the minimum makes that a fact rather than
@@ -1670,6 +1766,14 @@ int pn_tt_matmul_group_arm(pn_tt_device *device, uint32_t weight_tile_bytes, uin
     pn_tt_matmul_group *group = &device->group;
     uint32_t member;
 
+    /* L1a.3: members 1.. are grid cores for this prompt; arming them would start a second
+     * residency under a live grid triad. Refused; pn_tt_matmul_grid_retract() re-arms. */
+    if (group->grid_lent || group->members_lent) {
+        fprintf(stderr, "pn_tt: the decode group will not arm while its members are lent to "
+                        "the prefill\n");
+        return FT_TT_EINVAL;
+    }
+
     group->sequence = 0u;
     group->chained = 0u;
     memset(group->pending, 0, sizeof(group->pending));
@@ -1795,6 +1899,9 @@ int pn_tt_matmul_group_arm(pn_tt_device *device, uint32_t weight_tile_bytes, uin
     group->pull_table_ok = false;
     group->pull = pn_tt_env_u32("PN_TT_MATMUL_PULL", 1u) != 0u;
     group->red_pull_skip = pn_tt_red("matmul_pull_skip");
+    group->pull_defer = pn_tt_env_u32("PN_TT_MATMUL_PULL_DEFER", 0u) != 0u;
+    group->pull_serial = pn_tt_env_u32("PN_TT_MATMUL_PULL_SWEEP", 1u) == 0u;
+    group->m0_held = false;
     if (group->pull && group->member_count > 1u && group->member_count <= 64u &&
         !group->cooperative) {
         uint32_t table[2u + 64u];
@@ -1817,15 +1924,22 @@ int pn_tt_matmul_group_arm(pn_tt_device *device, uint32_t weight_tile_bytes, uin
             memcmp(table, back, words * 4u) == 0)
             group->pull_table_ok = true;
         fprintf(stderr, "pn_tt: matmul PULL completion %s — member 0 (core %u) reads %u "
-                        "members' done-sequence before posting%s\n",
+                        "members' done-sequence before posting; %s, %s sweep%s\n",
                 group->pull_table_ok ? "ARMED" : "REFUSED (the table did not read back)",
                 group->member[0].core_index, group->member_count,
+                group->pull_defer ? "at the chain's end only" : "every split projection",
+                group->pull_serial ? "one-at-a-time" : "parallel",
                 group->red_pull_skip ? "; RED PROOF: the pull is SKIPPED" : "");
     }
     device->resident_tile_bytes = weight_tile_bytes;
     device->resident_depth = depth;
     device->resident_running = true;
-    group->last_alive_seconds = pn_tt_now_seconds();
+    pn_tt_group_mark_alive(group, pn_tt_now_seconds(), true);
+    /* S3b: RE-PLANT the members' replica table on every arm (a no-op with the knob off). A
+     * failure is not the arm's: the fused path is refused and the FFN runs unfused. */
+    if (pn_tt_replica_map_publish_fused(device) != 0)
+        fprintf(stderr, "pn_tt: the fused SwiGLU replica table did not land on the matmul "
+                        "members — the FFN runs unfused\n");
     return FT_TT_OK;
 }
 
@@ -1835,6 +1949,8 @@ void pn_tt_matmul_group_retire(pn_tt_device *device)
     uint32_t member;
 
     device->resident_running = false;
+    /* A held member-0 descriptor belongs to a chain nobody will flush on this residency. */
+    group->m0_held = false;
     /* NOT the prefill grid: an idle refresh retires and re-arms the decode group at a
      * prefill's first projection, and the grid it would kill is the one about to be used.
      * The grid is retired by pn_tt_matmul_grid_end() and at device close. */
@@ -1988,6 +2104,8 @@ int pn_tt_matmul_group_place_weight_columns(pn_tt_device *device,
         return -1;
     }
 
+    weight->probe_selected = pn_tt_weight_probe_selected(entry->name);
+
     /* THE REMAINDER GOES TO THE FIRST MEMBERS, one column each, so the widths differ by at
      * most one and every column of the weight is owned exactly once. `first` is the running
      * sum, which is what makes the panels concatenate at Mt = 1 when they are not all the
@@ -2038,12 +2156,24 @@ int pn_tt_matmul_group_place_weight_columns(pn_tt_device *device,
         group->uneven_weights++;
     }
 
-    for (member = 0; member < members; member++)
-        banks[member] = (*bank_cursor + member) % device->dram_bank_count;
-    if (ft_tt_dram_stripe_choose_ports(&device->runtime.grid, banks, members,
-                                       FT_TT_COORD_TRANSLATED, doors) != FT_TT_OK) {
-        fprintf(stderr, "pn_tt: could not choose weight doors for %s\n", entry->name);
-        return -1;
+    /* WHICH BANKS: the rotation, or a fixed nearest-bank map (PN_TT_WEIGHT_BANKS,
+     * pn_tt_weight_banks.h). Either way the same bytes go up; only (bank, address, door)
+     * moves. */
+    {
+        const int chosen = pn_tt_weight_banks_choose(device, members, banks, doors);
+
+        if (chosen < 0)
+            return -1;
+        if (chosen == 0) {
+            for (member = 0; member < members; member++)
+                banks[member] = (*bank_cursor + member) % device->dram_bank_count;
+            if (ft_tt_dram_stripe_choose_ports(&device->runtime.grid, banks, members,
+                                               FT_TT_COORD_TRANSLATED, doors) != FT_TT_OK) {
+                fprintf(stderr, "pn_tt: could not choose weight doors for %s\n",
+                        entry->name);
+                return -1;
+            }
+        }
     }
 
     memset(&request, 0, sizeof(request));
@@ -2094,11 +2224,24 @@ int pn_tt_matmul_group_place_weight_columns(pn_tt_device *device,
                     first[member] + columns[member]);
             return -1;
         }
+        /* RED PROOF `PN_TT_RED=weight_place_offset`: member 1's panel of the FIRST sharded
+         * weight is uploaded ONE TILE past the address its descriptor reads, so every tile
+         * of that panel is read one tile early. A placement change that moved bytes wrong
+         * looks exactly like this, and it must DIFFER. */
+        static bool red_offset_used = false;
+        uint32_t upload_address = (uint32_t)buffer[member].address;
+
+        if (member == 1u && !red_offset_used && pn_tt_red("weight_place_offset")) {
+            red_offset_used = true;
+            upload_address += weight->tile_bytes;
+            fprintf(stderr, "pn_tt: RED PROOF — %s member 1 panel uploaded one tile late\n",
+                    entry->name);
+        }
         if (pn_tt_upload_panel_columns(device, entry, runs, run_count, column_bytes,
                                        first[member], columns[member],
                                        (uint16_t)doors[member].coord.x,
                                        (uint16_t)doors[member].coord.y,
-                                       (uint32_t)buffer[member].address) != 0) {
+                                       upload_address) != 0) {
             fprintf(stderr, "pn_tt: upload failed for %s shard %u\n", entry->name, member);
             return -1;
         }
@@ -2226,6 +2369,54 @@ static uint32_t pn_tt_group_tile_rows(const pn_tt_activation *input,
     return rows;
 }
 
+/**
+ * CLASS CLOCK: charge each member's card-busy delta since the last flush to census `row`.
+ * Host-issued decode only (the host awaits every flush there); one 4-byte read a member.
+ */
+static void pn_tt_group_class_clock(pn_tt_device *device, uint32_t row)
+{
+    pn_tt_matmul_group *group = &device->group;
+    uint64_t max_delta = 0u, sum = 0u;
+    uint32_t member;
+
+    if (group->class_clock < 0)
+        group->class_clock = pn_tt_env_u32("PN_TT_MATMUL_CLASS_CLOCK", 0u) != 0u ? 1 : 0;
+    if (group->class_clock == 0)
+        return;
+    for (member = 0; member < group->member_count; member++) {
+        uint32_t busy = 0u, delta;
+
+        if (!group->member[member].queue ||
+            ft_tt_queue_read_field(&device->runtime.noc, group->member[member].queue,
+                                   (ft_tt_queue_control_field)13, &busy) != FT_TT_OK)
+            continue;
+        /* A re-arm restarts the counter: then the whole new count is this flush's. */
+        delta = busy >= group->class_clock_last[member] ? busy - group->class_clock_last[member]
+                                                        : busy;
+        group->class_clock_last[member] = busy;
+        sum += delta;
+        group->flush_census[row].card_busy_member[member] += delta;
+        if (delta > max_delta)
+            max_delta = delta;
+    }
+    /* Member 0's PULL WAIT (writer word 61): the part of its busy spent waiting for the
+     * others, so its own work is busy - pull. */
+    if (group->member_count > 0u && group->member[0].queue) {
+        uint32_t pull = 0u;
+
+        if (device->runtime.noc.read(device->runtime.noc.user, group->member[0].queue->x,
+                                     group->member[0].queue->y,
+                                     group->member[0].queue->control_address + 61u * 4u,
+                                     &pull, sizeof(pull)) == FT_TT_OK) {
+            group->flush_census[row].card_pull_wait +=
+                pull >= group->class_clock_pull_last ? pull - group->class_clock_pull_last : pull;
+            group->class_clock_pull_last = pull;
+        }
+    }
+    group->flush_census[row].card_busy_max += max_delta;
+    group->flush_census[row].card_busy_sum += sum;
+}
+
 /** The sixteen descriptor words for ONE member of ONE projection. */
 static void pn_tt_group_parameters(pn_tt_device *device, const pn_tt_weight *weight,
                                    const pn_tt_activation *input,
@@ -2344,8 +2535,10 @@ static void pn_tt_group_parameters(pn_tt_device *device, const pn_tt_weight *wei
             parameters[FT_TT_QUEUE_MATMUL_B_N_MAJOR] |= 1u << 19;
         /* M5: `PN_TT_MATMUL_PROBE` = word-13 bits 12-15 (1 no read, 2 no compute, 4 no write,
          * 8 FLUSH writer) — resident_queue_protocol.h kMatmulProbe*. */
-        parameters[FT_TT_QUEUE_MATMUL_B_N_MAJOR] |=
-            (pn_tt_env_u32("PN_TT_MATMUL_PROBE", 0u) & 0xFu) << 12;
+        if (weight->probe_selected || !getenv(PN_TT_MATMUL_PROBE_ONLY_ENV) ||
+            !*getenv(PN_TT_MATMUL_PROBE_ONLY_ENV))
+            parameters[FT_TT_QUEUE_MATMUL_B_N_MAJOR] |=
+                (pn_tt_env_u32("PN_TT_MATMUL_PROBE", 0u) & 0xFu) << 12;
     }
     /* THE SAME VALUE ON EVERY DESCRIPTOR OF THE RESIDENCY, because CB_IN1's chunk is
      * `depth * NB` and a chunk size that changes walks the write pointer off the grid the
@@ -2736,8 +2929,8 @@ static void pn_tt_group_count_reads(pn_tt_device *device, const pn_tt_weight *we
     blocks = row_blocks * column_blocks * (tile_inner / depth);
     a_bytes = tile_rows * column_blocks * tile_inner * (uint64_t)PN_TT_TILE_BF16;
     /* A-REUSE: the kernel's own condition (ring == Kt, MB == 1) — A once per row. */
-    if ((parameters[FT_TT_QUEUE_MATMUL_B_N_MAJOR] & (1u << 18)) != 0u && rows == 1u &&
-        pn_tt_a_reuse_tiles() == tile_inner)
+    if ((parameters[FT_TT_QUEUE_MATMUL_B_N_MAJOR] & (1u << 18)) != 0u &&
+        pn_tt_a_reuse_fires(pn_tt_a_reuse_tiles(), tile_inner, rows))
         a_bytes = tile_rows * tile_inner * (uint64_t)PN_TT_TILE_BF16;
     b_bytes = row_blocks * tile_cols * tile_inner * (uint64_t)device->resident_tile_bytes;
 
@@ -2811,6 +3004,32 @@ static void pn_tt_group_chain_begin(pn_tt_matmul_group *group, double now, bool 
     group->chain_projections = 0u;
 }
 
+/**
+ * Publish member 0's held descriptor (pn_tt_matmul_pull.h). `last`: the flush awaits it, so it
+ * keeps the pull it was written with; otherwise another projection of the chain follows and it
+ * goes without one. A no-op when nothing is held.
+ */
+static int pn_tt_group_release_m0(pn_tt_device *device, bool last)
+{
+    pn_tt_matmul_group *group = &device->group;
+    ft_tt_queue_descriptor descriptor = group->m0_held_descriptor;
+    int rc;
+
+    if (!group->m0_held)
+        return FT_TT_OK;
+    group->m0_held = false;
+    if (!last && descriptor.a3 != 0u) {
+        descriptor.a3 = 0u;
+        descriptor.a4 = 0u;
+        group->pulls_deferred++;
+    }
+    rc = ft_tt_queue_stage(pn_tt_issue_access(&device->runtime, group->issue_shape),
+                           group->member[0].queue, &descriptor, 1u);
+    if (rc == FT_TT_OK)
+        rc = ft_tt_queue_publish(&device->runtime.noc, group->member[0].queue);
+    return rc;
+}
+
 static int pn_tt_group_issue(pn_tt_device *device, const pn_tt_weight *weight,
                              const pn_tt_activation *input, const pn_tt_activation *output,
                              bool split, uint32_t members)
@@ -2818,6 +3037,11 @@ static int pn_tt_group_issue(pn_tt_device *device, const pn_tt_weight *weight,
     pn_tt_matmul_group *group = &device->group;
     uint32_t parameters[FT_TT_QUEUE_PARAM_WORDS];
     double issued_from = pn_tt_now_seconds();
+    /* BEFORE this projection's member 0 reads `issued` for its parameter slot and token. */
+    int held_rc = pn_tt_group_release_m0(device, false);
+
+    if (held_rc != FT_TT_OK)
+        return held_rc;
 
     pn_tt_group_chain_begin(group, issued_from, false);
     device->group.chain_projections++;
@@ -2836,6 +3060,13 @@ static int pn_tt_group_issue(pn_tt_device *device, const pn_tt_weight *weight,
         int rc;
 
         pn_tt_group_parameters(device, weight, input, output, member, split, parameters);
+        /* S3b: a FUSED descriptor is the gate member's own plus the fused bits over word 15
+         * (whose low 24 bits stay the block word). */
+        if (group->swiglu_up)
+            parameters[FT_TT_QUEUE_MATMUL_COLUMN_BLOCK] |= group->swiglu_bits;
+        /* S3a: a RESADD descriptor is the projection's own plus the RESADD bits. */
+        if (group->resadd_residual)
+            parameters[FT_TT_QUEUE_MATMUL_COLUMN_BLOCK] |= group->resadd_bits;
 
         /* RED PROOF. Nt = 0 is the one malformation that is unambiguously a REFUSAL and not
          * a wrong answer. Injected AFTER the host check on purpose — the point is to run the
@@ -2891,21 +3122,22 @@ static int pn_tt_group_issue(pn_tt_device *device, const pn_tt_weight *weight,
         /* a1 is the DEBUG starve count — trailing K-blocks the reader deliberately withholds
          * so the compute thread is left in a real cb_wait_front. 0 for every real request. */
         descriptor.a1 = (split && members > 1u) ? group->g0_a1 : 0u;
-        /* a3 = M2 PULL: member 0 of a split projection waits for `members` on the card. */
-        if (member == 0u && group->pull_table_ok && split && members > 1u) {
-            descriptor.a3 = members | (group->red_pull_skip ? 0x80000000u : 0u);
-            descriptor.a4 = group->sequence;
-            group->chain_pull_members = members;
-            group->chain_pull_target = group->sequence;
-            group->chain_last_pulled = true;
-        } else if (member == 0u && group->pull_table_ok && !split &&
-                   group->chain_pull_members > 1u) {
-            /* A SOLO projection after a split one in the same chain: member 0 still
-             * pulls the members of that split up to ITS sequence (v2). */
-            descriptor.a3 = group->chain_pull_members |
-                            (group->red_pull_skip ? 0x80000000u : 0u);
-            descriptor.a4 = group->chain_pull_target;
-            group->chain_last_pulled = true;
+        /* a3/a4 = M2 PULL: member 0 waits on the card for the members of the chain's last
+         * split projection — that projection's own, or a split before a SOLO one (v2).
+         * Written as if this descriptor ends the chain; a held one that does not is
+         * published without it (pn_tt_matmul_pull.h). */
+        if (member == 0u && group->pull_table_ok) {
+            pn_tt_pull_chain chain = { group->chain_pull_members, group->chain_pull_target };
+            pn_tt_pull_words words;
+
+            pn_tt_pull_chain_note(&chain, split, members, group->sequence);
+            words = pn_tt_pull_words_for(&chain, true, group->red_pull_skip,
+                                         group->pull_serial);
+            group->chain_pull_members = chain.members;
+            group->chain_pull_target = chain.target;
+            descriptor.a3 = words.a3;
+            descriptor.a4 = words.a4;
+            group->chain_last_pulled = words.a3 != 0u;
         } else if (member == 0u) {
             group->chain_last_pulled = false;
         }
@@ -2918,15 +3150,34 @@ static int pn_tt_group_issue(pn_tt_device *device, const pn_tt_weight *weight,
         descriptor.a2 = weight->tile_rows > 0u && parameters[FT_TT_QUEUE_MATMUL_TILE_ROWS] > 1u
                             ? weight->tile_cols
                             : 0u;
+        /* S3b: a fused descriptor is Mt = 1 with no stash, so a1/a2 carry the UP shard. */
+        if (group->swiglu_up)
+            pn_tt_swiglu_up_words(group->swiglu_up, member, &descriptor.a1, &descriptor.a2);
+        /* S3a: a RESADD descriptor is Mt = 1 with no stash, so a1/a2 carry the RESIDUAL at
+         * the member's first column. */
+        if (group->resadd_residual)
+            pn_tt_resadd_words(group->resadd_residual,
+                               split ? weight->shard_column_first[member] : 0u,
+                               (uint16_t)device->dram[group->resadd_residual->bank].x,
+                               (uint16_t)device->dram[group->resadd_residual->bank].y,
+                               &descriptor.a1, &descriptor.a2);
         /* a5 is the GROUP SEQUENCE, and it is what the writer posts beside the token. */
         descriptor.a5 = group->sequence;
         /* STAGE THEN PUBLISH, NOT `enqueue` — the two halves go through DIFFERENT accessors
          * on the wide shape, and the head bump is on `noc` on both because a four-byte write
-         * cannot come through the 16-byte L1 accessor at all (pn_tt_issue.h). */
-        rc = ft_tt_queue_stage(pn_tt_issue_access(&device->runtime, group->issue_shape),
-                               slot->queue, &descriptor, 1u);
-        if (rc == FT_TT_OK)
-            rc = ft_tt_queue_publish(&device->runtime.noc, slot->queue);
+         * cannot come through the 16-byte L1 accessor at all (pn_tt_issue.h). Member 0's is
+         * HELD when pulls are deferred; nothing else stages on its queue before the release,
+         * so it still lands at `index`. */
+        if (member == 0u && group->pull_table_ok && group->pull_defer) {
+            group->m0_held_descriptor = descriptor;
+            group->m0_held = true;
+            rc = FT_TT_OK;
+        } else {
+            rc = ft_tt_queue_stage(pn_tt_issue_access(&device->runtime, group->issue_shape),
+                                   slot->queue, &descriptor, 1u);
+            if (rc == FT_TT_OK)
+                rc = ft_tt_queue_publish(&device->runtime.noc, slot->queue);
+        }
         /* Two writes: the ring slot, then the head bump that publishes it. The head is a
          * separate write BY REQUIREMENT — it is what makes the descriptor visible, so it
          * cannot be merged with the payload it announces. */
@@ -2953,6 +3204,11 @@ static int pn_tt_group_issue(pn_tt_device *device, const pn_tt_weight *weight,
                                 pn_tt_group_activation_bank(group, input, member),
                                 split ? weight->shard_bank[member] : weight->bank,
                                 member == 0u);
+        /* The up panel's B bytes (and the A re-reads its passes make) are the same shape. */
+        if (group->swiglu_up)
+            pn_tt_group_count_reads(device, group->swiglu_up, parameters,
+                                    pn_tt_group_activation_bank(group, input, member),
+                                    group->swiglu_up->shard_bank[member], false);
     }
 
     group->chain_issue_end = pn_tt_now_seconds();
@@ -2985,6 +3241,10 @@ int pn_tt_matmul_group_flush(pn_tt_device *device)
             return grc;
     }
     group->flushes++;
+    /* The chain's last member-0 descriptor goes out WITH its pull, before anything waits. */
+    rc = pn_tt_group_release_m0(device, true);
+    if (rc != FT_TT_OK)
+        return rc;
     waiting_from = pn_tt_now_seconds();
 
     if (group->pull_table_ok && group->chain_last_pulled && group->pending[0]) {
@@ -3059,14 +3319,15 @@ int pn_tt_matmul_group_flush(pn_tt_device *device)
             group->flush_census[row].busy_await += census_busy_await;
             group->flush_census[row].busy_count += census_busy_count;
             group->flush_census[row].polls += census_polls;
+            pn_tt_group_class_clock(device, row);
         } else {
             group->flush_census_dropped++;
         }
     }
     group->chained = 0u;
-    memset(group->pending, 0, sizeof(group->pending));
     if (rc == FT_TT_OK)
-        group->last_alive_seconds = mark;
+        pn_tt_group_mark_alive(group, mark, false);
+    memset(group->pending, 0, sizeof(group->pending));
     return rc;
 }
 
@@ -3082,8 +3343,10 @@ bool pn_tt_matmul_group_idle_expired(const pn_tt_device *device, double *out_idl
     const long limit_ms = pn_tt_residency_idle_retire_limit_ms();
     double idle;
 
+    /* L1a.3: no idle re-arm while members serve the grid (the arm would refuse). */
     if (limit_ms == 0 || group->chained != 0u || group->last_alive_seconds <= 0.0 ||
-        pn_tt_red("matmul_idle_retire_off") || !pn_tt_idle_retire_allowed("matmul"))
+        group->grid_lent || group->members_lent || pn_tt_red("matmul_idle_retire_off") ||
+        !pn_tt_idle_retire_allowed("matmul"))
         return false;
     idle = pn_tt_now_seconds() - group->last_alive_seconds;
     if (out_idle_seconds)
@@ -3135,13 +3398,16 @@ int pn_tt_matmul_group_keepalive(pn_tt_device *device, double min_idle_seconds)
             pn_tt_group_await(device, &group->member[member],
                               group->member[member].queue->issued) != FT_TT_OK)
             return -1;
-    group->last_alive_seconds = pn_tt_now_seconds();
+    pn_tt_group_mark_alive(group, pn_tt_now_seconds(), true);
     return sent;
 }
 
 /* ===========================================================================
  * PHASE G — THE PREFILL GRID
  * =========================================================================== */
+
+/** Set only while the grid cycle gate runs: where each grid boot's host time goes (P-boot). */
+static ft_tt_runtime_boot_timing *g_grid_boot_timing;
 
 /** Boot the grid's firmware ONCE (a process's first prefill). Sequential, like the members. */
 static int pn_tt_grid_boot(pn_tt_device *device)
@@ -3163,6 +3429,19 @@ static int pn_tt_grid_boot(pn_tt_device *device)
                 count, group->member_count);
         return -1;
     }
+    /* A RESIDENT FAMILY ON A GRID CORE IS A WEDGE, NOT A SHARE: residencies live for the
+     * whole process (decode and prefill alike), and grid firmware booted under one leaves two
+     * programs on one Tensix. Refused by name before any core boots; the grid stays off. */
+    for (index = 0; index < count; index++) {
+        const char *holder = pn_tt_core_holder(device, first + index, NULL);
+
+        if (holder) {
+            fprintf(stderr, "pn_tt: prefill grid core %u is held by %s — the grid stays off. "
+                            "Move that family or set PN_TT_PREFILL_GRID_FIRST.\n",
+                    first + index, holder);
+            return -1;
+        }
+    }
     for (index = 0; index < count; index++) {
         pn_tt_matmul_member *slot = &group->grid[index];
         ft_tt_noc_coord core;
@@ -3177,8 +3456,8 @@ static int pn_tt_grid_boot(pn_tt_device *device)
         slot->core_y = (uint16_t)core.y;
         if (!pn_tt_core_boot_is_permitted(&device->runtime, slot->core_index,
                                           "a prefill grid core", "PN_TT_PREFILL_GRID_FIRST") ||
-            ft_tt_runtime_boot_core(&device->runtime.noc, slot->core_x, slot->core_y,
-                                    &device->firmware) != FT_TT_OK) {
+            ft_tt_runtime_boot_core_timed(&device->runtime.noc, slot->core_x, slot->core_y,
+                                          &device->firmware, g_grid_boot_timing) != FT_TT_OK) {
             fprintf(stderr, "pn_tt: prefill grid core %u could not be booted\n",
                     slot->core_index);
             return -1;
@@ -3205,6 +3484,9 @@ static void pn_tt_grid_stop(pn_tt_device *device)
     group->grid_running = false;
     memset(group->grid_pending, 0, sizeof(group->grid_pending));
     group->grid_detached = 0u;
+    group->grid_ring = 0u;
+    pn_tt_grid_marks_reset(&group->grid_marks, group->grid_count);
+    group->grid_last_mark = PN_TT_GRID_MARK_NONE;
 }
 
 /**
@@ -3247,20 +3529,35 @@ static uint32_t pn_tt_grid_park(pn_tt_device *device)
 }
 
 /** The grid's wedge gate: `PN_TT_PREFILL_GRID_CYCLES=N` boot -> start -> stop -> park the
- *  whole grid N times before the first real prefill, and say how many cycles went clean. */
+ *  whole grid N times before the first real prefill, and say how many cycles went clean and
+ *  where each one's time went (boot split by ft_tt_runtime_boot_core_timed; P-boot). */
 static void pn_tt_grid_cycle_gate(pn_tt_device *device)
 {
     pn_tt_matmul_group *group = &device->group;
     const uint32_t cycles = pn_tt_env_u32("PN_TT_PREFILL_GRID_CYCLES", 0u);
+    /* PROBE: `PN_TT_GRID_CYCLE_ATTN=1` also arms, retires
+     * and parks the attention program on every grid core each cycle (pn_tt_attention_grid.h),
+     * and the gate prints what each half of the swap cost. */
+    const bool attention = pn_tt_attention_grid_cycle_wanted();
+    double boot_s = 0.0, start_s = 0.0, stop_s = 0.0, park_s = 0.0, attn_up = 0.0, attn_down = 0.0;
+    uint32_t cores[sizeof(group->grid) / sizeof(group->grid[0])];
+    ft_tt_runtime_boot_timing boot_timing;
     static bool done;
     uint32_t cycle, index, clean = 0u;
+    double mark;
 
     if (done || cycles == 0u)
         return;
     done = true;
+    memset(&boot_timing, 0, sizeof(boot_timing));
+    g_grid_boot_timing = &boot_timing;
     for (cycle = 0; cycle < cycles; cycle++) {
-        bool ok = pn_tt_grid_boot(device) == 0;
+        bool ok;
 
+        mark = pn_tt_now_seconds();
+        ok = pn_tt_grid_boot(device) == 0;
+        boot_s += pn_tt_now_seconds() - mark;
+        mark = pn_tt_now_seconds();
         for (index = 0; ok && index < group->grid_count; index++) {
             if (pn_tt_slot_start(device, &group->grid[index], index,
                                  device->resident_tile_bytes, device->resident_depth,
@@ -3272,17 +3569,44 @@ static void pn_tt_grid_cycle_gate(pn_tt_device *device)
             }
             group->grid[index].running = true;
         }
+        start_s += pn_tt_now_seconds() - mark;
+        mark = pn_tt_now_seconds();
         pn_tt_grid_stop(device);
+        stop_s += pn_tt_now_seconds() - mark;
+        mark = pn_tt_now_seconds();
         if (pn_tt_grid_park(device) != group->grid_count)
             ok = false;
+        park_s += pn_tt_now_seconds() - mark;
+        if (ok && attention) {
+            pn_tt_attention_grid_cycle_time spent;
+
+            for (index = 0; index < group->grid_count; index++)
+                cores[index] = group->grid[index].core_index;
+            memset(&spent, 0, sizeof(spent));
+            if (pn_tt_attention_grid_cycle(device, cores, group->grid_count, &spent) != 0)
+                ok = false;
+            attn_up += spent.arm_seconds;
+            attn_down += spent.park_seconds;
+        }
         if (!ok) {
             fprintf(stderr, "pn_tt: GRID CYCLE %u FAILED — stopping the gate\n", cycle);
             break;
         }
         clean++;
     }
-    fprintf(stderr, "pn_tt: GRID CYCLE GATE — %u of %u boot/start/stop/park cycles clean\n",
-            clean, cycles);
+    g_grid_boot_timing = NULL;
+    fprintf(stderr, "pn_tt: GRID CYCLE GATE — %u of %u boot/start/stop/park cycles clean%s\n",
+            clean, cycles, attention ? " (with the attention program on every grid core)" : "");
+    if (clean > 0u)
+        fprintf(stderr, "pn_tt: GRID CYCLE TIMING (ms a cycle, %u cores) — boot %.2f (reset %.2f, "
+                        "firmware images %.2f for %.0f KiB, handshake %.2f) start %.2f stop %.2f "
+                        "park %.2f; attention arm %.2f retire+park %.2f\n",
+                group->grid_count, boot_s * 1e3 / clean, boot_timing.reset_seconds * 1e3 / clean,
+                boot_timing.images_seconds * 1e3 / clean,
+                (double)boot_timing.image_bytes / 1024.0 / clean,
+                boot_timing.handshake_seconds * 1e3 / clean, start_s * 1e3 / clean,
+                stop_s * 1e3 / clean, park_s * 1e3 / clean, attn_up * 1e3 / clean,
+                attn_down * 1e3 / clean);
 }
 
 int pn_tt_matmul_grid_begin(pn_tt_device *device)
@@ -3325,8 +3649,225 @@ int pn_tt_matmul_grid_begin(pn_tt_device *device)
         group->grid[index].running = true;
     }
     group->grid_running = true;
+    pn_tt_grid_marks_reset(&group->grid_marks, group->grid_count);
+    group->grid_last_mark = PN_TT_GRID_MARK_NONE;
     pn_tt_device_telemetry_log(device, "grid started");
     return 0;
+}
+
+uint32_t pn_tt_matmul_grid_lend(pn_tt_device *device, uint32_t *cores, uint32_t max)
+{
+    pn_tt_matmul_group *group = &device->group;
+    uint32_t index, parked;
+
+    if (!group->grid_running || !cores || max < group->grid_count)
+        return 0u;
+    if (pn_tt_grid_flush(device) != 0)
+        return 0u;
+    pn_tt_grid_stop(device);
+    parked = pn_tt_grid_park(device);
+    if (parked != group->grid_count) {
+        fprintf(stderr, "pn_tt: grid LEND — %u of %u cores parked; lending none\n", parked,
+                group->grid_count);
+        return 0u;
+    }
+    for (index = 0; index < group->grid_count; index++)
+        cores[index] = group->grid[index].core_index;
+    return group->grid_count;
+}
+
+/** Has `slot`'s triad exited (after a stop)? */
+static bool pn_tt_slot_exited(pn_tt_device *device, pn_tt_matmul_member *slot)
+{
+    uint32_t pending = PN_TT_TRIAD_MASK;
+
+    return ft_tt_queue_all_processors_exited(&device->runtime.noc, slot->queue,
+                                             PN_TT_TRIAD_MASK, &pending) == FT_TT_OK;
+}
+
+/** Add one grid slot on `core` at index `g`; `boot` boots the grid firmware there first. */
+static int pn_tt_grid_add_slot(pn_tt_device *device, uint32_t g, uint32_t core, bool boot)
+{
+    pn_tt_matmul_member *slot = &device->group.grid[g];
+    ft_tt_noc_coord coord;
+
+    memset(slot, 0, sizeof(*slot));
+    slot->queue = &slot->own_queue;
+    slot->core_index = core;
+    if (ft_tt_coord_tensix_by_index(&device->runtime.grid, core, FT_TT_COORD_TRANSLATED,
+                                    &coord) != FT_TT_OK)
+        return FT_TT_EINVAL;
+    slot->core_x = (uint16_t)coord.x;
+    slot->core_y = (uint16_t)coord.y;
+    if (boot) {
+        if (!pn_tt_core_boot_is_permitted(&device->runtime, core, "a lent grid core",
+                                          "PN_TT_PREFILL_LEND") ||
+            ft_tt_runtime_boot_core(&device->runtime.noc, slot->core_x, slot->core_y,
+                                    &device->firmware) != FT_TT_OK)
+            return FT_TT_EIO;
+        slot->booted = true;
+    }
+    if (pn_tt_slot_start(device, slot, g, device->resident_tile_bytes, device->resident_depth,
+                         true) != FT_TT_OK)
+        return FT_TT_EIO;
+    slot->running = true;
+    return FT_TT_OK;
+}
+
+/** The grid at `count` cores: pieces and marks follow. */
+static void pn_tt_grid_set_count(pn_tt_matmul_group *group, uint32_t count)
+{
+    group->grid_count = count;
+    group->grid_pieces = count / group->member_count;
+    pn_tt_grid_marks_reset(&group->grid_marks, count);
+    group->grid_last_mark = PN_TT_GRID_MARK_NONE;
+}
+
+uint32_t pn_tt_matmul_grid_extend(pn_tt_device *device, uint32_t extra_core)
+{
+    pn_tt_matmul_group *group = &device->group;
+    const uint32_t base = group->grid_count, members = group->member_count;
+    uint32_t m, g;
+
+    if (!group->grid_running || group->grid_lent || group->members_lent || members < 2u ||
+        extra_core == UINT32_MAX ||
+        base + members > (uint32_t)(sizeof(group->grid) / sizeof(group->grid[0])) ||
+        (base + members) % members != 0u || pn_tt_grid_flush(device) != 0)
+        return 0u;
+    for (m = 1; m < members; m++) {
+        pn_tt_group_member_stop(device, &group->member[m]);
+        if (!pn_tt_slot_exited(device, &group->member[m])) {
+            fprintf(stderr, "pn_tt: grid EXTEND — decode member %u (core %u) did not exit; "
+                            "the grid stays at %u\n", m, group->member[m].core_index, base);
+            pn_tt_matmul_group_retire(device);
+            (void)pn_tt_matmul_group_arm(device, device->resident_tile_bytes,
+                                         device->resident_depth);
+            return 0u;
+        }
+    }
+    group->grid_lent = true;
+    group->grid_lent_base = base;
+    for (g = base, m = 1; m < members; m++, g++)
+        if (pn_tt_grid_add_slot(device, g, group->member[m].core_index, false) != FT_TT_OK)
+            break;
+    if (m == members && pn_tt_grid_add_slot(device, g, extra_core, true) == FT_TT_OK)
+        g++;
+    pn_tt_grid_set_count(group, g);
+    if (g != base + members) {
+        fprintf(stderr, "pn_tt: grid EXTEND — core %u did not start; giving the cores back\n",
+                g < base + members - 1u ? group->member[g - base + 1u].core_index : extra_core);
+        (void)pn_tt_matmul_grid_retract(device, NULL);
+        return 0u;
+    }
+    fprintf(stderr, "pn_tt: grid EXTEND — %u -> %u cores (decode members 1-%u + core %u), %u "
+                    "pieces a shard\n", base, g, members - 1u, extra_core, group->grid_pieces);
+    return members;
+}
+
+uint32_t pn_tt_matmul_members_lend(pn_tt_device *device, uint32_t *cores, uint32_t max)
+{
+    pn_tt_matmul_group *group = &device->group;
+    uint32_t m, lent = 0u;
+
+    if (!device->resident_running || group->grid_lent || group->members_lent ||
+        group->member_count < 2u || group->chained != 0u)
+        return 0u;
+    for (m = 1; m < group->member_count && lent < max; m++) {
+        pn_tt_matmul_member *slot = &group->member[m];
+
+        pn_tt_group_member_stop(device, slot);
+        group->members_lent = true; /* from the first stop: the group must not re-arm */
+        if (!pn_tt_slot_exited(device, slot) ||
+            ft_tt_launch_assert_reset(&device->runtime.noc, slot->core_x, slot->core_y,
+                                      FT_TT_SOFT_RESET_ALL_RISCS) != FT_TT_OK) {
+            fprintf(stderr, "pn_tt: members LEND — decode member %u (core %u) did not exit; "
+                            "%u lent\n", m, slot->core_index, lent);
+            break;
+        }
+        cores[lent++] = slot->core_index;
+    }
+    return lent;
+}
+
+int pn_tt_matmul_members_return(pn_tt_device *device, const uint32_t *stuck, uint32_t stuck_count)
+{
+    pn_tt_matmul_group *group = &device->group;
+    uint32_t m, s;
+    int rc = 0;
+
+    if (!group->members_lent)
+        return 0;
+    for (m = 1; m < group->member_count; m++) {
+        pn_tt_matmul_member *slot = &group->member[m];
+        bool is_stuck = false;
+
+        for (s = 0; s < stuck_count; s++)
+            is_stuck |= stuck[s] == slot->core_index;
+        if (is_stuck || !pn_tt_core_boot_is_permitted(&device->runtime, slot->core_index,
+                                                      "a returned matmul member",
+                                                      "PN_TT_PREFILL_LEND") ||
+            ft_tt_runtime_boot_core(&device->runtime.noc, slot->core_x, slot->core_y,
+                                    &device->firmware) != FT_TT_OK) {
+            fprintf(stderr, "pn_tt: members RETURN — core %u did not boot%s\n", slot->core_index,
+                    is_stuck ? " (its borrower did not exit)" : "");
+            rc = -1;
+        }
+    }
+    group->members_lent = false;
+    if (rc != 0) {
+        device->resident_running = false; /* a missing member: never arm a partial group */
+        return rc;
+    }
+    pn_tt_matmul_group_retire(device);
+    if (pn_tt_matmul_group_arm(device, device->resident_tile_bytes, device->resident_depth) !=
+        FT_TT_OK) {
+        fprintf(stderr, "pn_tt: members RETURN — the decode group did not re-arm\n");
+        device->resident_running = false;
+        rc = -1;
+    }
+    return rc;
+}
+
+int pn_tt_matmul_grid_retract(pn_tt_device *device, bool *extra_parked)
+{
+    pn_tt_matmul_group *group = &device->group;
+    const uint32_t base = group->grid_lent_base;
+    uint32_t g;
+    int rc = 0;
+
+    if (extra_parked)
+        *extra_parked = false;
+    if (!group->grid_lent)
+        return 0;
+    if (pn_tt_grid_flush(device) != 0)
+        rc = -1;
+    for (g = base; g < group->grid_count; g++) {
+        pn_tt_matmul_member *slot = &group->grid[g];
+        bool exited;
+
+        pn_tt_group_member_stop(device, slot);
+        exited = pn_tt_slot_exited(device, slot);
+        if (!exited) {
+            fprintf(stderr, "pn_tt: grid RETRACT — core %u did not exit\n", slot->core_index);
+            rc = -1;
+        }
+        /* The extra core carries the grid's firmware: parked for its owner to boot again. */
+        if (slot->booted && exited &&
+            ft_tt_launch_assert_reset(&device->runtime.noc, slot->core_x, slot->core_y,
+                                      FT_TT_SOFT_RESET_ALL_RISCS) == FT_TT_OK && extra_parked)
+            *extra_parked = true;
+        memset(slot, 0, sizeof(*slot));
+    }
+    pn_tt_grid_set_count(group, base);
+    group->grid_lent = false;
+    pn_tt_matmul_group_retire(device);
+    if (pn_tt_matmul_group_arm(device, device->resident_tile_bytes, device->resident_depth) !=
+        FT_TT_OK) {
+        fprintf(stderr, "pn_tt: grid RETRACT — the decode group did not re-arm\n");
+        device->resident_running = false;
+        rc = -1;
+    }
+    return rc;
 }
 
 /** A grid flush failed: every grid core's control block and its five processors' status, so
@@ -3367,6 +3908,23 @@ static void pn_tt_grid_failure_dump(pn_tt_device *device)
             group->grid_count);
 }
 
+/** Each grid core's issued count (G.2 marks). */
+static void pn_tt_grid_issued_counts(const pn_tt_matmul_group *group, uint32_t *issued)
+{
+    memset(issued, 0, PN_TT_GRID_MARK_CORES * sizeof(issued[0]));
+    for (uint32_t i = 0; i < group->grid_count && i < PN_TT_GRID_MARK_CORES; i++)
+        issued[i] = group->grid[i].queue ? group->grid[i].queue->issued : 0u;
+}
+
+/** G.2: mark everything issued so far as the last detached projection. */
+static void pn_tt_grid_mark_push(pn_tt_matmul_group *group)
+{
+    uint32_t issued[PN_TT_GRID_MARK_CORES];
+
+    pn_tt_grid_issued_counts(group, issued);
+    group->grid_last_mark = pn_tt_grid_marks_push(&group->grid_marks, issued);
+}
+
 static int pn_tt_grid_flush(pn_tt_device *device)
 {
     pn_tt_matmul_group *group = &device->group;
@@ -3381,6 +3939,13 @@ static int pn_tt_grid_flush(pn_tt_device *device)
             rc = pn_tt_group_await(device, &group->grid[index],
                                    group->grid[index].queue->issued);
         group->grid_pending[index] = false;
+    }
+    group->grid_ring = 0u;
+    {
+        uint32_t issued[PN_TT_GRID_MARK_CORES];
+
+        pn_tt_grid_issued_counts(group, issued);
+        pn_tt_grid_marks_all(&group->grid_marks, issued);
     }
     if (rc != FT_TT_OK)
         pn_tt_grid_failure_dump(device);
@@ -3403,93 +3968,285 @@ void pn_tt_matmul_grid_end(pn_tt_device *device)
     (void)pn_tt_grid_flush(device);
     pn_tt_grid_stop(device);
     pn_tt_device_telemetry_log(device, "grid end (before park)");
-    if (pn_tt_env_u32("PN_TT_PREFILL_GRID_PARK", 1u) != 0u)
+    /* DEFAULT OFF since the prefill lane's run_pg_park.sh (2026-10-22): kept booted, the next
+     * prefill's grid-begin is 0.038 s instead of 0.100 (serve 1,630 warm TTFT 2,397 -> 2,333-
+     * 2,342 ms) and decode after it moved -0.1..-0.4% (g256 38.47 vs 38.30-38.44), all texts
+     * IDENTICAL. `PN_TT_PREFILL_GRID_PARK=1` parks as before. */
+    if (pn_tt_env_u32("PN_TT_PREFILL_GRID_PARK", 0u) != 0u)
         fprintf(stderr, "pn_tt: prefill grid PARKED — %u of %u cores held in reset\n",
                 pn_tt_grid_park(device), group->grid_count);
     fprintf(stderr, "pn_tt: prefill grid — %llu projections (%llu from the L1 stash, %llu read "
-                    "B from DRAM), %.3f s awaiting\n",
+                    "B from DRAM, %llu row-split pieces, %llu unsplit weights by rows), %.3f s "
+                    "awaiting\n",
             (unsigned long long)group->grid_projections,
             (unsigned long long)group->grid_stashed,
-            (unsigned long long)group->grid_fallbacks, group->grid_seconds);
+            (unsigned long long)group->grid_fallbacks,
+            (unsigned long long)group->grid_msplit_pieces,
+            (unsigned long long)group->grid_unsplit_projections, group->grid_seconds);
+    if (group->grid_mark_waits || group->grid_mark_full)
+        fprintf(stderr, "pn_tt: prefill grid — G.2 marks: %llu waits by step, %llu fell back to a "
+                        "full wait\n",
+                (unsigned long long)group->grid_mark_waits,
+                (unsigned long long)group->grid_mark_full);
+    pn_tt_grid_probe_report();
+}
+
+/** One grid descriptor: columns [col_first, col_first + cols) of shard `m` (local to the shard)
+ *  over tile rows [row_first, row_first + rows) (`by_rows`: the M split's piece), on core `g`. */
+typedef struct pn_tt_grid_piece {
+    uint32_t g, m, col_first, cols, row_first, rows;
+    bool by_rows;
+    bool shift_b; /**< RED `grid_chunk_b_shift` on this descriptor */
+    bool unsplit; /**< an UNSPLIT weight's row piece (O.0): B is the whole weight */
+} pn_tt_grid_piece;
+
+static int pn_tt_grid_issue_piece(pn_tt_device *device, const pn_tt_weight *weight,
+                                  const pn_tt_activation *input,
+                                  const pn_tt_activation *output, const pn_tt_grid_piece *piece)
+{
+    pn_tt_matmul_group *group = &device->group;
+    const uint32_t kt = weight->tile_rows;
+    const uint32_t g = piece->g;
+    pn_tt_matmul_member *slot = &group->grid[g];
+    const uint32_t replica = input->replica_count > 1u ? g % input->replica_count : 0u;
+    const bool red = pn_tt_red("grid_piece_shift");
+    uint32_t parameters[FT_TT_QUEUE_PARAM_WORDS];
+    ft_tt_queue_descriptor descriptor;
+    uint32_t address = 0u;
+    int rc;
+
+    pn_tt_group_parameters(device, weight, input, output, piece->m, !piece->unsplit, parameters);
+    parameters[FT_TT_QUEUE_MATMUL_TILE_COLS] = piece->cols;
+    /* RED PROOF `grid_piece_shift`: every piece reads its B one column late — must
+     * DIFFER (the last piece of a shard reads past its slice). `grid_chunk_b_shift`: the
+     * same for stash chunks past the first only. */
+    parameters[FT_TT_QUEUE_MATMUL_B_BASE] +=
+        (piece->col_first + (red || piece->shift_b ? 1u : 0u)) * kt * weight->tile_bytes;
+    parameters[FT_TT_QUEUE_MATMUL_C_BASE] += piece->col_first * PN_TT_TILE_BF16;
+    parameters[FT_TT_QUEUE_MATMUL_A_X] = (uint16_t)device->dram[input->replica_bank[replica]].x;
+    parameters[FT_TT_QUEUE_MATMUL_A_Y] = (uint16_t)device->dram[input->replica_bank[replica]].y;
+    parameters[FT_TT_QUEUE_MATMUL_A_BASE] = input->replica_address[replica];
+    if (piece->by_rows) {
+        /* RED PROOF `grid_msplit_a_shift`: pieces past the first read A one tile row
+         * early (inside the strip) — must DIFFER. */
+        const uint32_t a_row =
+            piece->row_first - (pn_tt_red("grid_msplit_a_shift") && piece->row_first ? 1u : 0u);
+
+        parameters[FT_TT_QUEUE_MATMUL_TILE_ROWS] = piece->rows;
+        parameters[FT_TT_QUEUE_MATMUL_A_BASE] += a_row * kt * PN_TT_TILE_BF16;
+        parameters[FT_TT_QUEUE_MATMUL_C_BASE] +=
+            piece->row_first * weight->tile_cols * PN_TT_TILE_BF16;
+        group->grid_msplit_pieces++;
+    }
+    /* TIMING PROBE `PN_TT_PROBE_GRID_ROWS=N` (P-nogrid, prefill rework spec §3): every grid
+     * descriptor computes at most N tile rows — a legal, smaller descriptor with the same
+     * count, marks and B reads, so the pass runs at ~no grid compute. Text garbage by design. */
+    {
+        const uint32_t probe_rows = pn_tt_env_u32("PN_TT_PROBE_GRID_ROWS", 0u);
+
+        if (probe_rows != 0u && parameters[FT_TT_QUEUE_MATMUL_TILE_ROWS] > probe_rows)
+            parameters[FT_TT_QUEUE_MATMUL_TILE_ROWS] = probe_rows;
+    }
+    /* DIAGNOSIS `PN_TT_GRID_TRACE=1`: grid core 0's and 23's words, every projection. */
+    if ((g == 0u || g == 23u) && pn_tt_env_u32("PN_TT_GRID_TRACE", 0u) != 0u)
+        fprintf(stderr, "pn_tt: GRID TRACE g%u issued %u slot %u: Mt %u Kt %u Nt %u A "
+                        "(%u,%u)+%x B (%u,%u)+%x C (%u,%u)+%x depth %u flags %x block "
+                        "%x coop %u stash %x\n",
+                g, slot->queue->issued, slot->queue->issued & (PN_TT_QUEUE_PARAM_SLOTS - 1u),
+                parameters[0], parameters[1], parameters[2], parameters[3], parameters[4],
+                parameters[5], parameters[6], parameters[7], parameters[8], parameters[9],
+                parameters[10], parameters[11], parameters[12], parameters[13], parameters[15],
+                parameters[14], group->grid_stash_address);
+    rc = ft_tt_queue_write_op_parameters(
+        pn_tt_issue_access(&device->runtime, group->issue_shape), slot->queue,
+        slot->queue->issued & (PN_TT_QUEUE_PARAM_SLOTS - 1u), parameters, &address);
+    if (rc != FT_TT_OK)
+        return rc;
+    memset(&descriptor, 0, sizeof(descriptor));
+    descriptor.opcode = FT_TT_QUEUE_OP_MATMUL;
+    descriptor.a0 = address;
+    if (group->grid_stash_address != 0u &&
+        (uint64_t)piece->cols * kt <= group->grid_stash_tiles) {
+        descriptor.a1 = 0x80000000u | (group->grid_stash_address >> 4);
+        group->grid_stashed++;
+    } else {
+        group->grid_fallbacks++;
+    }
+    descriptor.a2 = parameters[FT_TT_QUEUE_MATMUL_TILE_ROWS] > 1u ? weight->tile_cols : 0u;
+    rc = ft_tt_queue_stage(pn_tt_issue_access(&device->runtime, group->issue_shape),
+                           slot->queue, &descriptor, 1u);
+    if (rc == FT_TT_OK)
+        rc = ft_tt_queue_publish(&device->runtime.noc, slot->queue);
+    if (rc == FT_TT_OK)
+        group->grid_pending[g] = true;
+    return rc;
+}
+
+/** Shard `m`'s M split decision (pn_tt_grid_msplit.h): narrow shards cut by rows. */
+static bool pn_tt_grid_shard_by_rows(const pn_tt_matmul_group *group, uint32_t cols, uint32_t kt,
+                                     uint32_t mt)
+{
+    return group->grid_stash_address != 0u &&
+           pn_tt_grid_msplit_applies(cols, kt, group->grid_stash_tiles, mt, group->grid_pieces,
+                                     pn_tt_grid_msplit_max_columns());
+}
+
+/** Column piece `p` of a shard of `cols` columns when it is cut by columns. */
+static uint32_t pn_tt_grid_piece_columns(uint32_t cols, uint32_t pieces, uint32_t p)
+{
+    return cols / pieces + (p < cols % pieces ? 1u : 0u);
+}
+
+/** Descriptors the busiest grid core takes for this projection (GRID STASH CHUNKS). */
+static uint32_t pn_tt_grid_projection_depth(const pn_tt_device *device,
+                                            const pn_tt_weight *weight,
+                                            const pn_tt_activation *input,
+                                            const pn_tt_activation *output)
+{
+    const pn_tt_matmul_group *group = &device->group;
+    const uint32_t kt = weight->tile_rows, mt = pn_tt_group_tile_rows(input, output);
+    const uint32_t stash = group->grid_stash_address != 0u ? group->grid_stash_tiles : 0u;
+    uint32_t depth = 1u;
+
+    for (uint32_t m = 0; m < weight->shard_count; m++) {
+        const uint32_t cols = weight->shard_tile_cols[m];
+        /* The widest piece is piece 0. */
+        const uint32_t chunks =
+            pn_tt_grid_shard_by_rows(group, cols, kt, mt)
+                ? 1u
+                : pn_tt_grid_stash_chunks(pn_tt_grid_piece_columns(cols, group->grid_pieces, 0u),
+                                          kt, stash, pn_tt_grid_stash_chunks_enabled());
+
+        depth = chunks > depth ? chunks : depth;
+    }
+    return depth;
+}
+
+/** G.2 marks on? (`PN_TT_GRID_MARKS=0` off.) */
+static bool pn_tt_grid_marks_enabled(void)
+{
+    static int cached = -1;
+
+    if (cached < 0) {
+        const char *env = getenv("PN_TT_GRID_MARKS");
+
+        cached = env && *env ? atoi(env) != 0 : 1;
+    }
+    return cached != 0;
+}
+
+/**
+ * Room in the grid's rings for `depth` more descriptors a core. The rings hold 8; a chain longer
+ * than 6 is flushed first. Detached projections (PHASE W2) count against the same ring, and so
+ * does every stash chunk. G.2: with nothing on the matvec chain, wait only for the OLDEST
+ * detached projections that make room (their marks) instead of draining every one.
+ */
+static int pn_tt_grid_room(pn_tt_device *device, uint32_t depth)
+{
+    pn_tt_matmul_group *group = &device->group;
+    int rc;
+
+    if (group->chained + group->grid_detached < 6u && group->grid_ring + depth <= 6u)
+        return FT_TT_OK;
+    if (group->chained == 0u && pn_tt_grid_marks_enabled()) {
+        const uint32_t id = pn_tt_grid_marks_room(&group->grid_marks, depth, 0u, 6u);
+
+        if (id != PN_TT_GRID_MARK_FULL && id != PN_TT_GRID_MARK_NONE) {
+            rc = pn_tt_matmul_grid_wait_mark(device, id);
+            if (rc != FT_TT_OK)
+                return rc;
+            if (group->grid_detached < 6u && group->grid_ring + depth <= 6u)
+                return FT_TT_OK;
+        }
+    }
+    rc = group->chained ? pn_tt_matmul_group_flush(device) : FT_TT_OK;
+    if (rc == FT_TT_OK && group->grid_detached)
+        rc = pn_tt_matmul_grid_detached_wait(device);
+    return rc;
+}
+
+uint32_t pn_tt_matmul_grid_last_mark(const pn_tt_device *device)
+{
+    return device ? device->group.grid_last_mark : PN_TT_GRID_MARK_NONE;
+}
+
+int pn_tt_matmul_grid_wait_mark(pn_tt_device *device, uint32_t mark)
+{
+    pn_tt_matmul_group *group = &device->group;
+    uint32_t need[PN_TT_GRID_MARK_CORES];
+    int n, rc = 1;
+
+    if (mark == PN_TT_GRID_MARK_NONE)
+        return FT_TT_OK;
+    /* RED `grid_mark_early`: the wait stops one projection short — must DIFFER. */
+    if (pn_tt_red("grid_mark_early") && mark > 0u)
+        mark--;
+    if (!pn_tt_grid_marks_enabled())
+        return pn_tt_matmul_grid_detached_wait(device);
+    n = pn_tt_grid_marks_take(&group->grid_marks, mark, need);
+    for (uint32_t i = 0; n > 0 && rc == 1 && i < group->grid_count && i < PN_TT_GRID_MARK_CORES;
+         i++)
+        if (need[i])
+            rc = pn_tt_dispatch_stream_await(group->grid[i].queue->x, group->grid[i].queue->y,
+                                             need[i]);
+    if (n < 0 || rc != 1) {
+        /* Not streamed, or not expressible: wait for everything for real. */
+        group->grid_mark_full++;
+        rc = pn_tt_grid_flush(device);
+        group->grid_detached = 0u;
+        return rc;
+    }
+    group->grid_mark_waits++;
+    group->grid_ring = pn_tt_grid_marks_ring(&group->grid_marks);
+    group->grid_detached = pn_tt_grid_marks_detached(&group->grid_marks);
+    return FT_TT_OK;
 }
 
 /** One multi-row projection over the grid: every decode shard cut into `grid_pieces` column
- *  pieces, piece p of shard m on grid core m * pieces + p. */
+ *  pieces, piece p of shard m on grid core m * pieces + p; a piece wider than the B stash goes
+ *  as stash-sized column chunks on its core (pn_tt_grid_stash_chunks). */
 static int pn_tt_grid_issue_descriptors(pn_tt_device *device, const pn_tt_weight *weight,
                                         const pn_tt_activation *input,
                                         const pn_tt_activation *output)
 {
     pn_tt_matmul_group *group = &device->group;
-    const uint32_t kt = weight->tile_rows;
-    const uint32_t pieces = group->grid_pieces;
-    const bool red = pn_tt_red("grid_piece_shift");
-    uint32_t parameters[FT_TT_QUEUE_PARAM_WORDS];
-    uint32_t m, p;
+    const uint32_t kt = weight->tile_rows, pieces = group->grid_pieces;
+    const uint32_t mt = pn_tt_group_tile_rows(input, output);
+    const uint32_t stash = group->grid_stash_address != 0u ? group->grid_stash_tiles : 0u;
+    const bool chunked = pn_tt_grid_stash_chunks_enabled();
+    const bool red_chunk = pn_tt_red("grid_chunk_b_shift");
 
-    for (m = 0; m < weight->shard_count; m++) {
+    for (uint32_t m = 0; m < weight->shard_count; m++) {
         const uint32_t cols = weight->shard_tile_cols[m];
+        const bool by_rows = pn_tt_grid_shard_by_rows(group, cols, kt, mt);
         uint32_t first_local = 0u;
 
-        for (p = 0; p < pieces; p++) {
-            const uint32_t g = m * pieces + p;
-            pn_tt_matmul_member *slot = &group->grid[g];
-            const uint32_t pc = cols / pieces + (p < cols % pieces ? 1u : 0u);
-            const uint32_t replica = input->replica_count > 1u ? g % input->replica_count : 0u;
-            ft_tt_queue_descriptor descriptor;
-            uint32_t address = 0u;
-            int rc;
+        for (uint32_t p = 0; p < pieces; p++) {
+            const uint32_t pc = by_rows ? cols : pn_tt_grid_piece_columns(cols, pieces, p);
+            const uint32_t chunks = by_rows ? 1u : pn_tt_grid_stash_chunks(pc, kt, stash, chunked);
+            pn_tt_grid_piece piece = { m * pieces + p, m, first_local, pc, 0u, mt, by_rows, false,
+                                       false };
 
-            if (pc == 0u)
+            if (by_rows)
+                pn_tt_grid_msplit_rows(mt, pieces, group->row_block, p, &piece.row_first,
+                                       &piece.rows);
+            if (pc == 0u || piece.rows == 0u)
                 continue;
-            pn_tt_group_parameters(device, weight, input, output, m, true, parameters);
-            parameters[FT_TT_QUEUE_MATMUL_TILE_COLS] = pc;
-            /* RED PROOF `grid_piece_shift`: every piece reads its B one column late — must
-             * DIFFER (the last piece of a shard reads past its slice). */
-            parameters[FT_TT_QUEUE_MATMUL_B_BASE] +=
-                (first_local + (red ? 1u : 0u)) * kt * weight->tile_bytes;
-            parameters[FT_TT_QUEUE_MATMUL_C_BASE] += first_local * PN_TT_TILE_BF16;
-            parameters[FT_TT_QUEUE_MATMUL_A_X] =
-                (uint16_t)device->dram[input->replica_bank[replica]].x;
-            parameters[FT_TT_QUEUE_MATMUL_A_Y] =
-                (uint16_t)device->dram[input->replica_bank[replica]].y;
-            parameters[FT_TT_QUEUE_MATMUL_A_BASE] = input->replica_address[replica];
-            /* DIAGNOSIS `PN_TT_GRID_TRACE=1`: grid core 0's and 23's words, every projection. */
-            if ((g == 0u || g == 23u) && pn_tt_env_u32("PN_TT_GRID_TRACE", 0u) != 0u)
-                fprintf(stderr, "pn_tt: GRID TRACE g%u issued %u slot %u: Mt %u Kt %u Nt %u A "
-                                "(%u,%u)+%x B (%u,%u)+%x C (%u,%u)+%x depth %u flags %x block "
-                                "%x coop %u stash %x\n",
-                        g, slot->queue->issued,
-                        slot->queue->issued & (PN_TT_QUEUE_PARAM_SLOTS - 1u), parameters[0],
-                        parameters[1], parameters[2], parameters[3], parameters[4],
-                        parameters[5], parameters[6], parameters[7], parameters[8],
-                        parameters[9], parameters[10], parameters[11], parameters[12],
-                        parameters[13], parameters[15], parameters[14],
-                        group->grid_stash_address);
-            rc = ft_tt_queue_write_op_parameters(
-                pn_tt_issue_access(&device->runtime, group->issue_shape), slot->queue,
-                slot->queue->issued & (PN_TT_QUEUE_PARAM_SLOTS - 1u), parameters, &address);
-            if (rc != FT_TT_OK)
-                return rc;
-            memset(&descriptor, 0, sizeof(descriptor));
-            descriptor.opcode = FT_TT_QUEUE_OP_MATMUL;
-            descriptor.a0 = address;
-            if (group->grid_stash_address != 0u &&
-                (uint64_t)pc * kt <= group->grid_stash_tiles) {
-                descriptor.a1 = 0x80000000u | (group->grid_stash_address >> 4);
-                group->grid_stashed++;
-            } else {
-                group->grid_fallbacks++;
+            for (uint32_t c = 0; c < chunks; c++) {
+                uint32_t chunk_first = 0u;
+                int rc;
+
+                if (chunks > 1u) {
+                    pn_tt_grid_stash_chunk_columns(pc, chunks, c, &chunk_first, &piece.cols);
+                    piece.col_first = first_local + chunk_first;
+                    piece.shift_b = red_chunk && c > 0u;
+                }
+                rc = pn_tt_grid_issue_piece(device, weight, input, output, &piece);
+                if (rc != FT_TT_OK)
+                    return rc;
             }
-            descriptor.a2 = parameters[FT_TT_QUEUE_MATMUL_TILE_ROWS] > 1u ? weight->tile_cols
-                                                                          : 0u;
-            rc = ft_tt_queue_stage(pn_tt_issue_access(&device->runtime, group->issue_shape),
-                                   slot->queue, &descriptor, 1u);
-            if (rc == FT_TT_OK)
-                rc = ft_tt_queue_publish(&device->runtime.noc, slot->queue);
-            if (rc != FT_TT_OK)
-                return rc;
-            group->grid_pending[g] = true;
-            first_local += pc;
+            if (!by_rows)
+                first_local += pc;
         }
     }
     group->grid_projections++;
@@ -3503,19 +4260,64 @@ static int pn_tt_grid_issue(pn_tt_device *device, const pn_tt_weight *weight,
     int rc;
 
     /* The grid's rings hold 8; a chain longer than 6 is flushed first. Detached projections
-     * (PHASE W2) count against the same ring. */
-    if (group->chained + group->grid_detached >= 6u) {
-        rc = group->chained ? pn_tt_matmul_group_flush(device) : FT_TT_OK;
-        if (rc == FT_TT_OK && group->grid_detached)
-            rc = pn_tt_matmul_grid_detached_wait(device);
+     * (PHASE W2) count against the same ring, and so does every stash chunk. */
+    const uint32_t depth = pn_tt_grid_projection_depth(device, weight, input, output);
+
+    rc = pn_tt_grid_room(device, depth);
+    if (rc != FT_TT_OK)
+        return rc;
+    pn_tt_group_chain_begin(group, pn_tt_now_seconds(), true);
+    rc = pn_tt_grid_issue_descriptors(device, weight, input, output);
+    if (rc == FT_TT_OK) {
+        group->chained++;
+        group->grid_ring += depth;
+        pn_tt_grid_marks_issued(&group->grid_marks, depth, false);
+    }
+    return rc;
+}
+
+/**
+ * GRID UNSPLIT ROWS (q38-gdn-chain O.0, pn_tt_grid_msplit.h): a multi-row projection of an
+ * UNSPLIT weight cut by rows over `pieces` grid cores — piece p on grid core p, all the weight's
+ * columns over its rows. Chained like any grid projection, so the flush that waited for the one
+ * decode member now waits for these cores; or DETACHED (G.2, the overlap's wavefront under
+ * table gates). RED `grid_unsplit_rows_skip`: the last piece is never issued (its rows keep
+ * whatever they held) — must DIFFER.
+ */
+static int pn_tt_grid_issue_unsplit(pn_tt_device *device, const pn_tt_weight *weight,
+                                    const pn_tt_activation *input,
+                                    const pn_tt_activation *output, uint32_t pieces,
+                                    bool detached)
+{
+    pn_tt_matmul_group *group = &device->group;
+    const uint32_t mt = pn_tt_group_tile_rows(input, output);
+    const uint32_t issued = pieces - (pn_tt_red("grid_unsplit_rows_skip") ? 1u : 0u);
+    int rc;
+
+    rc = pn_tt_grid_room(device, 1u);
+    if (rc != FT_TT_OK)
+        return rc;
+    if (!detached)
+        pn_tt_group_chain_begin(group, pn_tt_now_seconds(), true);
+    for (uint32_t p = 0; p < issued; p++) {
+        pn_tt_grid_piece piece = { p, 0u, 0u, weight->tile_cols, 0u, 0u, true, false, true };
+
+        pn_tt_grid_msplit_rows(mt, pieces, group->row_block, p, &piece.row_first, &piece.rows);
+        if (piece.rows == 0u)
+            continue;
+        rc = pn_tt_grid_issue_piece(device, weight, input, output, &piece);
         if (rc != FT_TT_OK)
             return rc;
     }
-    pn_tt_group_chain_begin(group, pn_tt_now_seconds(), true);
-    rc = pn_tt_grid_issue_descriptors(device, weight, input, output);
-    if (rc == FT_TT_OK)
+    group->grid_projections++;
+    group->grid_unsplit_projections++;
+    if (detached)
+        group->grid_detached++;
+    else
         group->chained++;
-    return rc;
+    group->grid_ring += 1u;
+    pn_tt_grid_marks_issued(&group->grid_marks, 1u, detached);
+    return FT_TT_OK;
 }
 
 /* ---- PHASE W2: DETACHED grid projections ---------------------------------------------------
@@ -3530,21 +4332,42 @@ int pn_tt_matmul_grid_issue_detached(pn_tt_device *device, const pn_tt_weight *w
                                      const pn_tt_activation *output)
 {
     pn_tt_matmul_group *group = &device->group;
+    uint32_t depth;
     int rc;
 
     if (!device || !weight || !input || !output || !group->grid_running ||
-        weight->shard_count != group->member_count || input->replica_count < 2u)
+        input->replica_count < 2u)
         return FT_TT_EINVAL;
-    if (group->chained + group->grid_detached >= 6u) {
-        rc = group->chained ? pn_tt_matmul_group_flush(device) : FT_TT_OK;
-        if (rc == FT_TT_OK && group->grid_detached)
-            rc = pn_tt_matmul_grid_detached_wait(device);
-        if (rc != FT_TT_OK)
-            return rc;
+    /* G.2: an UNSPLIT weight (ssm_alpha / ssm_beta) detached, cut by rows, where allowed. */
+    if (weight->shard_count != group->member_count) {
+        const uint32_t mt = pn_tt_group_tile_rows(input, output);
+        const uint32_t pieces =
+            group->grid_unsplit_ok && mt > 1u
+                ? pn_tt_grid_unsplit_pieces(weight->tile_cols, weight->tile_rows,
+                                            group->grid_stash_address != 0u
+                                                ? group->grid_stash_tiles : 0u,
+                                            mt, group->row_block, group->grid_count,
+                                            pn_tt_grid_unsplit_max_columns())
+                : 0u;
+
+        if (pieces == 0u)
+            return FT_TT_EINVAL;
+        rc = pn_tt_grid_issue_unsplit(device, weight, input, output, pieces, true);
+        if (rc == FT_TT_OK)
+            pn_tt_grid_mark_push(group);
+        return rc;
     }
+    depth = pn_tt_grid_projection_depth(device, weight, input, output);
+    rc = pn_tt_grid_room(device, depth);
+    if (rc != FT_TT_OK)
+        return rc;
     rc = pn_tt_grid_issue_descriptors(device, weight, input, output);
-    if (rc == FT_TT_OK)
+    if (rc == FT_TT_OK) {
         group->grid_detached++;
+        group->grid_ring += depth;
+        pn_tt_grid_marks_issued(&group->grid_marks, depth, true);
+        pn_tt_grid_mark_push(group);
+    }
     return rc;
 }
 
@@ -3567,6 +4390,12 @@ bool pn_tt_matmul_group_member0_completion(const pn_tt_device *device, uint16_t 
 bool pn_tt_matmul_grid_is_running(const pn_tt_device *device)
 {
     return device && device->group.grid_running;
+}
+
+void pn_tt_matmul_grid_unsplit_allow(pn_tt_device *device, bool allow)
+{
+    if (device)
+        device->group.grid_unsplit_ok = allow;
 }
 
 int pn_tt_matmul_grid_detached_poll(pn_tt_device *device)
@@ -3601,6 +4430,36 @@ int pn_tt_matmul_grid_detached_wait(pn_tt_device *device)
     return rc;
 }
 
+/* PREFILL GRID PROBE (`PN_TT_GRID_PROBE=1`, pn_tt_grid_probe.h): a multi-row projection
+ * timed alone — flushed before, issued, flushed — and booked by shape. */
+static int pn_tt_matmul_group_enqueue_probed(pn_tt_device *device, const pn_tt_weight *weight,
+                                             const pn_tt_activation *input,
+                                             const pn_tt_activation *output)
+{
+    static bool inside;
+    const uint64_t grid_before = device->group.grid_projections;
+    double t0, t1;
+    int rc;
+
+    if (inside || pn_tt_matmul_group_flush(device) != FT_TT_OK)
+        return -2;
+    inside = true;
+    t0 = pn_tt_now_seconds();
+    rc = pn_tt_matmul_group_enqueue(device, weight, input, output);
+    t1 = pn_tt_now_seconds();
+    if (rc == FT_TT_OK)
+        rc = pn_tt_matmul_group_flush(device);
+    inside = false;
+    if (rc == FT_TT_OK)
+        pn_tt_grid_probe_book(pn_tt_group_tile_rows(input, output), weight->tile_rows,
+                              weight->tile_cols,
+                              device->group.grid_projections != grid_before
+                                  ? device->group.grid_count
+                                  : (weight->shard_count > 1u ? weight->shard_count : 1u),
+                              t1 - t0, pn_tt_now_seconds() - t1);
+    return rc;
+}
+
 int pn_tt_matmul_group_enqueue(pn_tt_device *device, const pn_tt_weight *weight,
                                const pn_tt_activation *input, const pn_tt_activation *output)
 {
@@ -3611,11 +4470,27 @@ int pn_tt_matmul_group_enqueue(pn_tt_device *device, const pn_tt_weight *weight,
     bool split = weight->shard_count > 1u;
     uint32_t members = split ? weight->shard_count : 1u;
     uint32_t member;
+    pn_tt_activation probe_input;
+    bool probe_spread = false;
 
     if (!device->resident_running)
         return FT_TT_ERROR;
+    if (pn_tt_grid_probe_enabled() && pn_tt_group_tile_rows(input, output) > 1u) {
+        const int probed = pn_tt_matmul_group_enqueue_probed(device, weight, input, output);
+
+        if (probed != -2)
+            return probed;
+    }
+    if (!split && (pn_tt_fuse_probe_bits() & PN_TT_FUSE_PROBE_SOLO))
+        return FT_TT_OK;
     if (group->member_count < members)
         return FT_TT_EINVAL;
+    /* PRICE PROBE (timing only): an unmirrored input read as if mirrored. */
+    if (split && pn_tt_unmirrored_probe_view(input, pn_tt_group_tile_rows(input, output),
+                                             device->dram_bank_count, &probe_input)) {
+        input = &probe_input;
+        probe_spread = true;
+    }
     /* PER MEMBER, because a ragged split gives them different widths and the shape the
      * reader refuses is a MEMBER's Nt, not the weight's. */
     for (member = 0; member < members; member++) {
@@ -3629,8 +4504,32 @@ int pn_tt_matmul_group_enqueue(pn_tt_device *device, const pn_tt_weight *weight,
      * slower than the decode group (`PN_TT_PREFILL_GRID_ANY=1` overrides). */
     if (group->grid_running && split && weight->shard_count == group->member_count &&
         pn_tt_group_tile_rows(input, output) > 1u &&
+        !(probe_spread && pn_tt_unmirrored_probe_mode() == 2u) &&
         (input->replica_count > 1u || pn_tt_env_u32("PN_TT_PREFILL_GRID_ANY", 0u) != 0u))
         return pn_tt_grid_issue(device, weight, input, output);
+    /* O.0: a multi-row projection of an UNSPLIT weight (ssm_alpha / ssm_beta) goes to the grid
+     * cut by rows, instead of one decode member sweeping every row — where the caller allowed
+     * it (nothing gates on member 0's count). Mirrored inputs only, as above. */
+    if (group->grid_running && group->grid_unsplit_ok && !split &&
+        pn_tt_group_tile_rows(input, output) > 1u &&
+        (input->replica_count > 1u || pn_tt_env_u32("PN_TT_PREFILL_GRID_ANY", 0u) != 0u)) {
+        const uint32_t pieces = pn_tt_grid_unsplit_pieces(
+            weight->tile_cols, weight->tile_rows,
+            group->grid_stash_address != 0u ? group->grid_stash_tiles : 0u,
+            pn_tt_group_tile_rows(input, output), group->row_block, group->grid_count,
+            pn_tt_grid_unsplit_max_columns());
+
+        if (pieces != 0u)
+            return pn_tt_grid_issue_unsplit(device, weight, input, output, pieces, false);
+    }
+    /* L1a.3: members 1.. are grid cores for this prompt — a split projection the grid did
+     * not take has no decode members to run on. Refused by name, never issued. */
+    if ((group->grid_lent || group->members_lent) && split) {
+        fprintf(stderr, "pn_tt: a split projection Kt=%u Nt=%u reached the decode group while "
+                        "its members serve the prefill grid — refused\n",
+                weight->tile_rows, weight->tile_cols);
+        return FT_TT_EINVAL;
+    }
     /* THE RING IS THE BOUND, not the caller's judgement: ft_tt_queue_stage() does not check
      * occupancy, so a chain longer than the ring would write over descriptors the card has
      * not read. Flushing here keeps every caller correct without every caller counting. */
@@ -3748,6 +4647,104 @@ int pn_tt_matmul_group_enqueue(pn_tt_device *device, const pn_tt_weight *weight,
         }
     }
     return pn_tt_group_issue(device, weight, input, output, split, members);
+}
+
+/** S3b: can THIS group run `gate` + `up` fused into `output` right now? (header contract). */
+static bool pn_tt_group_swiglu_fits(const pn_tt_device *device, const pn_tt_weight *gate,
+                                    const pn_tt_weight *up, const pn_tt_activation *input,
+                                    const pn_tt_activation *output)
+{
+    const pn_tt_matmul_group *group = &device->group;
+    uint32_t member;
+
+    if (!pn_tt_fuse_swiglu_mode() || !device->resident_running || !input || !output ||
+        !pn_tt_swiglu_shards_pair(gate, up) || group->member_count < gate->shard_count ||
+        pn_tt_group_tile_rows(input, output) != 1u || pn_tt_matmul_pipe() == 0 ||
+        group->cooperative || group->g0_a1 != 0u || group->row_block > 1u ||
+        group->swiglu_up != NULL || pn_tt_env_u32("PN_TT_MATMUL_PROBE", 0u) != 0u ||
+        !pn_tt_replica_map_fused_covers(device, output))
+        return false;
+    for (member = 0u; member < gate->shard_count; member++)
+        if (!pn_tt_group_descriptor_is_executable(device, gate, gate->shard_tile_cols[member]))
+            return false;
+    return true;
+}
+
+int pn_tt_matmul_group_enqueue_swiglu(pn_tt_device *device, const pn_tt_weight *gate,
+                                      const pn_tt_weight *up, const pn_tt_activation *input,
+                                      const pn_tt_activation *output)
+{
+    pn_tt_matmul_group *group = &device->group;
+    int rc;
+
+    if (!device || !pn_tt_group_swiglu_fits(device, gate, up, input, output))
+        return FT_TT_EINVAL;
+    /* THE RING IS THE BOUND, as in pn_tt_matmul_group_enqueue(). */
+    if (group->chained >= pn_tt_matvec_chain_limit()) {
+        rc = pn_tt_matmul_group_flush(device);
+        if (rc != FT_TT_OK)
+            return rc;
+    }
+    group->swiglu_up = up;
+    group->swiglu_bits = pn_tt_swiglu_block_bits(pn_tt_eltwise_silu_row0(device),
+                                                 pn_tt_red("fuse_swiglu_no_stage"));
+    rc = pn_tt_group_issue(device, gate, input, output, true, gate->shard_count);
+    group->swiglu_up = NULL;
+    group->swiglu_bits = 0u;
+    if (rc == FT_TT_OK)
+        group->swiglu_issues++;
+    return rc;
+}
+
+/** S3a: can THIS group run `weight` with the residual add fused right now? (header contract). */
+static bool pn_tt_group_resadd_fits(const pn_tt_device *device, const pn_tt_weight *weight,
+                                    const pn_tt_activation *input,
+                                    const pn_tt_activation *residual,
+                                    const pn_tt_activation *output)
+{
+    const pn_tt_matmul_group *group = &device->group;
+    uint32_t member;
+
+    if (!pn_tt_fuse_resadd_mode() || !device->resident_running || !weight || !input ||
+        !residual || !output || weight->shard_count < 2u ||
+        group->member_count < weight->shard_count ||
+        !pn_tt_resadd_strips_pair(residual, output, weight->tile_cols) ||
+        pn_tt_group_tile_rows(input, output) != 1u || pn_tt_matmul_pipe() == 0 ||
+        group->cooperative || group->g0_a1 != 0u || group->row_block > 1u ||
+        group->swiglu_up != NULL || group->resadd_residual != NULL ||
+        pn_tt_env_u32("PN_TT_MATMUL_PROBE", 0u) != 0u)
+        return false;
+    for (member = 0u; member < weight->shard_count; member++)
+        if (!pn_tt_group_descriptor_is_executable(device, weight, weight->shard_tile_cols[member]))
+            return false;
+    return true;
+}
+
+int pn_tt_matmul_group_enqueue_resadd(pn_tt_device *device, const pn_tt_weight *weight,
+                                      const pn_tt_activation *input,
+                                      const pn_tt_activation *residual,
+                                      const pn_tt_activation *output)
+{
+    pn_tt_matmul_group *group;
+    int rc;
+
+    if (!device || !pn_tt_group_resadd_fits(device, weight, input, residual, output))
+        return FT_TT_EINVAL;
+    group = &device->group;
+    /* THE RING IS THE BOUND, as in pn_tt_matmul_group_enqueue(). */
+    if (group->chained >= pn_tt_matvec_chain_limit()) {
+        rc = pn_tt_matmul_group_flush(device);
+        if (rc != FT_TT_OK)
+            return rc;
+    }
+    group->resadd_residual = residual;
+    group->resadd_bits = pn_tt_resadd_block_bits(pn_tt_red("fuse_resadd_skip"));
+    rc = pn_tt_group_issue(device, weight, input, output, true, weight->shard_count);
+    group->resadd_residual = NULL;
+    group->resadd_bits = 0u;
+    if (rc == FT_TT_OK)
+        group->resadd_issues++;
+    return rc;
 }
 
 int pn_tt_matmul_group_g0(pn_tt_device *device, const pn_tt_weight *weight)
@@ -4045,6 +5042,19 @@ void pn_tt_matmul_group_time_report(const pn_tt_device *device)
             (unsigned long long)group->poll_reads, (unsigned long long)group->group_reads,
             (double)group->group_reads / (double)ops);
     pn_tt_matmul_group_link_report(device);
+    if (group->pull_table_ok)
+        fprintf(stderr, "llama_tt: matmul PULL — %llu pulled flushes, %llu member-0 "
+                        "descriptors published without their pull (deferred to the chain's "
+                        "end; host-issued only), %s sweep\n",
+                (unsigned long long)group->pulled_flushes,
+                (unsigned long long)group->pulls_deferred,
+                group->pull_serial ? "one-at-a-time" : "parallel");
+    if (group->swiglu_issues)
+        fprintf(stderr, "llama_tt: matmul SWIGLU — %llu fused gate/up/silu_mul projections "
+                        "issued\n", (unsigned long long)group->swiglu_issues);
+    if (group->resadd_issues)
+        fprintf(stderr, "llama_tt: matmul RESADD — %llu projections issued with the residual "
+                        "add fused\n", (unsigned long long)group->resadd_issues);
     if (group->member_count == 1u)
         return;
     fprintf(stderr, "llama_tt: per-member wait —");
@@ -4204,6 +5214,30 @@ void pn_tt_matmul_group_read_report(const pn_tt_device *device, double tokens)
                     (double)group->flush_census[row].projections / (n > 0.0 ? n : 1.0),
                     y * 1e6, group->flush_census[row].wait / (n > 0.0 ? n : 1.0) * 1e6,
                     y > 0.0 ? x / y / 1e9 : 0.0);
+            if (group->class_clock == 1 && n > 0.0) {
+                const double busiest = (double)group->flush_census[row].card_busy_max * 16.0 /
+                                       1.35e9 / n;
+                const double mean = (double)group->flush_census[row].card_busy_sum * 16.0 /
+                                    1.35e9 / n / (double)group->member_count;
+
+                fprintf(stderr,
+                        "llama_tt:   CLASS CLOCK — card busy per flush: busiest member %.1f "
+                        "us, mean %.1f us; %.1f GB/s over the busiest\n",
+                        busiest * 1e6, mean * 1e6, busiest > 0.0 ? x / busiest / 1e9 : 0.0);
+                {
+                    uint32_t m;
+
+                    fprintf(stderr, "llama_tt:   CLASS CLOCK — m0 pull wait %.1f us; per member "
+                                    "us/flush:",
+                            (double)group->flush_census[row].card_pull_wait * 16.0 / 1.35e9 /
+                                n * 1e6);
+                    for (m = 0; m < group->member_count; m++)
+                        fprintf(stderr, " %.0f",
+                                (double)group->flush_census[row].card_busy_member[m] * 16.0 /
+                                    1.35e9 / n * 1e6);
+                    fprintf(stderr, "\n");
+                }
+            }
             {
                 const pn_tt_matmul_group *gg = group;
                 const double nn = n > 0.0 ? n : 1.0;
@@ -4240,6 +5274,27 @@ void pn_tt_matmul_group_read_report(const pn_tt_device *device, double tokens)
                     (unsigned long long)group->flush_census_dropped);
         }
     }
+}
+
+
+uint32_t pn_tt_matmul_group_incomplete(pn_tt_device *device)
+{
+    pn_tt_matmul_group *group = device ? &device->group : NULL;
+    uint32_t incomplete = 0u;
+
+    if (!group)
+        return 0u;
+    for (uint32_t member = 0; member < group->member_count; member++) {
+        pn_tt_matmul_member *slot = &group->member[member];
+        uint32_t completed = 0u;
+
+        if (!slot->queue || !slot->booted)
+            continue;
+        (void)ft_tt_queue_read_field(&device->runtime.noc, slot->queue,
+                                     FT_TT_QUEUE_FIELD_COMPLETED_COUNT, &completed);
+        incomplete += completed != slot->queue->issued;
+    }
+    return incomplete;
 }
 
 #endif /* USE_TT */

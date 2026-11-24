@@ -131,6 +131,20 @@ tm_tensor *pn_qwen35moe_forward_batch_cuda(pn_model *model,
                                            float *per_pos_logits);
 
 /**
+ * Can a dense-FFN qwen35 model (Ornith, Bonsai) on the GPU take the batched
+ * prefill? 1 when every weight's quant has a batched matvec (K-quants, Q8_0,
+ * F32); 0 otherwise (e.g. Bonsai's native ternary Q2_0) or for any other model.
+ * The serve keeps the per-token loop for a 0.
+ *
+ * @param model  Loaded model (NULL -> 0)
+ * @return       1 = take pn_qwen35moe_forward_batch_cuda, 0 = per-token prefill
+ *
+ * Thread-safe: yes (reads the loaded weights only)
+ * Reentrant: yes
+ */
+int pn_qwen35moe_dense_batch_prefill_ok(const pn_model *model);
+
+/**
  * Phase 9b — prefill chunk pipelining (QWEN35_PREFILL_PIPELINE=1, default OFF).
  *
  * Under a 2-die layer split the dies run strictly sequentially per chunk: the
@@ -199,6 +213,66 @@ void pn_qwen35moe_prefill_drain_cuda(pn_model *model);
  * Reentrant: no
  * Signal-safe: no
  */
+/**
+ * @brief QWEN35_BS_PD_OVERLAP (default on; =0 off): the MoE TP decode-slots step runs
+ *        on its own buffer lane so it can interleave with a prefill chunk's
+ *        layers. CUDA builds only.
+ * @return 1 when the switch is on, else 0. Read once.
+ */
+int pn_qwen35moe_pd_overlap_enabled(void);
+
+/**
+ * @brief Prefill cursor for the stage-alternating overlap (QWEN35_BS_PD_OVERLAP,
+ *        MoE TP2 on 4 dies only). Walks tokens[0, n_total) at state->pos through
+ *        the 2-stage wide pipeline a few layers at a time, so a decode step can
+ *        run between its pieces (pn_qwen35moe_pd_cycle_cuda). Bit-exact with
+ *        pn_qwen35moe_prefill_range_pipelined_cuda.
+ *
+ * Lifetime: begin → any mix of cycle / advance / quiesce → finish or abort
+ * (each frees the cursor). `tokens` must stay valid until then. Every call is
+ * made by the GPU turn owner.
+ *
+ * begin: NULL = refused (switch off, not MoE TP2, profiler or eager host KV
+ *        mirror on); nothing was touched, the caller prefills another way.
+ * cycle: one decode step over n_users slots exactly as
+ *        pn_qwen35moe_decode_slots_rows (same arguments and results), with
+ *        prefill pieces issued in each board's idle half, at most `pieces`
+ *        layers per board. Returns 0 / -1.
+ * advance: no decoders: run the pipeline alone until max_chunks more chunks
+ *        retired (or all). Returns 0 / -1.
+ * issued_all: every chunk's every layer was issued.
+ * injected_all: the last chunk entered the pipeline. From then on no piece is
+ *        left that would re-seed the live buffers, so a quiesce must not hand
+ *        the turn over: finish has to follow under the same turn.
+ * remaining: tokens of the range not yet retired.
+ * quiesce: retire what is in flight, drain, and set state->pos to the retired
+ *        position, so the GPU turn can be handed over. Returns 0 / -1.
+ * finish: retire the rest, drain, run the head on the last row, set state->pos
+ *        to the end of the range. *logits_out = an OWNED [n_vocab] tensor.
+ *        Returns 0 / -1 (state undefined: the caller resets).
+ * abort: retire only what entered the pipeline, drain, set state->pos there.
+ *        Returns 0 / -1.
+ */
+typedef struct pn_qwen35moe_pd_cursor pn_qwen35moe_pd_cursor;
+pn_qwen35moe_pd_cursor *pn_qwen35moe_pd_begin_cuda(pn_model *model, pn_state *state,
+                                                   const uint32_t *tokens, int n_total,
+                                                   int chunk);
+int pn_qwen35moe_pd_cycle_cuda(pn_model *model, pn_qwen35moe_pd_cursor *cur,
+                               const uint32_t *tokens, pn_state **states, const int *rows,
+                               int n_users, float **logits_out, int pieces);
+int pn_qwen35moe_pd_advance_cuda(pn_qwen35moe_pd_cursor *cur, int max_chunks);
+int pn_qwen35moe_pd_issued_all(const pn_qwen35moe_pd_cursor *cur);
+int pn_qwen35moe_pd_injected_all(const pn_qwen35moe_pd_cursor *cur);
+int pn_qwen35moe_pd_remaining(const pn_qwen35moe_pd_cursor *cur);
+/* The last overlap cycle's host wall time per phase (QWEN35_BS_STATS): stage-0
+ * decode issue, die-0 drain at the hop, hand-off + hop copies, stage-1 decode
+ * issue, stage-0 pieces, head (waits for die 3), stage-1 pieces. */
+#define PN_QWEN35MOE_PD_PHASES 7
+void pn_qwen35moe_pd_phase_ms(const pn_qwen35moe_pd_cursor *cur,
+                              double ms[PN_QWEN35MOE_PD_PHASES]);
+int pn_qwen35moe_pd_quiesce_cuda(pn_qwen35moe_pd_cursor *cur);
+int pn_qwen35moe_pd_finish_cuda(pn_qwen35moe_pd_cursor *cur, tm_tensor **logits_out);
+int pn_qwen35moe_pd_abort_cuda(pn_qwen35moe_pd_cursor *cur);
 int pn_qwen35moe_prefill_pipeline_wide_enabled(void);
 int pn_qwen35moe_prefill_range_pipelined_cuda(pn_model *model,
                                               const uint32_t *tokens,
@@ -227,6 +301,72 @@ int pn_qwen35moe_prefill_range_pipelined_cuda(pn_model *model,
 int pn_qwen35moe_spec_verify(pn_model *model, const uint32_t *tokens, int n,
                              pn_state *state, int32_t *argmax_out);
 int pn_qwen35moe_spec_accept(pn_model *model, pn_state *state, int n_accept);
+/** Test hook: row `row` of the last verify's full logits (n_vocab floats). */
+int pn_qwen35moe_spec_row_logits(pn_model *model, int row, float *out);
+/** pn_qwen35moe_spec_verify, but every row's top-k (id, value) pairs land in ids/vals
+ *  ([n][k], descending, ties by ascending id) — the same pairs the plain decode step
+ *  presents for that row — so the caller can SAMPLE each row exactly as plain decode
+ *  would. n <= 5 (the rows kernel). Commit with pn_qwen35moe_spec_accept. */
+int pn_qwen35moe_spec_verify_topk(pn_model *model, const uint32_t *tokens, int n,
+                                  pn_state *state, int k, int *ids, float *vals);
+
+/* ---- MTP draft head on the CUDA path (QWEN35_MTP=1; Phase 2F) ----
+ * The head keeps its own KV over every committed position. After each trunk batch that
+ * advanced `state` (a prefill chunk of <= 128 tokens, or a verify's accept), call
+ * pn_qwen35moe_mtp_push_rows with that batch's input tokens and the count it advanced;
+ * pn_qwen35moe_mtp_draft then drafts the tokens after the uncommitted `seed` (at
+ * state->pos). Drafts never change the emitted stream; the verify decides it. */
+
+/** Test hook: pn_qwen35moe_gpu_forget_state's binding drop on a fake TP layout (both rank
+ *  halves bound). @return the bindings left: 0 = correct, -1 = no memory. */
+int pn_qwen35moe_tp_forget_selftest(void);
+
+/** Test hook (CUDA, one die): a fake TP attention layer restored from host (new content_gen,
+ *  fresh mirror) then resumed at a pos0 > 0, run in the TP walk's order (both-rank pre-sync,
+ *  then each rank's sync + stale mark). @return refused syncs + ring rows that differ from
+ *  the host mirror: 0 = correct, -1 = no memory, -2 = no CUDA device (skip). */
+int pn_qwen35moe_tp_restore_sync_selftest(void);
+
+/** Whether the model carries an uploaded MTP head. */
+int pn_qwen35moe_mtp_ready(pn_model *model);
+/** Join the last trunk batch's first n rows (positions state->pos - n ..) to the head's
+ *  backlog; tokens[0..n) are those rows' input tokens. 0, or -1 (head off / no rows). */
+int pn_qwen35moe_mtp_push_rows(pn_model *model, pn_state *state, const uint32_t *tokens,
+                               int n);
+/** The trunk state was set back (a checkpoint restore): drop the head's backlog and
+ *  continue it from state->pos. 0, or -1 (head off). */
+int pn_qwen35moe_mtp_rewind(pn_model *model, pn_state *state);
+/** Draft continuation: called after draft `drafted` (1-based count so far) with its
+ *  confidence; return non-zero to draft one more. */
+typedef int (*pn_mtp_more_fn)(void *ctx, int drafted, float conf);
+/** Up to kmax drafts after `seed`; confs[i] = draft i's softmax over the head's top 8.
+ *  @return the count (>= 1), or -1 (no head / backlog not at state->pos) */
+int pn_qwen35moe_mtp_draft(pn_model *model, pn_state *state, uint32_t seed, int kmax,
+                           uint32_t *drafts, float *confs, pn_mtp_more_fn more,
+                           void *more_ctx);
+/** Pairs a pick callback sees per draft. */
+#define PN_MTP_PICK_PAIRS 20
+/** Draft choice: draft `draft_index` (0-based) from the head's top `n` pairs (full-vocabulary
+ *  ids, values descending, ties by ascending id). Return the token the head chains on. */
+typedef uint32_t (*pn_mtp_pick_fn)(void *ctx, int draft_index, const int *ids,
+                                   const float *vals, int n);
+/** pn_qwen35moe_mtp_draft, each draft chosen by `pick` (NULL = the argmax) from the head's
+ *  top PN_MTP_PICK_PAIRS pairs. confs[] stay the argmax's confidence. */
+int pn_qwen35moe_mtp_draft_pick(pn_model *model, pn_state *state, uint32_t seed, int kmax,
+                                uint32_t *drafts, float *confs, pn_mtp_more_fn more,
+                                void *more_ctx, pn_mtp_pick_fn pick, void *pick_ctx);
+typedef struct {
+    long drafts;      /* drafts produced */
+    long kv_rows;     /* head rows appended (catch-up + chained) */
+    long full_rows;   /* rows run through the whole head block */
+    double draft_ms;  /* wall time inside pn_qwen35moe_mtp_draft */
+    double prof_ms[4];/* QWEN35_MTP_PROF=1: kv rows / attention / MoE / head pick (sync'd) */
+} pn_mtp_stats;
+int pn_qwen35moe_mtp_stats(pn_model *model, pn_mtp_stats *out);
+/** Verify CUDA graphs (QWEN35_VERIFY_GRAPH): captures, replays and failed captures so far,
+ *  summed over dies and row counts. */
+int pn_qwen35moe_verify_graph_stats(pn_model *model, long *captures, long *replays,
+                                    long *failures);
 
 /**
  * MULTI-USER DECODE, increment 2 of the batched-forward work: K users each
@@ -256,22 +396,88 @@ int pn_qwen35moe_spec_accept(pn_model *model, pn_state *state, int n_accept);
  */
 int pn_qwen35moe_decode_slot_bind(pn_model *model, pn_state *state, int slot,
                                   int n_slots);
-/**
- * Move a DECODE slot's live SSM state from GPU index `src` to `dst` via D2D
- * copy (conv_slots[src] → conv_slots[dst], ssm_slots likewise), then update
- * the GPU's slot_state[dst] bookkeeping.  Used by the dynamic-width batch
- * scheduler (Phase D2) to compact the active user set to [0, n_active) when a
- * user joins or leaves, without going through the stale host mirror.
- *
- * Must be called under the scheduler's gpu_mu.  Returns 0 on success, -1 if
- * src/dst are out of range or the slot buffers are not allocated.  If src ==
- * dst, a no-op (returns 0).
- */
-int pn_qwen35moe_decode_slot_move(pn_model *model, int src, int dst,
-                                  int n_slots);
 int pn_qwen35moe_decode_slots(pn_model *model, const uint32_t *tokens,
                               pn_state **states, int n_users,
                               float **logits_out);
+
+/**
+ * BENCH ONLY: advance bound, already-stepped decode row `row` of `state` by `add`
+ * positions without computing them (the skipped KV rows are garbage; timing only).
+ * Lets a decode-attention benchmark reach 64k-128k context without prefilling it.
+ * Returns 0, or -1 if the row is not current for `state` or the ring would wrap.
+ * Thread-safe: no (call between decode steps). Reentrant: no. Signal-safe: no.
+ */
+int pn_qwen35moe_bench_skip_positions(pn_model *model, pn_state *state, int row,
+                                      int add);
+
+/**
+ * pn_qwen35moe_decode_slots with an explicit ROW MAP: user u decodes in the
+ * persistent slot row rows[u] it was bound to (rows NULL = u). The rows need
+ * not be contiguous or ordered, so a scheduler can give every session a fixed
+ * block for its lifetime and step any subset of them with nothing moved.
+ * Bit-exact per user vs the identity map. Returns 0 / -1 like decode_slots.
+ */
+int pn_qwen35moe_decode_slots_rows(pn_model *model, const uint32_t *tokens,
+                                   pn_state **states, const int *rows,
+                                   int n_users, float **logits_out);
+
+/**
+ * Carve `n_rows` per-session decode blocks on the model's dies: for each row a
+ * ctx_cap KV ring row per attention layer (+ q4 sink/window shadows) and a
+ * conv + recurrent SSM image per SSM layer. Call once at load, before any
+ * bind; `geom` (any state of this model) supplies the KV geometry. Returns 0,
+ * or -1 (logged) when the blocks do not fit — refuse the load then.
+ */
+int pn_qwen35moe_decode_slots_carve(pn_model *model, pn_state *geom, int n_rows);
+
+/**
+ * 1 when decode row `row` still holds `state` exactly as committed (its SSM
+ * image at state->pos and all KV rows [0, pos) on every attention layer), so a
+ * resumed turn can continue from the card with no host copy; 0 otherwise.
+ * Bookkeeping only; call owning the GPU turn.
+ */
+int pn_qwen35moe_slot_holds_state(pn_model *model, int row, pn_state *state);
+
+/**
+ * Carve one turn-start checkpoint per decode row (the serve's rung 1c): per
+ * SSM layer a conv + recurrent image, per q4 attention layer the fp16
+ * sink/window shadows. Call once at load, after
+ * pn_qwen35moe_decode_slots_carve. Returns 0, or -1 (logged, nothing kept)
+ * when they do not fit; the serve then runs without checkpoints.
+ */
+int pn_qwen35moe_slot_checkpoints_carve(pn_model *model, pn_state *geom,
+                                        int n_rows);
+
+/**
+ * Save `state`'s live image as row `row`'s checkpoint at state->pos. Call
+ * owning the GPU turn right after a prefill of this state (its live shared
+ * buffers hold it at state->pos on every layer). Returns 0, or -1 when the
+ * live buffers do not hold it (nothing changed) or no checkpoints are carved.
+ */
+int pn_qwen35moe_slot_checkpoint_save(pn_model *model, pn_state *state, int row);
+
+/**
+ * Put decode row `row` back at its checkpoint: the checkpoint must be
+ * `state`'s at position `pos`, taken since the state's last reset or restore,
+ * and the row must still hold the state's KV rows [0, pos). Copies the saved
+ * images into the row, sets the row's bookkeeping and state->pos to `pos`.
+ * The caller then forgets the state's shared bindings so the next forward
+ * re-seeds from the row. Returns 0, or -1 with nothing changed.
+ */
+int pn_qwen35moe_slot_checkpoint_restore(pn_model *model, pn_state *state,
+                                         int row, int pos);
+
+/**
+ * The two calls above with the checkpoint index `ck` decoupled from the decode
+ * row: save into checkpoint `ck` (any index below the carved row count), and
+ * restore checkpoint `ck` into decode row `row`. Same contracts. The serve
+ * carves 2 x slots and gives slot i the turn checkpoint i and the divergence
+ * checkpoint slots + i.
+ */
+int pn_qwen35moe_slot_checkpoint_save_at(pn_model *model, pn_state *state,
+                                         int ck);
+int pn_qwen35moe_slot_checkpoint_restore_from(pn_model *model, pn_state *state,
+                                              int row, int ck, int pos);
 
 /**
  * The memory-pressure decode-concurrency ceiling (rung 2 of the reactive
@@ -348,6 +554,15 @@ int pn_qwen35moe_decode_slot_ssm_to_host(pn_model *model, int gpu_idx,
  * pn_state_reset.  No-op on the CPU path (host state already authoritative).
  */
 void pn_qwen35moe_gpu_forget_state(pn_model *model, pn_state *state);
+
+/**
+ * The SSM half of pn_qwen35moe_gpu_forget_state: drop only the shared-buffer SSM binding
+ * for `state`, so the next single-user forward re-seeds its recurrent image (from the
+ * state's decode row when that row is current, D2D) while the shared KV ring keeps its
+ * watermark and tops up only the rows it lacks. For a state that decoded in its slot since
+ * its last single-user forward (solo-slot MTP). Host bookkeeping only. CUDA builds.
+ */
+void pn_qwen35moe_gpu_forget_ssm(pn_model *model, pn_state *state);
 
 /**
  * ASYNC single-token decode step (C2, QWEN35_ASYNC_SCHED): begin launches
@@ -499,6 +714,10 @@ void pn_qwen35moe_state_set_full_logits(pn_state *state, int on);
 /** True when `model`'s pn_state is a pn_qwen35moe_state (MoE + dense Bonsai). */
 int pn_qwen35moe_owns_state(const pn_model *model);
 
+/** True when `model` is a qwen35 model with a dense SwiGLU FFN (Qwen3.8, Ornith, Bonsai)
+ *  rather than MoE experts. */
+int pn_qwen35moe_dense_ffn(const pn_model *model);
+
 
 /* Explicit die placement (pn_load_on, Phase 7). Stored on the model BEFORE the
  * GPU upload so its die selection prefers the placement over the
@@ -506,6 +725,19 @@ int pn_qwen35moe_owns_state(const pn_model *model);
  * declared here so the engine loader can call it. n == 0 clears. */
 void pn_qwen35moe_model_set_dies(pn_qwen35moe_model *m, const int *dies, int n);
 int  pn_qwen35moe_model_dies(const pn_qwen35moe_model *m, const int **dies_out);
+
+/* KV cache format of this load (pn_kv_format, engine.h), set by the engine loader
+ * before any state exists. kv_q4: the format every new KV cache starts in — the
+ * explicit choice, else QWEN35_KV_Q4 (default ON). Thread-safe: set before publish. */
+void pn_qwen35moe_model_set_kv_format(pn_qwen35moe_model *m, int kv_format);
+int  pn_qwen35moe_model_kv_format(const pn_qwen35moe_model *m);
+int  pn_qwen35moe_model_kv_q4(const pn_qwen35moe_model *m);
+
+/* Decode blocks the serve will carve on the card for this load (pn_load_opts.
+ * card_sessions), set by the engine loader before the upload so the die gate
+ * prices them. 0 = none. Thread-safe: set before publish. */
+void pn_qwen35moe_model_set_card_sessions(pn_qwen35moe_model *m, int n);
+int  pn_qwen35moe_model_card_sessions(const pn_qwen35moe_model *m);
 
 /* Dual-state lifecycle: per-SSM-layer conv/ssm state + per-attention-layer KV
  * cache + per-token scratch arena (implemented in qwen35moe_forward.c). */
@@ -537,6 +769,18 @@ void  pn_qwen35moe_state_reset(void *state);
  * Thread-safe: no
  */
 void *pn_qwen35moe_state_snapshot(const void *state, int pos);
+
+/**
+ * A RECURRENT snapshot at `pos`: every SSM layer's conv/recurrent state and the
+ * q4 fp16 sink/window shadows, but NO KV rows. A restore puts the state back at
+ * `pos` over the KV rows [0, pos) the host mirror still holds, so it is valid
+ * only while no row below `pos` was rewritten (the single-user turn snapshot:
+ * a drop_last request resumes at the last turn's start). Not serializable.
+ * Same host-mirror protocol as pn_qwen35moe_state_snapshot.
+ *
+ * Thread-safe: no
+ */
+void *pn_qwen35moe_state_snapshot_recurrent(const void *state, int pos);
 
 /**
  * Restore a snapshot into `state`'s host buffers (dims must match exactly —
@@ -644,6 +888,11 @@ int pn_qwen35moe_tt_dense_row(void *model_ctx, float *out, int n_vocab);
  *  dense row 0 marked in `need` (`model_ctx` is the pn_model). */
 int pn_qwen35moe_tt_dense_chunks(void *model_ctx, const unsigned char *need, float *out,
                                  int n_vocab);
+/** pn_sampling_params.tail_counts for this forward: the card counts logits row `row` of the
+ *  last head (0 = decode, k = verify row k) into the key bins (pn_tt_topk_tail.h).
+ *  `PN_TT_TAIL_CROSSCHECK=1`: row 0's counts are checked against the dense row on the host. */
+int pn_qwen35moe_tt_tail_counts(void *model_ctx, int row, const uint32_t *keys, int bins,
+                                uint32_t *counts);
 /** True when the verify can hand a chooser each row's sparse logits AND plain decode's rows
  *  are the same sparse presentation (`PN_TT_SPARSE_LOGITS`): speculative sampling is then
  *  identical to plain sampling. */
@@ -661,6 +910,18 @@ void pn_qwen35moe_tt_red_accept_next_cycle(void);
  *  (`PN_TT_MTP`), after its owed catch-up. @return the count, or -1 (no MTP: draft elsewhere) */
 int pn_qwen35moe_tt_mtp_draft(pn_model *model, pn_state *state, uint32_t seed, int k,
                               uint32_t *drafts);
+/** The MTP head's draft chooser for SAMPLED drafts: draft `draft_index`'s top-N (index, value)
+ *  pairs (vocabulary ids) -> the draft (pn_spec_sample_draft). */
+typedef uint32_t (*pn_spec_draft_fn)(void *ctx, int draft_index, const uint32_t *index,
+                                     const float *value, uint32_t count);
+/** The speculative counters so far (cycles, drafts verified, drafts accepted): a caller takes
+ *  differences around a request. @return 0, or -1 (no TT model) */
+int pn_qwen35moe_tt_spec_counts(pn_model *model, uint64_t *cycles, uint64_t *drafted,
+                                uint64_t *accepted);
+/** pn_qwen35moe_tt_mtp_draft with a draft chooser (NULL = the head's argmax). The head then
+ *  returns `PN_TT_SPEC_Q_PAIRS` pairs a draft (default: the request's top-N). */
+int pn_qwen35moe_tt_mtp_draft_ex(pn_model *model, pn_state *state, uint32_t seed, int k,
+                                 uint32_t *drafts, pn_spec_draft_fn draw, void *draw_ctx);
 
 /**
  * Put this model's MATMULS on a Tenstorrent Blackhole card (qwen35moe_forward_tt.c).
@@ -725,6 +986,11 @@ int pn_qwen35moe_tt_checkpoint_resume(pn_model *model, pn_state *state, const ui
  */
 void pn_qwen35moe_tt_checkpoint_ceiling(pn_model *model, const pn_state *state, int ceiling);
 
+/** 1 when the model keeps the multi-turn prefill checkpoint on the card (enabled, the load
+ *  reserved its twins, the recurrence on the card), else 0: think_history drop_last resumes
+ *  from it. */
+int pn_qwen35moe_tt_checkpoint_available(const pn_model *model);
+
 /** 1 when the card's K/V and carried state hold `state`'s sequence (the last forward on the
  *  card was for it), else 0. An append that continues a sequence needs it. */
 int pn_qwen35moe_tt_card_holds(const pn_model *model, const pn_state *state);
@@ -769,6 +1035,15 @@ tm_tensor *pn_qwen35moe_prefill_tt(pn_model *model, const uint32_t *tokens, int 
  * Signal-safe: no
  */
 int pn_qwen35moe_prefill_tt_last_batched(const pn_model *model);
+
+/**
+ * Did the last `pn_qwen35moe_prefill_tt()` ABORT part way (as opposed to declining)? Then the
+ * card's state was partly written and the session was invalidated (`state->pos` is 0): the
+ * caller must FAIL the request, not replay the prompt per token.
+ *
+ * @return 1 when it aborted, 0 otherwise (declined, succeeded, or not the TT forward)
+ */
+int pn_qwen35moe_prefill_tt_aborted(const pn_model *model);
 
 /**
  * The matmul split for the run so far: how many went to the card, how many the seam

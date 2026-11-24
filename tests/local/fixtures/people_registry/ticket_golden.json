@@ -1,0 +1,20 @@
+{
+ "what": "Attach ticket golden (spec §4.6). Python hmac/base64 made it; Pantheon and Argus D7 must reproduce ticket byte for byte from secret + fields, and accept it until exp + 30.",
+ "hmac_key": "the 32 raw bytes of secret (hex-decoded), not its hex text",
+ "secret": "5ec7e7a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d",
+ "fields": {
+  "v": 1,
+  "key": "c-0123456789ab",
+  "person": "p1a2b3c4d",
+  "device_id": "d0123456789abcdef",
+  "cpub": "8f40c5adb68f25624ae5b214ea767a6ec94d829d3d7b5e1ad1ba6f3e2138285f",
+  "role": "control",
+  "exp": 1793000060,
+  "nonce": "00112233445566778899aabbccddeeff"
+ },
+ "payload": "{\"v\":1,\"key\":\"c-0123456789ab\",\"person\":\"p1a2b3c4d\",\"device_id\":\"d0123456789abcdef\",\"cpub\":\"8f40c5adb68f25624ae5b214ea767a6ec94d829d3d7b5e1ad1ba6f3e2138285f\",\"role\":\"control\",\"exp\":1793000060,\"nonce\":\"00112233445566778899aabbccddeeff\"}",
+ "payload_b64url": "eyJ2IjoxLCJrZXkiOiJjLTAxMjM0NTY3ODlhYiIsInBlcnNvbiI6InAxYTJiM2M0ZCIsImRldmljZV9pZCI6ImQwMTIzNDU2Nzg5YWJjZGVmIiwiY3B1YiI6IjhmNDBjNWFkYjY4ZjI1NjI0YWU1YjIxNGVhNzY3YTZlYzk0ZDgyOWQzZDdiNWUxYWQxYmE2ZjNlMjEzODI4NWYiLCJyb2xlIjoiY29udHJvbCIsImV4cCI6MTc5MzAwMDA2MCwibm9uY2UiOiIwMDExMjIzMzQ0NTU2Njc3ODg5OWFhYmJjY2RkZWVmZiJ9",
+ "mac": "dfcaefa59a1ccf2a990078de10820612199f6ab080f771eb0186595590667103",
+ "ticket": "eyJ2IjoxLCJrZXkiOiJjLTAxMjM0NTY3ODlhYiIsInBlcnNvbiI6InAxYTJiM2M0ZCIsImRldmljZV9pZCI6ImQwMTIzNDU2Nzg5YWJjZGVmIiwiY3B1YiI6IjhmNDBjNWFkYjY4ZjI1NjI0YWU1YjIxNGVhNzY3YTZlYzk0ZDgyOWQzZDdiNWUxYWQxYmE2ZjNlMjEzODI4NWYiLCJyb2xlIjoiY29udHJvbCIsImV4cCI6MTc5MzAwMDA2MCwibm9uY2UiOiIwMDExMjIzMzQ0NTU2Njc3ODg5OWFhYmJjY2RkZWVmZiJ9.dfcaefa59a1ccf2a990078de10820612199f6ab080f771eb0186595590667103",
+ "accept_until": 1793000090
+}

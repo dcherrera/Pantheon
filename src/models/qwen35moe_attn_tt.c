@@ -80,6 +80,8 @@
 
 #include "../accel/tt/pn_tt_column_runs.h"
 #include "../accel/tt/pn_tt_head_norm.h"
+#include "../accel/tt/pn_tt_kv_append_split.h"
+#include "../accel/tt/pn_tt_kv_rotate.h"
 
 /** Elements per tile row, and the tile count of a width. */
 #define QWEN35_ATTN_TILE 32u
@@ -115,6 +117,12 @@ int pn_qwen35_tt_attn_split_q(pn_qwen35_tt *g, const pn_qwen35moe_config *cfg, c
                  pn_tt_weight *) =
         extra ? pn_tt_device_stage_extra_columns : pn_tt_device_stage_weight_columns;
 
+    /* Uploaded as its halves at load (qwen35_tt_split_attn_q_at_load): already in place. */
+    if (!extra && slot->attn_q_split)
+        return slot->attn_q_only.tile_cols == heads * head_tiles &&
+                       slot->attn_gate_only.tile_cols == heads * head_tiles
+                   ? 0
+                   : -1;
     if (pn_tt_column_runs_field(heads, joint_tiles, 0u, head_tiles, runs,
                                 PN_TT_COLUMN_RUNS_MAX) != heads ||
         stage(g->device, name, runs, heads, &slot->attn_q_only) != 0) {
@@ -141,6 +149,17 @@ int pn_qwen35_tt_attn_split_q(pn_qwen35_tt *g, const pn_qwen35moe_config *cfg, c
         return -1;
     }
     return 0;
+}
+
+void pn_qwen35_tt_interleave_qg(const float *q, const float *gate, uint32_t heads,
+                                uint32_t head_dim, float *qg)
+{
+    for (uint32_t h = 0; h < heads; h++) {
+        memcpy(qg + (size_t)h * 2u * head_dim, q + (size_t)h * head_dim,
+               head_dim * sizeof(float));
+        memcpy(qg + ((size_t)h * 2u + 1u) * head_dim, gate + (size_t)h * head_dim,
+               head_dim * sizeof(float));
+    }
 }
 
 /** The extra strips the card arm needs beside the ones the resident forward already holds. */
@@ -277,6 +296,37 @@ bool pn_qwen35_tt_attn_is_on_card(const pn_qwen35_tt *g)
  * The block
  * ================================================================ */
 
+/* K4H (pn_tt_kv_rotate.h): qH and kH go into the strips RoPE just consumed — `q` and `attn_k`
+ * are dead until the next layer's projections — so no strip is added and the attention and
+ * the append read them in place of `q_rot` / `k_rot`. Every path below calls these three. */
+int pn_qwen35_tt_attn_rotate(pn_qwen35_tt *g, const pn_qwen35moe_config *cfg)
+{
+    if (!pn_tt_kv_rotating(g->device))
+        return 0;
+    return (pn_tt_kv_rotate(g->device, &g->attn_card.q_rot, &g->attn_card.q,
+                            (uint32_t)cfg->n_head) == 0 &&
+            pn_tt_kv_rotate(g->device, &g->attn_card.k_rot, &g->card.attn_k,
+                            (uint32_t)cfg->n_head_kv) == 0)
+               ? 0
+               : -1;
+}
+
+pn_tt_activation *pn_qwen35_tt_attn_query(pn_qwen35_tt *g)
+{
+    const char *red = getenv("PN_TT_RED");
+
+    /* RED `kv_rotate_q_skip`: the cache holds kH and the attention reads the unrotated q —
+     * q.(kH) is not q.k, so every attention output moves. Must DIFFER from k4h. */
+    if (!pn_tt_kv_rotating(g->device) || (red && strcmp(red, "kv_rotate_q_skip") == 0))
+        return &g->attn_card.q_rot;
+    return &g->attn_card.q;
+}
+
+pn_tt_activation *pn_qwen35_tt_attn_key(pn_qwen35_tt *g)
+{
+    return pn_tt_kv_rotating(g->device) ? &g->card.attn_k : &g->attn_card.k_rot;
+}
+
 int pn_qwen35_tt_attn_project_card(pn_qwen35_tt *g, const pn_qwen35_tt_layer *d)
 {
     pn_qwen35_tt_strips *s = &g->card;
@@ -317,15 +367,16 @@ int pn_qwen35_tt_attn_core_card(pn_qwen35_tt *g, const pn_qwen35_tt_layer *d,
 
     if (pn_tt_rope(g->device, &a->q, &a->q_rot, (uint32_t)cfg->n_head, (uint32_t)pos) != 0 ||
         pn_tt_rope(g->device, &s->attn_k, &a->k_rot, (uint32_t)cfg->n_head_kv,
-                   (uint32_t)pos) != 0)
+                   (uint32_t)pos) != 0 ||
+        pn_qwen35_tt_attn_rotate(g, cfg) != 0)
         return -1;
-    if (pn_tt_kv_append(g->device, (uint32_t)attn_index, false, &a->k_rot,
+    if (pn_tt_kv_append(g->device, (uint32_t)attn_index, false, pn_qwen35_tt_attn_key(g),
                         (uint32_t)pos) != 0 ||
         pn_tt_kv_append(g->device, (uint32_t)attn_index, true, &s->attn_v,
                         (uint32_t)pos) != 0)
         return -1;
-    if (pn_tt_attention(g->device, (uint32_t)attn_index, &a->q_rot, &s->attn_out,
-                        (uint32_t)seq_len) != 0)
+    if (pn_tt_attention(g->device, (uint32_t)attn_index, pn_qwen35_tt_attn_query(g),
+                        &s->attn_out, (uint32_t)seq_len) != 0)
         return -1;
 
     /* SIGMOID, NOT SILU. `silu(x) = x*sigmoid(x)`, so reusing the SwiGLU member here is off
@@ -357,20 +408,77 @@ int pn_qwen35_tt_attn_core_chunk(pn_qwen35_tt *g, const pn_qwen35_tt_layer *d,
     if (pn_tt_rope_chunk(g->device, &a->q, &a->q_rot, (uint32_t)cfg->n_head,
                          (uint32_t)base_pos, (uint32_t)rows) != 0 ||
         pn_tt_rope_chunk(g->device, &s->attn_k, &a->k_rot, (uint32_t)cfg->n_head_kv,
-                         (uint32_t)base_pos, (uint32_t)rows) != 0)
+                         (uint32_t)base_pos, (uint32_t)rows) != 0 ||
+        pn_qwen35_tt_attn_rotate(g, cfg) != 0)
         return -1;
-    if (pn_tt_kv_append_chunk(g->device, (uint32_t)attn_index, false, &a->k_rot,
-                              (uint32_t)base_pos, (uint32_t)rows) != 0 ||
-        pn_tt_kv_append_chunk(g->device, (uint32_t)attn_index, true, &s->attn_v,
-                              (uint32_t)base_pos, (uint32_t)rows) != 0)
+    /* K and V together: split over the KV append cores when the cache is block float
+     * (pn_tt_kv_append_split.h), else K then V on the memory core as always. */
+    if (pn_tt_kv_append_chunk_pair(g->device, (uint32_t)attn_index, pn_qwen35_tt_attn_key(g),
+                                   &s->attn_v, (uint32_t)base_pos, (uint32_t)rows) != 0)
         return -1;
-    if (pn_tt_attention_chunk(g->device, (uint32_t)attn_index, &a->q_rot, &s->attn_out,
-                              (uint32_t)base_pos, (uint32_t)rows) != 0)
+    if (pn_tt_attention_chunk(g->device, (uint32_t)attn_index, pn_qwen35_tt_attn_query(g),
+                              &s->attn_out, (uint32_t)base_pos, (uint32_t)rows) != 0)
         return -1;
 
     /* SIGMOID, NOT SILU — the same note as the per-position arm, and per element, so the
      * chunk costs one descriptor. */
     return pn_tt_sigmoid_mul(g->device, &a->z, &s->attn_out, &a->gate, &a->gated);
+}
+
+/* ================================================================
+ * Prefill lane ATTENTION PIPE: the chunk core in three steps, so band b+1's QK norms and RoPE
+ * run (awaited, on their own families) while band b's attention is still in flight.
+ * ================================================================ */
+
+int pn_qwen35_tt_attn_chunk_prep(pn_qwen35_tt *g, const pn_qwen35_tt_layer *d,
+                                 const pn_qwen35moe_config *cfg, int base_pos, int rows)
+{
+    pn_qwen35_tt_strips *s = &g->card;
+    pn_qwen35_tt_attn_strips *a = &g->attn_card;
+
+    if (pn_tt_head_norm_bf16(g->device, FT_TT_OP_REDUCE_FN_RMS_NORM, &d->attn_q_norm,
+                             (uint32_t)cfg->n_head, &a->q, &a->q) != 0 ||
+        pn_tt_head_norm_bf16(g->device, FT_TT_OP_REDUCE_FN_RMS_NORM, &d->attn_k_norm,
+                             (uint32_t)cfg->n_head_kv, &s->attn_k, &s->attn_k) != 0 ||
+        pn_tt_rope_chunk(g->device, &a->q, &a->q_rot, (uint32_t)cfg->n_head,
+                         (uint32_t)base_pos, (uint32_t)rows) != 0 ||
+        pn_tt_rope_chunk(g->device, &s->attn_k, &a->k_rot, (uint32_t)cfg->n_head_kv,
+                         (uint32_t)base_pos, (uint32_t)rows) != 0 ||
+        pn_qwen35_tt_attn_rotate(g, cfg) != 0)
+        return -1;
+    return 0;
+}
+
+/** The K/V appends (awaited), then the attention LEFT IN FLIGHT (settle before reading it). */
+int pn_qwen35_tt_attn_chunk_issue(pn_qwen35_tt *g, int attn_index, int base_pos, int rows)
+{
+    pn_qwen35_tt_strips *s = &g->card;
+    int rc;
+
+    /* K and V together: split over the KV append cores when the cache is block float
+     * (pn_tt_kv_append_split.h), else K then V on the memory core as always. */
+    if (pn_tt_kv_append_chunk_pair(g->device, (uint32_t)attn_index, pn_qwen35_tt_attn_key(g),
+                                   &s->attn_v, (uint32_t)base_pos, (uint32_t)rows) != 0)
+        return -1;
+    pn_tt_attention_defer(g->device, true);
+    rc = pn_tt_attention_chunk(g->device, (uint32_t)attn_index, pn_qwen35_tt_attn_query(g),
+                               &s->attn_out, (uint32_t)base_pos, (uint32_t)rows);
+    pn_tt_attention_defer(g->device, false);
+    return rc;
+}
+
+/** Deep path (pn_tt_attn_deep.h): the band's K/V appends, awaited. */
+int pn_qwen35_tt_attn_chunk_append(pn_qwen35_tt *g, int attn_index, int base_pos, int rows)
+{
+    return pn_tt_kv_append_chunk_pair(g->device, (uint32_t)attn_index, &g->attn_card.k_rot,
+                                      &g->card.attn_v, (uint32_t)base_pos, (uint32_t)rows);
+}
+
+/** Deep path: the band's head descriptors queued on the members, nothing awaited. */
+int pn_qwen35_tt_attn_chunk_queue(pn_qwen35_tt *g, int attn_index, int base_pos, int rows)
+{
+    return pn_tt_attention_chunk_queue(g->device, (uint32_t)attn_index, &g->attn_card.q_rot,
+                                       &g->card.attn_out, (uint32_t)base_pos, (uint32_t)rows);
 }
 
 int pn_qwen35_tt_attn_block_card(pn_qwen35_tt *g, const pn_qwen35_tt_layer *d,
@@ -380,8 +488,9 @@ int pn_qwen35_tt_attn_block_card(pn_qwen35_tt *g, const pn_qwen35_tt_layer *d,
     if (pn_qwen35_tt_attn_project_card(g, d) != 0 ||
         pn_qwen35_tt_attn_core_card(g, d, cfg, attn_index, pos, seq_len) != 0)
         return -1;
-    return pn_qwen35_tt_project(g, &d->attn_output, &g->attn_card.gated, &g->card.project,
-                                true);
+    /* S3a: the residual add fused when it fits (not under the compare arm, which reads
+     * `project`); the caller's residual step then only flips the slot. */
+    return pn_qwen35_tt_project_out(g, &d->attn_output, &g->attn_card.gated);
 }
 
 /* ================================================================

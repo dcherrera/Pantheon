@@ -1,0 +1,322 @@
+{
+  "schema": 1,
+  "version": 1,
+  "published": "2026-11-13",
+  "models": [
+    {
+      "id": "qwen3.8-27b-q8",
+      "name": "Qwen3.8 27B",
+      "family": "qwen3.8",
+      "description": "Qwen's 27B dense reasoning and agent model from Q8_0 weights, on one Tenstorrent Blackhole p150 (K8V4 KV, a prefix checkpoint for fast follow-up turns) or two Tesla K80 boards (4 GPUs, one user), with MTP speculative decoding.",
+      "licence": {
+        "id": "apache-2.0",
+        "url": "https://huggingface.co/Qwen/Qwen3.8-27B/blob/main/LICENSE"
+      },
+      "capabilities": [
+        "chat",
+        "tools",
+        "reasoning"
+      ],
+      "files": [
+        {
+          "role": "weights",
+          "hf_repo": "TeamIDE/Qwen3.8-27B-Pantheon-TT",
+          "revision": "a93045f974870d6013ac6115e5a569c3ad090ede",
+          "filename": "Qwen3.8-27B-Q8_0.meta.gguf",
+          "size": 21652032,
+          "sha256": "6ff6c58542d3ddd58a932751069cea926f1be6c0a08944a6e91719bf7dae2655",
+          "unit_types": [
+            "p150"
+          ]
+        },
+        {
+          "role": "extra",
+          "hf_repo": "TeamIDE/Qwen3.8-27B-Pantheon-TT",
+          "revision": "a93045f974870d6013ac6115e5a569c3ad090ede",
+          "filename": "Qwen3.8-27B-Q8_0.meta.bfp8.fttw",
+          "size": 28602143000,
+          "sha256": "ab48831ca486105800428696833f6ed28449ec129783c22ce86faf7d575fff5e",
+          "unit_types": [
+            "p150"
+          ]
+        },
+        {
+          "role": "extra",
+          "hf_repo": "TeamIDE/Qwen3.8-27B-Pantheon-TT",
+          "revision": "a93045f974870d6013ac6115e5a569c3ad090ede",
+          "filename": "Qwen3.8-27B-Q8_0.meta.bfp8.mtp.fttw",
+          "size": 451323072,
+          "sha256": "fd5094bb7ebf884a1bab4cf261b6e1f5b01ec9410efa0f519de9287aca4d2a4b",
+          "unit_types": [
+            "p150"
+          ]
+        },
+        {
+          "role": "weights",
+          "hf_repo": "TeamIDE/Qwen3.8-27B-Pantheon-K80",
+          "revision": "fe90f2f50659fb56f95a8525760f83f17cda6fc6",
+          "filename": "Qwen3.8-27B-Q8_0.gguf",
+          "size": 29047086048,
+          "sha256": "a680f44a06920e5d689774823782006aa3acc8db95750323373b24139b67e348",
+          "unit_types": [
+            "k80-gpu"
+          ]
+        }
+      ],
+      "profiles": [
+        {
+          "id": "p150-one",
+          "rank": 1,
+          "hardware": {
+            "unit_type": "p150",
+            "count": 1,
+            "same_card": false,
+            "min_mem_per_unit": 0,
+            "min_host_ram": 7000000000
+          },
+          "load": {
+            "ctx_cap": 30720,
+            "max_sessions": 1,
+            "max_concurrent": 0,
+            "reasoning_budget": 0,
+            "mtp": true,
+            "mtp_drafts": 1
+          },
+          "options": {
+            "kv_type": "k8v4",
+            "ctx_min": 8192,
+            "ctx_max": 30720,
+            "sessions_max": 1,
+            "mem": {
+              "fixed": 33053181214,
+              "ctx_per_token": 0,
+              "per_session": 0,
+              "kv_per_token": 28288
+            }
+          },
+          "sampling": {
+            "temperature": 1.0,
+            "top_p": 0.95,
+            "top_k": 20,
+            "min_p": 0,
+            "presence_penalty": 0
+          },
+          "measured": {
+            "decode_tok_s": {
+              "8k": 10.74,
+              "14k": 0,
+              "32k": 8.44
+            },
+            "ttft": {
+              "prompt_tokens": 2845,
+              "seconds": 17.61
+            },
+            "context_window": 30720
+          }
+        },
+        {
+          "id": "p150-one-bf16",
+          "rank": 2,
+          "hardware": {
+            "unit_type": "p150",
+            "count": 1,
+            "same_card": false,
+            "min_mem_per_unit": 0,
+            "min_host_ram": 7000000000
+          },
+          "load": {
+            "ctx_cap": 30720,
+            "max_sessions": 1,
+            "max_concurrent": 0,
+            "reasoning_budget": 0,
+            "mtp": false
+          },
+          "options": {
+            "kv_type": "bf16",
+            "ctx_min": 8192,
+            "ctx_max": 30720,
+            "sessions_max": 1,
+            "mem": {
+              "fixed": 31869731078,
+              "ctx_per_token": 0,
+              "per_session": 0,
+              "kv_per_token": 65536
+            }
+          },
+          "sampling": {
+            "temperature": 1.0,
+            "top_p": 0.95,
+            "top_k": 20,
+            "min_p": 0,
+            "presence_penalty": 0
+          },
+          "measured": {
+            "decode_tok_s": {
+              "8k": 6.61,
+              "14k": 6.36,
+              "32k": 5.6
+            },
+            "ttft": {
+              "prompt_tokens": 2844,
+              "seconds": 15.39
+            },
+            "context_window": 30720
+          }
+        },
+        {
+          "id": "k80-two-boards",
+          "rank": 1,
+          "hardware": {
+            "unit_type": "k80-gpu",
+            "count": 4,
+            "same_card": false,
+            "per_card": 2,
+            "min_mem_per_unit": 9754902528,
+            "min_host_ram": 7000000000
+          },
+          "load": {
+            "ctx_cap": 32768,
+            "max_sessions": 1,
+            "max_concurrent": 0,
+            "reasoning_budget": 5120,
+            "reasoning_reserve": 3072,
+            "mtp": true
+          },
+          "options": {
+            "kv_type": "q4",
+            "ctx_min": 8192,
+            "ctx_max": 131072,
+            "sessions_max": 1,
+            "mem": {
+              "fixed": 9401532416,
+              "ctx_per_token": 1664,
+              "per_session": 0,
+              "kv_per_token": 8704
+            }
+          },
+          "sampling": {
+            "temperature": 1.0,
+            "top_p": 0.95,
+            "top_k": 20,
+            "min_p": 0,
+            "presence_penalty": 0
+          },
+          "measured": {
+            "decode_tok_s": {
+              "8k": 6.87,
+              "14k": 5.86,
+              "32k": 0
+            },
+            "ttft": {
+              "prompt_tokens": 8404,
+              "seconds": 899.6
+            },
+            "context_window": 32768
+          }
+        }
+      ]
+    },
+    {
+      "id": "qwen3.8-27b-tier256k",
+      "name": "Qwen3.8 27B Long-Context (mixed 8/4-bit)",
+      "family": "qwen3.8",
+      "description": "STAGING, test catalog only: Qwen3.8-27B on one p150 at 262,144 tokens; 192 FFN matrices 4-bit (GPTQ), rest 8-bit, K8V4 KV, MTP k1. Not lossless. Measured numbers are placeholders.",
+      "licence": {
+        "id": "apache-2.0",
+        "url": "https://huggingface.co/Qwen/Qwen3.8-27B/blob/main/LICENSE"
+      },
+      "capabilities": [
+        "chat",
+        "tools",
+        "reasoning"
+      ],
+      "files": [
+        {
+          "role": "weights",
+          "hf_repo": "TeamIDE/Qwen3.8-27B-Pantheon-TT",
+          "revision": "a93045f974870d6013ac6115e5a569c3ad090ede",
+          "filename": "Qwen3.8-27B-Q8_0.meta.gguf",
+          "size": 21652032,
+          "sha256": "6ff6c58542d3ddd58a932751069cea926f1be6c0a08944a6e91719bf7dae2655",
+          "unit_types": [
+            "p150"
+          ]
+        },
+        {
+          "role": "extra",
+          "hf_repo": "TeamIDE/Qwen3.8-27B-Pantheon-TT-256k",
+          "revision": "0000000000000000000000000000000000000000",
+          "filename": "Qwen3.8-27B-Q8_0.meta.bfp4ffn.fttw",
+          "size": 20045796760,
+          "sha256": "e537e151a5631d5cd528494fd573e2db82a7d38a4b7ceab378478898bb2425a5",
+          "unit_types": [
+            "p150"
+          ]
+        },
+        {
+          "role": "extra",
+          "hf_repo": "TeamIDE/Qwen3.8-27B-Pantheon-TT-256k",
+          "revision": "0000000000000000000000000000000000000000",
+          "filename": "Qwen3.8-27B-Q8_0.meta.bfp4ffn.mtp.fttw",
+          "size": 451323072,
+          "sha256": "fd5094bb7ebf884a1bab4cf261b6e1f5b01ec9410efa0f519de9287aca4d2a4b",
+          "unit_types": [
+            "p150"
+          ]
+        }
+      ],
+      "profiles": [
+        {
+          "id": "p150-one-256k",
+          "rank": 1,
+          "hardware": {
+            "unit_type": "p150",
+            "count": 1,
+            "same_card": false,
+            "min_mem_per_unit": 0,
+            "min_host_ram": 7000000000
+          },
+          "load": {
+            "ctx_cap": 262144,
+            "max_sessions": 1,
+            "max_concurrent": 0,
+            "reasoning_budget": 0,
+            "mtp": true,
+            "mtp_drafts": 1
+          },
+          "options": {
+            "kv_type": "k8v4",
+            "ctx_min": 8192,
+            "ctx_max": 262144,
+            "sessions_max": 1,
+            "mem": {
+              "fixed": 24496801054,
+              "ctx_per_token": 0,
+              "per_session": 0,
+              "kv_per_token": 28288
+            }
+          },
+          "sampling": {
+            "temperature": 1.0,
+            "top_p": 0.95,
+            "top_k": 20,
+            "min_p": 0,
+            "presence_penalty": 0
+          },
+          "measured": {
+            "decode_tok_s": {
+              "8k": 10.74,
+              "14k": 0,
+              "32k": 8.44
+            },
+            "ttft": {
+              "prompt_tokens": 2845,
+              "seconds": 17.61
+            },
+            "context_window": 262144
+          }
+        }
+      ]
+    }
+  ]
+}

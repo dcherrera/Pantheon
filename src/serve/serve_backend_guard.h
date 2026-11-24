@@ -24,8 +24,9 @@
  *        POST /admin/models/load with a `dies` array is refused by the same
  *        rule rather than by a second, drifting copy of it.
  *
- *        A CPU serve stays fully available and is asked for the obvious way:
- *        do not pass `--dies`. n_dies == 0 is always OK here, on every backend.
+ *        n_dies == 0 is always OK here, on every backend: where such a load
+ *        runs is the load guard's call (core/load_guard.h) — the CPU forward in
+ *        a CPU build or with `--cpu`, never as a fallback in an accelerator one.
  *
  *        Note the first arm is COMPILE-TIME, deliberately, and is checked
  *        before the die count. pn_dm_init_logical() can hand a CPU build a

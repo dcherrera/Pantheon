@@ -4,7 +4,7 @@
  * @file   simd.c
  * @brief  NEON / AVX2+FMA / plain-C implementations of the CPU vector kernels.
  *
- * Written from a behaviour specification (plans/cleanroom_r2_simd_spec.md); no ggml or
+ * Written from a behaviour specification (cleanroom_r2_simd_spec.md, recorded in docs/cleanroom/README.md); no ggml or
  * llama.cpp source was consulted.
  *
  * Release builds use -ffast-math, so output bits depend on the shape of this source (which
@@ -170,7 +170,10 @@ float pn_vsum_f32(const float *a, int n) {
 void pn_vsilu_mul_f32(const float *gate, const float *up, float *out, int n) {
     for (int i = 0; i < n; i++) {
         float x = gate[i];
-        float s = x / (1.0f + expf(-x));
+        /* Below -88.72 expf(-x) overflows. -ffast-math assumes it cannot, and the x86
+         * vectorised expf then returns NaN (Qwen3's last-layer gates reach -100): NaN
+         * logits, "!!!!" text. The exact answer there is x/inf = -0, so 0 is bit-equal. */
+        float s = x < -0x1.62e42ep+6f ? 0.0f : x / (1.0f + expf(-x));
         out[i] = s * up[i];
     }
 }

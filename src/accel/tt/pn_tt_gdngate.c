@@ -4,7 +4,7 @@
  * @file pn_tt_gdngate.c
  * @brief The GDN GATE family host half. See pn_tt_gdngate.h for what and why.
  *
- * @status Written PM 7 (2026-10-08). Unexecuted.
+ * @status Shipped: det gates on every TT path. FLAT retry after an idle retire fixed 2026-11-13.
  * @issues None
  * @todo None
  */
@@ -355,6 +355,7 @@ int pn_tt_gdngate_flat(pn_tt_device *device, uint32_t layer, const pn_tt_activat
                        uint32_t dst_address, uint32_t row_stride)
 {
     uint32_t words[PN_TT_GDNGATE_MAX_MEMBERS][kGgWords];
+    bool enqueued[PN_TT_GDNGATE_MAX_MEMBERS];
     uint32_t members, per, index;
     int failed = 0;
 
@@ -370,16 +371,20 @@ int pn_tt_gdngate_flat(pn_tt_device *device, uint32_t layer, const pn_tt_activat
     for (index = 0; index < members; index++) {
         gdngate_flat_words(device, layer, alpha, beta, rows, dst_bank, dst_address, row_stride,
                            index * per, per, words[index]);
-        if (pn_tt_residency_enqueue(&device->gdngate[index], FT_TT_QUEUE_OP_GDN_GATE,
-                                    words[index], 1u) != 0)
-            failed = 1;
+        /* A refused enqueue is not a failure yet: an idle-retired member refuses by design
+         * (pn_tt_residency.c, THE IDLE RETIRE) and the loop below re-arms it and runs its
+         * slice. Counting it here failed the forward after a clean retry (mtpft selftest2,
+         * 2026-11-13: the first per-token spec request after > 5 s idle, "generation failed"). */
+        enqueued[index] = pn_tt_residency_enqueue(&device->gdngate[index],
+                                                  FT_TT_QUEUE_OP_GDN_GATE, words[index],
+                                                  1u) == 0;
     }
     device->gdngate_flats++;
     /* Awaited here: the DELTA after it reads what they write (streamed: puller AWAITs). */
     for (index = 0; index < members; index++) {
         pn_tt_residency *member = &device->gdngate[index];
 
-        if (pn_tt_residency_await(member, PN_TT_OP_TIMEOUT_MS) == 0)
+        if (enqueued[index] && pn_tt_residency_await(member, PN_TT_OP_TIMEOUT_MS) == 0)
             continue;
         /* A refused member (idle retire): re-armed and its slice run again, awaited. */
         fprintf(stderr, "pn_tt: gdngate member %u refused a FLAT descriptor — retiring it by "

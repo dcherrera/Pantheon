@@ -1,0 +1,10 @@
+{"endpoint":"POST /local/pair","class":"none",
+ "request":{"code":"1234 5678","label":"argus","device_id":"d0123456789abcdef","device_name":"mac-studio",
+            "handle":"david","name":"David"},
+ "status":200,
+ "response":{"key":"pnk_…","id":"k1a2b3c4d","kind":"device","role":"admin","label":"argus",
+             "person":{"id":"p1a2b3c4d","handle":"david","name":"David","admin":true,"may_load":true,"created":1793000000},
+             "first_owner":true},
+ "errors":[{"when":"wrong, expired or used code","status":403,"type":"pairing_refused"},
+           {"when":"over the box-wide pair rate","status":429,"type":"rate_limited"},
+           {"when":"the key could not be stored","status":507,"type":"key_store_error"}]}

@@ -1,0 +1,1 @@
+The reference material above is C source from an inference engine. Pick one function from it, explain what it does step by step, point out one bug risk or edge case it does not handle, and write an improved version of it.

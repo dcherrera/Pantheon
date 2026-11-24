@@ -1,0 +1,10 @@
+{"endpoint":"POST /local/sessions/<key>/attach","class":"device",
+ "request":{"cpub":"<64 hex>"},
+ "status":200,
+ "response":{"host_addr":"192.0.2.20:53211","host_pub":"<64 hex>","ticket":"<b64url payload>.<64 hex>",
+             "role":"control","expires_in":60},
+ "errors":[{"when":"cpub missing or not 64 hex","status":400,"type":"bad_cpub"},
+           {"when":"the caller has no right on the row (not shared; a desktop row of another person)","status":403,"type":"forbidden"},
+           {"when":"no row with that key","status":404,"type":"not_found"},
+           {"when":"the row reads disconnected","status":409,"type":"disconnected"},
+           {"when":"this device key has no device_id yet (POST /local/me/device first)","status":409,"type":"device_unclaimed"}]}

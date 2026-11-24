@@ -133,6 +133,25 @@ typedef struct {
      * turn must make a call) and yes inside it only when the call can still be
      * closed — the serve then closes it (tgj_closing_text). */
     int         (*end_allowed)(void *st);
+    /* Optional (may be NULL): a private copy of the walk `st`, which the caller may
+     * advance (advance) and query (refresh) without touching the live walk, and its
+     * release. The batched MTP driver looks ahead over drafts with it, so speculation
+     * stops before any row the mask would touch (batch_sched_spec.h). */
+    void       *(*clone)(void *st);
+    void        (*clone_free)(void *st);
+    /* Optional (may be NULL = no steer, the sampler unchanged): on a masked
+     * step the sampler hands this the text of the model's own top token (the
+     * unmasked argmax) when `allowed` refuses it.  The grammar may then move
+     * `st` so the mask that follows leaves only a forced continuation
+     * (field_patterns: a refused close on a patterned value becomes the
+     * pattern's next literal bytes, tg_steer).  Returns 1 when it moved `st`. */
+    int         (*steer)(void *st, const char *text);
+    /* Optional (may be NULL = never): has forced-mode reasoning ended on the walk
+     * (the serve's sg_tg_forced_ended)?  The BATCHED driver asks after each token
+     * it deposits and records the first ring position where it holds, so the
+     * owner flips its emitter out of <think> at that token, not when the
+     * driver's walk has already run ahead over a backlog (bs_slot_reasoning_ended). */
+    int         (*reasoning_ended)(void *st);
 } pn_tool_grammar_hook;
 
 /* One entry of an OpenAI `logit_bias` map: a token id and the bias (nominally
@@ -224,6 +243,18 @@ typedef struct {
      * the chunks holding allowed tokens instead of the whole row.  NULL = whole row
      * only.  Same ctx as dense_row.  Returns 0 on success. */
     int  (*dense_chunks)(void *ctx, const unsigned char *need, float *logits, int n_vocab);
+    /* A uniform already drawn for the NEXT draw (0 = none; the default). Speculative
+     * sampling sets it when a verify row past 0 needed the dense row after its draw: the
+     * row defers WITH the draw and the next draw at that position consumes it, so the RNG
+     * stream and the draw's distribution are plain decode's. */
+    int   carried_uniform_set;
+    float carried_uniform;
+    /* Optional, with dense_row: count the RAW logit row `row` (0 = this step's, k = verify
+     * row k) into bins on the device — counts[j] = logits whose bf16 order key lies in
+     * [keys[j], keys[j-1]), counts[bins] = below keys[bins-1] (keys strictly descending).
+     * Lets the sampler bound the mass outside a top-N row without the dense row
+     * (sampler_topn_tail.h). Same ctx as dense_row. Returns 0 on success. */
+    int  (*tail_counts)(void *ctx, int row, const uint32_t *keys, int bins, uint32_t *counts);
 } pn_sampling_params;
 
 /* Generation callback — called for each new token */
@@ -258,7 +289,8 @@ typedef enum {
  * live memory state minus reserved headroom, and returns the verdict. On
  * PN_ADMIT_CAPPED, *fit_tokens_out (if non-NULL) receives the largest prefill
  * length that fits. Never allocates, never blocks. If the memory-watch layer is
- * not running it returns PN_ADMIT_FIT (fail-open — no behavior change).
+ * not running it fails open on memory, but a prompt past the model's configured
+ * window (pn_session_ctx_cap) is still PN_ADMIT_CAPPED to that window.
  *
  * Thread-safe: yes
  * Reentrant: yes
@@ -360,6 +392,15 @@ int pn_stream_tokens(pn_model *model, pn_state *state,
  * Returns NULL on error.
  */
 pn_output* pn_infer(pn_model *model, pn_state *state, uint32_t token);
+
+/*
+ * Batched prefill of `n_tokens` prompt tokens (an accelerator's batched path, e.g. the TT
+ * card's), returning the LAST position's logits like pn_infer(). Returns NULL when no
+ * batched path took the prompt (the state is then untouched and the caller runs pn_infer()
+ * per token). Caller frees with pn_output_free().
+ */
+pn_output* pn_infer_prefill(pn_model *model, pn_state *state, const uint32_t *tokens,
+                            int n_tokens);
 
 /* Free a pn_output returned by pn_infer() */
 void pn_output_free(pn_output *out);

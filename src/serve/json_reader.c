@@ -379,16 +379,26 @@ bool jr_as_bool(const jr_value *value, bool fallback)
 }
 
 /* Render a number without a trailing ".0" when it is integral, so a schema
- * like {"minimum": 0} round-trips as 0 rather than 0.0. */
+ * like {"minimum": 0} round-trips as 0 rather than 0.0.  Anything else gets the
+ * SHORTEST digits that read back to the same double, as Python's json.dumps
+ * (float repr) writes it: 0.1 is "0.1", not %.17g's "0.10000000000000001".
+ * For a non-integral double %g picks the same plain/exponent form repr does. */
 static void jr_write_number(json_writer *jw, double n)
 {
-    if (isfinite(n) && n == floor(n) && fabs(n) < 1e15)
+    if (isfinite(n) && n == floor(n) && fabs(n) < 1e15) {
         jw_printf(jw, "%lld", (long long)n);
-    else
-        jw_printf(jw, "%.17g", n);
+        return;
+    }
+    char digits[32];
+    for (int precision = 1; precision <= 17; precision++) {
+        snprintf(digits, sizeof(digits), "%.*g", precision, n);
+        if (strtod(digits, NULL) == n) break;
+    }
+    jw_raw(jw, digits);
 }
 
-void jr_to_json(const jr_value *value, json_writer *jw)
+static void jr_write_value(const jr_value *value, json_writer *jw,
+                           const char *item_sep, const char *key_sep)
 {
     if (!value) { jw_raw(jw, "null"); return; }
     switch (value->type) {
@@ -399,20 +409,30 @@ void jr_to_json(const jr_value *value, json_writer *jw)
         case JR_ARRAY:
             jw_raw(jw, "[");
             for (int i = 0; i < value->as.array.count; i++) {
-                if (i) jw_raw(jw, ",");
-                jr_to_json(value->as.array.items[i], jw);
+                if (i) jw_raw(jw, item_sep);
+                jr_write_value(value->as.array.items[i], jw, item_sep, key_sep);
             }
             jw_raw(jw, "]");
             break;
         case JR_OBJECT:
             jw_raw(jw, "{");
             for (int i = 0; i < value->as.object.count; i++) {
-                if (i) jw_raw(jw, ",");
+                if (i) jw_raw(jw, item_sep);
                 jw_string(jw, value->as.object.members[i].key);
-                jw_raw(jw, ":");
-                jr_to_json(value->as.object.members[i].value, jw);
+                jw_raw(jw, key_sep);
+                jr_write_value(value->as.object.members[i].value, jw, item_sep, key_sep);
             }
             jw_raw(jw, "}");
             break;
     }
+}
+
+void jr_to_json(const jr_value *value, json_writer *jw)
+{
+    jr_write_value(value, jw, ",", ":");
+}
+
+void jr_to_json_tojson(const jr_value *value, json_writer *jw)
+{
+    jr_write_value(value, jw, ", ", ": ");
 }

@@ -10,7 +10,8 @@ cd Pantheon
 make USE_BLAS=1 pantheon
 ```
 
-Foundry comes in as a git submodule at `foundry/`; in a clone made without
+In the public repository Foundry comes in as a git submodule at `foundry/`; in a
+clone made without
 `--recursive`, run `git submodule update --init` first.
 
 Build flags:

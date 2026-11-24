@@ -65,19 +65,25 @@
 
 #include "../../include/pantheon.h"
 #include "../core/engine.h"
+#include "../core/mem/pn_host_heap.h"
 #include "../core/mem/pn_memwatch.h"
 #include "../accel/backend_identity.h"
 #include "../accel/die_manager.h"
 #include "http_server.h"
 #include "model_admin.h"
 #include "model_registry.h"
+#include "model_session.h"
 #include "openai_chat.h"
+#include "replica_pin.h"
 #include "request_profile.h"
+#include "request_timing_line.h"
 #include "serve_backend_guard.h"
 #include "serve_registry.h"
 #include "serve_shutdown.h"
 #include "session_watch.h"
 #include "signal_handlers.h"
+#include "serve_spec_mtp_cuda.h"
+#include "reasoning_budget.h"
 
 #ifdef USE_CUDA
 #include "cuda/fc_cuda.h"
@@ -93,12 +99,16 @@ typedef struct {
     int         dies[PN_MODEL_MAX_DIES];
     int         n_dies;                 /* 0 = auto-place / CPU */
     int         reasoning_budget;       /* --reasoning-budget; 0 = disabled */
+    int         reasoning_reserve;      /* --reasoning-reserve; 0 = default */
     int         max_sessions;           /* --max-sessions; 0 = engine default */
     int         max_concurrent;         /* --max-concurrent; batch-slot cap.
                                          * 0 = fall back to max_sessions. */
     int         ctx_cap;                /* --ctx-cap; per-session context cap in
                                          * tokens (KV ring window). 0 = engine
                                          * default (QWEN35_MAX_SEQ / fallback). */
+    bool        mtp;                    /* --mtp; load the MTP head, decode with
+                                         * exact MTP speculation (single-user) */
+    bool        cpu;                    /* --cpu; the host CPU forward, asked for */
 } serve_model_arg;
 
 /* Shared, read-mostly server context handed to every connection thread: the
@@ -117,6 +127,38 @@ typedef struct {
     serve_ctx *ctx;
 } connection_job;
 
+/* mr_load one --model through the shared admin load path (MTP env + sampling
+ * defaults live there). */
+static int serve_load_model(mr_registry *reg, const serve_model_arg *spec,
+                            const pn_load_opts *opts, char *err, size_t errlen)
+{
+    ma_load_request lr;
+
+    memset(&lr, 0, sizeof(lr));
+    lr.path = spec->path;
+    lr.name = spec->name;
+    memcpy(lr.dies, spec->dies, sizeof(lr.dies));
+    lr.n_dies = spec->n_dies;
+    lr.opts = *opts;
+    lr.reasoning_budget = spec->reasoning_budget;
+    lr.reasoning_reserve = spec->reasoning_reserve;
+    lr.max_sessions = spec->max_sessions;
+    lr.max_concurrent = spec->max_concurrent;
+    lr.mtp = spec->mtp;
+    return ma_load_model(reg, &lr, err, errlen);
+}
+
+/* Pantheon Local hooks (A1); all NULL for a plain serve. */
+static pn_serve_local_hooks g_local_hooks;
+
+void pn_serve_set_local_hooks(const pn_serve_local_hooks *hooks)
+{
+    if (hooks)
+        g_local_hooks = *hooks;
+    else
+        memset(&g_local_hooks, 0, sizeof(g_local_hooks));
+}
+
 static void print_serve_usage(void)
 {
     printf("Usage: pantheon serve --model <path> [--name <id>] [--model <path> ...] [options]\n\n");
@@ -131,14 +173,20 @@ static void print_serve_usage(void)
     printf("                        for a wider --ctx-cap, NOT speed: each extra die adds\n");
     printf("                        one activation hand-off per step. Use the fewest dies\n");
     printf("                        that hold the model at the cap you want.\n");
-    printf("                        Omit to let the engine place it\n");
-    printf("                        — and OMIT IT TO SERVE ON THE CPU DELIBERATELY: a\n");
-    printf("                        --dies that names dies this binary cannot use is a\n");
-    printf("                        hard refusal to start, never a silent CPU fallback.\n");
+    printf("                        Omit to let the engine place it. A --dies this binary\n");
+    printf("                        cannot use, or a model no die can hold, is a hard\n");
+    printf("                        refusal to start, never a silent CPU fallback.\n");
+    printf("  --cpu                 Run this model on the host CPU forward (an accelerator\n");
+    printf("                        build otherwise refuses a model its dies cannot take).\n");
+    printf("                        Refused too when its weights do not fit host RAM.\n");
     printf("  --reasoning-budget <n>  Cap reasoning to <n> tokens on this model: once\n");
     printf("                        the model has generated <n> tokens inside <think>\n");
     printf("                        without closing it, force </think> so it answers\n");
     printf("                        (reasoning-runaway guard; 0/absent = unbounded)\n");
+    printf("  --reasoning-reserve <n>  Keep <n> of max_tokens for the answer after a\n");
+    printf("                        forced close: the cap run is min(budget,\n");
+    printf("                        max_tokens - <n>) (0/absent = %d)\n",
+           PN_REASONING_RESERVE_DEFAULT);
     printf("  --max-sessions <n>    Cap this model's live prefix-cache sessions to <n>\n");
     printf("                        (VRAM-sized; a new session over the cap is refused\n");
     printf("                        429/503; 0/absent = default %d)\n", BS_MAX_USERS);
@@ -151,8 +199,16 @@ static void print_serve_usage(void)
     printf("                        the KV ring window. A prompt past it is refused with\n");
     printf("                        context_over_budget (client compacts + retries) — no\n");
     printf("                        silent drop-oldest. 0/absent = engine default.\n");
+    printf("  --mtp                 Exact MTP speculative decoding for this model (CUDA\n");
+    printf("                        qwen35moe with an MTP head): loads the head; a request\n");
+    printf("                        decoding alone speculates (batched path: while it is\n");
+    printf("                        the only active slot; QWEN35_BATCH_SLOTS=0: always).\n");
+    printf("                        Output is token-identical to plain decode (greedy and\n");
+    printf("                        seeded sampling). Refuses to start without a head.\n");
     printf("  --served-name <id>    Back-compat alias for the FIRST model's --name\n");
     printf("\nGlobal options:\n");
+    printf("  --local               Appliance mode (used by `pantheon local`): --model is\n");
+    printf("                        optional and the serve may start with no model\n");
     printf("  --host <addr>         Bind address (default %s)\n", SERVE_DEFAULT_HOST);
     printf("  --port <n>            Port (default %d)\n", SERVE_DEFAULT_PORT);
     printf("  --config <path>       HuggingFace config.json (safetensors models)\n");
@@ -240,10 +296,12 @@ static int handle_session_watch(int cfd, serve_ctx *ctx, const hs_request *req)
     }
     char name[MR_MAX_NAME] = "";
     char sid[64] = "";
+    char replica_q[16] = "";
     const char *q = strchr(req->path, '?');
     if (q) {
         query_param_str(q + 1, "name", name, sizeof(name));
         query_param_str(q + 1, "session_id", sid, sizeof(sid));
+        query_param_str(q + 1, "replica", replica_q, sizeof(replica_q));
     }
     /* Fall back to the X-Session-Id header if the query omitted session_id. */
     if (!sid[0] && req->session_id && req->session_id[0])
@@ -254,10 +312,21 @@ static int handle_session_watch(int cfd, serve_ctx *ctx, const hs_request *req)
         return 0;
     }
 
-    mr_entry *entry = mr_acquire(ctx->reg, name[0] ? name : NULL);
+    /* The session's own replica (a watch pins the one its turns run on). A
+     * watch opened before the first turn binds the session, so it honours a
+     * requested copy too (?replica=N, else X-Pantheon-Replica). */
+    mr_route route = {0};
+    char pin_err[96];
+    if (pn_replica_pin_parse(NULL, replica_q[0] ? replica_q : req->replica, &route.replica,
+                             pin_err, sizeof(pin_err)) != 0) {
+        hs_send_error(cfd, 400, "invalid_request_error", pin_err);
+        return 0;
+    }
+    mr_entry *entry = pn_replica_pin_acquire(cfd, ctx->reg, name[0] ? name : NULL, sid, &route);
     if (!entry) {
-        hs_send_error(cfd, 404, "model_not_found",
-                      "the requested model is not loaded (see GET /v1/models)");
+        if (route.status != MR_ROUTE_NO_REPLICA)
+            hs_send_error(cfd, 404, "model_not_found",
+                          "the requested model is not loaded (see GET /v1/models)");
         return 0;
     }
     if (!entry->prefix_cache) {
@@ -270,6 +339,10 @@ static int handle_session_watch(int cfd, serve_ctx *ctx, const hs_request *req)
     int rc = pn_session_watch_add(ctx->watch, cfd, entry,
                                   entry->name, sid);
     mr_release(ctx->reg, entry);   /* the manager took its own reference */
+    if (rc == MS_NOT_YOURS) {      /* Pantheon Local: another person's session */
+        hs_send_error(cfd, 403, "session_not_yours", MS_NOT_YOURS_MESSAGE);
+        return 0;
+    }
     if (rc != 0) {
         hs_send_error(cfd, 503, "watch_unavailable",
                       "session watch table is full; retry shortly");
@@ -281,13 +354,21 @@ static int handle_session_watch(int cfd, serve_ctx *ctx, const hs_request *req)
 /* Route one parsed request to the matching handler. Cheap routes answer inline
  * (no lock); the chat completion route serializes per model inside
  * oai_handle_chat. Returns 1 if the connection fd was ADOPTED (a held
- * /session/watch — the caller must NOT close it), 0 otherwise. */
+ * /session/watch or a local hook's held fd — the caller must NOT close it), 0
+ * otherwise. */
 static int dispatch(int cfd, serve_ctx *ctx, const hs_request *req)
 {
     if (strcmp(req->method, "OPTIONS") == 0) {
         hs_send_json(cfd, 200, "{}");   /* CORS preflight */
         return 0;
     }
+    /* Pantheon Local routes first: its /local/ routes, and its wrapper of
+     * /admin/models/unload that also updates the remembered loaded set. A
+     * hook answer of 2 means it adopted the fd (a held host wait). */
+    int hooked = g_local_hooks.route ? g_local_hooks.route(cfd, ctx->reg, req,
+                                                           g_local_hooks.user) : 0;
+    if (hooked)
+        return hooked == 2;
     if (strcmp(req->method, "GET") == 0 &&
         strncmp(req->path, "/session/watch", 14) == 0 &&
         (req->path[14] == '\0' || req->path[14] == '?')) {
@@ -311,7 +392,7 @@ static int dispatch(int cfd, serve_ctx *ctx, const hs_request *req)
                              "Retry-After: 1\r\n");
             return 0;
         }
-        oai_handle_chat(cfd, ctx->reg, req->body, req->session_id);
+        oai_handle_chat(cfd, ctx->reg, req->body, req->session_id, req->replica);
         pn_serve_generation_leave();
         return 0;
     }
@@ -340,11 +421,14 @@ static int dispatch(int cfd, serve_ctx *ctx, const hs_request *req)
     }
     if (strcmp(req->method, "POST") == 0 &&
         strcmp(req->path, "/session/restore") == 0) {
-        oai_handle_session_restore(cfd, ctx->reg, req->body, req->session_id);
+        oai_handle_session_restore(cfd, ctx->reg, req->body, req->session_id,
+                                   req->replica);
         return 0;
     }
+    /* /v1/session/release: an alias (clients prefix every route with /v1). */
     if (strcmp(req->method, "POST") == 0 &&
-        strcmp(req->path, "/session/release") == 0) {
+        (strcmp(req->path, "/session/release") == 0 ||
+         strcmp(req->path, "/v1/session/release") == 0)) {
         oai_handle_session_release(cfd, ctx->reg, req->body, req->session_id);
         return 0;
     }
@@ -384,10 +468,27 @@ static int dispatch(int cfd, serve_ctx *ctx, const hs_request *req)
     return 0;
 }
 
+/* A Pantheon Local host wait (GET /local/hosts/<key>/wait): every host sends
+ * one per 30 s, so logging them would flood the journal (20 hosts = 2,400 lines
+ * an hour). */
+static int request_is_host_wait(const hs_request *req)
+{
+    const char *prefix = "/local/hosts/";
+    const char *key = NULL;
+    size_t n = 0;
+
+    if (strcmp(req->method, "GET") != 0 || strncmp(req->path, prefix, strlen(prefix)) != 0)
+        return 0;
+    key = req->path + strlen(prefix);
+    n = strcspn(key, "/?");
+    return n > 0 && strncmp(key + n, "/wait", 5) == 0 &&
+           (key[n + 5] == '\0' || key[n + 5] == '?');
+}
+
 /* Read, route, and answer one connection, then close it — UNLESS the route
- * adopted the fd (a held /session/watch, which the watch manager now owns and
- * will close itself). Shared between the per-connection thread and the inline
- * fallback path. */
+ * adopted the fd (a held /session/watch or a Pantheon Local host wait, whose
+ * owner closes it itself). Shared between the per-connection thread and the
+ * inline fallback path. */
 static void handle_connection(int cfd, serve_ctx *ctx)
 {
     hs_request req;
@@ -396,10 +497,17 @@ static void handle_connection(int cfd, serve_ctx *ctx)
     pn_reqprof_phase_start(PN_REQ_HTTP_READ);
     int read_rc = hs_read_request(cfd, &req);
     pn_reqprof_phase_end(PN_REQ_HTTP_READ);
+    sg_request_arrival_mark();   /* TTFT origin for the [req] line */
     if (read_rc == 0) {
-        fprintf(stderr, "serve: %s %s\n", req.method, req.path);
+        if (!request_is_host_wait(&req))
+            fprintf(stderr, "serve: %s %s\n", req.method, req.path);
         pn_reqprof_note_route(req.method, req.path);
-        adopted = dispatch(cfd, ctx, &req);
+        hs_set_thread_response_headers(NULL);   /* this request's own, set by its route */
+        hs_set_thread_principal(NULL, 0);       /* set by the auth hook (Pantheon Local) */
+        if (hs_auth_check(cfd, &req) == 0)
+            adopted = dispatch(cfd, ctx, &req);
+        hs_set_thread_response_headers(NULL);
+        hs_set_thread_principal(NULL, 0);
         hs_request_free(&req);
     }
     pn_reqprof_end();
@@ -414,6 +522,8 @@ static void *connection_thread(void *arg)
     connection_job *job = arg;
     handle_connection(job->client_fd, job->ctx);
     free(job);
+    /* B5: hand this request's freed host memory back to the OS. */
+    pn_host_heap_release();
     return NULL;
 }
 
@@ -519,6 +629,8 @@ static void serve_run_shutdown(int listen_fd, pn_session_watch_mgr *watch,
 
     hs_close(listen_fd);
     serve_registry_deregister_all();
+    if (g_local_hooks.on_shutdown)
+        g_local_hooks.on_shutdown(g_local_hooks.user);
 
     decision = serve_drain_generations();
     if (decision == PN_SHUTDOWN_DRAIN_RETIRE) {
@@ -594,6 +706,7 @@ int pn_serve_main(int argc, char **argv)
     const char *host = SERVE_DEFAULT_HOST;
     int port = SERVE_DEFAULT_PORT;
     int quantize = 0;
+    bool local_mode = false;
 
     /* FIRST line this process writes. The backend is a compile-time constant
      * and the only reason it was ever unknown is that nothing printed it: a
@@ -603,6 +716,9 @@ int pn_serve_main(int argc, char **argv)
     fprintf(stderr, "serve: backend=%s build=%s accelerator=%s\n",
             pn_backend_name(), pn_backend_build_commit(),
             pn_backend_has_accelerator() ? "yes" : "no");
+    if (pn_host_heap_init())
+        fprintf(stderr, "serve: host heap returns freed request memory "
+                "(PANTHEON_HEAP_TUNE=0 turns it off)\n");
 
     memset(specs, 0, sizeof(specs));
     for (int i = 1; i < argc; i++) {
@@ -648,6 +764,20 @@ int pn_serve_main(int argc, char **argv)
                 return 1;
             }
             specs[n_specs - 1].reasoning_budget = (int)rb;
+        } else if (strcmp(argv[i], "--reasoning-reserve") == 0 && i + 1 < argc) {
+            if (n_specs == 0) {
+                fprintf(stderr, "serve: --reasoning-reserve must follow a --model\n");
+                return 1;
+            }
+            const char *rrarg = argv[++i];
+            char *rrend = NULL;
+            long rr = strtol(rrarg, &rrend, 10);
+            if (rrend == rrarg || *rrend != '\0' || rr < 0 || rr > (1 << 20)) {
+                fprintf(stderr, "serve: bad --reasoning-reserve '%s' "
+                        "(want a token count 0..%d)\n", rrarg, 1 << 20);
+                return 1;
+            }
+            specs[n_specs - 1].reasoning_reserve = (int)rr;
         } else if (strcmp(argv[i], "--ctx-cap") == 0 && i + 1 < argc) {
             if (n_specs == 0) {
                 fprintf(stderr, "serve: --ctx-cap must follow a --model\n");
@@ -684,6 +814,18 @@ int pn_serve_main(int argc, char **argv)
                 return 1;
             }
             specs[n_specs - 1].max_sessions = (int)ms;
+        } else if (strcmp(argv[i], "--mtp") == 0) {
+            if (n_specs == 0) {
+                fprintf(stderr, "serve: --mtp must follow a --model\n");
+                return 1;
+            }
+            specs[n_specs - 1].mtp = true;
+        } else if (strcmp(argv[i], "--cpu") == 0) {
+            if (n_specs == 0) {
+                fprintf(stderr, "serve: --cpu must follow a --model\n");
+                return 1;
+            }
+            specs[n_specs - 1].cpu = true;
         } else if (strcmp(argv[i], "--max-concurrent") == 0 && i + 1 < argc) {
             if (n_specs == 0) {
                 fprintf(stderr, "serve: --max-concurrent must follow a --model\n");
@@ -713,6 +855,8 @@ int pn_serve_main(int argc, char **argv)
             vocab_path = argv[++i];
         } else if (strcmp(argv[i], "--quantize") == 0) {
             quantize = 1;
+        } else if (strcmp(argv[i], "--local") == 0) {
+            local_mode = true;
         } else {
             fprintf(stderr, "serve: unknown option '%s'\n", argv[i]);
             print_serve_usage();
@@ -720,7 +864,7 @@ int pn_serve_main(int argc, char **argv)
         }
     }
 
-    if (n_specs == 0) {
+    if (n_specs == 0 && !local_mode) {
         fprintf(stderr, "serve: --model is required\n");
         print_serve_usage();
         return 1;
@@ -821,7 +965,7 @@ int pn_serve_main(int argc, char **argv)
      * period and measurements had already been taken off it before anyone
      * noticed. A warning on a process that then serves for a week is the
      * failure, not the fix. A CPU serve is still fully available — it is asked
-     * for by NOT passing --dies (see print_serve_usage). */
+     * for with --cpu (see print_serve_usage). */
     if (refuse_dies_without_backend(specs, n_specs))
         return 1;
 
@@ -834,16 +978,14 @@ int pn_serve_main(int argc, char **argv)
     pn_load_opts opts = { .vocab_path = vocab_path, .config_path = config_path,
                           .quantize = (bool)quantize };
     for (int i = 0; i < n_specs; i++) {
-        char err[256];
+        char err[512];
         /* Per-model context cap (KV Phase 1): the ring is sized to this at load,
          * so set it on the shared opts before each model's load. */
         opts.ctx_cap = specs[i].ctx_cap;
+        opts.cpu_only = specs[i].cpu;
         fprintf(stderr, "serve: loading %s ...\n", specs[i].path);
-        if (mr_load(&reg, specs[i].path, specs[i].name, &opts,
-                    specs[i].n_dies > 0 ? specs[i].dies : NULL,
-                    specs[i].n_dies, specs[i].reasoning_budget,
-                    specs[i].max_sessions, specs[i].max_concurrent,
-                    err, sizeof(err)) != 0) {
+        int load_rc = serve_load_model(&reg, &specs[i], &opts, err, sizeof(err));
+        if (load_rc != 0) {
             fprintf(stderr, "serve: failed to load %s: %s\n", specs[i].path, err);
             mr_free(&reg);
             return 1;
@@ -882,6 +1024,14 @@ int pn_serve_main(int argc, char **argv)
         for (int i = 0; i < n; i++)
             fprintf(stderr, "%s %s", i ? "," : "", info[i].name);
         fprintf(stderr, ")\n");
+    }
+
+    /* Pantheon Local: discovery, pairing code, loaded-set reload. A failure
+     * here is a refusal to run, not a degraded appliance. */
+    if (g_local_hooks.on_listening &&
+        g_local_hooks.on_listening(&reg, host, port, g_local_hooks.user) != 0) {
+        serve_run_shutdown(listen_fd, watch, &reg);
+        return 1;
     }
 
     /* Dispatch layer (Phase G0): self-register each served model with the

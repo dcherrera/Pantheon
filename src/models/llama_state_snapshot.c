@@ -33,6 +33,7 @@
  */
 
 #include "llama.h"
+#include "../core/mem/pn_host_admission.h"
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -54,6 +55,7 @@ typedef struct {
     int head_dim;
     int max_seq;            /* the SOURCE cache's ring length (diagnostic) */
     llama_snap_layer *lay;
+    uint64_t host_admitted; /* host bytes admitted for the rows (released on free) */
 } llama_kv_snap;
 
 /* Elements per layer in the packed representation. */
@@ -165,7 +167,20 @@ void pn_llama_kv_snapshot_free(void *snap_v)
         }
         free(sn->lay);
     }
+    pn_host_release(sn->host_admitted);
     free(sn);
+}
+
+/* Admit the packed rows of `sn` (2 x layers x elems floats) before allocating
+ * them; the charge rides on the snapshot until pn_llama_kv_snapshot_free. */
+static int snap_admit_rows(llama_kv_snap *sn, size_t elems)
+{
+    uint64_t bytes = 2ull * (uint64_t)sn->n_layers * (uint64_t)elems * sizeof(float);
+    if (pn_host_admit_hint(bytes, "dense session snapshot", "shorten the session or "
+                           "free host memory", NULL, 0) != 0)
+        return -1;
+    sn->host_admitted = bytes;
+    return 0;
 }
 
 void *pn_llama_kv_snapshot(const void *cache_v, int pos)
@@ -197,6 +212,8 @@ void *pn_llama_kv_snapshot(const void *cache_v, int pos)
         goto fail;
 
     size_t elems = snap_layer_elems(sn);
+    if (snap_admit_rows(sn, elems) != 0)
+        goto fail;
     for (int i = 0; i < cache->n_layers; i++) {
         sn->lay[i].k_rows = malloc(elems * sizeof(float));
         sn->lay[i].v_rows = malloc(elems * sizeof(float));
@@ -378,6 +395,9 @@ int pn_llama_kv_snap_serialize(const void *snap_v, uint64_t weights_version,
     if (sz.err)
         return -1;
 
+    if (pn_host_admit_check(sz.off, "dense session snapshot blob", "shorten the "
+                            "session or free host memory", NULL, 0) != 0)
+        return -1;
     unsigned char *buf = malloc(sz.off ? sz.off : 1);
     if (!buf)
         return -1;
@@ -439,6 +459,8 @@ void *pn_llama_kv_snap_deserialize(const unsigned char *bytes, size_t len,
         elems > SIZE_MAX / sizeof(float))
         goto fail;
     size_t rows_b = elems * sizeof(float);
+    if (snap_admit_rows(sn, elems) != 0)
+        goto fail;
 
     for (int i = 0; i < n_layers; i++) {
         sn->lay[i].k_rows = malloc(rows_b);

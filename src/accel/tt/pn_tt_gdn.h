@@ -117,6 +117,21 @@ int pn_tt_device_arm_gdn(pn_tt_device *device, const pn_tt_gdn_shape *shape);
 /** Did the GDN family actually arm for this run? */
 bool pn_tt_gdn_is_armed(const pn_tt_device *device);
 
+/** L1a (prefill rework): how many decode GDN residencies (`gdn` + head-split members) could be
+ *  lent to prefill; 0 when the family is not armed. */
+uint32_t pn_tt_gdn_lend_count(const pn_tt_device *device);
+
+/**
+ * L1a: retire decode GDN residency `member_index` (0 = `gdn`) so its core can serve prefill.
+ * Its carried state is in DRAM and untouched. @return its core, or UINT32_MAX when its firmware
+ * is not on a core or it did not retire (then nothing may boot on that core)
+ */
+uint32_t pn_tt_gdn_lend(pn_tt_device *device, uint32_t member_index);
+
+/** L1a: arm decode GDN residency `member_index` fresh on `core` again (its firmware re-booted).
+ *  @return true when it is running */
+bool pn_tt_gdn_restore(pn_tt_device *device, uint32_t member_index, uint32_t core);
+
 /**
  * TRANSPOSE one layer's conv1d weight into tap-major planes and upload it. Once, at load.
  *
@@ -141,7 +156,34 @@ int pn_tt_gdn_state_reset(pn_tt_device *device);
  *  the state to slot `slot` (-1: back in place); trade layer `layer`'s live window + state with
  *  slot `slot`'s. @return 0 or -1 */
 int pn_tt_gdn_snapshot_reserve(pn_tt_device *device, uint32_t slots);
+
+/** Allocate the prefix checkpoint's twin set now (it is otherwise allocated at the first
+ *  capture, in each layer's own bank). 0, or -1. */
+int pn_tt_gdn_checkpoint_reserve(pn_tt_device *device);
+
+/**
+ * PROJECT, allocating nothing: the least free bytes any DRAM bank would keep after `slots`
+ * snapshot slots (those not yet reserved), the checkpoint set if `checkpoint` and not yet
+ * held — both in each layer's own bank — and `stacks` blocks of `stack_bytes`, each into the
+ * bank with the most free (pn_tt_moe_place_stack's rule). 0, or -1.
+ */
+int pn_tt_gdn_project_bank_free(pn_tt_device *device, uint32_t slots, bool checkpoint,
+                                uint32_t stacks, uint64_t stack_bytes, uint64_t *out_min_free);
 int pn_tt_gdn_state_out(pn_tt_device *device, int slot);
+/** The verify's slot map (pn_tt_gdn_verify_slots.h): COMPACT (rows - 1 slots) or legacy. */
+void pn_tt_gdn_verify_compact_set(pn_tt_device *device, bool compact);
+/** Snapshot slots a verify of `rows` rows needs under this device's map. */
+uint32_t pn_tt_gdn_verify_slots(const pn_tt_device *device, uint32_t rows);
+/** Per-row walk, row `row` of `rows`: route its state write (pn_tt_gdn_state_out) to the slot
+ *  the map names, or in place. @return 0 or -1 */
+int pn_tt_gdn_verify_row_out(pn_tt_device *device, uint32_t rows, uint32_t row);
+/** Per-row walk, after row `row`'s descriptor: trade `layer`'s live part(s) with that slot
+ *  (nothing when the row wrote in place). @return 0 or -1 */
+int pn_tt_gdn_verify_row_trade(pn_tt_device *device, uint32_t layer, uint32_t rows,
+                               uint32_t row, bool window, bool state);
+/** The slot holding the state after row `last_kept` of the last `rows`-row verify. */
+uint32_t pn_tt_gdn_verify_rollback_slot(const pn_tt_device *device, uint32_t rows,
+                                        uint32_t last_kept);
 int pn_tt_gdn_layer_swap(pn_tt_device *device, uint32_t layer, uint32_t slot);
 int pn_tt_gdn_layer_swap_part(pn_tt_device *device, uint32_t layer, uint32_t slot, bool window,
                               bool state);
@@ -156,13 +198,19 @@ int pn_tt_gdn_await_deferred(pn_tt_device *device);
 int pn_tt_gdn_gate_upload_rows(pn_tt_device *device, uint32_t rows, const float *decay,
                                const float *beta);
 int pn_tt_gdn_delta_descriptor_only(pn_tt_device *device, uint32_t layer);
+
+/** THE EXACT CARD GATES in decode: until cleared (`address` 0), DELTA descriptors
+ *  (pn_tt_gdn_delta_descriptor_only, pn_tt_gdn_delta_rows_oncard) name the table block at
+ *  `bank`:`address` (pn_tt_gdnc_table_decode_block) and the reader builds their gate blocks
+ *  from the strips it names — nothing uploaded, nothing read back. */
+void pn_tt_gdn_table_gate(pn_tt_device *device, uint32_t bank, uint32_t address);
 /** MULTI-ROW DELTA: verify rows 0..rows-1 in one descriptor per member (see pn_tt_gdn.c). */
 int pn_tt_gdn_delta_rows_oncard(pn_tt_device *device, uint32_t layer, uint32_t rows);
 
 /** PM 6 MULTI-ROW CONV: the CONV of verify rows [0, rows) in ONE descriptor per member (strip
  *  mode): row r reads the window its one-row descriptor would have, writes its output to row r
- *  and its rolled window to snapshot slot r; then the window swaps in row order (live = after
- *  the last row, slot r = before row r). -2 when refused before anything ran (the caller may
+ *  and its rolled window to the slot the verify map names (legacy: slot r, then the window
+ *  swaps in row order — live = after the last row, slot r = before row r). -2 when refused before anything ran (the caller may
  *  take the per-row walk), -1 on a card failure. */
 int pn_tt_gdn_conv_rows_oncard(pn_tt_device *device, uint32_t layer, uint32_t rows);
 
@@ -311,6 +359,9 @@ uint32_t pn_tt_gdn_stream_tiles(const pn_tt_device *device);
 
 /** `2 * k_heads * state_size/32` — q then k, the prefix the L2 norm covers. */
 uint32_t pn_tt_gdn_key_tiles(const pn_tt_device *device);
+
+/** The GDN's V-heads: the live columns of the alpha/beta strips. 0 before the arm. */
+uint32_t pn_tt_gdn_v_heads(const pn_tt_device *device);
 
 /** `v_heads * state_size/32` — v, and the same count as `y`. */
 uint32_t pn_tt_gdn_value_tiles(const pn_tt_device *device);

@@ -18,6 +18,8 @@
 #ifndef PN_QWEN35MOE_PREFILL_TT_WALL_H
 #define PN_QWEN35MOE_PREFILL_TT_WALL_H
 
+#include <stdbool.h>
+
 typedef enum {
     PN_PREFILL_WALL_SETUP,        /**< tall enter, row scratch, state zero, grid begin */
     PN_PREFILL_WALL_STATE_RESET,  /**< the carried GDN state + conv window zeroed (in SETUP) */
@@ -46,6 +48,14 @@ void pn_prefill_wall_close(pn_prefill_wall_region region, double accounted_secon
 /** The re-arm clock (seconds spent booting / starting / stopping residencies so far): each
  *  region then also reports how much of its wall was idle-retire re-arms. NULL = none. */
 void pn_prefill_wall_set_rearm_clock(double (*clock)(void));
+
+/** PROFILE (2026-10-26): one layer of a batched pass took `seconds` of wall (its norm, mixer,
+ *  projections, FFN and residuals; a W2 layer includes the next layer's prep it ran). */
+void pn_prefill_wall_layer(bool attention, double seconds);
+
+/** PROFILE: one attention layer's streamed band loop (QK norms, RoPE, K/V appends, the chunk
+ *  mixer, the gate) took `seconds`, open to finish. */
+void pn_prefill_wall_attn_mixer(double seconds);
 
 /** Print `prefill WALL —` and one row per region that moved. */
 void pn_prefill_wall_report(int n_tokens, double accounted_seconds);

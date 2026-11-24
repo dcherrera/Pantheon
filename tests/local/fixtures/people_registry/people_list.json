@@ -1,0 +1,6 @@
+{"endpoint":"GET /local/people","class":"device",
+ "request":null,
+ "status":200,
+ "response":{"people":[{"id":"p1a2b3c4d","handle":"david","name":"David","admin":true,"may_load":true,"created":1793000000}]},
+ "response_short":{"people":[{"id":"p1a2b3c4d","handle":"david","name":"David"}]},
+ "errors":[{"when":"an inference key","status":403,"type":"forbidden"}]}

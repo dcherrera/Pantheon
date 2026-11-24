@@ -1,0 +1,734 @@
+{
+  "schema": 1,
+  "version": 8,
+  "published": "2026-11-19",
+  "models": [
+    {
+      "id": "qwen3.6-35b-a3b-q3km",
+      "name": "Qwen3.6 35B-A3B (Q3_K_M)",
+      "family": "qwen3.6",
+      "description": "Qwen's 35B mixture-of-experts reasoning model (3B active) on one Tesla K80 board, with MTP speculative decoding.",
+      "licence": {
+        "id": "apache-2.0",
+        "url": "https://huggingface.co/Qwen/Qwen3.6-35B-A3B/blob/main/LICENSE"
+      },
+      "capabilities": [
+        "chat",
+        "tools",
+        "reasoning"
+      ],
+      "files": [
+        {
+          "role": "weights",
+          "hf_repo": "TeamIDE/Qwen3.6-35B-A3B-Pantheon-K80",
+          "revision": "b4f4e2c4ee73c1a4b2c2149ffa4912491d1ac517",
+          "filename": "Qwen_Qwen3.6-35B-A3B-Q3_K_M.gguf",
+          "size": 17117951616,
+          "sha256": "17350b1355d32397cffe7d4b446fd9361dbb01aa26bbf41fc950aa595033794f"
+        }
+      ],
+      "profiles": [
+        {
+          "id": "k80-pair",
+          "rank": 1,
+          "hardware": {
+            "unit_type": "k80-gpu",
+            "count": 2,
+            "same_card": true,
+            "min_mem_per_unit": 10756292608,
+            "min_host_ram": 7000000000
+          },
+          "load": {
+            "ctx_cap": 40960,
+            "max_sessions": 1,
+            "max_concurrent": 0,
+            "reasoning_budget": 2000,
+            "mtp": true
+          },
+          "options": {
+            "kv_type": "q4",
+            "ctx_min": 8192,
+            "ctx_max": 131072,
+            "sessions_max": 4,
+            "mem": {
+              "fixed": 12075220992,
+              "ctx_per_token": 3478,
+              "per_session": 4718592,
+              "kv_per_token": 2880
+            }
+          },
+          "sampling": {
+            "temperature": 0.6,
+            "top_p": 0.95,
+            "top_k": 20,
+            "min_p": 0,
+            "presence_penalty": 0
+          },
+          "measured": {
+            "decode_tok_s": {
+              "8k": 24.5,
+              "14k": 19.7,
+              "32k": 13.6
+            },
+            "ttft": {
+              "prompt_tokens": 8444,
+              "seconds": 74.2
+            },
+            "context_window": 40960
+          }
+        },
+        {
+          "id": "k80-pair-fp32",
+          "rank": 2,
+          "hardware": {
+            "unit_type": "k80-gpu",
+            "count": 2,
+            "same_card": true,
+            "min_mem_per_unit": 10756292608,
+            "min_host_ram": 7000000000
+          },
+          "load": {
+            "ctx_cap": 32768,
+            "max_sessions": 1,
+            "max_concurrent": 0,
+            "reasoning_budget": 2000,
+            "mtp": false
+          },
+          "options": {
+            "kv_type": "fp32",
+            "ctx_min": 8192,
+            "ctx_max": 32768,
+            "sessions_max": 4,
+            "mem": {
+              "fixed": 10800332800,
+              "ctx_per_token": 20480,
+              "per_session": 36700160,
+              "kv_per_token": 20480
+            }
+          },
+          "sampling": {
+            "temperature": 0.6,
+            "top_p": 0.95,
+            "top_k": 20,
+            "min_p": 0,
+            "presence_penalty": 0
+          },
+          "measured": {
+            "decode_tok_s": {
+              "8k": 19.13,
+              "14k": 16.16,
+              "32k": 0
+            },
+            "ttft": {
+              "prompt_tokens": 8444,
+              "seconds": 102.0
+            },
+            "context_window": 32768
+          }
+        }
+      ]
+    },
+    {
+      "id": "qwen3.6-35b-a3b-q8",
+      "name": "Qwen3.6 35B-A3B (Q8_0)",
+      "family": "qwen3.6",
+      "description": "Qwen's 35B mixture-of-experts reasoning model (3B active) from Q8_0 weights, on one Tenstorrent Blackhole p150 or two Tesla K80 boards (4 GPUs), with MTP speculative decoding.",
+      "licence": {
+        "id": "apache-2.0",
+        "url": "https://huggingface.co/Qwen/Qwen3.6-35B-A3B/blob/main/LICENSE"
+      },
+      "capabilities": [
+        "chat",
+        "tools",
+        "reasoning"
+      ],
+      "files": [
+        {
+          "role": "weights",
+          "hf_repo": "TeamIDE/Qwen3.6-35B-A3B-Pantheon-K80",
+          "revision": "272bf5edbc1255971effa8d45e62e13b9398ba54",
+          "filename": "Qwen3.6-35B-A3B-Q8_0.gguf",
+          "size": 37801097248,
+          "sha256": "0bd4666292101b41b1965008814f0948c1a6a7e0bd7187e7a12ce6dd1d16212e",
+          "unit_types": ["k80-gpu"]
+        },
+        {
+          "role": "weights",
+          "hf_repo": "TeamIDE/Qwen3.6-35B-A3B-Pantheon-TT",
+          "revision": "3cf0ba295349218c2ac28f82ba25f3142260eb97",
+          "filename": "Qwen_Qwen3.6-35B-A3B-Q8_0.meta.gguf",
+          "size": 15972512,
+          "sha256": "90f46deabc2feda8ed32af9f83c96d1709bc1148040142b48bd2b4b09830b01c",
+          "unit_types": ["p150"]
+        },
+        {
+          "role": "extra",
+          "hf_repo": "TeamIDE/Qwen3.6-35B-A3B-Pantheon-TT",
+          "revision": "3cf0ba295349218c2ac28f82ba25f3142260eb97",
+          "filename": "Qwen_Qwen3.6-35B-A3B-Q8_0.meta.moe_bfp6.fttw",
+          "size": 28843656936,
+          "sha256": "deec8f87dcb7b664aac4537aa00b9fa6a1094deae3af4dbb2a3ecd7deea137bf",
+          "unit_types": ["p150"]
+        },
+        {
+          "role": "extra",
+          "hf_repo": "TeamIDE/Qwen3.6-35B-A3B-Pantheon-TT",
+          "revision": "3cf0ba295349218c2ac28f82ba25f3142260eb97",
+          "filename": "Qwen_Qwen3.6-35B-A3B-Q8_0.meta.moe_bfp6.mtp.fttw",
+          "size": 697686184,
+          "sha256": "cd394ede33894a8ca4840f9fa57fc9d4c165124776e9983065072c32e9a659ab",
+          "unit_types": ["p150"]
+        }
+      ],
+      "profiles": [
+        {
+          "id": "p150-one",
+          "rank": 1,
+          "hardware": {
+            "unit_type": "p150",
+            "count": 1,
+            "same_card": false,
+            "min_mem_per_unit": 0,
+            "min_host_ram": 7000000000
+          },
+          "load": {
+            "ctx_cap": 36864,
+            "max_sessions": 1,
+            "max_concurrent": 0,
+            "reasoning_budget": 0,
+            "mtp": true
+          },
+          "options": {
+            "kv_type": "bf16",
+            "ctx_min": 8192,
+            "ctx_max": 36864,
+            "sessions_max": 1,
+            "mem": {
+              "fixed": 31370000000,
+              "ctx_per_token": 0,
+              "per_session": 0,
+              "kv_per_token": 22528
+            }
+          },
+          "sampling": {
+            "temperature": 0.6,
+            "top_p": 0.95,
+            "top_k": 20,
+            "min_p": 0,
+            "presence_penalty": 0
+          },
+          "measured": {
+            "decode_tok_s": {
+              "8k": 12.18,
+              "14k": 11.43,
+              "32k": 9.83
+            },
+            "ttft": {
+              "prompt_tokens": 8147,
+              "seconds": 192.0
+            },
+            "context_window": 36864
+          }
+        },
+        {
+          "id": "k80-two-boards",
+          "rank": 1,
+          "hardware": {
+            "unit_type": "k80-gpu",
+            "count": 4,
+            "same_card": false,
+            "per_card": 2,
+            "min_mem_per_unit": 10340368384,
+            "min_host_ram": 7000000000
+          },
+          "load": {
+            "ctx_cap": 40960,
+            "max_sessions": 1,
+            "max_concurrent": 0,
+            "reasoning_budget": 5120,
+            "reasoning_reserve": 3072,
+            "mtp": true
+          },
+          "options": {
+            "kv_type": "q4",
+            "ctx_min": 8192,
+            "ctx_max": 131072,
+            "sessions_max": 4,
+            "mem": {
+              "fixed": 11367743488,
+              "ctx_per_token": 2230,
+              "per_session": 13631488,
+              "kv_per_token": 1766
+            }
+          },
+          "sampling": {
+            "temperature": 0.6,
+            "top_p": 0.95,
+            "top_k": 20,
+            "min_p": 0,
+            "presence_penalty": 0
+          },
+          "measured": {
+            "decode_tok_s": {
+              "8k": 21.3,
+              "14k": 22.0,
+              "32k": 13.8
+            },
+            "ttft": {
+              "prompt_tokens": 8444,
+              "seconds": 51.4
+            },
+            "context_window": 40960
+          }
+        }
+      ]
+    },
+    {
+      "id": "ornith-1.5-9b-q8",
+      "name": "Ornith 1.5 9B",
+      "family": "ornith-1.5",
+      "description": "ornith-ai's 9B dense coding and agent model on one Tenstorrent Blackhole p150 or one Tesla K80 GPU, with MTP speculative decoding.",
+      "licence": {
+        "id": "mit",
+        "url": "https://huggingface.co/ornith-ai/Ornith-1.5-9B"
+      },
+      "capabilities": [
+        "chat",
+        "tools",
+        "reasoning"
+      ],
+      "files": [
+        {
+          "role": "weights",
+          "hf_repo": "TeamIDE/Ornith-1.5-9B-Pantheon-TT",
+          "revision": "86feee7f479dce675c821fad48dc77e76df1a3b5",
+          "filename": "Ornith-1.5-9B-Q8_0.gguf",
+          "size": 9786060384,
+          "sha256": "22086870b009dbe9815ee752c48a82de930118a7c5ce5599590892ae03b8b010"
+        },
+        {
+          "role": "extra",
+          "hf_repo": "TeamIDE/Ornith-1.5-9B-Pantheon-TT",
+          "revision": "86feee7f479dce675c821fad48dc77e76df1a3b5",
+          "filename": "Ornith-1.5-9B-Q8_0.bfp8.fttw",
+          "size": 9778719184,
+          "sha256": "a81f0d06875c29997639abc5192de06cfae457891df56314a839b4111054cd79",
+          "unit_types": ["p150"]
+        },
+        {
+          "role": "extra",
+          "hf_repo": "TeamIDE/Ornith-1.5-9B-Pantheon-TT",
+          "revision": "86feee7f479dce675c821fad48dc77e76df1a3b5",
+          "filename": "Ornith-1.5-9B-Q8_0.bfp8.mtp.fttw",
+          "size": 258561216,
+          "sha256": "db5ebc0d1864b29125623cd8a96c97268ec7aea919e2e52b53436732f7582bfb",
+          "unit_types": ["p150"]
+        }
+      ],
+      "profiles": [
+        {
+          "id": "p150-one",
+          "rank": 1,
+          "hardware": {
+            "unit_type": "p150",
+            "count": 1,
+            "same_card": false,
+            "min_mem_per_unit": 0,
+            "min_host_ram": 7000000000
+          },
+          "load": {
+            "ctx_cap": 131072,
+            "max_sessions": 1,
+            "max_concurrent": 0,
+            "reasoning_budget": 0,
+            "mtp": true
+          },
+          "options": {
+            "kv_type": "bf16",
+            "ctx_min": 8192,
+            "ctx_max": 131072,
+            "sessions_max": 1,
+            "mem": {
+              "fixed": 11939740647,
+              "ctx_per_token": 0,
+              "per_session": 0,
+              "kv_per_token": 36864
+            }
+          },
+          "sampling": {
+            "temperature": 0.6,
+            "top_p": 0.95,
+            "top_k": 20,
+            "min_p": 0,
+            "presence_penalty": 0
+          },
+          "measured": {
+            "decode_tok_s": {
+              "8k": 40.8,
+              "14k": 37.92,
+              "32k": 0
+            },
+            "ttft": {
+              "prompt_tokens": 7395,
+              "seconds": 8.465
+            },
+            "context_window": 131072
+          }
+        },
+        {
+          "id": "k80-one",
+          "rank": 2,
+          "hardware": {
+            "unit_type": "k80-gpu",
+            "count": 1,
+            "same_card": false,
+            "min_mem_per_unit": 8982102016,
+            "min_host_ram": 7000000000
+          },
+          "load": {
+            "ctx_cap": 32768,
+            "max_sessions": 1,
+            "max_concurrent": 0,
+            "reasoning_budget": 0,
+            "mtp": true
+          },
+          "options": {
+            "kv_type": "q4",
+            "ctx_min": 8192,
+            "ctx_max": 131072,
+            "sessions_max": 4,
+            "mem": {
+              "fixed": 9895411712,
+              "ctx_per_token": 10368,
+              "per_session": 0,
+              "kv_per_token": 9216
+            }
+          },
+          "sampling": {
+            "temperature": 0.6,
+            "top_p": 0.95,
+            "top_k": 20,
+            "min_p": 0,
+            "presence_penalty": 0
+          },
+          "measured": {
+            "decode_tok_s": {
+              "8k": 7.7,
+              "14k": 8.29,
+              "32k": 7.85
+            },
+            "ttft": {
+              "prompt_tokens": 8445,
+              "seconds": 424.6
+            },
+            "context_window": 32768
+          }
+        },
+        {
+          "id": "k80-one-fp32",
+          "rank": 3,
+          "hardware": {
+            "unit_type": "k80-gpu",
+            "count": 1,
+            "same_card": false,
+            "min_mem_per_unit": 9344909312,
+            "min_host_ram": 7000000000
+          },
+          "load": {
+            "ctx_cap": 16384,
+            "max_sessions": 1,
+            "max_concurrent": 0,
+            "reasoning_budget": 0,
+            "mtp": false
+          },
+          "options": {
+            "kv_type": "fp32",
+            "ctx_min": 8192,
+            "ctx_max": 16384,
+            "sessions_max": 4,
+            "mem": {
+              "fixed": 9286189056,
+              "ctx_per_token": 65536,
+              "per_session": 58720256,
+              "kv_per_token": 65536
+            }
+          },
+          "sampling": {
+            "temperature": 0.6,
+            "top_p": 0.95,
+            "top_k": 20,
+            "min_p": 0,
+            "presence_penalty": 0
+          },
+          "measured": {
+            "decode_tok_s": {
+              "8k": 6.2,
+              "14k": 5.99,
+              "32k": 0
+            },
+            "ttft": {
+              "prompt_tokens": 8445,
+              "seconds": 411.5
+            },
+            "context_window": 16384
+          }
+        }
+      ]
+    },
+    {
+      "id": "qwen3.8-27b-q8",
+      "name": "Qwen3.8 27B",
+      "family": "qwen3.8",
+      "description": "Qwen's 27B dense reasoning and agent model from Q8_0 weights, on one Tenstorrent Blackhole p150 (K8V4 KV, a prefix checkpoint for fast follow-up turns) or two Tesla K80 boards (4 GPUs, one user), with MTP speculative decoding.",
+      "licence": {
+        "id": "apache-2.0",
+        "url": "https://huggingface.co/Qwen/Qwen3.8-27B/blob/main/LICENSE"
+      },
+      "capabilities": [
+        "chat",
+        "tools",
+        "reasoning"
+      ],
+      "files": [
+        {
+          "role": "weights",
+          "hf_repo": "TeamIDE/Qwen3.8-27B-Pantheon-TT",
+          "revision": "a93045f974870d6013ac6115e5a569c3ad090ede",
+          "filename": "Qwen3.8-27B-Q8_0.meta.gguf",
+          "size": 21652032,
+          "sha256": "6ff6c58542d3ddd58a932751069cea926f1be6c0a08944a6e91719bf7dae2655",
+          "unit_types": ["p150"]
+        },
+        {
+          "role": "extra",
+          "hf_repo": "TeamIDE/Qwen3.8-27B-Pantheon-TT",
+          "revision": "a93045f974870d6013ac6115e5a569c3ad090ede",
+          "filename": "Qwen3.8-27B-Q8_0.meta.bfp8.fttw",
+          "size": 28602143000,
+          "sha256": "ab48831ca486105800428696833f6ed28449ec129783c22ce86faf7d575fff5e",
+          "unit_types": ["p150"]
+        },
+        {
+          "role": "extra",
+          "hf_repo": "TeamIDE/Qwen3.8-27B-Pantheon-TT",
+          "revision": "a93045f974870d6013ac6115e5a569c3ad090ede",
+          "filename": "Qwen3.8-27B-Q8_0.meta.bfp8.mtp.fttw",
+          "size": 451323072,
+          "sha256": "fd5094bb7ebf884a1bab4cf261b6e1f5b01ec9410efa0f519de9287aca4d2a4b",
+          "unit_types": ["p150"]
+        },
+        {
+          "role": "weights",
+          "hf_repo": "TeamIDE/Qwen3.8-27B-Pantheon-K80",
+          "revision": "fe90f2f50659fb56f95a8525760f83f17cda6fc6",
+          "filename": "Qwen3.8-27B-Q8_0.gguf",
+          "size": 29047086048,
+          "sha256": "a680f44a06920e5d689774823782006aa3acc8db95750323373b24139b67e348",
+          "unit_types": ["k80-gpu"]
+        }
+      ],
+      "profiles": [
+        {
+          "id": "p150-one",
+          "rank": 1,
+          "hardware": {
+            "unit_type": "p150",
+            "count": 1,
+            "same_card": false,
+            "min_mem_per_unit": 0,
+            "min_host_ram": 7000000000
+          },
+          "load": {
+            "ctx_cap": 30720,
+            "max_sessions": 1,
+            "max_concurrent": 0,
+            "reasoning_budget": 0,
+            "mtp": true,
+            "mtp_drafts": 1
+          },
+          "options": {
+            "kv_type": "k8v4",
+            "ctx_min": 8192,
+            "ctx_max": 30720,
+            "sessions_max": 1,
+            "mem": {
+              "fixed": 33053181214,
+              "ctx_per_token": 0,
+              "per_session": 0,
+              "kv_per_token": 28288
+            }
+          },
+          "sampling": {
+            "temperature": 1.0,
+            "top_p": 0.95,
+            "top_k": 20,
+            "min_p": 0,
+            "presence_penalty": 0
+          },
+          "measured": {
+            "decode_tok_s": {
+              "8k": 10.74,
+              "14k": 0,
+              "32k": 8.44
+            },
+            "ttft": {
+              "prompt_tokens": 2845,
+              "seconds": 17.61
+            },
+            "context_window": 30720
+          }
+        },
+        {
+          "id": "p150-one-bf16",
+          "rank": 2,
+          "hardware": {
+            "unit_type": "p150",
+            "count": 1,
+            "same_card": false,
+            "min_mem_per_unit": 0,
+            "min_host_ram": 7000000000
+          },
+          "load": {
+            "ctx_cap": 30720,
+            "max_sessions": 1,
+            "max_concurrent": 0,
+            "reasoning_budget": 0,
+            "mtp": false
+          },
+          "options": {
+            "kv_type": "bf16",
+            "ctx_min": 8192,
+            "ctx_max": 30720,
+            "sessions_max": 1,
+            "mem": {
+              "fixed": 31869731078,
+              "ctx_per_token": 0,
+              "per_session": 0,
+              "kv_per_token": 65536
+            }
+          },
+          "sampling": {
+            "temperature": 1.0,
+            "top_p": 0.95,
+            "top_k": 20,
+            "min_p": 0,
+            "presence_penalty": 0
+          },
+          "measured": {
+            "decode_tok_s": {
+              "8k": 6.61,
+              "14k": 6.36,
+              "32k": 5.6
+            },
+            "ttft": {
+              "prompt_tokens": 2844,
+              "seconds": 15.39
+            },
+            "context_window": 30720
+          }
+        },
+        {
+          "id": "p150-one-100k",
+          "rank": 3,
+          "hardware": {
+            "unit_type": "p150",
+            "count": 1,
+            "same_card": false,
+            "min_mem_per_unit": 0,
+            "min_host_ram": 7000000000
+          },
+          "load": {
+            "ctx_cap": 102400,
+            "max_sessions": 1,
+            "max_concurrent": 0,
+            "reasoning_budget": 0,
+            "mtp": true,
+            "mtp_drafts": 1
+          },
+          "options": {
+            "kv_type": "k8v4",
+            "ctx_min": 8192,
+            "ctx_max": 102400,
+            "sessions_max": 1,
+            "mem": {
+              "fixed": 29981121822,
+              "ctx_per_token": 0,
+              "per_session": 0,
+              "kv_per_token": 28288
+            }
+          },
+          "sampling": {
+            "temperature": 1.0,
+            "top_p": 0.95,
+            "top_k": 20,
+            "min_p": 0,
+            "presence_penalty": 0
+          },
+          "measured": {
+            "decode_tok_s": {
+              "8k": 13.00,
+              "14k": 0,
+              "32k": 12.68
+            },
+            "ttft": {
+              "prompt_tokens": 31267,
+              "seconds": 162.6
+            },
+            "context_window": 102400
+          }
+        },
+        {
+          "id": "k80-two-boards",
+          "rank": 1,
+          "hardware": {
+            "unit_type": "k80-gpu",
+            "count": 4,
+            "same_card": false,
+            "per_card": 2,
+            "min_mem_per_unit": 9754902528,
+            "min_host_ram": 7000000000
+          },
+          "load": {
+            "ctx_cap": 32768,
+            "max_sessions": 1,
+            "max_concurrent": 0,
+            "reasoning_budget": 5120,
+            "reasoning_reserve": 3072,
+            "mtp": true
+          },
+          "options": {
+            "kv_type": "q4",
+            "ctx_min": 8192,
+            "ctx_max": 131072,
+            "sessions_max": 1,
+            "mem": {
+              "fixed": 9401532416,
+              "ctx_per_token": 1664,
+              "per_session": 0,
+              "kv_per_token": 8704
+            }
+          },
+          "sampling": {
+            "temperature": 1.0,
+            "top_p": 0.95,
+            "top_k": 20,
+            "min_p": 0,
+            "presence_penalty": 0
+          },
+          "measured": {
+            "decode_tok_s": {
+              "8k": 6.87,
+              "14k": 5.86,
+              "32k": 0
+            },
+            "ttft": {
+              "prompt_tokens": 8404,
+              "seconds": 899.6
+            },
+            "context_window": 32768
+          }
+        }
+      ]
+    }
+  ]
+}

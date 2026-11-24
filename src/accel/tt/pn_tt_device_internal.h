@@ -30,8 +30,15 @@
 #include "pn_tt_eltwise_split.h"
 #include "pn_tt_fp32_strip.h"
 #include "pn_tt_gdn.h"
+#include "pn_tt_group_pull.h"
+#include "pn_tt_kv_format.h"
 #include "pn_tt_matmul_group.h"
+#include "pn_tt_norm_schedule.h"
+#include "pn_tt_attn_deep.h"
+#include "pn_tt_lend_ledger.h"
 #include "pn_tt_residency.h"
+#include "pn_tt_swiglu_fuse.h"
+#include "pn_tt_resadd_fuse.h"
 
 #include "tt/ft_tt_buffer.h"
 #include "tt/ft_tt_fttw.h"
@@ -40,15 +47,25 @@
 #include "tt/ft_tt_queue.h"
 #include "tt/ft_tt_runtime.h"
 #include "pn_tt_stage_pipeline.h"
+#include "pn_tt_weight_split.h"
 
 /** Staging slots for PHASE DELTA — one per 16-row sub-chunk of a 32-row pass. */
 #define PN_TT_GDNC_STAGE_SLOTS 2u
 
-/** Most cores the prefill attention chunk mixer may split its Q heads across. */
-#define PN_TT_ATTN_MAX_MEMBERS 8u
+/** Most cores the prefill attention chunk mixer may split its Q heads across (16 = one Q
+ *  head a core for Ornith, the default since 2026-10-26; `PN_TT_ATTN_CORES`). */
+#define PN_TT_ATTN_MAX_MEMBERS 16u
+/** Attention members C may borrow onto lent grid cores (the grid's cap, = PN_TT_ATTN_GRID_MAX_CORES). */
+#define PN_TT_ATTN_GRID_MAX_MEMBERS 64u
+/** Split-K decode attention's split-only cores past the head-split members
+ *  (`PN_TT_ATTN_SPLITK_CORE_LIST`, pn_tt_attention_splitk.h): at most 64 split cores. */
+#define PN_TT_ATTN_SPLITK_MAX_EXTRA 48u
 
 /** Most cores one per-head norm width may split its heads across. */
 #define PN_TT_HEAD_NORM_MAX_MEMBERS 8u
+
+/** Most cores a prefill KV append pair may pack on (core 83 + 7; pn_tt_kv_append_split.h). */
+#define PN_TT_KV_APPEND_MAX_MEMBERS 8u
 
 /** Bounds every wait. There is no untimed path to the card (spec §7.3). */
 #define PN_TT_OP_TIMEOUT_MS 60000u
@@ -75,9 +92,11 @@
  *  and not a guarantee. */
 #define PN_TT_KV_DISPLACED_KEYS 8u
 
-/** One resident weight plus the name it answers to. */
+/** One resident weight plus the name it answers to. `part` is -1 for the whole tensor, or the
+ *  column part a load-time split rule uploaded instead of it (pn_tt_weight_split.h). */
 typedef struct {
     char name[FT_TT_ARTIFACT_NAME_BYTES];
+    int32_t part;
     pn_tt_weight weight;
 } pn_tt_resident;
 
@@ -102,6 +121,11 @@ typedef struct pn_tt_gdn_buffer {
 #define PN_TT_TOPK_MAX_MEMBERS 8u
 #define PN_TT_GDN_MAX_MEMBERS 16u
 
+/** Most RMS-norm (reduce) column-split members, member 0 included. The card's slice code is a
+ *  4-bit member count (resident_reduce_protocol.h ftr_slice), so 15 is its ceiling; 8 is the
+ *  widest that divides Qwen3.8's 160 tile columns into equal slices after 5 and 4. */
+#define PN_TT_REDUCE_MAX_MEMBERS 8u
+
 /** CHUNKWISE residencies one core split may hold, member 0 included.
  *
  *  SIXTEEN rather than the decode family's eight because the two phases divide by different
@@ -123,9 +147,16 @@ typedef struct pn_tt_gdn_region {
 /** One layer's K and V regions in card DRAM. Identical geometry and two separate bases —
  *  contract F1 and N4 (two regions rather than one with a fixed offset, so each is a plain
  *  ft_tt_op_operand). Internal because no public call takes or returns one. */
+/** Most KV head GROUPS a layer's K (and V) region may be split into, each its own bank
+ *  (pn_tt_kv_banks.h). */
+#define PN_TT_KV_MAX_BANK_GROUPS 8u
+
 typedef struct pn_tt_kv_region {
     uint32_t k_bank, k_address;
     uint32_t v_bank, v_address;
+    /* KV BANK GROUPS (pn_tt_kv_banks.h): group g's heads at [g] (group 0 = the fields above). */
+    uint32_t k_group_bank[PN_TT_KV_MAX_BANK_GROUPS], k_group_address[PN_TT_KV_MAX_BANK_GROUPS];
+    uint32_t v_group_bank[PN_TT_KV_MAX_BANK_GROUPS], v_group_address[PN_TT_KV_MAX_BANK_GROUPS];
 } pn_tt_kv_region;
 
 /** Distinct HEAD widths one model may need per-head reduces at.
@@ -149,6 +180,9 @@ typedef struct pn_tt_head_norm_residency {
      *  block index, so a member is the same descriptor at an offset base — host-only. */
     pn_tt_residency member[PN_TT_HEAD_NORM_MAX_MEMBERS - 1u];
     uint32_t members; /**< 1 = no split */
+    pn_tt_group_pull pull; /**< S1: member 0 posts for the split (pn_tt_group_pull.h) */
+    /** P3: fixed at arm time with the placement it needs (pn_tt_norm_schedule.h). */
+    pn_tt_norm_schedule schedule;
 } pn_tt_head_norm_residency;
 
 /** The two directions of the activation strip bridge, in the order `render[]` holds them. */
@@ -176,6 +210,7 @@ typedef struct pn_tt_render_residency {
      *  member ladder — what that cannot show is the SHAPE of the set, and "it stopped at N"
      *  is exactly the finding that needs it. */
     double member_seconds[PN_TT_RENDER_SPLIT_MAX_MEMBERS];
+    pn_tt_group_pull pull; /**< S1: member 0 posts for the split (pn_tt_group_pull.h) */
     uint32_t in_tile_bytes;
     uint32_t out_tile_bytes;
     uint32_t tiles; /**< the widest strip placed for; 0 when this direction never armed */
@@ -256,19 +291,28 @@ struct pn_tt_device {
      * activations through DRAM instead of through the host.
      */
     pn_tt_residency reduce;  /**< RMS norm (the reduce family) */
-    /** L4: the second RMS-norm member — each owns half of every row's final chain and
-     *  output (kRedFinal byte 3); both reduce the whole row. `PN_TT_REDUCE_CORES=2`. */
-    pn_tt_residency reduce_member;
+    /** L4: the RMS-norm column split's extra members — member m owns slice m of every row's
+     *  final chain and output (kRedFinal byte 3); every member reduces the whole row.
+     *  `PN_TT_REDUCE_CORES` (default 2, up to PN_TT_REDUCE_MAX_MEMBERS since 2026-11-19). */
+    pn_tt_residency reduce_member[PN_TT_REDUCE_MAX_MEMBERS - 1u];
     /** MEASURE ONLY (2026-10-05, PHASE G pre-work): `PN_TT_IDLE_FILL=N` arms N extra reduce
      *  residencies on cores 0..N-1 that never receive work — the price of RESIDENT-BUT-IDLE
      *  cores, which a full-grid prefill would add. */
     pn_tt_residency idle_fill[64];
     uint32_t idle_fill_count;
     uint32_t reduce_members;
+    pn_tt_group_pull reduce_pull; /**< S1: `reduce` posts for the L4 split */
+    /** P0: the persistent norm role (pn_tt_norm_role.h); NULL until first armed. */
+    struct pn_tt_norm_role *norm_role;
     pn_tt_residency eltwise; /**< SwiGLU gate and residual add */
     pn_tt_residency sample;  /**< exact top-N over the logit row */
     pn_tt_residency rope;      /**< NeoX rotary, on q and k */
     pn_tt_residency memory;    /**< the KV append (no compute thread: DM0|DM1 only) */
+    /** THE PREFILL KV APPEND SPLIT (pn_tt_kv_append_split.h): members 1..N-1 run the `memory`
+     *  program on their own cores and pack one head of K or V each; decode never uses them. */
+    pn_tt_residency memory_member[PN_TT_KV_APPEND_MAX_MEMBERS - 1u];
+    uint32_t memory_members;   /**< 1 = no split */
+    pn_tt_group_pull memory_pull; /**< S1: `memory` posts for a split append */
     /** STEP 3 (A): the on-card puller (BRISC only, `PN_TT_PULLER_CORE`, default 89). */
     pn_tt_residency puller;
     pn_tt_residency attention; /**< flash decode, one descriptor per KV group */
@@ -278,7 +322,31 @@ struct pn_tt_device {
      *  in by the host, so the split needs no kernel change. */
     pn_tt_residency attention_member[PN_TT_ATTN_MAX_MEMBERS - 1u];
     uint32_t attention_members;  /**< 1 = no split */
+    pn_tt_group_pull attention_pull; /**< S1: lane 0 posts for a decode lane round */
     double attention_member_seconds[PN_TT_ATTN_MAX_MEMBERS];
+    /** Deep-queued prefill attention: the layer-pass's issue flow (pn_tt_attn_deep.h);
+     *  `members == 0` between layer-passes. */
+    pn_tt_attn_deep_flow attention_deep_flow;
+    /** C: attention residencies borrowed onto the parked grid cores for a layer-pass
+     *  (pn_tt_attention_grid.h); calloc'd on first use, `attention_grid_count` live. */
+    pn_tt_residency *attention_grid;
+    uint32_t attention_grid_count;
+    /** L1a: the decode residencies whose cores the current prompt lent (pn_tt_prefill_lend.h). */
+    pn_tt_lend_ledger prefill_lend;
+    /** L1a.3: the lent GDN member whose core is the grid's 64th (UINT32_MAX core: none). */
+    uint32_t prefill_lend_grid_member, prefill_lend_grid_core;
+    /** SPLIT-K (pn_tt_attention_splitk.h): set at arm when `PN_TT_ATTN_SPLITK=1` found the
+     *  `_split` program, which every attention core then runs. The extras are split-only
+     *  cores past the members; the partial buffer holds PN_TT_ATTN_SPLITK_MAX_PARTIALS
+     *  partials; the zero mask (on the constants' bank) is a non-final ROWS chunk's tail. */
+    bool attn_splitk;
+    /** FAST-MATH (pn_tt_attn_fast.h): the `PN_TT_ATTN_FAST` variant every attention core runs
+     *  in place of the shipped program, set at arm; NULL = the shipped program. */
+    const char *attn_fast_program;
+    pn_tt_residency attention_splitk_extra[PN_TT_ATTN_SPLITK_MAX_EXTRA];
+    uint32_t attention_splitk_extras;
+    uint32_t attn_partial_bank, attn_partial_address;
+    uint32_t attn_zero_mask_address;
     pn_tt_residency gdn;       /**< the Gated-Delta-Net block, two descriptors per SSM layer */
     /** THE CHUNKWISE Gated-Delta-Net block — the same two phases over C <= 32 POSITIONS in one
      *  descriptor, for prefill. It carries NO STATE OF ITS OWN: the conv window and the
@@ -308,6 +376,7 @@ struct pn_tt_device {
      *  fewer. */
     pn_tt_residency gdn_member[PN_TT_GDN_MAX_MEMBERS - 1u];
     uint32_t gdn_members; /**< 1 when unsplit — `gdn` alone */
+    pn_tt_group_pull gdn_pull; /**< S1: `gdn` posts for a CONV / DELTA split */
     /** EXTRA ELTWISE residencies, behind `PN_TT_ELTWISE_CORES`. Every descriptor of the
      *  family is split into `eltwise_members` contiguous, DISJOINT tile ranges — no shared
      *  buffer, no shared DRAM byte, no reduction — and the set is enqueued before any member
@@ -319,12 +388,16 @@ struct pn_tt_device {
      *  Members past it are WIDE members (`PN_TT_ELTWISE_WIDE_CORES`), which only descriptors
      *  of `PN_TT_ELTWISE_WIDE_MIN_TILES` or more use — the prefill SwiGLU. */
     uint32_t eltwise_decode_members;
+    /** S1: member 0 posts for every split descriptor; the table names all `eltwise_members`
+     *  (decode then wide), and a decode split pulls the first `eltwise_decode_members`. */
+    pn_tt_group_pull eltwise_pull;
     /** PM 7: the NEXT eltwise descriptor is enqueued and NOT awaited
      *  (`pn_tt_eltwise_group_defer_next`); it stays pending until
      *  `pn_tt_eltwise_group_settle()` (or the next eltwise descriptor) awaits it. Streamed,
      *  that moves its puller AWAIT from straight after it to where a consumer needs it. */
     bool eltwise_defer_next;
     uint32_t eltwise_pending_members; /**< members of the pending descriptor, 0 = none */
+    bool eltwise_pending_pulled;      /**< it went out with the S1 pull */
     uint32_t eltwise_pending_words[PN_TT_ELTWISE_SPLIT_MAX_MEMBERS][FT_TT_OP_VECTOR_WORDS];
     ft_tt_op_eltwise_request eltwise_pending_request;
     double eltwise_pending_started;
@@ -385,6 +458,8 @@ struct pn_tt_device {
      *  apart — see pn_tt_device_oncard_named(). */
     bool oncard_named[PN_TT_ONCARD_COUNT];
     uint32_t reduce_tile_cols;   /**< the ONE Wt every reduce descriptor carries */
+    /** P3: the model norm's schedule, fixed at arm time with the placement it needs. */
+    pn_tt_norm_schedule reduce_schedule;
     uint32_t eltwise_depth;      /**< the ONE block depth every eltwise descriptor carries */
     /** The caller's promise that every strip holds ONE live row (row 0) right now — a
      *  single-token forward. pn_tt_device_set_single_row(). */
@@ -394,6 +469,14 @@ struct pn_tt_device {
      *  row-0 body covers rows 0-3). */
     uint32_t verify_rows;
     uint32_t topk_row; /**< S2c: the logits row the next top-k selects over (0 = decode) */
+    bool topk_drain_only; /**< FUSE PROBE: the next top-k pops its blocks, selects nothing */
+    /** TAIL COUNTS (pn_tt_topk_tail.h): when tail_bins > 0 the next top-k also counts the row
+     *  into the bins tail_keys define; every member's counts are summed into tail_counts and
+     *  tail_ok says whether all of them counted. */
+    uint32_t tail_bins;
+    uint32_t tail_keys[32];
+    uint32_t tail_counts[33];
+    bool tail_ok;
     /** The matmul K-block depth THIS MODEL wants when `PN_TT_PREFETCH_TILES` is unset
      *  (0 = the global default). pn_tt_device_prefer_prefetch_tiles(). */
     uint32_t prefetch_tiles_preferred;
@@ -433,6 +516,10 @@ struct pn_tt_device {
      *  de-interleaved half of a joint projection — must continue the same rotation rather
      *  than restart it and pile every restaged tensor onto one bank. Starts at 2. */
     uint32_t weight_bank_cursor;
+    /** A tensor family uploaded as its column parts instead of whole, set before the artifact
+     *  loads (`pn_tt_device_split_weights_at_load`). `weight_split_set` false = none. */
+    pn_tt_weight_split_rule weight_split;
+    bool weight_split_set;
 
     /* ------------------------------------------------------------
      * The attention triple — RoPE, KV append, flash decode
@@ -440,7 +527,23 @@ struct pn_tt_device {
      * The shapes are kept, not consumed: every one of the three residencies is BOUNDED and
      * retires on idle, so re-arming one needs what it was armed with.
      */
-    ft_tt_kv_cache_layout kv_layout; /**< K and V share it (contract F1) */
+    /** K's layout. V's has the same geometry (contract F1) and its own tile when the cache
+     *  is mixed (pn_tt_kv_format.h): `kv_v_layout`. Pick by `pn_tt_kv_layout_of()`. */
+    ft_tt_kv_cache_layout kv_layout;
+    ft_tt_kv_cache_layout kv_v_layout;
+    ft_tt_kv_cache_layout kv_group_layout;   /**< one bank group's K heads (pn_tt_kv_banks.h) */
+    ft_tt_kv_cache_layout kv_v_group_layout; /**< ... and V heads */
+    uint32_t kv_bank_groups;                 /**< 1 = one region a layer per K / V */
+    bool kv_append_banked;                   /**< one BANKED append descriptor a region */
+    pn_tt_kv_type kv_type;                   /**< K and V formats (pn_tt_kv_format.h) */
+    /** The KV type the fit policy chose for this load, over `PN_TT_KV_TYPE`
+     *  (pn_tt_device_set_kv_type); `kv_type_set` false = the knob's. */
+    pn_tt_kv_type kv_type_override;
+    bool kv_type_set;
+    /** K4H: H as a resident matmul weight (pn_tt_kv_rotate.h); `kv_rotate_armed` once
+     *  uploaded. Only when `kv_type.rotate`. */
+    pn_tt_weight kv_rotate_weight;
+    bool kv_rotate_armed;
     pn_tt_kv_region *kv_region;      /**< one per layer */
     uint32_t kv_layer_count;
     uint32_t attn_q_heads, attn_kv_heads, attn_head_dim, attn_rope_dim;
@@ -492,10 +595,15 @@ struct pn_tt_device {
      */
     pn_tt_gdn_shape gdn_shape;
     pn_tt_gdn_region *gdn_region;    /**< one per SSM layer */
+    /** Option D: does `gdn_region[].weight` alias the chunkwise family's conv constant copy 0
+     *  (pn_tt_gdn_conv_share.h)? A pn_tt_gdn_conv_share_state. */
+    uint8_t gdn_conv_share;
     /** STEP 4 S2: snapshot slots of every layer's window + state for the speculative verify's
      *  rollback, `gdn_snapshot[slot * layers + layer]`, allocated on first use. */
     pn_tt_gdn_region *gdn_snapshot;
     uint32_t gdn_snapshot_slots;
+    /** The verify's COMPACT slot map (rows - 1 slots, pn_tt_gdn_verify_slots.h); off = legacy. */
+    bool gdn_verify_compact;
     /** Multi-turn: every layer's window + state copied at a prefill pass boundary
      *  (pn_tt_gdn_checkpoint.c), one region a layer, allocated on the first capture. */
     pn_tt_gdn_region *gdn_checkpoint;
@@ -505,6 +613,8 @@ struct pn_tt_device {
      *  by pn_tt_gdn_await_deferred(); one gate block a row so queued DELTAs never share one. */
     bool gdn_defer;
     uint32_t gdn_pending_members;
+    /** S1: every split the deferred window holds went out pulled, so `gdn` alone is awaited. */
+    bool gdn_pending_pulled;
     uint64_t keepalive_nops; /**< PM 5: NOPs the keepalive has sent */
     uint32_t gdn_pending_depth; /**< deferred descriptors a member holds since its last await */
     uint64_t gdn_defer_drains;  /**< full-ring drains the deferred rows took (flow control) */
@@ -518,6 +628,10 @@ struct pn_tt_device {
      *  first `2*k_heads*state_tiles` tiles of it. */
     pn_tt_gdn_buffer gdn_stream_out;
     pn_tt_gdn_buffer gdn_gate; /**< DELTA: decay[H] then beta[H], flat fp32 */
+    /** THE EXACT CARD GATES in decode (pn_tt_gdn_table_gate): while `gdn_table_on`, DELTA
+     *  descriptors name this table block and the reader builds the gate block itself. */
+    pn_tt_gdn_buffer gdn_table_gate;
+    bool gdn_table_on;
     pn_tt_gdn_buffer gdn_y;    /**< DELTA: y, a row-0 strip, head-major */
     unsigned char *gdn_stage;        /**< host tile staging; grown on demand */
     size_t gdn_stage_bytes;
@@ -586,7 +700,27 @@ struct pn_tt_device {
      *  `m % replicas` (copy 0 = `gdnc_constant`). `layer_count * (replicas - 1)` entries. */
     pn_tt_gdn_buffer *gdnc_constant_replica;
     uint32_t gdnc_constant_replicas;
+    /** The copy count the model's fit asked for (pn_tt_gdnc_request_replicas); 0 = the
+     *  default. `PN_TT_GDNC_CONST_REPLICAS` still wins. */
+    uint32_t gdnc_constant_replicas_requested;
     uint32_t gdnc_conv_layer; /**< the layer of the CONV descriptor being submitted */
+    uint32_t gdnc_delta_layer; /**< the layer of the DELTA descriptor being submitted */
+    /** Prefill lane (`PN_TT_GDNC_STATE_BANKS`): each DELTA member's heads of a layer's
+     *  recurrent state in that member's OWN bank while the layer's band loop runs, copied in
+     *  from / out to `gdn_region[layer].state` around it. `layer_count * gdnc_members`. */
+    pn_tt_gdn_buffer *gdnc_state_split;
+    bool *gdnc_state_split_live;
+    uint32_t gdnc_state_split_members;
+    /** Prefill lane PIPE 2 (`PN_TT_GDN_PIPE=2`): a second stream_in / stream_out / y triple
+     *  (one bank, the two activation pairs' contract) so band b+1's widen + CONV and band b's
+     *  DELTA / RMS never share a buffer. `gdnc_parity` 1 = the alternates are swapped into
+     *  `gdn_stream_in` / `gdn_stream_out` / `gdn_y`. */
+    pn_tt_gdn_buffer gdnc_alt_stream_in, gdnc_alt_stream_out, gdnc_alt_y;
+    bool gdnc_alt_ready;
+    uint32_t gdnc_parity;
+    /** The next PHASE DELTA descriptor carries kGdncFlagSerialize (its reader waits for the
+     *  previous descriptor's published completion: the state carries through DRAM). */
+    bool gdnc_serialize;
     /** THE DELTA STAGING, IN TWO SLOTS — one per sub-chunk index (`first_row / 16`), so the
      *  host can stage sub-chunk 1 while the card is still reading sub-chunk 0's. Each slot
      *  is a whole constant region (I, 2I, the strict mask, scale, then one decay-ratio tile
@@ -608,6 +742,9 @@ struct pn_tt_device {
     /** The worker that builds a staging's heads while this thread uploads them
      *  (`PN_TT_GDNC_STAGE_THREAD`). Stopped in pn_tt_gdnc_release(). */
     pn_tt_stage_pipeline gdnc_stage_pipeline;
+    /** The exact card gates (pn_tt_gdnc_table_arm): the host's lookup tables and each layer's
+     *  table block. NULL until armed. */
+    struct pn_tt_gdnc_table_state *gdnc_table;
     /** ONE-SHOT host work to run between the next split's enqueue and its await. */
     int (*gdnc_overlap_fn)(void *context);
     void *gdnc_overlap_context;
@@ -710,6 +847,11 @@ struct pn_tt_device {
         const pn_tt_weight *weight;
         pn_tt_activation input;
         pn_tt_activation output;
+        /** S3b: non-NULL = a FUSED SwiGLU projection (`weight` is the gate, this the up). */
+        const pn_tt_weight *swiglu_up;
+        /** S3a: true = a RESADD projection (`output` = `residual` + bf16(input . weight)). */
+        bool resadd;
+        pn_tt_activation residual;
     } pending[PN_TT_MATVEC_CHAIN_CEILING];
     uint32_t pending_count;
 
@@ -736,6 +878,13 @@ struct pn_tt_device {
      *  that report at all. See pn_tt_descriptor_census.h. */
     pn_tt_descriptor_census census;
     uint64_t bytes_read, bytes_written;
+
+    /** The routed-expert block (pn_tt_moe.c), NULL until armed; `moe_defer_weights` keeps
+     *  MoE-block weights out of the dense load so that module places them. */
+    struct pn_tt_moe *moe;
+    bool moe_defer_weights;
+    /** Host wall seconds spent folding + writing expert stacks (plan S3). */
+    double moe_fold_seconds;
 };
 
 /** Seconds since an arbitrary epoch. Shared by the two files that time this device. */
@@ -797,7 +946,10 @@ int pn_tt_matvec_dispatch(pn_tt_device *device, const pn_tt_weight *weight,
  *  are legal, so the name of the program it will arm is no longer private to the file that
  *  loads it. Two files naming the same program in two string literals is the shape this
  *  backend has already been bitten by. */
-#define PN_TT_RESIDENT_PROGRAM "rtriad_bfp8"
+/*  S3b: the NAME is now chosen once per process — `rtriad_bfp8`, or `rtriad_bfp8_swiglu` under
+ *  `PN_TT_FUSE_SWIGLU=1` (pn_tt_swiglu_fuse.h) — still through this one macro, so the device
+ *  open and the DST interlock below can never ask for two different programs. */
+#define PN_TT_RESIDENT_PROGRAM (pn_tt_resident_program_name())
 
 #define PN_TT_GDN_PROGRAM "gdn"
 
@@ -846,9 +998,51 @@ int pn_tt_reduce_constants_upload(pn_tt_device *device, ft_tt_op_reduce_function
                                   const float *gamma, uint32_t width, float eps,
                                   uint32_t tile_bytes, pn_tt_norm_constants *out_constants);
 
+/**
+ * P3: put `schedule`'s CB extents on `residency` (already filled for its Wt). When the arena
+ * cannot hold them the schedule falls back to the pre-P3 one, logged, rather than the norm
+ * falling back to the host. `what` names the residency in that line.
+ */
+void pn_tt_norm_schedule_fit(pn_tt_norm_schedule *schedule, ft_tt_op_reduce_residency *residency,
+                             const char *what);
+
+/**
+ * P3: finish a norm descriptor's words for `schedule` — the RED face-0 arm
+ * (`PN_TT_RED=norm_fast_face0`: a half read lands face 0 only, so the output MUST differ).
+ */
+void pn_tt_norm_schedule_words(const pn_tt_norm_schedule *schedule, uint32_t *words);
+
 /** Is `name` the PN_TT_RED mutation this process was asked to run? Shared so the attention
  *  family's red proofs read the same knob as the on-card ones. */
 bool pn_tt_red(const char *name);
+
+/**
+ * Allocate `bytes` of DRAM in the next round-robin bank (`strip_bank_cursor`, advanced once,
+ * exactly as every any-bank site did), or — ONLY when that bank cannot fit it — in another
+ * bank, most free first. A model whose expert stacks fill some banks (Qwen3.6 + its MTP head:
+ * one bank down to 1.7 MB) then still places a lazily allocated buffer while total DRAM has
+ * room; an allocation that fit before lands exactly where it did.
+ * @return 0, or -1 when no bank can fit it
+ */
+int pn_tt_dram_alloc_any(pn_tt_device *device, size_t bytes, ft_tt_buffer *out);
+
+/**
+ * Allocate `bytes` of DRAM in the bank with the most free bytes that can hold it
+ * (pn_tt_strip_placement_emptiest_bank). For the unmirrored strips of a set whose mirrors
+ * were placed first, so they never take room a pinned mirror needed.
+ * @return 0, or -1 when no bank can fit it
+ */
+int pn_tt_dram_alloc_emptiest(pn_tt_device *device, size_t bytes, ft_tt_buffer *out);
+
+/** The DRAM half of arming the GDN family: every layer's regions and the shared staging
+ *  buffers, no residency. `pn_tt_device_arm_gdn()` calls it once its circular buffers fit;
+ *  a host device with only an allocator can run it (tests/test_tt_q38_conv_share.c). 0/-1. */
+int pn_tt_gdn_place_regions(pn_tt_device *device);
+/** Allocate one layer's decode conv weight (any bank), as the GDN arm does. 0/-1. */
+int pn_tt_gdn_alloc_conv_weight(pn_tt_device *device, pn_tt_gdn_buffer *out);
+/** The DRAM half of arming the chunkwise family: conv constants (and their copies), delta
+ *  constants, gate blocks. `pn_tt_device_arm_gdnc()` calls it. 0/-1. */
+int pn_tt_gdnc_place_regions(pn_tt_device *device);
 
 /** Allocate a region shaped like SSM layer `layer`'s live window + state, on the live
  *  region's banks (one coordinate word carries both). Left uninitialised. 0 or -1. */
@@ -915,6 +1109,12 @@ bool pn_tt_prepare_family(pn_tt_device *device, pn_tt_residency *residency, cons
 bool pn_tt_prepare_family_on_core(pn_tt_device *device, pn_tt_residency *residency,
                                   const char *program, const char *name, const char *core_env,
                                   uint32_t core, uint32_t processor_mask);
+
+/** Who, if anyone, holds `core` in THIS process — matmul member 0, a group member, a booted
+ *  prefill grid core or any live family residency — BY NAME, so a refusal can say it.
+ *  `except` (may be NULL) is skipped. @return the holder's name, or NULL when free */
+const char *pn_tt_core_holder(const pn_tt_device *device, uint32_t core,
+                              const pn_tt_residency *except);
 
 /** Kick a prepared residency whose circular buffers the caller has now placed. */
 bool pn_tt_start_family(pn_tt_residency *residency);

@@ -18,6 +18,7 @@ tests/test_build
 tests/test_graph_capture_concurrency
 tests/test_attn_ring_retry
 tests/test_graph_capture_retry
+tests/test_qwen35_slots_fused
 tests/test_gguf
 tests/test_arena
 tests/test_qmv
@@ -31,9 +32,14 @@ tests/test_empty_argument
 tests/test_frame_capture
 tests/test_tool_grammar
 tests/test_tool_grammar_json
+tests/test_tool_grammar_reasoned
+tests/test_tool_grammar_json_reasoned
 tests/test_grammar_spec_chooser
 tests/test_grammar_mask_shortlist
+tests/test_grammar_select_shortlist
 tests/test_grammar_topn_sampler
+tests/test_grammar_exact_bound
+tests/test_grammar_dense_shortlist
 tests/test_serve_emitter
 tests/test_tool_call_stream
 tests/test_repetition_loop_detector
@@ -43,6 +49,9 @@ tests/test_session_affinity
 tests/test_session_watch
 tests/test_serve_shutdown
 tests/test_bs_load
+tests/test_think_flip_backlog
+tests/test_bs_finalize_yield
+tests/test_request_timing_line
 tests/test_sampler_parity
 tests/test_bpe_pretokenize
 tests/test_rwkvx
@@ -68,6 +77,13 @@ tests/test_rwkvx
 !.teamide/notes/
 !.teamide/agents/
 
+# Agent run files.
+.argus/
+argus.log
+
+# Stray files from a mistyped `make USE_X=1` (e.g. `USE_CUDA=1` as a target).
+/USE_*
+
 # qwen35moe test binaries (sources tracked, binaries not)
 tests/test_qwen35moe
 tests/test_qwen35moe_metal_coverage
@@ -79,6 +95,7 @@ tests/gen_golden_qwen35
 # Accelerator-parity harness binaries (sources tracked, binaries not)
 tests/test_chat_parity_gate
 tests/test_prefix_projection
+tests/test_template_parity_qwen
 
 # qwen35moe GPU-vs-CPU parity harness binary (source tracked, binary not)
 tests/test_kernel_parity
@@ -104,9 +121,12 @@ tests/test_embed_row
 # Serve-scheduler + PC-batched gate binaries (source tracked, binary not)
 tests/test_serve_sched_qwen35
 tests/test_serve_sched_prefix_cache
+tests/test_serve_sched_session_switch
 tests/test_prefix_cache_qwen35
 tests/bench_serve_prefix_cache
 tests/test_prefix_cache_sys
+tests/test_think_history_as_sent
+tests/test_think_history_drop_last
 
 # Local agent/editor notes; deliberately untracked.
 CLAUDE.md
@@ -136,6 +156,14 @@ tests/test_topn_row_exact
 tests/test_grammar_arm_window
 tests/test_gdn_layout
 tests/test_tt_column_runs
+tests/test_tt_grid_msplit
+tests/test_tt_attn_splitk
+tests/test_tt_attn_splitk_red
+tests/test_tt_dispatch_shape_key
+tests/test_tt_dispatch_shape_key_red
+tests/test_tt_attn_fast
+tests/test_tt_attn_fast_red
+tests/test_tt_family_guard
 tests/test_qwen35_ckpt_band
 
 # Compiled test binaries. This used to be one line per test, so every NEW test
@@ -146,6 +174,7 @@ tests/bench_*
 tests/gen_golden_*
 !tests/*.c
 !tests/*.h
+!tests/*.py
 
 # Parity-gate dumps and logs (L11 Mac CPU oracle): large, regenerable
 tests/parity_out/
@@ -156,10 +185,25 @@ tests/parity_out/
 # bench_ngram_accept --generate output (recorded token streams); make your own.
 tests/data/ngram_accept_dumps/
 
-# checkpoint-ceiling round captures (Mac side)
-tests/serve_prefix_think_ckpt/out/
-# toolcall stream probe captures
-tests/serve_toolcall_stream/out/
-# required-with-thinking proof captures
-tests/serve_required_thinking/out/
-tests/serve_required_thinking/probe_bin/
+# GPQA eval: gated dataset (never commit question text) and raw run outputs
+evals/gpqa/data/
+evals/gpqa/results/
+evals/gpqa/__pycache__/
+
+# Grammar-row census: the tool and the Mac's dumped rows / serve logs.
+tools/grammar_exact/grammar_row_census
+tools/grammar_exact/data/
+/tests/qwen3_parity/probe_layers
+
+# The card-format oracle dumper (built binary).
+tools/oracle/qwen36_oracle_dump
+tools/oracle/qwen36_oracle_compare
+tools/oracle/act_stats_merge
+tests/test_field_pattern
+tests/test_tool_grammar_field_patterns
+tests/test_tool_grammar_json_field_patterns
+tests/test_field_pattern_steer
+tests/bench_field_pattern_mask
+tests/mut/build/
+tests/test_sampler_margin_draw
+tests/bench_sampler_rows

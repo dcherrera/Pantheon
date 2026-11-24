@@ -6,7 +6,7 @@
  *        map, the knobs and the argument for why this family splits cleanly live there, and
  *        the tile arithmetic lives in pn_tt_eltwise_split.c where a test can reach it.
  *
- * @status Behind `PN_TT_ELTWISE_CORES`, default 1.
+ * @status Behind `PN_TT_ELTWISE_CORES`, default 4 (members 1..3 on 112, 48, 49).
  * @issues None
  * @todo None
  */
@@ -20,6 +20,7 @@
 #include <string.h>
 
 #include "pn_tt_device_internal.h"
+#include "pn_tt_group_pull.h"
 #include "pn_tt_name_list.h"
 
 /** Members, and where they start. See the header for why 106 cannot collide.
@@ -59,10 +60,51 @@
  *  two knobs. `PN_TT_ELTWISE_DEPTH=8` at ONE member is 5.02 tok/s and fits -103.5 + 2.003,
  *  against the control's 5.01 and -100.5 + 1.999. The depth is worth **0.0%**. */
 #define PN_TT_ELTWISE_CORES_ENV           "PN_TT_ELTWISE_CORES"
-#define PN_TT_ELTWISE_CORES_DEFAULT       2u
+/* 4 since 2026-10-21 (L10 D7: +2.3% MTP decode, IDENTICAL). Was 2 while the host issued
+ * every descriptor (L1: 4 was slower then); the puller removed that tax. */
+#define PN_TT_ELTWISE_CORES_DEFAULT       4u
 #define PN_TT_ELTWISE_MEMBER_CORE_ENV     "PN_TT_ELTWISE_MEMBER_CORE_FIRST"
-/* 112 since the PX7 placement shipped (was 106, inside the 16-member matmul's 96..110). */
-#define PN_TT_ELTWISE_MEMBER_CORE_DEFAULT 112u
+#define PN_TT_ELTWISE_MEMBER_CORE_LIST_ENV "PN_TT_ELTWISE_MEMBER_CORE_LIST"
+/* MEMBERS 1..3 ON THE ONLY CORES NO FAMILY HOLDS ON DECODE OR PREFILL. 112 since PX7; 48 and
+ * 49 sit between the prefill grid (0..47) and the gdn members (50..57). The grid cannot share
+ * a member's core even though decode and prefill never overlap: a member is RESIDENT for the
+ * whole process (it serves prefill descriptors too), and booting grid firmware onto a live
+ * residency wedges the core — `pn_tt_grid_boot()` now refuses that by name. */
+#define PN_TT_ELTWISE_MEMBER_CORE_LIST_DEFAULT "112,48,49"
+
+/**
+ * The core member `index + 1` arms on. `PN_TT_ELTWISE_MEMBER_CORE_LIST` when set; else
+ * `PN_TT_ELTWISE_MEMBER_CORE_FIRST + index` when THAT is set (the pre-list knob, kept); else
+ * the default list. A list too short for the count returns UINT32_MAX, which no core has, so
+ * the arm fails there and the split collapses by name.
+ *
+ * @param out_env  the knob that placed it, for the refusal message
+ */
+static uint32_t eltwise_member_core(uint32_t index, const char **out_env)
+{
+    const char *list = getenv(PN_TT_ELTWISE_MEMBER_CORE_LIST_ENV);
+    const char *first = getenv(PN_TT_ELTWISE_MEMBER_CORE_ENV);
+    uint32_t position = 0u;
+    char *end;
+
+    if ((!list || !*list) && first && *first) {
+        *out_env = PN_TT_ELTWISE_MEMBER_CORE_ENV;
+        return (uint32_t)strtoul(first, NULL, 10) + index;
+    }
+    *out_env = PN_TT_ELTWISE_MEMBER_CORE_LIST_ENV;
+    if (!list || !*list)
+        list = PN_TT_ELTWISE_MEMBER_CORE_LIST_DEFAULT;
+    while (*list) {
+        const unsigned long core = strtoul(list, &end, 10);
+
+        if (end == list)
+            break;
+        if (position++ == index)
+            return (uint32_t)core;
+        list = *end == ',' ? end + 1 : end;
+    }
+    return UINT32_MAX;
+}
 
 /**
  * PHASE W1a — WIDE MEMBERS for the prefill's whole-prompt descriptors.
@@ -82,9 +124,6 @@
  * on a different core: bit-exact by construction. The mirrors of each wide slice are keyed in
  * that member's own replica table (`pn_tt_replica_map.c`).
  */
-#define PN_TT_ELTWISE_WIDE_CORES_ENV      "PN_TT_ELTWISE_WIDE_CORES"
-#define PN_TT_ELTWISE_WIDE_CORE_ENV       "PN_TT_ELTWISE_WIDE_CORE_FIRST"
-#define PN_TT_ELTWISE_WIDE_CORE_DEFAULT   58u
 #define PN_TT_ELTWISE_WIDE_MIN_TILES_ENV  "PN_TT_ELTWISE_WIDE_MIN_TILES"
 #define PN_TT_ELTWISE_WIDE_MIN_TILES_DEFAULT 2048u
 
@@ -285,7 +324,7 @@ static ft_tt_op_eltwise_request eltwise_placement(const pn_tt_device *device)
 void pn_tt_eltwise_group_arm(pn_tt_device *device, uint32_t members,
                              const ft_tt_op_eltwise_request *placement)
 {
-    uint32_t first, index;
+    uint32_t index;
 
     if (!device || !placement)
         return;
@@ -297,14 +336,20 @@ void pn_tt_eltwise_group_arm(pn_tt_device *device, uint32_t members,
         eltwise_group_arm_wide(device, placement);
         return;
     }
-    first = pn_tt_env_u32(PN_TT_ELTWISE_MEMBER_CORE_ENV, PN_TT_ELTWISE_MEMBER_CORE_DEFAULT);
     for (index = 0; index + 1u < members; index++) {
         pn_tt_residency *member = &device->eltwise_member[index];
         ft_tt_launch_cb_entry placed[FT_TT_OP_ELTWISE_CB_COUNT];
+        const char *core_env;
+        const uint32_t core = eltwise_member_core(index, &core_env);
 
+        if (core == UINT32_MAX) {
+            fprintf(stderr, "pn_tt: eltwise SPLIT — %s names no core for member %u\n",
+                    core_env, index + 1u);
+            break;
+        }
         if (!pn_tt_prepare_family_on_core(device, member, PN_TT_ELTWISE_PROGRAM,
-                                          "eltwise-member", PN_TT_ELTWISE_MEMBER_CORE_ENV,
-                                          first + index, PN_TT_ONCARD_TRIAD_MASK))
+                                          "eltwise-member", core_env, core,
+                                          PN_TT_ONCARD_TRIAD_MASK))
             break;
         if (ft_tt_op_eltwise_place_cbs(placement, placed, member->cb_buffer,
                                        sizeof(member->cb_buffer), &member->cb_mask) !=
@@ -325,22 +370,30 @@ void pn_tt_eltwise_group_arm(pn_tt_device *device, uint32_t members,
         eltwise_group_arm_wide(device, placement);
         return;
     }
-    fprintf(stderr, "pn_tt: eltwise SPLIT — every descriptor over %u members, core %u then "
-                    "%u..%u, at block depth %u\n",
-            device->eltwise_members, device->eltwise.core_index, first,
-            first + device->eltwise_members - 2u, device->eltwise_depth);
+    fprintf(stderr, "pn_tt: eltwise SPLIT — every descriptor over %u members, core %u then",
+            device->eltwise_members, device->eltwise.core_index);
+    for (index = 0; index + 1u < device->eltwise_members; index++)
+        fprintf(stderr, "%s%u", index ? "," : " ", device->eltwise_member[index].core_index);
+    fprintf(stderr, ", at block depth %u\n", device->eltwise_depth);
     eltwise_group_arm_wide(device, placement);
+}
+
+uint32_t pn_tt_eltwise_wide_core_count(void)
+{
+    return pn_tt_env_u32(PN_TT_ELTWISE_WIDE_CORES_ENV, PN_TT_ELTWISE_WIDE_CORES_DEFAULT);
+}
+
+uint32_t pn_tt_eltwise_wide_core_first(void)
+{
+    return pn_tt_env_u32(PN_TT_ELTWISE_WIDE_CORE_ENV, PN_TT_ELTWISE_WIDE_CORE_DEFAULT);
 }
 
 /** W1a: arm the WIDE members after the decode split. A member that fails to arm stops the
  *  set where it is — the wide split is ragged by blocks, so any count is legal. */
 static void eltwise_group_arm_wide(pn_tt_device *device, const ft_tt_op_eltwise_request *placement)
 {
-    /* DEFAULT 13 (W1a, run_w1a_eltwise_wide.sh 2026-10-08): serve 1,630 TTFT 4.02 -> 3.25 s
-     * with the reader thread, decode flat; `PN_TT_ELTWISE_WIDE_CORES=0` off. */
-    const uint32_t want = pn_tt_env_u32(PN_TT_ELTWISE_WIDE_CORES_ENV, 13u);
-    const uint32_t first = pn_tt_env_u32(PN_TT_ELTWISE_WIDE_CORE_ENV,
-                                         PN_TT_ELTWISE_WIDE_CORE_DEFAULT);
+    const uint32_t want = pn_tt_eltwise_wide_core_count();
+    const uint32_t first = pn_tt_eltwise_wide_core_first();
     uint32_t index;
 
     device->eltwise_decode_members = device->eltwise_members;
@@ -416,7 +469,23 @@ bool pn_tt_eltwise_group_slice(const pn_tt_device *device, uint32_t tile_count,
         }
         return true;
     }
-    return pn_tt_eltwise_split_slice(tile_count, members, member, tile_bytes, out_slice);
+    if (!pn_tt_eltwise_split_slice(tile_count, members, member, tile_bytes, out_slice))
+        return false;
+    /* RED `eltwise_member_shift` (read once): at 3+ members the second-to-last member's slice
+     * starts one block late — it overlaps the last member's and leaves its own first block
+     * stale; must DIFFER. Proves the shipped 4-member split is what the gates scored. */
+    {
+        static int red = -1;
+
+        if (red < 0)
+            red = pn_tt_red("eltwise_member_shift") ? 1 : 0;
+        if (red && members > 2u && member + 2u == members && device->eltwise_depth &&
+            out_slice->tile_count) {
+            out_slice->first_tile += 2u * device->eltwise_depth;
+            out_slice->byte_offset = out_slice->first_tile * tile_bytes;
+        }
+    }
+    return true;
 }
 
 void pn_tt_eltwise_group_release(pn_tt_device *device)
@@ -447,7 +516,7 @@ static bool eltwise_member_rearm(pn_tt_device *device, uint32_t member_index,
 {
     ft_tt_launch_cb_entry placed[FT_TT_OP_ELTWISE_CB_COUNT];
     const char *core_env = member_index == 0u ? PN_TT_CORE_ELTWISE_ENV
-                                              : PN_TT_ELTWISE_MEMBER_CORE_ENV;
+                                              : PN_TT_ELTWISE_MEMBER_CORE_LIST_ENV;
     const char *name = member_index == 0u ? "eltwise" : "eltwise-member";
     pn_tt_residency *member;
     uint32_t core;
@@ -525,8 +594,19 @@ static pn_tt_residency *eltwise_member_residency(pn_tt_device *device, uint32_t 
     return index == 0u ? &device->eltwise : &device->eltwise_member[index - 1u];
 }
 
+/** The set's residencies in member order, decode then wide; returns how many. */
+static uint32_t eltwise_member_set(pn_tt_device *device, pn_tt_residency **set)
+{
+    uint32_t index;
+
+    for (index = 0; index < device->eltwise_members; index++)
+        set[index] = eltwise_member_residency(device, index);
+    return device->eltwise_members;
+}
+
 /**
- * Await every member of an enqueued descriptor, then re-arm and replay any member that was
+ * Await an enqueued descriptor — member 0 alone when it went out `pulled` (S1,
+ * pn_tt_group_pull.h), every member otherwise — then re-arm and replay any member that was
  * refused, then charge the set. `words[index]` is member `index`'s slice.
  *
  * PER-MEMBER RE-ARM AND REPLAY. Replaying one member's slice is the SAME COMPUTATION and not
@@ -538,26 +618,15 @@ static pn_tt_residency *eltwise_member_residency(pn_tt_device *device, uint32_t 
  */
 static int eltwise_group_complete(pn_tt_device *device, const ft_tt_op_eltwise_request *request,
                                   uint32_t (*words)[FT_TT_OP_VECTOR_WORDS], uint32_t members,
-                                  bool *bad, double started)
+                                  bool pulled, bool *bad, double started)
 {
+    pn_tt_residency *set[PN_TT_ELTWISE_MAX_MEMBERS];
     uint32_t index;
-    int failed = 0;
+    int failed;
 
-    /* EVERY member is awaited even after one has failed. An enqueue that got as far as the
-     * ring has a descriptor the card will run whatever this host does next, and leaving it
-     * un-awaited desynchronises that member's cursor for the rest of the run. */
-    for (index = 0; index < members; index++) {
-        pn_tt_residency *member = eltwise_member_residency(device, index);
-        const double member_started = pn_tt_now_seconds();
-        double member_elapsed;
-
-        if (pn_tt_residency_await(member, PN_TT_OP_TIMEOUT_MS) != 0)
-            bad[index] = true;
-        failed |= bad[index];
-        member_elapsed = pn_tt_now_seconds() - member_started;
-        device->eltwise_member_seconds[index] += member_elapsed;
-        member->seconds += member_elapsed;
-    }
+    (void)eltwise_member_set(device, set);
+    failed = pn_tt_group_pull_await(&device->eltwise_pull, pulled, set, members, bad,
+                                    device->eltwise_member_seconds);
     if (failed) {
         const ft_tt_op_eltwise_request placement = eltwise_placement(device);
 
@@ -603,17 +672,19 @@ int pn_tt_eltwise_group_settle(pn_tt_device *device)
     device->eltwise_pending_members = 0u;
     memset(bad, 0, sizeof(bad));
     return eltwise_group_complete(device, &device->eltwise_pending_request,
-                                  device->eltwise_pending_words, members, bad,
+                                  device->eltwise_pending_words, members,
+                                  device->eltwise_pending_pulled, bad,
                                   device->eltwise_pending_started);
 }
 
 int pn_tt_eltwise_group_submit(pn_tt_device *device, const ft_tt_op_eltwise_request *request)
 {
     uint32_t words[PN_TT_ELTWISE_MAX_MEMBERS][FT_TT_OP_VECTOR_WORDS];
+    pn_tt_residency *set[PN_TT_ELTWISE_MAX_MEMBERS];
     bool bad[PN_TT_ELTWISE_MAX_MEMBERS];
-    uint32_t members, index;
+    uint32_t members, index, table;
     double started;
-    bool wide, defer, enqueue_failed = false;
+    bool wide, defer, pulled, enqueue_failed;
 
     if (!device || !request)
         return -1;
@@ -660,11 +731,14 @@ int pn_tt_eltwise_group_submit(pn_tt_device *device, const ft_tt_op_eltwise_requ
      * whatever the strip held. Must DIFFER: proves the gate scores the deferred op. */
     if (defer && pn_tt_red("eltwise_defer_drop"))
         return 0;
+    /* S1: the table names the whole set (decode then wide), so a decode split pulls its
+     * first `members` and a wide one all of them. */
+    table = eltwise_member_set(device, set);
+    pulled = pn_tt_group_pull_decide(&device->eltwise_pull, pn_tt_group_pull_decode(device), set,
+                                     table, members, "eltwise");
     started = pn_tt_now_seconds();
-    for (index = 0; index < members; index++)
-        if (pn_tt_residency_enqueue(eltwise_member_residency(device, index),
-                                    FT_TT_QUEUE_OP_ELTWISE, words[index], 1u) != 0)
-            enqueue_failed = bad[index] = true;
+    enqueue_failed = pn_tt_group_pull_enqueue(&device->eltwise_pull, pulled, set, members,
+                                              FT_TT_QUEUE_OP_ELTWISE, words[0], bad) != 0;
     /* THE RESIDENCY CLOCKS RUN ON THIS PATH TOO (class 28: `ops != 0 && seconds == 0` read
      * as a free family). The enqueue is booked on member 0 and each member's serial await on
      * that member, so the rows SUM to the set's wall and no time is booked twice. */
@@ -676,10 +750,11 @@ int pn_tt_eltwise_group_submit(pn_tt_device *device, const ft_tt_op_eltwise_requ
         device->eltwise_pending_request = *request;
         device->eltwise_pending_started = started;
         device->eltwise_pending_members = members;
+        device->eltwise_pending_pulled = pulled;
         device->eltwise_deferred++;
         return 0;
     }
-    return eltwise_group_complete(device, request, words, members, bad, started);
+    return eltwise_group_complete(device, request, words, members, pulled, bad, started);
 }
 
 #endif /* USE_TT */

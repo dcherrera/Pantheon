@@ -45,9 +45,9 @@ bs_acquire_result bs_slot_acquire_or_wait(pn_batch_sched *a, int b,
         int *c, int *d, const char *e) {
     (void)a; (void)b; (void)c; (void)d; (void)e; return BS_ACQUIRE_OK;
 }
-void hs_begin_sse(int a) { (void)a; }
+int hs_begin_sse(int a) { (void)a; return 0; }
 int hs_client_alive(int a) { (void)a; return 1; }
-void hs_end_sse(int a) { (void)a; }
+int hs_end_sse(int a) { (void)a; return 0; }
 void hs_send_error(int a, int b, const char *c, const char *d) {
     (void)a; (void)b; (void)c; (void)d;
 }
@@ -66,7 +66,7 @@ void hs_send_json(int a, int b, const char *c) {
 /* EVERY streamed byte, in order, as a client receives it (events and SSE
  * comments) — the tool-call streaming tests fold this the way a client does. */
 static json_writer wire_all;
-void hs_send_sse(int a, const char *b) {
+int hs_send_sse(int a, const char *b) {
     (void)a;
     snprintf(wire_sse, sizeof(wire_sse), "%s", b ? b : "");
     if (wire_all.data) {
@@ -74,18 +74,35 @@ void hs_send_sse(int a, const char *b) {
         jw_raw(&wire_all, b ? b : "");
         jw_raw(&wire_all, "\n\n");
     }
+    return 0;
 }
-void hs_send_sse_comment(int a, const char *b) {
+int hs_send_sse_comment(int a, const char *b) {
     (void)a;
     if (wire_all.data) {
         jw_raw(&wire_all, ": ");
         jw_raw(&wire_all, b);
         jw_raw(&wire_all, "\n\n");
     }
+    return 0;
 }
 mr_entry *mr_acquire(mr_registry *a, const char *b) { (void)a; (void)b; return NULL; }
+mr_entry *mr_acquire_session(mr_registry *a, const char *b, const char *c)
+{ (void)a; (void)b; (void)c; return NULL; }
+void pn_replica_affinity_forget(const char *a) { (void)a; }
+int pn_replica_pin_parse(const jr_value *a, const char *b, int *c, char *d, size_t e)
+{ (void)a; (void)b; (void)d; (void)e; *c = 0; return 0; }
+mr_entry *pn_replica_pin_acquire(int a, mr_registry *b, const char *c, const char *d, mr_route *e)
+{ (void)a; (void)b; (void)c; (void)d; (void)e; return NULL; }
+void pn_replica_pin_announce(const mr_entry *a) { (void)a; }
+void pn_replica_pin_undo(const mr_route *a, const mr_entry *b, const char *c)
+{ (void)a; (void)b; (void)c; }
+void pn_replica_pin_send_full(int a, const mr_route *b, const mr_entry *c, int d)
+{ (void)a; (void)b; (void)c; (void)d; }
 int mr_count(mr_registry *a) { (void)a; return 0; }
 void mr_release(mr_registry *a, mr_entry *b) { (void)a; (void)b; }
+/* Set by a test: an unload has cancelled this entry's live turns. */
+static bool stub_cancel_requested = false;
+bool mr_turn_cancel_requested(const mr_entry *a) { (void)a; return stub_cancel_requested; }
 int mr_snapshot(mr_registry *a, mr_info *b, int c) { (void)a; (void)b; (void)c; return 0; }
 bool mr_model_is_minicpm(const pn_model *a) { (void)a; return false; }
 void pn_memwatch_read(pn_mem_state *a) { (void)a; }
@@ -372,13 +389,28 @@ static void test_nonstream_usage_omits_session_conflict_when_clean(void) {
     jr_free(root);
 }
 
+/* The sg_result fields send_usage_chunk reads. */
+static sg_result usage_result(int prompt, int completion, int cached,
+                              int kv_used, int kv_cap, int conflict) {
+    sg_result res = { 0 };
+    res.prompt_tokens = prompt;
+    res.completion_tokens = completion;
+    res.cached_prompt_tokens = cached;
+    res.kv_used_tokens = kv_used;
+    res.kv_cap_tokens = kv_cap;
+    res.session_conflict = conflict;
+    res.prefill_tokens = prompt - cached;
+    return res;
+}
+
 /* Streaming: the terminal usage chunk (stream_options.include_usage) carries it
  * in the same place — this is the path the client actually uses. */
 static void test_stream_usage_chunk_carries_session_conflict(void) {
     stream_ctx sc = { .client_fd = -1, .id = "cmpl-3", .created = 0,
                       .model_id = "test-model", .role_sent = true };
     wire_sse[0] = '\0';
-    send_usage_chunk(&sc, 33, 4, 0, 33, 32000, 1);
+    sg_result res = usage_result(33, 4, 0, 33, 32000, 1);
+    send_usage_chunk(&sc, &res);
 
     jr_value *root = jr_parse(wire_sse);
     ASSERT_NOT_NULL(root);
@@ -394,7 +426,8 @@ static void test_stream_usage_chunk_omits_session_conflict_when_clean(void) {
     stream_ctx sc = { .client_fd = -1, .id = "cmpl-4", .created = 0,
                       .model_id = "test-model", .role_sent = true };
     wire_sse[0] = '\0';
-    send_usage_chunk(&sc, 33, 4, 0, 33, 32000, 0);
+    sg_result res = usage_result(33, 4, 0, 33, 32000, 0);
+    send_usage_chunk(&sc, &res);
 
     jr_value *root = jr_parse(wire_sse);
     ASSERT_NOT_NULL(root);
@@ -471,12 +504,43 @@ static void test_nonstream_usage_reports_zero_cached_tokens_when_cold(void) {
     jr_free(root);
 }
 
+/* `resume` + `prefill_tokens` ride `usage` on both transports, every turn. */
+static void test_usage_reports_resume_and_prefill(void) {
+    sg_result res = wire_test_result(0);
+    res.prompt_tokens = 166;
+    res.cached_prompt_tokens = 8;
+    res.resume_kind = PN_RESUME_SYS_PREFIX;
+    res.prefill_tokens = 158;
+    wire_json[0] = '\0';
+    chat_choice ch = { .res = res };
+    send_completion_json(-1, "cmpl-9", 0, "test-model", &ch, 1, NULL, NULL);
+    jr_value *root = jr_parse(wire_json);
+    ASSERT_NOT_NULL(root);
+    const jr_value *usage = jr_object_get(root, "usage");
+    ASSERT_STR_EQ(jr_as_string(jr_object_get(usage, "resume")), "sys_prefix");
+    ASSERT_INT_EQ((int)jr_as_number(jr_object_get(usage, "prefill_tokens"), -1), 158);
+    jr_free(root);
+
+    stream_ctx sc = { .client_fd = -1, .id = "cmpl-10", .created = 0,
+                      .model_id = "test-model", .role_sent = true };
+    sg_result cold = usage_result(40, 2, 0, 42, 32000, 0);
+    wire_sse[0] = '\0';
+    send_usage_chunk(&sc, &cold);
+    root = jr_parse(wire_sse);
+    ASSERT_NOT_NULL(root);
+    usage = jr_object_get(root, "usage");
+    ASSERT_STR_EQ(jr_as_string(jr_object_get(usage, "resume")), "cold");
+    ASSERT_INT_EQ((int)jr_as_number(jr_object_get(usage, "prefill_tokens"), -1), 40);
+    jr_free(root);
+}
+
 /* Warm turn, streaming terminal usage chunk — the path benchmarks measure. */
 static void test_stream_usage_chunk_reports_cached_tokens(void) {
     stream_ctx sc = { .client_fd = -1, .id = "cmpl-7", .created = 0,
                       .model_id = "test-model", .role_sent = true };
     wire_sse[0] = '\0';
-    send_usage_chunk(&sc, 166, 4, 150, 170, 32000, 0);
+    sg_result res = usage_result(166, 4, 150, 170, 32000, 0);
+    send_usage_chunk(&sc, &res);
 
     jr_value *root = jr_parse(wire_sse);
     ASSERT_NOT_NULL(root);
@@ -495,7 +559,8 @@ static void test_stream_usage_chunk_reports_zero_cached_tokens_when_cold(void) {
     stream_ctx sc = { .client_fd = -1, .id = "cmpl-8", .created = 0,
                       .model_id = "test-model", .role_sent = true };
     wire_sse[0] = '\0';
-    send_usage_chunk(&sc, 166, 4, 0, 170, 32000, 0);
+    sg_result res = usage_result(166, 4, 0, 170, 32000, 0);
+    send_usage_chunk(&sc, &res);
 
     jr_value *root = jr_parse(wire_sse);
     ASSERT_NOT_NULL(root);
@@ -674,6 +739,101 @@ static void test_enable_thinking_is_parsed(void) {
     ASSERT_TRUE(req.gen.thinking == SG_THINKING_DEFAULT);
     chat_request_free(&req);
     jr_free(root);
+}
+
+/* `think_history`: the two known values reach the generator; absent and
+ * unknown values both leave today's ladder (KEEP), never an error. */
+static void test_think_history_is_parsed(void) {
+    static const struct { const char *body; pn_think_history want; } cases[] = {
+        { BODY_HEAD ",\"think_history\":\"as_sent\"}", PN_THINK_HISTORY_AS_SENT },
+        { BODY_HEAD ",\"think_history\":\"drop_last\"}", PN_THINK_HISTORY_DROP_LAST },
+        { BODY_HEAD "}", PN_THINK_HISTORY_KEEP },
+        { BODY_HEAD ",\"think_history\":\"drop_all\"}", PN_THINK_HISTORY_KEEP },
+        { BODY_HEAD ",\"think_history\":7}", PN_THINK_HISTORY_KEEP },
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        chat_request req;
+        jr_value *root = parse_body(cases[i].body, &req);
+        ASSERT_NOT_NULL(root);
+        ASSERT_INT_EQ((int)req.gen.think_history, (int)cases[i].want);
+        chat_request_free(&req);
+        jr_free(root);
+    }
+}
+
+/* `field_patterns`: an object of tool -> {property: pattern}.  A well-formed
+ * field reaches the generator (borrowed, only with tools); unknown tool names
+ * are the grammar's to ignore; a malformed field or a pattern that does not
+ * compile is refused (HTTP 400) with a message naming where. */
+#define FP_TOOLS ",\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"read\"}}]"
+
+static void test_field_patterns_are_parsed(void) {
+    chat_request req;
+    jr_value *root = parse_body(BODY_HEAD FP_TOOLS ",\"field_patterns\":{\"read\":"
+                                "{\"finding\":\"-|[^\\\\n]+ from: [^\\\\s,:]+:[0-9]+\"},"
+                                "\"no_such_tool\":{\"x\":\"a+\"}}}", &req);
+    ASSERT_NOT_NULL(root);
+    ASSERT_NOT_NULL(req.gen.field_patterns);
+    ASSERT_TRUE(jr_kind((const jr_value *)req.gen.field_patterns) == JR_OBJECT);
+    chat_request_free(&req);
+    jr_free(root);
+
+    static const char *ABSENT[] = {
+        BODY_HEAD FP_TOOLS "}", BODY_HEAD FP_TOOLS ",\"field_patterns\":null}",
+        BODY_HEAD ",\"field_patterns\":{\"read\":{\"finding\":\"a\"}}}",   /* no tools */
+    };
+    for (size_t i = 0; i < sizeof(ABSENT) / sizeof(ABSENT[0]); i++) {
+        root = parse_body(ABSENT[i], &req);
+        ASSERT_NOT_NULL(root);
+        ASSERT_NULL(req.gen.field_patterns);
+        chat_request_free(&req);
+        jr_free(root);
+    }
+}
+
+static void test_field_patterns_refused(void) {
+    static const struct { const char *body; const char *want; } cases[] = {
+        { BODY_HEAD FP_TOOLS ",\"field_patterns\":{\"read\":{\"finding\":\"(ab\"}}}",
+          "'field_patterns.read.finding': unbalanced '(' at byte 0" },
+        { BODY_HEAD FP_TOOLS ",\"field_patterns\":{\"read\":{\"finding\":\"a{200}\"}}}",
+          "'field_patterns.read.finding': repeat count too large at byte 1" },
+        { BODY_HEAD FP_TOOLS ",\"field_patterns\":{\"read\":{\"finding\":7}}}",
+          "'field_patterns.read.finding': pattern is not a string" },
+        { BODY_HEAD FP_TOOLS ",\"field_patterns\":{\"read\":\"a+\"}}",
+          "'field_patterns.read' must be an object of property name -> pattern" },
+        { BODY_HEAD FP_TOOLS ",\"field_patterns\":[\"read\"]}",
+          "'field_patterns' must be an object of tool name -> {property: pattern}" },
+        { BODY_HEAD ",\"field_patterns\":{\"read\":{\"finding\":\"[z-a]\"}}}",
+          "'field_patterns.read.finding': bad range in class at byte 1" },
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        jr_value *root = jr_parse(cases[i].body);
+        ASSERT_NOT_NULL(root);
+        chat_request req;
+        const char *err = NULL;
+        ASSERT_INT_EQ(parse_chat_request(root, &req, &err), -1);
+        ASSERT_NOT_NULL(err);
+        ASSERT_STR_EQ(err, cases[i].want);
+        chat_request_free(&req);
+        jr_free(root);
+    }
+}
+
+/* /v1/models `think_history`: drop_last only for a model whose scheduler
+ * carved turn checkpoints. */
+static void test_think_history_props(void) {
+    mr_info info;
+    memset(&info, 0, sizeof(info));
+    json_writer jw;
+    ASSERT_TRUE(jw_init(&jw));
+    write_think_history_props(&jw, &info);
+    ASSERT_STR_EQ(jw.data, ",\"think_history\":[\"as_sent\"]");
+    jw_free(&jw);
+    info.think_history_drop_last = true;
+    ASSERT_TRUE(jw_init(&jw));
+    write_think_history_props(&jw, &info);
+    ASSERT_STR_EQ(jw.data, ",\"think_history\":[\"as_sent\",\"drop_last\"]");
+    jw_free(&jw);
 }
 
 static void test_penalties_are_parsed_and_clamped(void) {
@@ -1542,6 +1702,30 @@ static void run_stub_stream(chat_request *req, const char *const *pieces, int n,
     stub_n_pieces = 0;
 }
 
+/* An unload cancels a live streaming turn. Mid-decode the generation loop ends
+ * on should_abort like a clean stop (rc 0, finish "stop"), so the run path must
+ * read the cancel itself: the client gets the model_unloaded error event, and
+ * NOT a closing "stop" chunk that would pass the cut-off answer off as done. */
+static void test_unload_cancel_streams_model_unloaded(void) {
+    static const char *const pieces[] = { "1\n", "2\n", "3\n" };
+    chat_request req;
+    jr_value *root = parse_body(BODY_HEAD ",\"stream\":true}", &req);
+    ASSERT_NOT_NULL(root);
+    mr_entry entry;
+    memset(&entry, 0, sizeof(entry));
+    oai_turn_abort_ctx routed = { .client_fd = NULL, .entry = &entry };
+    req.gen.should_abort = oai_turn_should_abort;   /* as oai_handle_chat arms it */
+    req.gen.abort_ud = &routed;
+    stub_cancel_requested = true;
+    run_stub_stream(&req, pieces, 3, 0);
+    stub_cancel_requested = false;
+
+    ASSERT_TRUE(strstr(wire_sse, "\"type\":\"model_unloaded\"") != NULL);
+    ASSERT_TRUE(strstr(wire_all.data, "\"finish_reason\":\"stop\"") == NULL);
+    chat_request_free(&req);
+    jr_free(root);
+}
+
 static void test_stream_tool_call_reaches_wire_before_turn_ends(void) {
     chat_request req;
     jr_value *root = parse_body(BODY_HEAD TOOLS_WRITE ",\"stream\":true}", &req);
@@ -1618,6 +1802,75 @@ static void test_stream_keepalive_while_call_is_held(void) {
     jr_free(root);
 }
 
+/* ============================================================
+ * pb-image-text: content arrays keep their text parts
+ * (image/video parts skipped; no vision on either backend).
+ * ============================================================ */
+
+static void test_content_array_keeps_text(void) {
+    /* E4 — string form unchanged (passes even without fix) */
+    {
+        chat_request req = {};
+        jr_value *root = parse_body(
+            "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}\n", &req);
+        ASSERT_NOT_NULL(root);
+        ASSERT_STR_EQ(req.messages[0].content, "hi");
+        chat_request_free(&req);
+        jr_free(root);
+    }
+    /* E1 — image_url + text: only text kept */
+    {
+        chat_request req = {};
+        jr_value *root = parse_body(
+            "{\"messages\":[{\"role\":\"user\",\"content\":"
+            "[{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,AAAA\"}},"
+            "{\"type\":\"text\",\"text\":\"Describe this image.\"}]}]}\n", &req);
+        ASSERT_NOT_NULL(root);
+        ASSERT_STR_EQ(req.messages[0].content, "Describe this image.");
+        chat_request_free(&req);
+        jr_free(root);
+    }
+    /* E2 — multiple text items concatenated */
+    {
+        chat_request req = {};
+        jr_value *root = parse_body(
+            "{\"messages\":[{\"role\":\"user\",\"content\":"
+            "[{\"type\":\"text\",\"text\":\"A\"},"
+            "{\"type\":\"text\",\"text\":\"B\"}]}]}\n", &req);
+        ASSERT_NOT_NULL(root);
+        ASSERT_STR_EQ(req.messages[0].content, "AB");
+        chat_request_free(&req);
+        jr_free(root);
+    }
+    /* E3 — all-image array gives empty string */
+    {
+        chat_request req = {};
+        jr_value *root = parse_body(
+            "{\"messages\":[{\"role\":\"user\",\"content\":"
+            "[{\"type\":\"image_url\",\"image_url\":{\"url\":\"x\"}}]}]}\n", &req);
+        ASSERT_NOT_NULL(root);
+        ASSERT_STR_EQ(req.messages[0].content, "");
+        chat_request_free(&req);
+        jr_free(root);
+    }
+    /* E5 — system array + tools: sys_content = "Be brief.", preamble carries it */
+    {
+        chat_request req = {};
+        jr_value *root = parse_body(
+            "{\"messages\":[{"
+            "\"role\":\"system\",\"content\":[{"
+            "\"type\":\"text\",\"text\":\"Be brief.\"}"
+            "]},{\"role\":\"user\",\"content\":\"hi\"}],"
+            "\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"f\","
+            "\"parameters\":{\"type\":\"object\",\"properties\":{}}}}]}\n", &req);
+        ASSERT_NOT_NULL(root);
+        ASSERT_STR_EQ(req.sys_content, "Be brief.");
+        ASSERT_TRUE(strstr(req.messages[0].content, "Be brief.") != NULL);
+        chat_request_free(&req);
+        jr_free(root);
+    }
+}
+
 int main(void) {
     printf("\n=== chat_request (tool_choice parse + forced_name lifetime) ===\n\n");
     RUN_TEST(forced_name_survives_dom_free);
@@ -1686,8 +1939,15 @@ int main(void) {
     RUN_TEST(nonstream_usage_reports_zero_cached_tokens_when_cold);
     RUN_TEST(stream_usage_chunk_reports_cached_tokens);
     RUN_TEST(stream_usage_chunk_reports_zero_cached_tokens_when_cold);
+    RUN_TEST(usage_reports_resume_and_prefill);
+    RUN_TEST(think_history_is_parsed);
+    RUN_TEST(field_patterns_are_parsed);
+    RUN_TEST(field_patterns_refused);
+    RUN_TEST(think_history_props);
+    RUN_TEST(unload_cancel_streams_model_unloaded);
     RUN_TEST(stream_tool_call_reaches_wire_before_turn_ends);
     RUN_TEST(stream_keepalive_while_call_is_held);
+    RUN_TEST(content_array_keeps_text);
     TEST_REPORT();
     return __ft_failed == 0 ? 0 : 1;
 }

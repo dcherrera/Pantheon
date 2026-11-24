@@ -1,6 +1,6 @@
 # PyTorch .pth Converter
 
-Convert PyTorch checkpoint files (`.pth`) to safetensors format in pure C. No Python, no pip, no dependencies.
+Convert PyTorch checkpoint files (`.pth`) to safetensors format in pure C, using Foundry's pth and safetensors modules. No Python, no pip.
 
 ## Why?
 

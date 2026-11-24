@@ -1,0 +1,9 @@
+{"endpoint":"POST /local/people","class":"admin",
+ "request":{"handle":"bob","name":"Bob","may_load":true},
+ "status":200,
+ "response":{"person":{"id":"p55aa66bb","handle":"bob","name":"Bob","admin":false,"may_load":true,"created":1793000100}},
+ "errors":[{"when":"handle breaks the rules (1-24 bytes, no control characters)","status":400,"type":"bad_handle"},
+           {"when":"name breaks the rules (1-64 bytes, no control characters)","status":400,"type":"bad_name"},
+           {"when":"the handle is taken (ASCII case ignored)","status":409,"type":"handle_taken"},
+           {"when":"64 people","status":507,"type":"people_full"},
+           {"when":"a non-admin","status":403,"type":"forbidden"}]}

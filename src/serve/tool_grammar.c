@@ -28,15 +28,20 @@
  *   TG_FUNC_NAME : a NAME from the tool-name set, then ">"
  *   TG_FUNC_NL   : the "\n" after "<function=NAME>"
  *   TG_BODY      : a body boundary — EITHER "<parameter=" OR "</function>",
- *                  with the "\n" separators between them skipped
+ *                  with the "\n" separators between them skipped;
+ *                  "<parameter=" only while a key is left unwritten
  *   TG_PARAM_LIT : the remainder of the literal "<parameter="
- *   TG_PARAM_KEY : a KEY from this tool's param set, then ">"
+ *   TG_PARAM_KEY : a KEY from this tool's param set this call has not yet
+ *                  written, then ">"
  *   TG_PARAM_NL  : the "\n" after "<parameter=KEY>"
  *   TG_VALUE     : free VALUE text up to "</parameter>" — the SAME bytes the
  *                  parser ends a value on, so the two cannot disagree about
  *                  where a value ended.  DELIBERATELY free otherwise: see
  *                  "FRAME CAPTURE" below — a nested opener is NOT killed here,
- *                  it is read back by the parser.
+ *                  it is read back by the parser.  A `field_patterns` rule
+ *                  on the key (tg_apply_field_patterns) masks the bytes that
+ *                  cannot lead to a matching value and lets "</parameter>"
+ *                  close only on a match.
  *   TG_VALUE_JSON: VALUE for a key whose schema `type` is "array"/"object" —
  *                  NOT free text: one well-formed JSON value of that container
  *                  kind (json_value_grammar.h), and only once it CLOSES does
@@ -116,7 +121,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "field_pattern.h"
 #include "json_value_grammar.h"
+#include "reasoned_reply_tracker.h"
+#include "think_close_rule.h"
 #include "tool_param_empty_value_rule.h"
 
 /* ── compiled string set (tool names, or one tool's parameter keys) ── */
@@ -146,12 +154,17 @@ typedef struct {
     unsigned char json_container;   /* '[' array, '{' object, 0 = free-text VALUE */
     bool          forbids_empty;    /* schema says this value may not be empty —
                                      * tool_param_empty_value_rule.h */
+    bool          string_typed;     /* schema `type` is absent or "string" */
+    field_pattern *pattern;         /* the request's `field_patterns` rule for this
+                                     * key (tg_apply_field_patterns), or NULL */
 } tg_key_meta;
 
 typedef struct {
     char        *name;
     tg_set       keys;
     uint64_t     required;   /* bit i set ⇔ keys.items[i] is in the schema's `required` */
+    uint64_t     required_if_reasoned;  /* bit i set ⇔ keys.items[i] is named by the
+                              * request's `required_if_reasoned` (tg_require_if_reasoned) */
     tg_key_meta *key_meta;   /* [keys.n], parallel to keys.items */
 } tg_tool;
 
@@ -182,6 +195,9 @@ typedef enum {
 } tg_phase;
 
 #define TG_NAME_MAX 256
+/* Longest forced literal tg_steer installs (a longer one is cut; its prefix
+ * is still forced). */
+#define TG_STEER_MAX 32
 
 struct tg_state {
     const tg_grammar *g;
@@ -225,6 +241,10 @@ struct tg_state {
                              * reasoning close WITHOUT depending on the emitter's
                              * <think> flag (which the Q3 model doesn't reliably
                              * trigger — BUG 1). */
+    bool     think_close_token;  /* only the "</think>" TOKEN closes reasoning
+                                  * (tg_set_think_close_token) */
+    int      opener_ws;     /* whitespace chars taken before a compelled opener
+                             * (TG_OPENER_WS_MAX) */
 
     const char *lit;        /* literal for a fixed-literal phase */
     int         lit_pos;
@@ -276,12 +296,39 @@ struct tg_state {
     bool val_floor;
     bool val_content;
 
+    /* FIELD PATTERN (tg_apply_field_patterns) for the free-text value being
+     * emitted, stashed by TG_PARAM_KEY like val_floor; NULL = no rule.  The
+     * pattern judges the value the parser hands the client: the bytes before
+     * "</parameter>", dup_trim'd.  So leading whitespace is never fed
+     * (pat_begun), `pat_live` is the walk over everything fed so far, and
+     * `pat_trimmed` is that walk as of the last non-whitespace byte — what a
+     * close right now would be judged on, trailing whitespace trimmed away.
+     * `pat_at_close` freezes pat_trimmed when a "</parameter>" match starts:
+     * its bytes are fed as content too (the match may break), and if it
+     * completes, the value it closed is judged on the frozen walk.  Embedded
+     * by value (fp_set is POD), so clone/copy carry them. */
+    const field_pattern *val_pattern;
+    bool   pat_begun;
+    fp_set pat_live, pat_trimmed, pat_at_close;
+    /* STEER (tg_steer): a forced literal the next chars must spell, consumed
+     * one char at a time before the char is stepped as usual; steer_pos ==
+     * steer_len = none pending. */
+    char          steer_lit[TG_STEER_MAX];
+    unsigned char steer_len, steer_pos;
+
     /* Which of cur_tool's parameter keys this call has emitted so far (bit per
      * keys index).  TG_BODY refuses "</function>" until it covers the tool's
      * `required` mask, so a call MISSING a required argument cannot complete.
      * Reset when a NAME is matched, so each call in a multi-call stream is judged
      * on its own. */
     uint64_t seen_keys;
+    /* The keys this call must emit before "</function>": the tool's `required`
+     * mask, plus its `required_if_reasoned` mask when the reply reasoned and this
+     * is its first call.  Set when the NAME is matched. */
+    uint64_t owed_keys;
+    /* Did the reply reason, and how many calls reached a NAME
+     * (reasoned_reply_tracker.h; watched only after tg_watch_reasoning). */
+    reasoned_reply reply;
 
     /* Forced-mode reasoning budget (BUG: a model that degenerates in <think> and
      * never emits "</think>" streams unconstrained forever).  We count chars seen
@@ -321,6 +368,12 @@ struct tg_state {
  * backstop. */
 #define TG_LANDING_BUDGET 512
 
+/* Whitespace a compelled opener may follow ("</think>\n\n<tool_call>" is the
+ * trained shape).  Unbounded, a model that wants to write prose under the mask
+ * takes whitespace tokens, its best allowed pick, until max_tokens and the turn
+ * ends with no call (K80 host, Qwen3.6 Q8, 2026-11-18). */
+#define TG_OPENER_WS_MAX 16
+
 /* Skeleton literals. */
 static const char LIT_TC_NL[]      = "\n";
 static const char LIT_FUNC_OPEN[]  = "<function=";
@@ -343,10 +396,6 @@ static const char LIT_TC_CLOSE[]   = "</tool_call>";
 /* FREE-region opener literals (indexed by free_which 1/2). */
 static const char OPEN_TC[]   = "<tool_call>";
 static const char OPEN_FUNC[] = "<function=";
-/* Reasoning-close marker.  In FORCED mode the grammar watches the raw stream for
- * this itself (self-contained reasoning-end) — see BUG 1. */
-static const char THINK_CLOSE[] = "</think>";
-
 /* Whitespace, for TG_VALUE's empty-value floor.  This is exactly the set
  * dup_trim() (tool_calling.c) strips with isspace(), so the grammar and the
  * parser agree on what "empty" means — a disagreement here is what produced
@@ -521,6 +570,8 @@ tg_grammar *tg_build(const jr_value *tools) {
                  * and container_of_type only fires on "array"/"object". */
                 meta->json_container = container_of_type(prop);
                 meta->forbids_empty = tool_param_forbids_empty_value(prop);
+                const char *type = jr_as_string(jr_object_get(prop, "type"));
+                meta->string_typed = !type || strcmp(type, "string") == 0;
             }
         }
 
@@ -550,8 +601,10 @@ void tg_free(tg_grammar *g) {
     for (int i = 0; i < g->n_tools; i++) {
         free(g->tools[i].name);
         if (g->tools[i].key_meta) {
-            for (int k = 0; k < g->tools[i].keys.n; k++)
+            for (int k = 0; k < g->tools[i].keys.n; k++) {
                 set_free(&g->tools[i].key_meta[k].enum_values);
+                fp_free(g->tools[i].key_meta[k].pattern);
+            }
             free(g->tools[i].key_meta);
         }
         set_free(&g->tools[i].keys);
@@ -596,7 +649,50 @@ tg_state *tg_state_new_required(const tg_grammar *g, bool think_open) {
     /* No open think block: the first generated char is already the answer, so
      * the call is compelled from token 0 (nothing to wait for). */
     if (!think_open) st->reasoning_ended = true;
+    else reasoned_reply_begin(&st->reply);
     return st;
+}
+
+void tg_watch_reasoning(tg_state *st) {
+    if (st) reasoned_reply_begin(&st->reply);
+}
+
+void tg_require_if_reasoned(tg_grammar *g, const jr_value *names) {
+    if (!g || jr_kind(names) != JR_ARRAY) return;
+    int n = jr_array_len(names);
+    for (int i = 0; i < n; i++) {
+        const char *key = jr_as_string(jr_array_get(names, i));
+        if (!key || !*key) continue;
+        for (int t = 0; t < g->n_tools; t++) {
+            int idx = set_exact_match(&g->tools[t].keys, key, (int)strlen(key));
+            if (idx >= 0 && idx < TG_REQ_MAX_KEYS)
+                g->tools[t].required_if_reasoned |= (uint64_t)1 << idx;
+        }
+    }
+}
+
+/* A pattern applies to a free-text string value only: not to an enum (already a
+ * closed set), a JSON container or a non-string scalar. */
+static bool key_takes_pattern(const tg_key_meta *meta) {
+    return meta->string_typed && meta->enum_values.n == 0 && !meta->json_container;
+}
+
+bool tg_apply_field_patterns(tg_grammar *g, const jr_value *field) {
+    if (!g || jr_kind(field) != JR_OBJECT) return true;
+    for (int t = 0; t < g->n_tools; t++) {
+        tg_tool *tool = &g->tools[t];
+        const jr_value *props = jr_object_get(field, tool->name);
+        if (jr_kind(props) != JR_OBJECT || !tool->key_meta) continue;
+        for (int k = 0; k < tool->keys.n; k++) {
+            tg_key_meta *meta = &tool->key_meta[k];
+            const char *src = jr_as_string(jr_object_get(props, tool->keys.items[k]));
+            if (!src || !key_takes_pattern(meta)) continue;
+            fp_free(meta->pattern);
+            meta->pattern = fp_compile(src, NULL, 0);
+            if (!meta->pattern) return false;
+        }
+    }
+    return true;
 }
 
 tg_state *tg_state_clone(const tg_state *st) {
@@ -612,13 +708,31 @@ void tg_state_copy(tg_state *dst, const tg_state *src) {
 
 void tg_state_free(tg_state *st) { free(st); }
 
+void tg_set_think_close_token(tg_state *st) {
+    if (st) st->think_close_token = true;
+}
+
 void tg_reasoning_end(tg_state *st) {
-    if (st) st->reasoning_ended = true;
+    if (!st) return;
+    st->reasoning_ended = true;
+    reasoned_reply_end(&st->reply);
 }
 
 void tg_reasoning_end_injected(tg_state *st) {
     if (!st) return;
     st->reasoning_ended = true;
+    reasoned_reply_end(&st->reply);
+    /* tool_choice "required": no window.  The close now lands on a line end
+     * (reasoning_budget.h), and prose after it only delays the call the client
+     * asked for — the model wrote its own math on into the reply and ran to
+     * max_tokens with no call.  The opener is compelled from the next token. */
+    if (st->think_gated) {
+        st->landing_chars = 0;
+        st->think_term = 0;
+        st->free_which = 0;
+        st->free_open  = 0;
+        return;
+    }
     /* Grant the landing window.  The reasoning region IS over (the close is in
      * the stream and the KV state), so every runaway guard stays armed — the
      * only thing deferred is COMPELLING the opener, and only for a bounded
@@ -632,6 +746,63 @@ void tg_reasoning_end_injected(tg_state *st) {
     st->think_term = 0;
     st->free_which = 0;
     st->free_open  = 0;
+}
+
+/* A "</parameter>" match is starting at this byte: freeze what a close would be
+ * judged on (field pattern; see tg_state.val_pattern). */
+static void value_pattern_mark_close(tg_state *st) {
+    if (st->val_pattern) st->pat_at_close = st->pat_trimmed;
+}
+
+/* Feed one value byte to the field pattern, as content.  DEAD when no way
+ * remains to a matching value: the walk is empty and closing now (trimmed, or
+ * through the "</parameter>" match under way) would not match either. */
+static void value_pattern_char(tg_state *st, char c) {
+    if (!st->val_pattern) return;
+    if (st->pat_begun || !tg_is_ws(c)) {
+        st->pat_begun = true;
+        fp_step(st->val_pattern, &st->pat_live, (unsigned char)c);
+        if (!tg_is_ws(c)) st->pat_trimmed = st->pat_live;
+    }
+    const fp_set *closable = st->val_term > 0 ? &st->pat_at_close : &st->pat_trimmed;
+    if (fp_set_empty(&st->pat_live) && !fp_accepting(st->val_pattern, closable))
+        st->phase = TG_DEAD;
+}
+
+/* May "</parameter>" close the value now, as far as the field pattern goes? */
+static bool value_pattern_closes(const tg_state *st) {
+    return !st->val_pattern || fp_accepting(st->val_pattern, &st->pat_at_close);
+}
+
+/* May key `i` of the current call still be opened?  A key is emitted at most once
+ * per call; one past the tracked mask is always open (the same degrade as an
+ * untracked `required` key, TG_REQ_MAX_KEYS). */
+static bool key_unseen(const tg_state *st, int i) {
+    return i >= TG_REQ_MAX_KEYS || !(st->seen_keys & ((uint64_t)1 << i));
+}
+
+/* Does some key the call may still open continue the KEY typed so far with `c`?
+ * Matches the whole prefix, not just position `set_pos`: with a seen key out of
+ * the set, a per-position check could spell that key and leave no way on. */
+static bool key_char_live(const tg_state *st, char c) {
+    const tg_set *s = st->set;
+    int pos = st->set_pos;
+    size_t cmp = (size_t)(pos < TG_NAME_MAX - 1 ? pos : TG_NAME_MAX - 1);
+    for (int i = 0; i < s->n; i++) {
+        const char *m = s->items[i];
+        if (key_unseen(st, i) && (int)strlen(m) > pos && m[pos] == c &&
+            strncmp(m, st->name_acc, cmp) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* Has the current call a key left to open? */
+static bool call_has_unseen_key(const tg_state *st) {
+    const tg_set *keys = &st->g->tools[st->cur_tool].keys;
+    for (int i = 0; i < keys->n; i++)
+        if (key_unseen(st, i)) return true;
+    return false;
 }
 
 static void enter_literal(tg_state *st, tg_phase p, const char *lit) {
@@ -650,24 +821,36 @@ static int lit_step(tg_state *st, char c) {
     return st->lit[st->lit_pos] == '\0' ? 1 : 0;
 }
 
+/* The model closed its reasoning (or ended a landing window with its own close):
+ * compel the opener from the next TOKEN — forced_pending holds it off for the rest
+ * of this one. */
+static void think_closed(tg_state *st) {
+    st->reasoning_ended = true;
+    st->landing_chars = 0;
+    st->forced_pending = true;
+    st->think_term = 0;
+    st->free_which = 0;
+    st->free_open = 0;
+}
+
+/* Is the walk waiting for the model's reasoning close?  Only FREE in forced mode
+ * watches: still reasoning, or inside a landing window. */
+static bool think_close_watched(const tg_state *st) {
+    return st->phase == TG_FREE && st->mode == TG_MODE_FORCED &&
+           (!st->reasoning_ended || st->landing_chars > 0);
+}
+
 /* Consume one char, mutating st (phase → TG_DEAD on any violation). */
 static void step_char(tg_state *st, char c) {
     switch (st->phase) {
 
     case TG_FREE: {
+        reasoned_reply_char(&st->reply, c, st->think_close_token);
         /* THINK-GATED (tg_state_new_required): inside the open think block only
          * the model's own "</think>" is watched for; nothing else is judged. */
         if (st->think_gated && !st->reasoning_ended) {
-            if (THINK_CLOSE[st->think_term] == c) {
-                st->think_term++;
-                if (THINK_CLOSE[st->think_term] == '\0') {
-                    st->reasoning_ended = true;
-                    st->forced_pending  = true;   /* compelled from the next TOKEN */
-                    st->think_term = 0;
-                }
-            } else {
-                st->think_term = (c == THINK_CLOSE[0]) ? 1 : 0;
-            }
+            if (think_close_text_step(&st->think_term, c, st->think_close_token))
+                think_closed(st);   /* compelled from the next TOKEN */
             return;
         }
 
@@ -708,22 +891,14 @@ static void step_char(tg_state *st, char c) {
                 st->forced_pending  = true;
                 st->think_term = 0;
                 st->free_which = 0; st->free_open = 0;
+                reasoned_reply_end(&st->reply);
                 return;   /* armed; the next TOKEN is masked toward the opener */
-            } else
-            if (THINK_CLOSE[st->think_term] == c) {
-                st->think_term++;
-                if (THINK_CLOSE[st->think_term] == '\0') {
-                    st->reasoning_ended = true;   /* "</think>" seen → compel opener */
-                    st->forced_pending  = true;   /* … from the next TOKEN */
-                    st->think_term = 0;
-                    st->free_which = 0; st->free_open = 0;
-                    return;   /* the close itself consumed; the rest of this
-                               * token is still grace (the close can arrive
-                               * glued to the text that follows it) */
-                }
-            } else {
-                /* Broke the "</think>" match; re-seed if this char restarts it. */
-                st->think_term = (c == THINK_CLOSE[0]) ? 1 : 0;
+            } else if (think_close_text_step(&st->think_term, c, st->think_close_token)) {
+                /* "</think>" seen → compel the opener from the next TOKEN.  The
+                 * close itself is consumed; the rest of this token is still
+                 * grace (the close can arrive glued to the text after it). */
+                think_closed(st);
+                return;
             }
             /* Still reasoning: fall through to the FREE opener tracker below so a
              * call opened DIRECTLY (mid-reasoning, no </think>) still engages the
@@ -745,22 +920,14 @@ static void step_char(tg_state *st, char c) {
          * `tool_choice=required` is NOT weakened: the opener is still compelled,
          * just up to TG_LANDING_BUDGET chars later. */
         if (st->mode == TG_MODE_FORCED && st->landing_chars > 0) {
-            if (THINK_CLOSE[st->think_term] == c) {
-                st->think_term++;
-                if (THINK_CLOSE[st->think_term] == '\0') {
-                    /* The model's own close — the grace is no longer warranted.
-                     * End the window HERE and consume this char, so the opener is
-                     * compelled from the NEXT one (never from this one, which
-                     * would drive a legal char to DEAD — and a DEAD walk reports
-                     * its mask INACTIVE, releasing the constraint entirely). */
-                    st->landing_chars = 0;
-                    st->forced_pending = true;
-                    st->think_term = 0;
-                    st->free_which = 0; st->free_open = 0;
-                    return;
-                }
-            } else {
-                st->think_term = (c == THINK_CLOSE[0]) ? 1 : 0;
+            if (think_close_text_step(&st->think_term, c, st->think_close_token)) {
+                /* The model's own close — the grace is no longer warranted.
+                 * End the window HERE and consume this char, so the opener is
+                 * compelled from the NEXT one (never from this one, which
+                 * would drive a legal char to DEAD — and a DEAD walk reports
+                 * its mask INACTIVE, releasing the constraint entirely). */
+                think_closed(st);
+                return;
             }
             st->landing_chars--;
             if (st->landing_chars == 0) {
@@ -791,8 +958,12 @@ static void step_char(tg_state *st, char c) {
          * (the observed no-force bug).  Whitespace only counts before the opener
          * starts; once '<' arrives the fixed skeleton takes over. */
         if (forced && st->free_open == 0 &&
-            (c == '\n' || c == ' ' || c == '\t' || c == '\r'))
+            (c == '\n' || c == ' ' || c == '\t' || c == '\r')) {
+            /* Bounded: past TG_OPENER_WS_MAX only the opener is left. */
+            if (st->opener_ws >= TG_OPENER_WS_MAX) { st->phase = TG_DEAD; return; }
+            st->opener_ws++;
             return;   /* stay in TG_FREE awaiting the opener */
+        }
 
         /* On a broken opener prefix: DEAD in forced mode, else reset to FREE
          * (re-seeding on '<'). */
@@ -823,10 +994,12 @@ static void step_char(tg_state *st, char c) {
         #undef TG_FREE_BREAK
         /* completed an opener? */
         if (st->free_which == 1 && st->free_open == (int)strlen(OPEN_TC)) {
+            reasoned_reply_call_opened(&st->reply, (int)strlen(OPEN_TC));
             st->wrapped = true;
             st->free_which = 0; st->free_open = 0;
             enter_literal(st, TG_TC_NL, LIT_TC_NL);
         } else if (st->free_which == 2 && st->free_open == (int)strlen(OPEN_FUNC)) {
+            reasoned_reply_call_opened(&st->reply, (int)strlen(OPEN_FUNC));
             st->wrapped = false;
             st->free_which = 0; st->free_open = 0;
             enter_set(st, TG_FUNC_NAME, &st->g->names);
@@ -852,6 +1025,9 @@ static void step_char(tg_state *st, char c) {
             if (idx < 0) { st->phase = TG_DEAD; return; }
             st->cur_tool = idx;   /* names set is 1:1 with tools */
             st->seen_keys = 0;    /* a fresh call owes this tool's required keys */
+            st->owed_keys = st->g->tools[idx].required;
+            if (reasoned_reply_call_named(&st->reply))
+                st->owed_keys |= st->g->tools[idx].required_if_reasoned;
             enter_literal(st, TG_FUNC_NL, LIT_FUNC_NL);
         } else if (set_char_live_pinned(st->set, st->forced_tool, st->set_pos, c)) {
             if (st->set_pos < TG_NAME_MAX - 1) st->name_acc[st->set_pos] = c;
@@ -881,6 +1057,11 @@ static void step_char(tg_state *st, char c) {
         }
         st->body_lt = false;
         if (c == 'p') {                       /* "<p" → parameter */
+            /* Every key already written: the only way on is "</function>".
+             * Without this a call holding all its required keys could reopen
+             * one forever — live, rm4 pbthink 4: a valid `finding`, then
+             * `keep`/`finding` repeated until max_tokens (call_incomplete). */
+            if (!call_has_unseen_key(st)) { st->phase = TG_DEAD; return; }
             enter_literal(st, TG_PARAM_LIT, LIT_PARAM);
             st->lit_pos = 2;                  /* "<p" already consumed */
         } else if (c == '/') {                /* "</" → function close */
@@ -898,7 +1079,7 @@ static void step_char(tg_state *st, char c) {
              * this is the XML dialect catching up to the same contract. */
             const tg_tool *t = (st->cur_tool >= 0) ? &st->g->tools[st->cur_tool]
                                                    : NULL;
-            if (t && (st->seen_keys & t->required) != t->required) {
+            if (t && (st->seen_keys & st->owed_keys) != st->owed_keys) {
                 st->phase = TG_DEAD; return;
             }
             enter_literal(st, TG_FUNC_CLOSE, LIT_FUNC_CLOSE);
@@ -916,7 +1097,8 @@ static void step_char(tg_state *st, char c) {
     case TG_PARAM_KEY:
         if (c == '>') {
             int kidx = set_exact_match(st->set, st->name_acc, st->set_pos);
-            if (kidx < 0) { st->phase = TG_DEAD; return; }
+            /* A key this call already wrote cannot be written again. */
+            if (kidx < 0 || !key_unseen(st, kidx)) { st->phase = TG_DEAD; return; }
             if (kidx < TG_REQ_MAX_KEYS)
                 st->seen_keys |= (uint64_t)1 << kidx;   /* satisfies `required` */
             /* Stash this key's VALUE shape (closed enum set, or the JSON
@@ -931,8 +1113,9 @@ static void step_char(tg_state *st, char c) {
             /* No key_meta at all means no schema was compiled for this tool; a
              * floor we were never told about must not be invented. */
             st->val_floor = meta ? meta->forbids_empty : false;
+            st->val_pattern = meta ? meta->pattern : NULL;
             enter_literal(st, TG_PARAM_NL, LIT_PARAM_NL);
-        } else if (set_char_live(st->set, st->set_pos, c)) {
+        } else if (key_char_live(st, c)) {
             if (st->set_pos < TG_NAME_MAX - 1) st->name_acc[st->set_pos] = c;
             st->set_pos++;
         } else st->phase = TG_DEAD;
@@ -948,6 +1131,10 @@ static void step_char(tg_state *st, char c) {
             st->set_pos = 0;   /* TG_VALUE_ENUM accumulates into name_acc */
             if (st->phase == TG_VALUE_JSON)
                 jvg_begin(&st->json_value, (char)st->json_container);
+            if (st->val_pattern) {
+                st->pat_begun = false;
+                st->pat_live = st->pat_trimmed = fp_start(st->val_pattern);
+            }
         }
         return;
 
@@ -1167,11 +1354,15 @@ static void step_char(tg_state *st, char c) {
          * "</function>", not the value. */
         const char *term = LIT_VALUE_CLOSE;
         if (term[st->val_term] == c) {
+            if (st->val_term == 0) value_pattern_mark_close(st);
             st->val_term++;
             if (term[st->val_term] == '\0') {
                 if (st->val_floor && !st->val_content) { st->phase = TG_DEAD; return; }
+                if (!value_pattern_closes(st)) { st->phase = TG_DEAD; return; }
                 st->phase = TG_BODY; st->body_lt = false;
+                return;
             }
+            value_pattern_char(st, c);
             return;
         }
         /* Terminator broke → everything the failed prefix consumed was value
@@ -1184,7 +1375,9 @@ static void step_char(tg_state *st, char c) {
          * has no proper border, so the only suffix of a failed prefix that can
          * restart the match is the single '<'. */
         if (st->val_term > 0 || !tg_is_ws(c)) st->val_content = true;
+        if (c == term[0]) value_pattern_mark_close(st);
         st->val_term = (c == term[0]) ? 1 : 0;
+        value_pattern_char(st, c);
         return;
     }
 
@@ -1222,8 +1415,60 @@ static void step_char(tg_state *st, char c) {
     }
 }
 
+/* step_char behind a pending steer literal: a char off the literal is DEAD. */
+static void step_steered(tg_state *st, char c) {
+    if (st->steer_pos < st->steer_len) {
+        if (c != st->steer_lit[st->steer_pos]) { st->phase = TG_DEAD; return; }
+        st->steer_pos++;
+    }
+    step_char(st, c);
+}
+
 static void walk(tg_state *st, const char *text) {
-    for (const char *p = text; *p; p++) step_char(st, *p);
+    if (st->phase == TG_FREE && think_close_token_piece(text, st->think_close_token))
+        reasoned_reply_close(&st->reply);
+    if (think_close_token_piece(text, st->think_close_token) && think_close_watched(st)) {
+        think_closed(st);
+        return;
+    }
+    for (const char *p = text; *p; p++) step_steered(st, *p);
+}
+
+/* Is `c`, stepped on `before` and killing the walk, the patterned value trying
+ * to END?  Either the whitespace that starts the trained "\n</parameter>" tail
+ * (only the pattern kills whitespace in a VALUE) or the '>' completing
+ * "</parameter>" (refused by the pattern; the floor is met once pat_begun). */
+static bool value_close_refused(const tg_state *before, char c) {
+    if (before->phase != TG_VALUE || !before->val_pattern) return false;
+    if (tg_is_ws(c)) return before->val_term == 0;
+    return c == '>' && before->val_term == (int)sizeof(LIT_VALUE_CLOSE) - 2;
+}
+
+bool tg_steer(tg_state *st, const char *token_text) {
+    if (!st || !token_text || !*token_text || st->phase != TG_VALUE || !st->val_pattern)
+        return false;
+    /* Not on an empty value (nothing to continue), not mid-"</parameter>" (its
+     * bytes are already value text), not while a steer is still pending. */
+    if (!st->pat_begun || st->val_term > 0 || st->steer_pos < st->steer_len) return false;
+    tg_state probe = *st;
+    bool refused = false;
+    for (const char *p = token_text; *p; p++) {
+        tg_state before = probe;
+        step_steered(&probe, *p);
+        if (probe.phase == TG_DEAD) { refused = value_close_refused(&before, *p); break; }
+        if (probe.phase != TG_VALUE) return false;   /* left the value legally */
+    }
+    if (!refused) return false;
+    char lit[TG_STEER_MAX];
+    int n = fp_forced_continuation(st->val_pattern, &st->pat_live, lit, (int)sizeof(lit));
+    if (n <= 0) return false;
+    tg_state check = *st;
+    for (int i = 0; i < n && check.phase == TG_VALUE; i++) step_char(&check, lit[i]);
+    if (check.phase != TG_VALUE) return false;
+    memcpy(st->steer_lit, lit, (size_t)n);
+    st->steer_len = (unsigned char)n;
+    st->steer_pos = 0;
+    return true;
 }
 
 bool tg_token_allowed(const tg_state *st, const char *token_text) {
@@ -1314,6 +1559,14 @@ bool tg_in_call(const tg_state *st) {
 
 bool tg_is_dead(const tg_state *st) {
     return st && st->phase == TG_DEAD;
+}
+
+bool tg_reply_reasoned(const tg_state *st) {
+    return st && reasoned_reply_reasoned(&st->reply);
+}
+
+int tg_calls_named(const tg_state *st) {
+    return st ? st->reply.calls_named : 0;
 }
 
 int tg_debug_reason_chars(const tg_state *st) {

@@ -163,7 +163,7 @@ int main(int argc, char **argv)
     if (warm_turns < 2) warm_turns = 2;
     if (warm_turns > MAX_TURNS) warm_turns = MAX_TURNS;
 
-    pn_batch_sched *sched = bs_create(model, K < MAX_K ? K : MAX_K);
+    pn_batch_sched *sched = bs_create(model, K < MAX_K ? K : MAX_K, NULL);
     if (!sched) { fprintf(stderr, "bs_create failed\n"); return 1; }
 
     fprintf(stderr, "bench: K=%d gen/turn=%d warm_turns=%d (turn0 untimed) "

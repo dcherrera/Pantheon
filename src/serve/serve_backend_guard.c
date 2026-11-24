@@ -119,7 +119,7 @@ int pn_backend_guard_message(pn_backend_guard_verdict verdict,
         "the %s backend, but the die manager probed 0 dies (build=%s). It would load "
         "the model and answer every request on the host CPU, as silently as if the "
         "dies had been honoured. Fix: make the dies visible (driver loaded, card "
-        "present, CUDA_VISIBLE_DEVICES not empty) — or drop --dies to serve on the "
-        "CPU deliberately.",
+        "present, CUDA_VISIBLE_DEVICES not empty) — or replace --dies with --cpu to "
+        "serve on the CPU deliberately.",
         name, die_list, pn_backend_name(), pn_backend_build_commit());
 }

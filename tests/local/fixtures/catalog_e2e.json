@@ -1,0 +1,143 @@
+{
+ "schema": 1,
+ "version": 1,
+ "published": "2026-10-26",
+ "models": [
+  {
+   "id": "qwen3-0.6b-q8",
+   "name": "Qwen3 0.6B Q8_0 (TEST ONLY e2e fixture)",
+   "family": "qwen3",
+   "description": "TEST ONLY: measured numbers are placeholders, not measurements",
+   "licence": {
+    "id": "apache-2.0",
+    "url": "https://huggingface.co/Qwen/Qwen3-0.6B"
+   },
+   "capabilities": [
+    "chat"
+   ],
+   "files": [
+    {
+     "role": "weights",
+     "hf_repo": "teamide/test-fixtures",
+     "revision": "0123456789abcdef0123456789abcdef01234567",
+     "filename": "qwen3-0.6b-Q8_0.gguf",
+     "size": 639446688,
+     "sha256": "9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031"
+    }
+   ],
+   "profiles": [
+    {
+     "id": "k80-one",
+     "rank": 1,
+     "hardware": {
+      "unit_type": "k80-gpu",
+      "count": 1,
+      "same_card": false,
+      "min_mem_per_unit": 2000000000,
+      "min_host_ram": 2000000000
+     },
+     "load": {
+      "ctx_cap": 4096,
+      "max_sessions": 2,
+      "max_concurrent": 1,
+      "reasoning_budget": 0,
+      "mtp": false
+     },
+     "sampling": {
+      "temperature": 0.6,
+      "top_p": 0.95,
+      "top_k": 20,
+      "min_p": 0,
+      "presence_penalty": 0
+     },
+     "measured": {
+      "decode_tok_s": {
+       "8k": 1.0,
+       "14k": 0,
+       "32k": 0
+      },
+      "ttft": {
+       "prompt_tokens": 100,
+       "seconds": 1.0
+      },
+      "context_window": 4096
+     }
+    },
+    {
+     "id": "p150-one",
+     "rank": 1,
+     "hardware": {
+      "unit_type": "p150",
+      "count": 1,
+      "same_card": false,
+      "min_mem_per_unit": 0,
+      "min_host_ram": 2000000000
+     },
+     "load": {
+      "ctx_cap": 4096,
+      "max_sessions": 2,
+      "max_concurrent": 1,
+      "reasoning_budget": 0,
+      "mtp": false
+     },
+     "sampling": {
+      "temperature": 0.6,
+      "top_p": 0.95,
+      "top_k": 20,
+      "min_p": 0,
+      "presence_penalty": 0
+     },
+     "measured": {
+      "decode_tok_s": {
+       "8k": 1.0,
+       "14k": 0,
+       "32k": 0
+      },
+      "ttft": {
+       "prompt_tokens": 100,
+       "seconds": 1.0
+      },
+      "context_window": 4096
+     }
+    },
+    {
+     "id": "cpu",
+     "rank": 2,
+     "hardware": {
+      "unit_type": "cpu",
+      "count": 1,
+      "same_card": false,
+      "min_mem_per_unit": 0,
+      "min_host_ram": 2000000000
+     },
+     "load": {
+      "ctx_cap": 4096,
+      "max_sessions": 2,
+      "max_concurrent": 1,
+      "reasoning_budget": 0,
+      "mtp": false
+     },
+     "sampling": {
+      "temperature": 0.6,
+      "top_p": 0.95,
+      "top_k": 20,
+      "min_p": 0,
+      "presence_penalty": 0
+     },
+     "measured": {
+      "decode_tok_s": {
+       "8k": 1.0,
+       "14k": 0,
+       "32k": 0
+      },
+      "ttft": {
+       "prompt_tokens": 100,
+       "seconds": 1.0
+      },
+      "context_window": 4096
+     }
+    }
+   ]
+  }
+ ]
+}

@@ -112,15 +112,20 @@
 /* 4. Project headers */
 #include "../accel/die_layer_split.h"
 #include "../accel/simd.h"
+#include "../core/load_guard.h"
+#include "../core/load_progress.h"
 #include "../core/mem/pn_admission.h"
+#include "../core/mem/pn_kv_geometry.h"
 #include "../core/mem/pn_memwatch.h"
 #include "../core/mem/pn_ladder.h"
 #include "../core/qweight.h"
 #include "../formats/gguf_layer_bytes.h"
 #include "gpu_attn_path_tracker.h"
 #include "gpu_graph_capture_tracker.h"
+#include "qwen35moe_die_projection.h"
 #include "qwen35moe_internal.h"
 #include "qwen35moe_kv_q4.h"
+#include "qwen35moe_mtp_ring.h"
 
 #ifdef USE_CUDA
 
@@ -159,6 +164,18 @@
  * ~2.1 MB per SSM layer per slot; 16 slots is ~1 GB across the model —
  * within a die pair's headroom next to the split weights). */
 #define PN_QWEN35MOE_GPU_MAX_SLOTS 16
+/* QWEN35_TP in-layer exchanges a die records an event for: core gather, out
+ * gather, then down reduce (dense) or hid gather + output gather (MoE). */
+#define TP_N_XCHG 4
+/* Buffer lanes (QWEN35_BS_PD_OVERLAP): the decode-slots step runs on its own
+ * batch scratch, die scratch and TP exchange set (QW_LANE_DECODE), so it can be
+ * issued between two layers of a prefill chunk that sits on the default set
+ * (QW_LANE_PREFILL). Same kernels on the same inputs: the lane only moves
+ * addresses. g->lane selects the live one; 0 everywhere but inside a decode
+ * step with the switch on. */
+#define QW_LANE_PREFILL 0
+#define QW_LANE_DECODE  1
+#define QW_N_LANES      2
 
 /* ============================================================
  * GPU-resident weight handle
@@ -180,6 +197,7 @@ typedef struct {
     int row_stride;        /* bytes per row */
     const pn_qweight *cpu; /* back-pointer to the CPU qweight (host fallback) */
     fc_cuda_ctx *ctx;      /* owning die context (which die holds this weight) */
+    int kpar;              /* 1 = Q8_0 parity slab of a TP K-split (cols = full K) */
 } gpu_weight;
 
 /* GPU copy of one F32 vector (norms, router bias, etc.). */
@@ -235,6 +253,11 @@ typedef struct {
      * residual in one kernel (fx_post). */
     gpu_fused fx_pre;
     gpu_fused fx_post;
+    /* The same two on the batched-decode (slots) path at one slot, over the
+     * batch scratch of generation fx_s_gen: see gpu_slots_fused_prepare. */
+    gpu_fused fx_pre_s;
+    gpu_fused fx_post_s;
+    unsigned fx_s_gen;
     int sdiag_logged;   /* QWEN35_SDIAG: this layer's structure reported once */
 } gpu_moe;
 
@@ -252,6 +275,9 @@ typedef struct {
     gpu_vec    post_attention_norm;
     gpu_moe    moe;
     fc_cuda_ctx *ctx;   /* die context this layer's weights live on */
+    /* QWEN35_TP: this struct is rank tp_rank's half of the layer (tp_on), with
+     * the local dims of pn_qwen35moe_gpu.tp_cfg (see the TP section). */
+    int tp_on, tp_rank;
     /* Persistent GPU-resident SSM dual state (conv + recurrent), allocated
      * ONCE on first use and then living entirely on this layer's die — no
      * per-token H2D/D2H round trip. The CONTENTS are (re)seeded from the host
@@ -265,6 +291,10 @@ typedef struct {
      * epilogues) in one kernel, and ssm_out + residual in one kernel. */
     gpu_fused fx_proj;
     gpu_fused fx_out;
+    /* The same two on the slots path at one slot (gpu_slots_fused_prepare). */
+    gpu_fused fx_proj_s;
+    gpu_fused fx_out_s;
+    unsigned fx_s_gen;
     /* Captured CUDA graph of this layer's ENTIRE position-invariant launch
      * sequence (attn_norm -> SSM block -> post_attention_norm -> MoE, ~13
      * launches), replayed with one cuGraphLaunch per token. Captured lazily
@@ -300,6 +330,13 @@ typedef struct {
     fc_buffer *conv_slots;
     fc_buffer *ssm_slots;
     int slots_cap;
+    /* Turn-start checkpoint per slot row (QWEN35_TURN_CHECKPOINT, serve's
+     * rung 1c): the row's recurrent image at its checkpoint position,
+     * [ckpt_cap][conv_n] / [ckpt_cap][ssm_n]. Carved with the session blocks
+     * (pn_qwen35moe_slot_checkpoints_carve); NULL when the feature is off. */
+    fc_buffer *conv_ckpt;
+    fc_buffer *ssm_ckpt;
+    int ckpt_cap;
     /* L9 — captured CUDA graph of this SSM layer's BATCHED-decode body
      * (attn_norm -> slot-SSM block -> post_attention_norm -> batched MoE,
      * ~30 launches -> 1), replayed once per batched decode step. The slots
@@ -335,10 +372,15 @@ typedef struct {
     gpu_vec    post_attention_norm;
     gpu_moe    moe;
     fc_cuda_ctx *ctx;   /* die context this layer's weights live on */
+    int tp_on, tp_rank; /* QWEN35_TP rank half (see gpu_ssm_layer) */
     /* Fused launches: q/k/v projections in one kernel, and attn_output +
      * residual in one kernel. */
     gpu_fused fx_qkv;
     gpu_fused fx_out;
+    /* attn_output + residual on the slots path at one slot
+     * (gpu_slots_fused_prepare). */
+    gpu_fused fx_out_s;
+    unsigned fx_s_gen;
     /* On-die flash-attention KV ring cache (batched prefill): K/V rows in
      * the host cache's exact [n_head_kv][max_seq][head_dim] layout, on this
      * layer's die. kv_host_id names the state whose cache the GPU copy
@@ -394,6 +436,13 @@ typedef struct {
     fc_buffer *k_slots_g, *v_slots_g;
     fc_buffer *k_sink_slots_g, *v_sink_slots_g;
     fc_buffer *k_win_slots_g, *v_win_slots_g;
+    /* Turn-start checkpoint per slot row (q4 mode): the fp16 sink/window
+     * shadows at the checkpoint position. The window ring is overwritten by
+     * every later token, so it is the one piece of attention state a rewind
+     * needs; KV rows below the checkpoint are never rewritten. */
+    fc_buffer *k_sink_ckpt, *v_sink_ckpt;
+    fc_buffer *k_win_ckpt, *v_win_ckpt;
+    int ckpt_cap;
     fc_buffer *dec_slots_m_g, *dec_slots_l_g, *dec_slots_acc_g;
     int kv_slots_cap_seq;       /* allocated max_seq rows per slot (0 = none) */
     int kv_slots_cap_n;         /* allocated slot count */
@@ -520,6 +569,9 @@ typedef struct {
 typedef struct {
     fc_cuda_ctx *ctx;             /* die this scratch belongs to (NULL = unset) */
     int n_cap;                    /* allocated batch capacity */
+    unsigned gen;                 /* bumped on every (re)allocation, unique
+                                   * across dies: what a cached descriptor
+                                   * over these buffers is keyed on */
     /* residual stream + per-block scratch */
     fc_buffer *hidden, *x_norm, *block_out;             /* [n][n_embd] */
     /* SSM block */
@@ -536,6 +588,9 @@ typedef struct {
     fc_buffer *m_gate, *m_up;                           /* [n][shared_ff] */
     fc_buffer *m_hid;                                   /* [n][k*expert_ff] */
     fc_buffer *m_out, *m_shexp;                         /* [n][n_embd] */
+    fc_buffer *m_sgate;                                 /* [n] sigmoid'd
+                                                         * shexp gate (fused
+                                                         * one-slot path) */
     /* Expert-union dedup request lists — allocated ONLY when
      * gpu_moe_dedup_enabled(), so the default-off build carries no extra
      * VRAM and the decode path is untouched. */
@@ -545,6 +600,12 @@ typedef struct {
      * gate+up (FC_MOE_DEDUP_COMPACT, default off). [fc_moe_dedup_wmax()] int2,
      * i.e. 2.8 KB at the prefill shape. */
     fc_buffer *m_wlist;
+    /* Decode-slots row map for the group this scratch is running (set with
+     * the positions by gpu_pos_buf_upload): rows_h[u] is the persistent
+     * ring/state row of launch position u, rows_g the same map on the die
+     * (a BORROWED view into the die's pos buffer — not freed here). */
+    fc_buffer *rows_g;
+    int rows_h[PN_QWEN35MOE_GPU_MAX_SLOTS];
 } gpu_batch_scratch;
 
 static void gpu_batch_scratch_free(gpu_batch_scratch *b);
@@ -621,6 +682,67 @@ typedef struct {
  * its context. Between consecutive dies the forward hands the residual stream
  * across — device-to-device when the pair has peer access (peer_ok[i]), else
  * staged through the host. */
+/* A captured verify segment (see verify_segment): per die, per row count. */
+typedef struct {
+    fc_graph *graph;
+    uint64_t key;               /* device-address fingerprint at capture */
+    int splits;                 /* rows-attention grid width at capture */
+    long captures, failures, replays;
+} gpu_verify_graph;
+
+/* The MTP draft head's device side (see the MTP section near the end of this file). */
+typedef struct {
+    int on;                       /* uploaded (QWEN35_MTP=1 and the GGUF has a head) */
+    fc_cuda_ctx *ctx;             /* the head die (the LM head's) */
+    gpu_attn_layer d;             /* attention + MoE weights; its own q4 KV ring */
+    gpu_weight eh_e, eh_h;        /* eh_proj halves: embedding / hidden */
+    gpu_vec enorm, hnorm, head_norm;
+    gpu_weight head_lo;           /* LM-head rows [0, sub_n) (aliases g->output) */
+    gpu_weight head_hi;           /* rows [tail_first, n_vocab) (a view of g->output) */
+    int sub_n, tail_first, n_tail;
+    fc_buffer *e, *en, *hn, *x, *xn, *k, *v;   /* [QW_MTP_ROWS_CAP rows] */
+    fc_buffer *qg, *q, *z, *aout, *blk, *tn, *mout, *h_chain, *logits;
+    fc_buffer *m_g, *l_g, *acc_g; /* rows-kernel split partials */
+    float *e_host;                /* embedding rows staged for upload */
+    fc_buffer *h_ver;             /* the last trunk batch's output_norm'd rows */
+    int ver_cap, ver_n;
+    fc_buffer *h_pend;            /* backlog rows' h, positions pend_base.. */
+    uint32_t pend_next[320];      /* backlog rows' next tokens (last: set by the draft) */
+    int pend_n, pend_base, next_pos;
+    const void *state;            /* the session the head's KV ring belongs to */
+    long drafts, kv_rows, full_rows;
+    double draft_ms;
+    double prof_ms[4];            /* QWEN35_MTP_PROF: kv rows / attention / MoE / head, sync'd */
+    double kv_prof_ms[3];         /* QWEN35_MTP_PROF=2: kv rows' host embed / upload / kernels */
+    pn_mtp_pick_fn pick;          /* the draft choice from the head's pairs (NULL = argmax) */
+    void *pick_ctx;
+    int pick_index;               /* the draft mtp_pick is choosing (0-based) */
+} gpu_mtp;
+
+/* QWEN35_TP in-layer exchange buffers of one lane, per die: the core gather,
+ * the out-projection gather, then the dense FFN down reduce or the MoE hidden
+ * and output gathers. Every copy is ordered on the dies' streams, so ONE set
+ * serves a stream of exchanges; a second lane (QW_LANE_DECODE) is what lets a
+ * decode stage run between two layers of a prefill chunk without touching the
+ * chunk's exchange state. */
+typedef struct {
+    int cap;                                         /* rows the buffers hold */
+    fc_buffer *core[PN_DIE_LAYER_SPLIT_MAX_DIES];    /* [cap][core] full order */
+    fc_buffer *half[PN_DIE_LAYER_SPLIT_MAX_DIES];    /* [cap][n_embd/2] out rows */
+    fc_buffer *blk[PN_DIE_LAYER_SPLIT_MAX_DIES];     /* [cap][n_embd] */
+    fc_buffer *recv[PN_DIE_LAYER_SPLIT_MAX_DIES];    /* [cap][n_embd] partner partial */
+    fc_buffer *hidl[PN_DIE_LAYER_SPLIT_MAX_DIES];    /* MoE: [cap*(k+1)][ff/2] rank hid */
+    fc_buffer *hidf[PN_DIE_LAYER_SPLIT_MAX_DIES];    /* MoE: [cap*(k+1)][ff] full hid */
+    fc_buffer *mol[PN_DIE_LAYER_SPLIT_MAX_DIES];     /* MoE: [2*cap][n_embd/2] rank rows */
+    fc_buffer *mof[PN_DIE_LAYER_SPLIT_MAX_DIES];     /* MoE: [2*cap][n_embd] routed+shared */
+    fc_event *ev[PN_DIE_LAYER_SPLIT_MAX_DIES][TP_N_XCHG];
+    /* QWEN35_TP_XCHG (default on): gathers are fc_xchg_2d launches ordered by
+     * these per-die counters (TP_N_XCHG slots, zeroed together) instead of
+     * events + copies; xchg = 0 when off or not allocated. */
+    fc_buffer *sync[PN_DIE_LAYER_SPLIT_MAX_DIES];
+    int xchg;
+} qw_tp_xset;
+
 typedef struct pn_qwen35moe_gpu {
     gpu_ssm_layer  *ssm;          /* [n_ssm] */
     gpu_attn_layer *attn;         /* [n_attn] */
@@ -658,6 +780,34 @@ typedef struct pn_qwen35moe_gpu {
     int vocab_half;               /* rows in the die-A (top) half */
     int vocab_split_ready;        /* 1 = split head uploaded + peer enabled */
 
+    /* QWEN35_TP (dense FFN or grouped Q8_0 MoE, exactly 4 dies): dies (0,1) and (2,3) are rank
+     * pairs of one board; die 2s+p is rank p of stage s and holds half of
+     * every layer in [layer_lo, layer_hi) of its stage (both ranks list the
+     * stage's range). Rank 0's halves sit in ssm[idx] / attn[idx], rank 1's at
+     * idx + tp_n_ssm / idx + tp_n_attn (the arrays are doubled, so every
+     * per-layer loop sees both). tp_cfg carries a rank's local dims. The
+     * per-die exchange buffers and events serve the in-layer exchanges (core
+     * gather, out-projection gather, then the dense FFN down reduce or the MoE
+     * hidden and output gathers). */
+    int tp;
+    int tp_n_ssm, tp_n_attn;
+    pn_qwen35moe_config tp_cfg;
+    /* The exchange buffers, per lane (see qw_tp_xset; tpx[g->lane] is live). */
+    qw_tp_xset tpx[QW_N_LANES];
+    /* MoE TP decode-slots step: one captured graph per stage spanning both
+     * ranks (QWEN35_TP_GRAPH), keyed by tp_slots_graph_key; tp_gen moves when
+     * an exchange or slot-state buffer is reallocated; tp_gev fence a graph
+     * against the partner die's stream. */
+    unsigned tp_gen;
+    int tp_capturing;   /* a stage graph is being captured: gathers are copy kernels */
+    fc_graph *tp_sgraph[2];
+    uint64_t tp_sgraph_key[2], tp_sgraph_warm[2];
+    int tp_sgraph_fail[2];
+    fc_event *tp_gev[PN_DIE_LAYER_SPLIT_MAX_DIES];
+    /* Per rank: global conv channel of each local one, global v-head of each
+     * local one (host state transfers gather / scatter through these). */
+    int *tp_chan[2], *tp_vhead[2];
+
     /* N-die residency / multiplexing. Die i holds layers [layer_lo[i],
      * layer_hi[i]); the ranges come from pn_plan_die_layer_split. */
     int n_die;                    /* 1 .. PN_DIE_LAYER_SPLIT_MAX_DIES */
@@ -678,6 +828,15 @@ typedef struct pn_qwen35moe_gpu {
 
     /* Lazily-created persistent scratch, one per die (see gpu_die_scratch). */
     gpu_die_scratch scratch[PN_DIE_LAYER_SPLIT_MAX_DIES];
+    /* The decode lane's own die and batch scratch (QW_LANE_DECODE), and the
+     * live lane: gpu_get_scratch / gpu_get_batch_scratch / TPX hand out the
+     * buffers of g->lane. */
+    gpu_die_scratch scratch_dec[PN_DIE_LAYER_SPLIT_MAX_DIES];
+    gpu_batch_scratch bscratch_dec[PN_DIE_LAYER_SPLIT_MAX_DIES];
+    int lane;
+    /* Inside an overlap cycle's head (pn_qwen35moe_pd_cycle_cuda): no solo-step
+     * MTP row capture. */
+    int pd_cycle;
 
     /* Batched-forward scratch, one per die, plus its host staging regions
      * (sized for bhost_cap positions; see gpu_get_batch_host). */
@@ -705,6 +864,11 @@ typedef struct pn_qwen35moe_gpu {
      * n_accept against it. */
     fc_buffer *spec_logits;
     int spec_logits_cap;
+    /* pn_qwen35moe_spec_verify_topk: per-row top-k into these host arrays (k = 0: argmax). */
+    int spec_topk_k;
+    int *spec_topk_ids;
+    float *spec_topk_vals;
+    gpu_mtp mtp;
     int spec_n;
     /* Phase 9.2 — the state and base position of that pending verify, so
      * spec_commit can fold the ACCEPTED KV rows into each attention layer's
@@ -719,9 +883,37 @@ typedef struct pn_qwen35moe_gpu {
      * is NOT per slot — it belongs to the per-user pn_qwen35moe_state whose
      * logits buffer it describes. */
     const void *slot_state[PN_QWEN35MOE_GPU_MAX_SLOTS];
+    /* What each slot row's SSM image is, so a resumed turn can re-seed the
+     * shared SSM buffers ON THE CARD instead of from host RAM: the bound
+     * state's KV content generation at bind and the position the image is at
+     * (bind sets it, every decode step that steps the row advances it). A
+     * reset or restore bumps the generation, which voids the image. */
+    unsigned slot_gen[PN_QWEN35MOE_GPU_MAX_SLOTS];
+    int slot_pos[PN_QWEN35MOE_GPU_MAX_SLOTS];
+    /* Turn-start checkpoint per row: whose it is, that state's KV content
+     * generation when it was taken (a reset or restore voids it) and its
+     * position. ckpt_state NULL = none. */
+    const void *ckpt_state[PN_QWEN35MOE_GPU_MAX_SLOTS];
+    unsigned ckpt_gen[PN_QWEN35MOE_GPU_MAX_SLOTS];
+    int ckpt_pos[PN_QWEN35MOE_GPU_MAX_SLOTS];
     int n_slots;                     /* bound slot count (0 = none) */
+    /* Per-die int32 [pos | rows] buffer: positions at [0, MAX), the row map
+     * at [MAX, 2*MAX) — one fixed-size H2D per die per step carries both, and
+     * neither device address ever moves (captured graphs stay valid). */
     fc_buffer *pos_buf[PN_DIE_LAYER_SPLIT_MAX_DIES];
-    int pos_buf_cap[PN_DIE_LAYER_SPLIT_MAX_DIES];
+    fc_buffer *rows_view[PN_DIE_LAYER_SPLIT_MAX_DIES];
+    /* QWEN35_BATCH_VERIFY: per-die split partials of the R-row verify
+     * attention (fc_attn_flash_decode_rows_q4_ctx), FC_ATTN_ROWS_MAX rows x
+     * n_head x DEC_SPLIT_MAX. A die's attention layers run in stream order,
+     * so one set per die serves all of them. */
+    fc_buffer *bv_m_g[PN_DIE_LAYER_SPLIT_MAX_DIES];
+    fc_buffer *bv_l_g[PN_DIE_LAYER_SPLIT_MAX_DIES];
+    fc_buffer *bv_acc_g[PN_DIE_LAYER_SPLIT_MAX_DIES];
+    fc_buffer *vpos_g[PN_DIE_LAYER_SPLIT_MAX_DIES];   /* verify [pos x5 | rows x5] */
+    fc_buffer *vrows_g[PN_DIE_LAYER_SPLIT_MAX_DIES];  /* view: the rows half */
+    gpu_verify_graph vgraph[PN_DIE_LAYER_SPLIT_MAX_DIES][5];
+    /* The current step's row map (launch position u -> persistent row). */
+    int step_rows[PN_QWEN35MOE_GPU_MAX_SLOTS];
 
     /* Full-step segment graphs (C1, QWEN35_GRAPH_FULL): ONE captured CUDA
      * graph per die segment covering EVERY layer body in that segment (SSM
@@ -768,7 +960,19 @@ typedef struct pn_qwen35moe_gpu {
     void *reg_next;
 } pn_qwen35moe_gpu;
 
+/* The live lane's TP exchange set. */
+#define TPX(g) (&(g)->tpx[(g)->lane])
+
 static void qw_defer_free(pn_qwen35moe_gpu *g);   /* teardown (impl below) */
+/* MTP draft head (impl in the MTP section at the end of this file). */
+static int mtp_upload(pn_qwen35moe_model *model, pn_qwen35moe_gpu *g,
+                      const pn_qwen35moe_config *cfg);
+static void mtp_free(pn_qwen35moe_gpu *g);
+static int mtp_prof_on(void);
+static void mtp_capture_rows(pn_qwen35moe_gpu *g, fc_cuda_ctx *ctx, fc_buffer *x_norm,
+                             int n, int n_embd);
+static int mtp_push(pn_qwen35moe_model *m, pn_qwen35moe_gpu *g, pn_qwen35moe_state *s,
+                    int pos_end, const uint32_t *tokens, int n);
 static void qw_tt_free(pn_qwen35moe_gpu *g);      /* TT teardown (impl below) */
 
 /* ============================================================
@@ -779,7 +983,8 @@ static void qw_tt_free(pn_qwen35moe_gpu *g);      /* TT teardown (impl below) */
  * (host_state).  pn_qwen35moe_state_free frees that state and has no model
  * handle, so it cannot reach the GPU layers directly — which is how a freed
  * kv survived as a dangling back-pointer and got dereferenced by the next
- * bind's lazy-mirror park copy (heap-use-after-free).
+ * bind's lazy-mirror park copy (heap-use-after-free; that copy is gone, the
+ * ring-realloc rescue and the slot-row SSM seed still dereference them).
  *
  * The lifetime is broken at the free site instead of guarded at the use site:
  * every live GPU context is registered here, and pn_qwen35moe_state_free calls
@@ -881,20 +1086,99 @@ static uint64_t gpu_head_weight_bytes(pn_qwen35moe_model *model)
     return head;
 }
 
+/* This die's shape for qwen35moe_die_projection.h: its layers by type, the
+ * weights it holds (repacked layers + `extra_weight_bytes` + the MTP draft head
+ * on the last die when kept), the session blocks the serve will carve and the
+ * runtime scratch. Returns 0, or -1 when the tensor table yields no blk.*
+ * bytes for the range (an unfamiliar layout: the caller gates conservatively). */
+static int gpu_die_shape(pn_qwen35moe_model *model, int layer_lo, int layer_hi,
+                         uint64_t extra_weight_bytes, int last_die, int max_ctx,
+                         int kv_q4, int tp, pn_qwen35_die_shape *sh)
+{
+    const pn_qwen35moe_config *cfg = pn_qwen35moe_model_config(model);
+    pn_gguf_file *gf = pn_qwen35moe_gguf(model);
+
+    memset(sh, 0, sizeof(*sh));
+    sh->layer_weight_bytes = pn_gguf_layer_range_upload_bytes(gf, layer_lo, layer_hi);
+    if (sh->layer_weight_bytes == 0)
+        return -1;
+    sh->extra_weight_bytes = extra_weight_bytes;
+    /* mtp_upload puts the head next to the LM head: a full attention + MoE block
+     * (~907 MiB on Qwen3.6-35B-A3B Q8_0) the gate used to leave out. */
+    if (last_die && pn_qwen35moe_model_mtp(model) && cfg->mtp_layer >= 0)
+        sh->mtp_weight_bytes = pn_gguf_layer_range_upload_bytes(gf, cfg->mtp_layer,
+                                                                cfg->mtp_layer + 1);
+    for (int layer = layer_lo; layer < layer_hi; layer++) {
+        if (pn_qwen35moe_model_layer_type(model, layer) == PN_QWEN35MOE_LAYER_ATTN)
+            sh->n_attn++;
+        else
+            sh->n_ssm++;
+    }
+    sh->session_rows = pn_qwen35moe_model_card_sessions(model);
+    sh->max_seq = max_ctx;
+    sh->kv_q4 = kv_q4 != 0;
+    sh->n_head_kv = cfg->n_head_kv;
+    sh->head_dim = cfg->head_dim;
+    sh->ssm_conv = cfg->ssm_conv;
+    sh->conv_dim = cfg->conv_dim;
+    sh->ssm_state = cfg->ssm_state;
+    sh->ssm_dt_rank = cfg->ssm_dt_rank;
+    sh->scratch_bytes = PN_ADMIT_DIE_SCRATCH_BASE_BYTES;
+    if (tp) {
+        /* QWEN35_TP rank: half of every layer's rows and heads; a dense FFN
+         * down is a parity slab, 80 B per 128 inputs instead of half of 144
+         * (+1/18 of the full down); a MoE router is whole on both ranks. */
+        uint64_t extra = 0;
+        for (int layer = layer_lo; layer < layer_hi; layer++) {
+            int idx = pn_qwen35moe_model_layer_index(model, layer);
+            const pn_qwen35moe_moe *moe =
+                pn_qwen35moe_model_layer_type(model, layer) == PN_QWEN35MOE_LAYER_ATTN
+                    ? &pn_qwen35moe_model_attn_layer(model, idx)->moe
+                    : &pn_qwen35moe_model_ssm_layer(model, idx)->moe;
+            extra += cfg->n_expert ? gpu_qweight_upload_bytes(&moe->ffn_gate_inp) / 2
+                                   : gpu_qweight_upload_bytes(&moe->ffn_down_shexp) / 18;
+        }
+        sh->layer_weight_bytes = sh->layer_weight_bytes / 2 + extra;
+        sh->n_head_kv = cfg->n_head_kv / 2;
+        sh->conv_dim = cfg->conv_dim / 2;
+        sh->ssm_dt_rank = cfg->ssm_dt_rank / 2;
+    }
+    return 0;
+}
+
+/* The old proration for a layout whose tensor table names no blk.* tensors:
+ * a share of the whole file + one KV window + the clamped scratch, gated against
+ * the full per-die reserve. Conservative on purpose. */
+static uint64_t gpu_die_need_prorated(pn_qwen35moe_model *model, int n_layers_here,
+                                      int n_layer, int max_ctx, int kv_q4)
+{
+    pn_gguf_file *gf = pn_qwen35moe_gguf(model);
+    uint64_t file_bytes = gf ? (uint64_t)gf->mmap_size : 0;
+    uint64_t weights = n_layer > 0 ? file_bytes * (uint64_t)n_layers_here / (uint64_t)n_layer
+                                   : file_bytes;
+    uint64_t per_tok = pn_qwen35moe_kv_bytes_per_token(model, kv_q4 != 0);
+    uint64_t kv = pn_admit_die_kv_bytes(per_tok, kv_q4 != 0, max_ctx, n_layers_here, n_layer);
+    uint64_t reserve = pn_die_reserve_bytes(), margin = pn_die_load_margin_bytes();
+    return weights + kv + pn_admit_die_scratch_bytes(max_ctx) +
+           (reserve > margin ? reserve - margin : 0);
+}
+
 /* MemoryAware per-die fit gate (§6.1): verify ONE die of an N-die split — or
  * the single die of an unsplit load, which is the same question at N=1 — can
- * hold its slice of the weights (layers [layer_lo,layer_hi) plus whatever
- * non-layer weight that die owns) + its layers' share of the KV @ max_ctx + the
- * GPU scratch reserve. Feeds the die's measured truth into memwatch and warns
- * on stranded VRAM (§8.2) on the way, so the check and the accounting always
- * agree. Returns 0 to proceed, -1 to refuse — the caller fails the load cleanly
- * instead of letting a doomed multi-minute upload cascade into `cuMemAlloc
- * failed: 2`. Fail-open when the die's free/total cannot be read (no truth to
- * gate against). */
+ * hold what it will hold while serving (qwen35moe_die_projection.h: its weights
+ * at their on-die size incl. the MTP head, the session blocks the serve carves,
+ * the runtime scratch) with PN_DIE_LOAD_MARGIN_BYTES to spare. Every term is an
+ * allocation the build makes; the projection used to charge Q8_0 at file size,
+ * leave out the MTP head and price the session rings through a clamped
+ * per-token scratch, errors that only cancelled by luck. Feeds the die's measured
+ * truth into memwatch and warns on stranded VRAM (§8.2) on the way. Returns 0 to
+ * proceed, -1 to refuse — the caller fails the load cleanly instead of letting a
+ * doomed multi-minute upload cascade into `cuMemAlloc failed: 2`. Fail-open
+ * when the die's free/total cannot be read (no truth to gate against). */
 static int gpu_admit_die_share(pn_qwen35moe_model *model, fc_cuda_ctx *ctx,
                                int die_id, int layer_lo, int layer_hi,
-                               uint64_t extra_weight_bytes, int n_layer,
-                               int max_ctx, int kv_q4)
+                               uint64_t extra_weight_bytes, int last_die,
+                               int n_layer, int max_ctx, int kv_q4, int tp)
 {
     int n_layers_here = layer_hi - layer_lo;
     size_t die_free = 0, die_total = 0;
@@ -914,34 +1198,19 @@ static int gpu_admit_die_share(pn_qwen35moe_model *model, fc_cuda_ctx *ctx,
                 (unsigned long long)(die_free >> 20),
                 (unsigned long long)(die_total >> 20));
 
-    /* This die's resident weight bytes = what its OWN layers weigh in the
-     * tensor table, plus any non-layer weight it holds (the LM head on die B).
-     * Not a prorated share of mmap_size: the file also carries token_embd —
-     * never uploaded, the embed is a host row copy — and output.weight, which
-     * belongs to one die. Prorating charged every die for both. On
-     * Qwen3.6-35B-A3B Q4_K_M that over-projected a die by ~1.6 GiB and refused
-     * a split that in fact fits with ~1.3 GiB of headroom per die.
-     * Falls back to the old proration when the table yields no blk.* tensors,
-     * so an unfamiliar layout is gated conservatively rather than blind. */
-    pn_gguf_file *gf = pn_qwen35moe_gguf(model);
-    uint64_t weights_bytes = pn_gguf_layer_range_bytes(gf, layer_lo, layer_hi);
-    if (weights_bytes > 0) {
-        weights_bytes += extra_weight_bytes;
+    pn_qwen35_die_shape sh;
+    pn_qwen35_die_need nd = { 0 };
+    uint64_t need;
+    if (gpu_die_shape(model, layer_lo, layer_hi, extra_weight_bytes, last_die, max_ctx,
+                      kv_q4, tp, &sh) == 0) {
+        pn_qwen35_die_project(&sh, &nd);
+        need = nd.total;
     } else {
-        uint64_t file_bytes = gf ? (uint64_t)gf->mmap_size : 0;
-        weights_bytes = (n_layer > 0)
-            ? file_bytes * (uint64_t)n_layers_here / (uint64_t)n_layer
-            : file_bytes;
+        need = gpu_die_need_prorated(model, n_layers_here, n_layer, max_ctx, kv_q4);
     }
-    /* Real whole-model KV/token from THIS model's attention-layer geometry
-     * (KV Phase 1), scaled by this die's layer share for the split-load check. */
-    uint64_t per_tok = pn_qwen35moe_kv_bytes_per_token(model, kv_q4 != 0);
-    uint64_t kv_bytes = pn_admit_die_kv_bytes(per_tok, kv_q4 != 0, max_ctx,
-                                              n_layers_here, n_layer);
-
-    uint64_t need = 0;
-    if (!pn_admit_model_load_die(weights_bytes, kv_bytes, max_ctx, die_free,
-                                 &need)) {
+    uint64_t margin = pn_die_load_margin_bytes();
+    uint64_t usable = die_free > margin ? die_free - margin : 0;
+    if (need > usable) {
         fprintf(stderr, "[admit] REFUSE model load: die ordinal %d has "
                 "%llu MiB free but its share needs ~%llu MiB "
                 "(%d/%d layers + KV@%d + scratch) — refusing before the "
@@ -950,8 +1219,21 @@ static int gpu_admit_die_share(pn_qwen35moe_model *model, fc_cuda_ctx *ctx,
                 (unsigned long long)(die_free >> 20),
                 (unsigned long long)(need >> 20),
                 n_layers_here, n_layer, max_ctx);
+        pn_accel_refusal_note("GPU die %d needs ~%llu MiB, has %llu MiB usable "
+                              "(%d/%d layers + KV for %d tokens + scratch)",
+                              die_id, (unsigned long long)(need >> 20),
+                              (unsigned long long)(usable >> 20),
+                              n_layers_here, n_layer, max_ctx);
         return -1;
     }
+    fprintf(stderr, "[admit] die ordinal %d: needs ~%llu MiB (weights %llu + %d session "
+            "block(s) %llu + scratch %llu) of %llu MiB free, %llu MiB spare over the "
+            "%llu MiB margin\n", die_id, (unsigned long long)(need >> 20),
+            (unsigned long long)(nd.weights >> 20),
+            sh.session_rows > 0 ? sh.session_rows : 1,
+            (unsigned long long)(nd.sessions >> 20), (unsigned long long)(nd.scratch >> 20),
+            (unsigned long long)(die_free >> 20),
+            (unsigned long long)((usable - need) >> 20), (unsigned long long)(margin >> 20));
     return 0;
 }
 
@@ -1021,6 +1303,30 @@ static int gpu_plan_dies(const pn_qwen35moe_model *model, int n_layer,
         if (getenv("QWEN35_GPU_DIE_A") || getenv("QWEN35_GPU_DIE_B"))
             fprintf(stderr, "qwen35moe: explicit die placement (%d dies) "
                     "supersedes QWEN35_GPU_DIE_A/B\n", n_die);
+    } else if (getenv("QWEN35_GPU_DIES") && *getenv("QWEN35_GPU_DIES")) {
+        /* No placement, but an explicit die list (tests and benches): an
+         * N-way split across exactly these dies, the same as a placement of
+         * them. Boundaries come from the planner (PN_DIE_SPLIT_LAYERS
+         * honoured). A malformed list refuses rather than falling back. */
+        const char *p = getenv("QWEN35_GPU_DIES");
+        n_die = 0;
+        while (*p) {
+            char *end;
+            long v = strtol(p, &end, 10);
+            if (end == p || v < 0 || n_die >= PN_DIE_LAYER_SPLIT_MAX_DIES ||
+                (*end && *end != ',')) {
+                fprintf(stderr, "qwen35moe: REFUSE — QWEN35_GPU_DIES='%s' is "
+                        "not a die list\n", getenv("QWEN35_GPU_DIES"));
+                return -1;
+            }
+            g->die[n_die++] = (int)v;
+            p = *end ? end + 1 : end;
+        }
+        if (n_die < 1 || n_die > n_layer) {
+            fprintf(stderr, "qwen35moe: REFUSE — QWEN35_GPU_DIES names %d dies "
+                    "for %d layers\n", n_die, n_layer);
+            return -1;
+        }
     } else {
         /* No placement: the legacy env/compile-time regime. */
         int boundary = GPU_DIE_SPLIT_LAYER;
@@ -1622,6 +1928,60 @@ static void qwen35moe_dbg_gpu(fc_cuda_ctx *ctx, const char *tag, int layer,
     qwen35moe_dbg(tag, layer, scratch, n);
 }
 
+/* QWEN35_BV_TRACE=1 (diagnostic, default off): after every layer, print an
+ * FNV-1a hash of each row's residual stream, keyed by absolute position, from
+ * the batched path (a verify) and the decode-slots path, so the first layer
+ * where a verify row and the plain step at the same position diverge can be
+ * read off the log ("BVT <path> L<layer> pos=<pos> <hash>"). Syncs per layer,
+ * and the attention-step hooks sit inside graph-captured slots bodies: run it
+ * with QWEN35_GRAPH=0, at K=1 (slot rows are keyed off pos[0]). Off, every hook
+ * is one predictable branch. */
+static int bv_trace_on(void)
+{
+    static int v = -1;
+    if (v < 0)
+        v = getenv("QWEN35_BV_TRACE") ? 1 : 0;
+    return v;
+}
+
+static int bv_trace_slots_pos0;   /* pos[0] of the current slots step */
+
+static void bv_trace_rows(fc_cuda_ctx *ctx, const char *path, const char *tag,
+                          int layer, fc_buffer *buf, int nrows, int c,
+                          const int *pos, int pos0)
+{
+    if (!bv_trace_on())
+        return;
+    float *h = malloc((size_t)nrows * c * sizeof(float));
+    if (!h)
+        return;
+    fc_sync_ctx(ctx);
+    fc_buffer_to_cpu_n(buf, h, (size_t)nrows * c * sizeof(float));
+    for (int r = 0; r < nrows; r++) {
+        uint32_t x = 2166136261u;
+        const unsigned char *p = (const unsigned char *)(h + (size_t)r * c);
+        for (size_t i = 0; i < (size_t)c * sizeof(float); i++)
+            x = (x ^ p[i]) * 16777619u;
+        fprintf(stderr, "BVT %s %s L%d pos=%d %08x\n", path, tag, layer,
+                pos ? pos[r] : pos0 + r, x);
+    }
+    free(h);
+}
+
+/* 1/sqrt(n) for the attention (n = head_dim) and SSM recurrence (n = S)
+ * scales — ONE out-of-line definition for every path. Under -ffast-math gcc
+ * lowers 1.0f/sqrtf(x) to an approximate rsqrt + Newton step (0x3d7fffff at
+ * 256, not 0.0625) or to an exact sqrt + divide, decided per call site and by
+ * inlining: an unrelated edit to a caller has flipped one site, which put the
+ * prefill and the decode step 1 ulp of scale apart (prefix-cache GATE 1 fail),
+ * and the speculative verify must match the decode step byte for byte. Every
+ * site reads this function, so all paths share the same bits — the rsqrt form
+ * the decode and prefill paths had been running. */
+__attribute__((noinline)) static float qw_scale_inv_sqrt(int n)
+{
+    return 1.0f / sqrtf((float)n);
+}
+
 /* ============================================================
  * Upload helpers
  * ============================================================ */
@@ -1763,6 +2123,47 @@ static void gpu_vec_free(gpu_vec *g)
         fc_buffer_free(g->buf);
 }
 
+/* Upload one MERGED expert tensor for the grouped kernels. Every type but Q8_0
+ * uses the dense layout (gpu_weight_upload); Q8_0 experts use foundry's 288-B
+ * expert super-blocks (fc_moe_repack_weight), which the grouped q80 kernels
+ * read and the dense q80 matvec does not. Same bytes per row as the dense
+ * repack (36 per 32 weights), so VRAM is unchanged. The temporary host copy
+ * is one merged tensor (~300 MiB at Qwen3.6's shape), freed before the next. */
+static int gpu_expert_upload(fc_cuda_ctx *ctx, gpu_weight *g,
+                             const pn_qweight *w)
+{
+    if ((int)w->type != GGUF_QUANT_Q8_0)
+        return gpu_weight_upload(ctx, g, w);
+    size_t rstride = fc_moe_repack_row_bytes((int)w->type, w->cols);
+    g->cpu = w;
+    g->type = w->type;
+    g->rows = w->rows;
+    g->cols = w->cols;
+    g->row_stride = (int)rstride;
+    g->bytes = NULL;
+    g->ctx = ctx;
+    if (!w->data || w->rows <= 0 || rstride == 0)
+        return -1;
+    size_t total = (size_t)w->rows * rstride;
+    unsigned char *tmp = malloc(total);
+    if (!tmp)
+        return -1;
+    if (fc_moe_repack_weight((int)w->type, w->data, tmp, w->rows, w->cols) != 0) {
+        free(tmp);
+        return -1;
+    }
+    g->bytes = fc_buffer_from_ptr_ctx(ctx, tmp, total);
+    free(tmp);
+    return g->bytes ? 0 : -1;
+}
+
+/* Q8_0 experts need cols % 256 == 0 for the expert super-blocks; every other
+ * type keeps the grouped path's existing rules. */
+static int gpu_expert_layout_ok(int type, int cols)
+{
+    return type != GGUF_QUANT_Q8_0 || fc_moe_repack_row_bytes(type, cols) != 0;
+}
+
 /* Upload one layer's shared-expert MoE weights. When dense (Bonsai), only the
  * three FFN projections (loaded into the shexp slots) exist — no router, no
  * routed experts, no scalar gate — so skip all of those and upload just the
@@ -1806,8 +2207,11 @@ static int gpu_moe_upload(fc_cuda_ctx *ctx, gpu_moe *g,
     int gu_type = (int)moe->gate_exps[0].type;
     int dn_type = (int)moe->down_exps[0].type;
     g->grouped = ((gu_type == GGUF_QUANT_Q3_K || gu_type == GGUF_QUANT_Q4_K ||
-                   gu_type == GGUF_QUANT_F16 || gu_type == GGUF_QUANT_BF16) &&
+                   gu_type == GGUF_QUANT_F16 || gu_type == GGUF_QUANT_BF16 ||
+                   gu_type == GGUF_QUANT_Q8_0) &&
                   (int)moe->up_exps[0].type == gu_type &&
+                  gpu_expert_layout_ok(gu_type, moe->gate_exps[0].cols) &&
+                  gpu_expert_layout_ok(dn_type, moe->down_exps[0].cols) &&
                   fc_moe_gateup_quant_available_ctx(ctx, gu_type) &&
                   fc_moe_down_quant_available_ctx(ctx, dn_type));
     if (g->grouped) {
@@ -1833,15 +2237,15 @@ static int gpu_moe_upload(fc_cuda_ctx *ctx, gpu_moe *g,
         pn_qweight merged;
         merged = *(&moe->gate_exps[0]);
         merged.rows = n_expert * moe->gate_exps[0].rows;
-        if (gpu_weight_upload(ctx, &g->gate_all, &merged) < 0)
+        if (gpu_expert_upload(ctx, &g->gate_all, &merged) < 0)
             return -1;
         merged = *(&moe->up_exps[0]);
         merged.rows = n_expert * moe->up_exps[0].rows;
-        if (gpu_weight_upload(ctx, &g->up_all, &merged) < 0)
+        if (gpu_expert_upload(ctx, &g->up_all, &merged) < 0)
             return -1;
         merged = *(&moe->down_exps[0]);
         merged.rows = n_expert * moe->down_exps[0].rows;
-        if (gpu_weight_upload(ctx, &g->down_all, &merged) < 0)
+        if (gpu_expert_upload(ctx, &g->down_all, &merged) < 0)
             return -1;
     } else {
         g->gate_exps = calloc((size_t)n_expert, sizeof(gpu_weight));
@@ -1981,12 +2385,405 @@ static void gpu_drop_weight_pages(pn_qwen35moe_model *model)
  * global layer maps to an SSM or attention local slot via the model's index
  * map; the slot is tagged with the context it now lives on, which is what lets
  * every later path resolve a layer's die from the layer itself. */
+/* Live load / unload progress (load_progress.h): what every die of the split
+ * holds now, from the contexts' own allocation tallies. A no-op unless the
+ * loading thread opened a progress slot. */
+static void gpu_progress_note_dies(const pn_qwen35moe_gpu *g)
+{
+    for (int i = 0; i < g->n_die; i++)
+        if (g->ctx[i])
+            pn_load_progress_set_bytes(g->die[i], fc_ctx_alloc_bytes(g->ctx[i]));
+}
+
+/* What die `i` holds beyond its layers once loaded: the LM head on the last die
+ * and its share of the KV at the load's window, as admission prices it. */
+static uint64_t gpu_progress_die_extra(pn_qwen35moe_model *model, const pn_qwen35moe_gpu *g,
+                                       int i)
+{
+    const pn_qwen35moe_config *cfg = pn_qwen35moe_model_config(model);
+    int kv_q4 = pn_qwen35moe_model_kv_q4(model);
+    uint64_t kv = pn_admit_die_kv_bytes(pn_qwen35moe_kv_bytes_per_token(model, kv_q4 != 0),
+                                        kv_q4 != 0, gpu_admit_max_ctx_model(model),
+                                        g->layer_hi[i] - g->layer_lo[i], cfg->n_layer);
+    return kv + (i == g->n_die - 1 ? gpu_head_weight_bytes(model) : 0);
+}
+
+/* The progress totals once die `i` has uploaded layers [lo, done): a die's
+ * device bytes per file byte (the repacked layout is larger than the GGUF)
+ * measured so far, applied to what is left on this die and to the dies after
+ * it. The slot still raises a total a die outgrows (MTP head, scratch). */
+static void gpu_progress_project(pn_qwen35moe_model *model, const pn_qwen35moe_gpu *g, int i,
+                                 uint64_t start, int done)
+{
+    pn_gguf_file *gf = pn_qwen35moe_gguf(model);
+    uint64_t now = fc_ctx_alloc_bytes(g->ctx[i]);
+    uint64_t file = pn_gguf_layer_range_bytes(gf, g->layer_lo[i], done);
+    if (file == 0 || now <= start)
+        return;
+    double ratio = (double)(now - start) / (double)file;
+    pn_load_progress_set_total(g->die[i], now + gpu_progress_die_extra(model, g, i) +
+        (uint64_t)(ratio * (double)pn_gguf_layer_range_bytes(gf, done, g->layer_hi[i])));
+    for (int j = i + 1; j < g->n_die; j++)
+        if (g->ctx[j])
+            pn_load_progress_set_total(g->die[j], fc_ctx_alloc_bytes(g->ctx[j]) +
+                gpu_progress_die_extra(model, g, j) +
+                (uint64_t)(ratio * (double)pn_gguf_layer_range_bytes(gf, g->layer_lo[j],
+                                                                     g->layer_hi[j])));
+}
+
+/* ============================================================
+ * QWEN35_TP — tensor-parallel weight upload (spec k80_q38_tp2 §3.2)
+ *
+ * Rank p of a pair holds, of every layer of its stage: whole output ROWS of
+ * every projection (heads 12p.. of attention, kv heads 2p.., the GDN k-heads
+ * 8p..8p+7 with the v-heads r*16 + 8p + j that the kernel's interleave
+ * vh = r*n_k + kh pairs with them, out-projection rows [2560p, +2560), FFN
+ * gate/up rows k with k % 2 == p) and, for FFN down, the Q8_0 parity slab of
+ * the inputs k % 2 == p (fc_matvec_q80_par_nx_ctx). Every output is computed
+ * whole by the same kernel as the layer split, so the halves are bit-exact; the
+ * down partials sum in the kernel's own tree order (foundry fc_cuda.h).
+ * GDN rows are ordered so the rank's local v-head lv = r*8 + j is global
+ * r*16 + 8p + j: the kernels then run unchanged on the local dims.
+ *
+ * MoE (spec k80_q36_tp2 §3.2): the grouped Q8_0 expert kernels fuse the routing
+ * weights and the sum over the k slots into down with their own lane trees, so
+ * no K split of them is exact. Rank p holds rows [p*ff/2, +ff/2) of every
+ * expert's (and the shared expert's) gate/up and output rows [p*n_embd/2, +)
+ * of every down; the rank hidden is gathered whole before down, and the router
+ * and the scalar gate are replicated. Every row is computed whole by today's
+ * kernels.
+ * ============================================================ */
+
+/* Row indices of rank p's half of a weight, by kind; returns the count. */
+enum {
+    TP_ROWS_ATTN_Q, TP_ROWS_ATTN_KV, TP_ROWS_OUT, TP_ROWS_GDN_QKV, TP_ROWS_GDN_VHEAD,
+    TP_ROWS_GDN_VDIM, TP_ROWS_FFN, TP_ROWS_SHEXP
+};
+
+static int tp_rows(int kind, int p, const pn_qwen35moe_config *cfg, int *rows)
+{
+    const int S = cfg->ssm_state, nk = cfg->ssm_n_group, nv = cfg->ssm_dt_rank;
+    const int nkl = nk / 2, groups = nv / nk;
+    int n = 0;
+
+    switch (kind) {
+    case TP_ROWS_ATTN_Q: {        /* [q_h | gate_h] per head, 2*head_dim rows a head */
+        const int per = cfg->n_head / 2 * 2 * cfg->head_dim;
+        for (int i = 0; i < per; i++)
+            rows[n++] = p * per + i;
+        break;
+    }
+    case TP_ROWS_ATTN_KV: {
+        const int per = cfg->n_head_kv / 2 * cfg->head_dim;
+        for (int i = 0; i < per; i++)
+            rows[n++] = p * per + i;
+        break;
+    }
+    case TP_ROWS_OUT:
+        for (int i = 0; i < cfg->n_embd / 2; i++)
+            rows[n++] = p * (cfg->n_embd / 2) + i;
+        break;
+    case TP_ROWS_GDN_QKV:         /* [q | k] rows of k-heads nkl*p.., then v rows */
+        for (int part = 0; part < 2; part++)
+            for (int i = 0; i < nkl * S; i++)
+                rows[n++] = part * nk * S + p * nkl * S + i;
+        for (int r = 0; r < groups; r++)
+            for (int i = 0; i < nkl * S; i++)
+                rows[n++] = 2 * nk * S + (r * nk + p * nkl) * S + i;
+        break;
+    case TP_ROWS_GDN_VHEAD:       /* one row (or element) per v-head */
+        for (int r = 0; r < groups; r++)
+            for (int j = 0; j < nkl; j++)
+                rows[n++] = r * nk + p * nkl + j;
+        break;
+    case TP_ROWS_GDN_VDIM:        /* S rows per v-head (z gate) */
+        for (int r = 0; r < groups; r++)
+            for (int i = 0; i < nkl * S; i++)
+                rows[n++] = (r * nk + p * nkl) * S + i;
+        break;
+    case TP_ROWS_FFN:
+        for (int j = 0; j < cfg->ffn_length / 2; j++)
+            rows[n++] = 2 * j + p;
+        break;
+    case TP_ROWS_SHEXP:           /* MoE shared expert gate/up: contiguous halves */
+        for (int j = 0; j < cfg->shared_ff / 2; j++)
+            rows[n++] = p * (cfg->shared_ff / 2) + j;
+        break;
+    }
+    return n;
+}
+
+/* Upload the rows rows[0..nrows) of w (in that order) to ctx's die: the raw
+ * rows are gathered, then repacked exactly as gpu_weight_upload does. */
+static int gpu_weight_upload_row_map(fc_cuda_ctx *ctx, gpu_weight *gw, const pn_qweight *w,
+                                     const int *rows, int nrows)
+{
+    memset(gw, 0, sizeof(*gw));
+    gw->cpu = w;
+    gw->type = w->type;
+    gw->rows = nrows;
+    gw->cols = w->cols;
+    gw->row_stride = (int)w->row_stride;
+    gw->ctx = ctx;
+    if (!w->data || nrows <= 0)
+        return -1;
+    unsigned char *raw = malloc((size_t)nrows * w->row_stride);
+    if (!raw)
+        return -1;
+    for (int i = 0; i < nrows; i++) {
+        if (rows[i] < 0 || rows[i] >= w->rows) {
+            free(raw);
+            return -1;
+        }
+        memcpy(raw + (size_t)i * w->row_stride,
+               (const unsigned char *)w->data + (size_t)rows[i] * w->row_stride,
+               w->row_stride);
+    }
+    size_t rstride = fc_repack_row_bytes((int)w->type, w->cols);
+    int rc = -1;
+    if (rstride) {
+        unsigned char *tmp = malloc((size_t)nrows * rstride);
+        if (tmp && fc_repack_weight((int)w->type, raw, tmp, nrows, w->cols) == 0) {
+            gw->bytes = fc_buffer_from_ptr_ctx(ctx, tmp, (size_t)nrows * rstride);
+            gw->row_stride = (int)rstride;
+            rc = gw->bytes ? 0 : -1;
+        }
+        free(tmp);
+    } else if ((int)w->type == GGUF_QUANT_F32) {
+        gw->bytes = fc_buffer_from_ptr_ctx(ctx, raw, (size_t)nrows * w->row_stride);
+        rc = gw->bytes ? 0 : -1;
+    }
+    free(raw);
+    return rc;
+}
+
+/* Rank p's Q8_0 parity slab of w (all rows, the inputs k % 2 == p). */
+static int gpu_weight_upload_parity(fc_cuda_ctx *ctx, gpu_weight *gw, const pn_qweight *w,
+                                    int p)
+{
+    memset(gw, 0, sizeof(*gw));
+    gw->cpu = w;
+    gw->type = w->type;
+    gw->rows = w->rows;
+    gw->cols = w->cols;
+    gw->ctx = ctx;
+    gw->kpar = 1;
+    size_t rstride = fc_repack_q80_parity_row_bytes(w->cols);
+    if (!w->data || (int)w->type != GGUF_QUANT_Q8_0 || !rstride)
+        return -1;
+    unsigned char *tmp = malloc((size_t)w->rows * rstride);
+    if (!tmp)
+        return -1;
+    if (fc_repack_weight_q80_parity(w->data, tmp, w->rows, w->cols, p) == 0)
+        gw->bytes = fc_buffer_from_ptr_ctx(ctx, tmp, (size_t)w->rows * rstride);
+    free(tmp);
+    gw->row_stride = (int)rstride;
+    return gw->bytes ? 0 : -1;
+}
+
+/* Elements idx[i]*per .. +per of src, in order, as one F32 vector on ctx. */
+static int gpu_vec_upload_map(fc_cuda_ctx *ctx, gpu_vec *gv, const float *src,
+                              const int *idx, int n, int per)
+{
+    gv->n = n * per;
+    gv->buf = NULL;
+    gv->ctx = ctx;
+    if (!src || n <= 0)
+        return -1;
+    float *tmp = malloc((size_t)n * per * sizeof(float));
+    if (!tmp)
+        return -1;
+    for (int i = 0; i < n; i++)
+        memcpy(tmp + (size_t)i * per, src + (size_t)idx[i] * per, (size_t)per * sizeof(float));
+    gv->buf = fc_buffer_from_ptr_ctx(ctx, tmp, (size_t)n * per * sizeof(float));
+    free(tmp);
+    return gv->buf ? 0 : -1;
+}
+
+/* Rows [p*per/2, +per/2) of every one of the n_expert experts of the merged
+ * Q8_0 tensor whose expert 0 is w (per rows each, contiguous), in expert order,
+ * repacked to the expert layout like gpu_expert_upload. */
+static int gpu_expert_upload_half(fc_cuda_ctx *ctx, gpu_weight *gw, const pn_qweight *w,
+                                  int n_expert, int p)
+{
+    const int per = w->rows, keep = per / 2;
+    const size_t rows = (size_t)n_expert * keep;
+    size_t rstride = fc_moe_repack_row_bytes((int)w->type, w->cols);
+    memset(gw, 0, sizeof(*gw));
+    gw->cpu = w;
+    gw->type = w->type;
+    gw->rows = (int)rows;
+    gw->cols = w->cols;
+    gw->row_stride = (int)rstride;
+    gw->ctx = ctx;
+    if (!w->data || (int)w->type != GGUF_QUANT_Q8_0 || !rstride)
+        return -1;
+    unsigned char *raw = malloc(rows * w->row_stride);
+    unsigned char *tmp = malloc(rows * rstride);
+    int rc = -1;
+    if (raw && tmp) {
+        for (int e = 0; e < n_expert; e++)
+            memcpy(raw + (size_t)e * keep * w->row_stride,
+                   (const unsigned char *)w->data +
+                       ((size_t)e * per + (size_t)p * keep) * w->row_stride,
+                   (size_t)keep * w->row_stride);
+        if (fc_moe_repack_weight((int)w->type, raw, tmp, (int)rows, w->cols) == 0) {
+            gw->bytes = fc_buffer_from_ptr_ctx(ctx, tmp, rows * rstride);
+            rc = gw->bytes ? 0 : -1;
+        }
+    }
+    free(raw);
+    free(tmp);
+    return rc;
+}
+
+/* Rank p's MoE: router and scalar gate whole; expert and shared gate/up rows
+ * [p*ff/2, +ff/2); expert and shared down output rows [p*n_embd/2, +). */
+static int gpu_tp_moe_upload(fc_cuda_ctx *ctx, gpu_moe *g, const pn_qwen35moe_moe *moe,
+                             const pn_qwen35moe_config *cfg, int p, int *rows)
+{
+    g->n_expert = cfg->n_expert;
+    g->grouped = 1;
+    g->gate_exps = g->up_exps = g->down_exps = NULL;
+    if (gpu_weight_upload(ctx, &g->ffn_gate_inp, &moe->ffn_gate_inp) < 0 ||
+        gpu_expert_upload_half(ctx, &g->gate_all, &moe->gate_exps[0], cfg->n_expert, p) < 0 ||
+        gpu_expert_upload_half(ctx, &g->up_all, &moe->up_exps[0], cfg->n_expert, p) < 0 ||
+        gpu_expert_upload_half(ctx, &g->down_all, &moe->down_exps[0], cfg->n_expert, p) < 0)
+        return -1;
+    int nr = tp_rows(TP_ROWS_SHEXP, p, cfg, rows);
+    if (gpu_weight_upload_row_map(ctx, &g->ffn_gate_shexp, &moe->ffn_gate_shexp, rows, nr) < 0 ||
+        gpu_weight_upload_row_map(ctx, &g->ffn_up_shexp, &moe->ffn_up_shexp, rows, nr) < 0)
+        return -1;
+    nr = tp_rows(TP_ROWS_OUT, p, cfg, rows);
+    if (gpu_weight_upload_row_map(ctx, &g->ffn_down_shexp, &moe->ffn_down_shexp, rows, nr) < 0)
+        return -1;
+    g->gate_inp_shexp_host = (const float *)moe->ffn_gate_inp_shexp.data;
+    return gpu_vec_upload(ctx, &g->ffn_gate_inp_shexp,
+                          (const float *)moe->ffn_gate_inp_shexp.data, cfg->n_embd);
+}
+
+/* Rank p's dense FFN: gate/up rows k % 2 == p, down's parity slab. */
+static int gpu_tp_ffn_upload(fc_cuda_ctx *ctx, gpu_moe *g, const pn_qwen35moe_moe *moe,
+                             const pn_qwen35moe_config *cfg, int p, int *rows)
+{
+    if (cfg->n_expert)
+        return gpu_tp_moe_upload(ctx, g, moe, cfg, p, rows);
+    g->n_expert = 0;
+    g->grouped = 0;
+    g->gate_exps = g->up_exps = g->down_exps = NULL;
+    g->gate_inp_shexp_host = NULL;
+    const int nr = tp_rows(TP_ROWS_FFN, p, cfg, rows);
+    if (gpu_weight_upload_row_map(ctx, &g->ffn_gate_shexp, &moe->ffn_gate_shexp, rows, nr) < 0 ||
+        gpu_weight_upload_row_map(ctx, &g->ffn_up_shexp, &moe->ffn_up_shexp, rows, nr) < 0 ||
+        gpu_weight_upload_parity(ctx, &g->ffn_down_shexp, &moe->ffn_down_shexp, p) < 0)
+        return -1;
+    return 0;
+}
+
+static int gpu_tp_upload_ssm_layer(fc_cuda_ctx *ctx, gpu_ssm_layer *d,
+                                   const pn_qwen35moe_ssm_layer *l,
+                                   const pn_qwen35moe_config *cfg, int p, int *rows)
+{
+    const int n_embd = cfg->n_embd;
+    int n;
+    d->ctx = ctx;
+    d->tp_on = 1;
+    d->tp_rank = p;
+    if (gpu_vec_upload(ctx, &d->attn_norm, l->attn_norm, n_embd) < 0 ||
+        gpu_vec_upload(ctx, &d->ssm_norm, l->ssm_norm, cfg->ssm_state) < 0 ||
+        gpu_vec_upload(ctx, &d->post_attention_norm, l->post_attention_norm, n_embd) < 0)
+        return -1;
+    n = tp_rows(TP_ROWS_GDN_QKV, p, cfg, rows);
+    if (gpu_weight_upload_row_map(ctx, &d->attn_qkv, &l->attn_qkv, rows, n) < 0 ||
+        gpu_vec_upload_map(ctx, &d->ssm_conv1d, l->ssm_conv1d, rows, n, cfg->ssm_conv) < 0)
+        return -1;
+    n = tp_rows(TP_ROWS_GDN_VDIM, p, cfg, rows);
+    if (gpu_weight_upload_row_map(ctx, &d->attn_gate, &l->attn_gate, rows, n) < 0)
+        return -1;
+    n = tp_rows(TP_ROWS_GDN_VHEAD, p, cfg, rows);
+    if (gpu_weight_upload_row_map(ctx, &d->ssm_alpha, &l->ssm_alpha, rows, n) < 0 ||
+        gpu_weight_upload_row_map(ctx, &d->ssm_beta, &l->ssm_beta, rows, n) < 0 ||
+        gpu_vec_upload_map(ctx, &d->ssm_a, l->ssm_a, rows, n, 1) < 0 ||
+        gpu_vec_upload_map(ctx, &d->ssm_dt, l->ssm_dt, rows, n, 1) < 0)
+        return -1;
+    n = tp_rows(TP_ROWS_OUT, p, cfg, rows);
+    if (gpu_weight_upload_row_map(ctx, &d->ssm_out, &l->ssm_out, rows, n) < 0)
+        return -1;
+    return gpu_tp_ffn_upload(ctx, &d->moe, &l->moe, cfg, p, rows);
+}
+
+static int gpu_tp_upload_attn_layer(fc_cuda_ctx *ctx, gpu_attn_layer *d,
+                                    const pn_qwen35moe_attn_layer *l,
+                                    const pn_qwen35moe_config *cfg, int p, int *rows)
+{
+    const int n_embd = cfg->n_embd;
+    int n;
+    d->ctx = ctx;
+    d->tp_on = 1;
+    d->tp_rank = p;
+    if (gpu_vec_upload(ctx, &d->attn_norm, l->attn_norm, n_embd) < 0 ||
+        gpu_vec_upload(ctx, &d->attn_q_norm, l->attn_q_norm, cfg->head_dim) < 0 ||
+        gpu_vec_upload(ctx, &d->attn_k_norm, l->attn_k_norm, cfg->head_dim) < 0 ||
+        gpu_vec_upload(ctx, &d->post_attention_norm, l->post_attention_norm, n_embd) < 0)
+        return -1;
+    n = tp_rows(TP_ROWS_ATTN_Q, p, cfg, rows);
+    if (gpu_weight_upload_row_map(ctx, &d->attn_q, &l->attn_q, rows, n) < 0)
+        return -1;
+    n = tp_rows(TP_ROWS_ATTN_KV, p, cfg, rows);
+    if (gpu_weight_upload_row_map(ctx, &d->attn_k, &l->attn_k, rows, n) < 0 ||
+        gpu_weight_upload_row_map(ctx, &d->attn_v, &l->attn_v, rows, n) < 0)
+        return -1;
+    n = tp_rows(TP_ROWS_OUT, p, cfg, rows);
+    if (gpu_weight_upload_row_map(ctx, &d->attn_output, &l->attn_output, rows, n) < 0)
+        return -1;
+    return gpu_tp_ffn_upload(ctx, &d->moe, &l->moe, cfg, p, rows);
+}
+
+/* Die i's halves of its stage's layers (rank i % 2). */
+static int gpu_tp_upload_layer_range(pn_qwen35moe_model *model, pn_qwen35moe_gpu *g, int i,
+                                     const pn_qwen35moe_config *cfg)
+{
+    const int p = i % 2;
+    int rows_cap = cfg->ffn_length;
+    if (rows_cap < cfg->conv_dim)
+        rows_cap = cfg->conv_dim;
+    if (rows_cap < 2 * cfg->n_head * cfg->head_dim)
+        rows_cap = 2 * cfg->n_head * cfg->head_dim;
+    int *rows = malloc((size_t)rows_cap * sizeof(int));
+    if (!rows)
+        return -1;
+    uint64_t start = fc_ctx_alloc_bytes(g->ctx[i]);
+    int rc = 0;
+    for (int layer = g->layer_lo[i]; rc == 0 && layer < g->layer_hi[i]; layer++) {
+        pn_load_progress_set_layer(layer, cfg->n_layer);
+        int idx = pn_qwen35moe_model_layer_index(model, layer);
+        if (pn_qwen35moe_model_layer_type(model, layer) == PN_QWEN35MOE_LAYER_ATTN)
+            rc = gpu_tp_upload_attn_layer(g->ctx[i], &g->attn[idx + p * g->tp_n_attn],
+                                          pn_qwen35moe_model_attn_layer(model, idx), cfg,
+                                          p, rows);
+        else
+            rc = gpu_tp_upload_ssm_layer(g->ctx[i], &g->ssm[idx + p * g->tp_n_ssm],
+                                         pn_qwen35moe_model_ssm_layer(model, idx), cfg, p,
+                                         rows);
+        pn_load_progress_set_layer(layer + 1, cfg->n_layer);
+        gpu_progress_note_dies(g);
+        gpu_progress_project(model, g, i, start, layer + 1);
+    }
+    free(rows);
+    return rc;
+}
+
 static int gpu_upload_layer_range(pn_qwen35moe_model *model,
                                   pn_qwen35moe_gpu *g, fc_cuda_ctx *ctx,
                                   const pn_qwen35moe_config *cfg,
                                   int layer_lo, int layer_hi)
 {
+    int die_index = 0;
+    while (die_index < g->n_die - 1 && g->ctx[die_index] != ctx)
+        die_index++;
+    uint64_t start = fc_ctx_alloc_bytes(ctx);
     for (int layer = layer_lo; layer < layer_hi; layer++) {
+        pn_load_progress_set_layer(layer, cfg->n_layer);
         int idx = pn_qwen35moe_model_layer_index(model, layer);
         if (pn_qwen35moe_model_layer_type(model, layer) ==
             PN_QWEN35MOE_LAYER_ATTN) {
@@ -2000,6 +2797,9 @@ static int gpu_upload_layer_range(pn_qwen35moe_model *model,
             if (gpu_upload_ssm_layer(ctx, &g->ssm[idx], l, cfg) < 0)
                 return -1;
         }
+        pn_load_progress_set_layer(layer + 1, cfg->n_layer);
+        gpu_progress_note_dies(g);
+        gpu_progress_project(model, g, die_index, start, layer + 1);
     }
     return 0;
 }
@@ -2023,13 +2823,14 @@ static int gpu_admit_one_die(pn_qwen35moe_model *model, pn_qwen35moe_gpu *g,
                              int i, int ordinal, uint64_t head_share_bytes)
 {
     uint64_t extra = head_share_bytes;
-    if (i == g->n_die - 1)
+    int last = i == g->n_die - 1;
+    if (last)
         extra += gpu_head_weight_bytes(model);
     const pn_qwen35moe_config *cfg = pn_qwen35moe_model_config(model);
     return gpu_admit_die_share(model, g->ctx[i], ordinal,
-                               g->layer_lo[i], g->layer_hi[i], extra,
+                               g->layer_lo[i], g->layer_hi[i], extra, last,
                                cfg->n_layer, gpu_admit_max_ctx_model(model),
-                               pn_qwen35moe_kv_q4_on());
+                               pn_qwen35moe_model_kv_q4(model), g->tp);
 }
 
 /* Bind a CUDA context to every die of the split and gate each die on its own
@@ -2057,10 +2858,16 @@ static int gpu_bind_and_gate_dies(pn_qwen35moe_model *model,
         if (!g->ctx[i] || !fc_cuda_ctx_available(g->ctx[i])) {
             fprintf(stderr, "qwen35moe: fc_cuda_init_device for die %d "
                     "(ordinal %d) failed\n", i, ordinal);
+            pn_accel_refusal_note("no CUDA context on GPU die %d", ordinal);
             return -1;
         }
         if (gpu_admit_one_die(model, g, i, ordinal, i == 0 ? head_a : 0) < 0)
             return -1;
+        /* The progress bar's first total for this die (refined while it uploads). */
+        pn_load_progress_set_total(g->die[i], fc_ctx_alloc_bytes(g->ctx[i]) +
+                                   pn_gguf_layer_range_bytes(pn_qwen35moe_gguf(model),
+                                                             g->layer_lo[i], g->layer_hi[i]) +
+                                   gpu_progress_die_extra(model, g, i) + (i == 0 ? head_a : 0));
     }
     return 0;
 }
@@ -2139,6 +2946,7 @@ static int gpu_setup_vocab_split(pn_qwen35moe_model *model,
      * while moving nothing would feed die 0's half of the LM head a stale
      * x_norm — wrong top-k for half the vocab, silently. */
     if (nv < 2 || half < 1 || !g->output.bytes ||
+        fc_cuda_devices_same_board(g->die[0], g->head_die) != 1 ||   /* never across boards */
         fc_cuda_enable_peer(g->ctx[0], g->head_ctx) != 0 ||
         !gpu_peer_link_moves_bytes(g->head_ctx, g->ctx[0])) {
         if (nv >= 2 && half >= 1 && g->output.bytes)
@@ -2197,6 +3005,15 @@ static void gpu_enable_handoff_peers(pn_qwen35moe_gpu *g)
 
     int n_peer = 0;
     for (int i = 0; i + 1 < g->n_die; i++) {
+        /* Peer access is never even ENABLED across boards: only the two dies of
+         * one multi-GPU board (fc_cuda_devices_same_board) get a peer link at all. */
+        if (fc_cuda_devices_same_board(g->die[i], g->die[i + 1]) != 1) {
+            g->peer_ok[i] = 0;
+            fprintf(stderr, "qwen35moe: die %d -> %d not on one board: hand-off "
+                    "staged through the host (peer access not enabled)\n",
+                    g->die[i], g->die[i + 1]);
+            continue;
+        }
         g->peer_ok[i] = (fc_cuda_enable_peer(g->ctx[i], g->ctx[i + 1]) == 0) &&
                         gpu_peer_link_moves_bytes(g->ctx[i], g->ctx[i + 1]);
         if (!g->peer_ok[i])
@@ -2209,6 +3026,318 @@ static void gpu_enable_handoff_peers(pn_qwen35moe_gpu *g)
         fprintf(stderr, "qwen35moe: boundary hand-off — %d of %d hops "
                 "device-to-device (verified), the rest staged through the "
                 "host\n", n_peer, g->n_die - 1);
+}
+
+/* ---- QWEN35_TP setup (spec k80_q38_tp2 §3.1) ---- */
+
+static int flash_on(void);   /* fwd decl (defined with the flash path) */
+
+/* QWEN35_TP: unset = AUTO (TP2 wherever tp_refusal finds nothing), "2" = asked for
+ * (a refusal is logged loudly), "0" = always the layer split. */
+enum { TP_MODE_OFF, TP_MODE_AUTO, TP_MODE_ON };
+
+static int tp_mode(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("QWEN35_TP");
+        v = !e || !e[0] ? TP_MODE_AUTO : atoi(e) == 2 ? TP_MODE_ON : TP_MODE_OFF;
+    }
+    return v;
+}
+
+/* A MoE layer TP can split: router and scalar gate present, the experts merged
+ * Q8_0 tensors (contiguous, as the grouped kernels index them) on the expert
+ * layout, the shared down a row-sliceable matrix. */
+static int tp_moe_weights_ok(const pn_qwen35moe_moe *moe, const pn_qwen35moe_config *cfg)
+{
+    const pn_qweight *g0 = &moe->gate_exps[0], *u0 = &moe->up_exps[0];
+    const pn_qweight *d0 = &moe->down_exps[0];
+    if (!moe->ffn_gate_inp.data || !moe->ffn_gate_inp_shexp.data || !moe->ffn_down_shexp.data ||
+        !fc_repack_row_bytes((int)moe->ffn_down_shexp.type, moe->ffn_down_shexp.cols))
+        return 0;
+    for (int e = 0; e < cfg->n_expert; e++) {
+        const pn_qweight *ge = &moe->gate_exps[e], *ue = &moe->up_exps[e];
+        const pn_qweight *de = &moe->down_exps[e];
+        if ((int)ge->type != GGUF_QUANT_Q8_0 || (int)ue->type != GGUF_QUANT_Q8_0 ||
+            (int)de->type != GGUF_QUANT_Q8_0 ||
+            ge->data != (const uint8_t *)g0->data + (size_t)e * g0->rows * g0->row_stride ||
+            ue->data != (const uint8_t *)u0->data + (size_t)e * u0->rows * u0->row_stride ||
+            de->data != (const uint8_t *)d0->data + (size_t)e * d0->rows * d0->row_stride)
+            return 0;
+    }
+    return g0->rows == cfg->expert_ff && d0->rows == cfg->n_embd &&
+           fc_moe_repack_row_bytes(GGUF_QUANT_Q8_0, g0->cols) &&
+           fc_moe_repack_row_bytes(GGUF_QUANT_Q8_0, d0->cols);
+}
+
+/* Every matrix TP splits has a GPU form for a row slice; a dense FFN down is Q8_0
+ * on 128-column groups (the parity slab), MoE experts as tp_moe_weights_ok. */
+static int tp_weights_ok(const pn_qwen35moe_model *model)
+{
+    const pn_qwen35moe_config *cfg = pn_qwen35moe_model_config(model);
+    for (int layer = 0; layer < cfg->n_layer; layer++) {
+        int idx = pn_qwen35moe_model_layer_index(model, layer);
+        const pn_qwen35moe_moe *moe;
+        const pn_qweight *w[6];
+        int nw = 0;
+        if (pn_qwen35moe_model_layer_type(model, layer) == PN_QWEN35MOE_LAYER_ATTN) {
+            const pn_qwen35moe_attn_layer *l = pn_qwen35moe_model_attn_layer(model, idx);
+            w[nw++] = &l->attn_q;
+            w[nw++] = &l->attn_k;
+            w[nw++] = &l->attn_v;
+            w[nw++] = &l->attn_output;
+            moe = &l->moe;
+        } else {
+            const pn_qwen35moe_ssm_layer *l = pn_qwen35moe_model_ssm_layer(model, idx);
+            w[nw++] = &l->attn_qkv;
+            w[nw++] = &l->attn_gate;
+            w[nw++] = &l->ssm_out;
+            moe = &l->moe;
+        }
+        w[nw++] = &moe->ffn_gate_shexp;
+        w[nw++] = &moe->ffn_up_shexp;
+        for (int i = 0; i < nw; i++)
+            if (!w[i]->data || !fc_repack_row_bytes((int)w[i]->type, w[i]->cols))
+                return 0;
+        if (cfg->n_expert) {
+            if (!tp_moe_weights_ok(moe, cfg))
+                return 0;
+        } else if ((int)moe->ffn_down_shexp.type != GGUF_QUANT_Q8_0 ||
+            !fc_repack_q80_parity_row_bytes(moe->ffn_down_shexp.cols))
+            return 0;
+    }
+    return 1;
+}
+
+/* NULL when this model and placement can run TP2, else why not. */
+static const char *tp_refusal(const pn_qwen35moe_model *model, const pn_qwen35moe_gpu *g,
+                              int small_bar)
+{
+    const pn_qwen35moe_config *cfg = pn_qwen35moe_model_config(model);
+    if (g->n_die != 4)
+        return "needs exactly 4 dies (two board pairs)";
+    if (!small_bar)
+        return "barswap placement";
+    if (!cfg->dense_ffn && !cfg->n_expert)
+        return "neither a dense FFN nor routed experts";
+    if (cfg->n_head % 2 || cfg->n_head_kv % 2 || (cfg->n_head / 2) % (cfg->n_head_kv / 2))
+        return "attention heads do not halve";
+    if (cfg->ssm_n_group % 2 || cfg->ssm_dt_rank % cfg->ssm_n_group)
+        return "GDN heads do not halve";
+    if (!cfg->n_expert && (cfg->ffn_length % 256 || cfg->n_embd % 64))
+        return "FFN or hidden width does not halve on 128-column groups";
+    /* MoE: rank gate/up launches cover whole 8-row blocks, down row pairs stay
+     * whole, and the shared hidden rides the expert hidden's gather (same ff). */
+    if (cfg->n_expert && (cfg->expert_ff % 16 || cfg->n_embd % 64 ||
+                          cfg->shared_ff != cfg->expert_ff ||
+                          cfg->n_expert_used > PN_QWEN35MOE_GPU_MAX_TOPK))
+        return "MoE expert or hidden width does not halve";
+    if (!flash_on())
+        return "QWEN35_FLASH=0";
+    if (pn_qwen35moe_host_kv_mirror_eager())
+        return "QWEN35_HOST_KV_MIRROR=1 (eager host KV mirror)";
+    /* Rank pairs must be the two dies of one board: peer access is never enabled
+     * across boards. */
+    if (fc_cuda_devices_same_board(g->die[0], g->die[1]) != 1 ||
+        fc_cuda_devices_same_board(g->die[2], g->die[3]) != 1)
+        return "dies 0+1 and 2+3 of the placement are not each one board";
+    if (!tp_weights_ok(model))
+        return cfg->n_expert
+            ? "a split weight has no TP form (merged Q8_0 experts, row-sliceable shared expert)"
+            : "a split weight has no TP form (Q8_0 FFN down on 128-column groups)";
+    return NULL;
+}
+
+/* Turn the 4-die plan into two stages of rank pairs: dies (0,1) run layers
+ * [0, split), dies (2,3) [split, n_layer). Doubles the layer arrays (rank 1 at
+ * idx + count) and derives a rank's local dims. Leaves g->tp 0 (layer split)
+ * when TP2 is not requested or refused. */
+static int gpu_tp_plan(const pn_qwen35moe_model *model, pn_qwen35moe_gpu *g, int small_bar)
+{
+    const int mode = tp_mode();
+    if (mode == TP_MODE_OFF)
+        return 0;
+    const char *why = tp_refusal(model, g, small_bar);
+    if (why) {
+        if (mode == TP_MODE_ON || g->n_die == 4)
+            fprintf(stderr, "qwen35moe: tensor parallel %s (%s); layer split\n",
+                    mode == TP_MODE_ON ? "refused" : "off", why);
+        return 0;
+    }
+    const pn_qwen35moe_config *cfg = pn_qwen35moe_model_config(model);
+    pn_die_layer_split plan;
+    if (pn_plan_die_layer_split(cfg->n_layer, 2, gpu_split_layer_override(2), &plan) != 0)
+        return -1;
+    for (int i = 0; i < 4; i++) {
+        g->layer_lo[i] = plan.layer_lo[i / 2];
+        g->layer_hi[i] = plan.layer_hi[i / 2];
+    }
+    g->split_layer = g->layer_hi[0];
+    gpu_ssm_layer *ssm = calloc((size_t)(2 * g->n_ssm) + 1, sizeof(gpu_ssm_layer));
+    gpu_attn_layer *attn = calloc((size_t)(2 * g->n_attn) + 1, sizeof(gpu_attn_layer));
+    if (!ssm || !attn) {
+        free(ssm);
+        free(attn);
+        return -1;
+    }
+    free(g->ssm);
+    free(g->attn);
+    g->ssm = ssm;
+    g->attn = attn;
+    g->tp_n_ssm = g->n_ssm;
+    g->tp_n_attn = g->n_attn;
+    g->n_ssm *= 2;
+    g->n_attn *= 2;
+    pn_qwen35moe_config *l = &g->tp_cfg;
+    *l = *cfg;
+    l->n_head = cfg->n_head / 2;
+    l->n_head_kv = cfg->n_head_kv / 2;
+    l->ssm_n_group = cfg->ssm_n_group / 2;
+    l->ssm_dt_rank = cfg->ssm_dt_rank / 2;
+    l->ssm_d_inner = cfg->ssm_d_inner / 2;
+    l->conv_dim = 2 * cfg->ssm_state * l->ssm_n_group + cfg->ssm_state * l->ssm_dt_rank;
+    l->ffn_length = cfg->ffn_length / 2;
+    for (int p = 0; p < 2; p++) {
+        g->tp_chan[p] = malloc((size_t)l->conv_dim * sizeof(int));
+        g->tp_vhead[p] = malloc((size_t)l->ssm_dt_rank * sizeof(int));
+        if (!g->tp_chan[p] || !g->tp_vhead[p])
+            return -1;
+        tp_rows(TP_ROWS_GDN_QKV, p, cfg, g->tp_chan[p]);
+        tp_rows(TP_ROWS_GDN_VHEAD, p, cfg, g->tp_vhead[p]);
+    }
+    g->tp = 1;
+    fprintf(stderr, "qwen35moe: tensor parallel (QWEN35_TP %s) — dies %d+%d run layers [%d,%d), "
+            "dies %d+%d [%d,%d), each die half of every layer\n",
+            mode == TP_MODE_ON ? "2" : "auto; =0 off", g->die[0], g->die[1], g->layer_lo[0],
+            g->layer_hi[0], g->die[2], g->die[3], g->layer_lo[2], g->layer_hi[2]);
+    return 0;
+}
+
+/* Peer access for the two rank pairs ONLY (never across boards: cross-board
+ * peer copies on this host report success and deliver garbage), each pair
+ * proven both ways. */
+static int gpu_tp_enable_pairs(pn_qwen35moe_gpu *g)
+{
+    for (int s = 0; s < 2; s++) {
+        fc_cuda_ctx *a = g->ctx[2 * s], *b = g->ctx[2 * s + 1];
+        if (fc_cuda_enable_peer(a, b) != 0 || !gpu_peer_link_moves_bytes(a, b) ||
+            !gpu_peer_link_moves_bytes(b, a)) {
+            fprintf(stderr, "qwen35moe: tensor parallel needs a verified peer link between "
+                    "dies %d and %d (one board)\n", g->die[2 * s], g->die[2 * s + 1]);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* ---- QWEN35_TP host state <-> a rank's local state ----
+ * Host mirrors keep the full layout. A rank's KV heads are one contiguous block
+ * of the head-major host ring (heads h0 .. h0 + nh), so KV transfers only shift
+ * the host offset; its SSM channels and v-heads are spread (tp_chan / tp_vhead),
+ * so SSM transfers gather / scatter. */
+
+/* Host-state index of layer struct i (rank-1 halves follow rank 0's). */
+static int qw_attn_hidx(const pn_qwen35moe_gpu *g, int i)
+{
+    return g->tp ? i % g->tp_n_attn : i;
+}
+
+static int qw_ssm_hidx(const pn_qwen35moe_gpu *g, int i)
+{
+    return g->tp ? i % g->tp_n_ssm : i;
+}
+
+/* Layer structs to visit against host state s (all of them under QWEN35_TP,
+ * whose doubled arrays map back through qw_*_hidx). */
+static int qw_ssm_lim(const pn_qwen35moe_gpu *g, const pn_qwen35moe_state *s)
+{
+    return g->tp ? g->n_ssm : (g->n_ssm < s->n_ssm ? g->n_ssm : s->n_ssm);
+}
+
+static int qw_attn_lim(const pn_qwen35moe_gpu *g, const pn_qwen35moe_state *s)
+{
+    return g->tp ? g->n_attn : (g->n_attn < s->n_attn ? g->n_attn : s->n_attn);
+}
+
+/* KV heads a layer struct holds, and the first one's host index. */
+static int qw_kv_nh(const gpu_attn_layer *d, const pn_qwen35moe_kv *kv)
+{
+    return d->tp_on ? kv->n_head_kv / 2 : kv->n_head_kv;
+}
+
+static int qw_kv_h0(const gpu_attn_layer *d, const pn_qwen35moe_kv *kv)
+{
+    return d->tp_on ? d->tp_rank * (kv->n_head_kv / 2) : 0;
+}
+
+/* The dims a layer struct's state uses: a TP half's local ones or the model's. */
+static const pn_qwen35moe_config *qw_state_cfg(const pn_qwen35moe_gpu *g, int tp_on,
+                                               const pn_qwen35moe_config *cfg)
+{
+    return tp_on ? &g->tp_cfg : cfg;
+}
+
+/* Download one QWEN35_TP half's SSM images (conv at conv_off of conv_buf,
+ * recurrent at ssm_off of ssm_buf) into host state st, or upload (to_dev) st's
+ * part into them, through the rank's channel / v-head maps. */
+static void qw_ssm_xfer_at(const pn_qwen35moe_gpu *g, const gpu_ssm_layer *d,
+                           fc_buffer *conv_buf, size_t conv_off, fc_buffer *ssm_buf,
+                           size_t ssm_off, pn_qwen35moe_ssm_state *st, int to_dev);
+
+/* Upload (to_dev) or download host SSM state st for one layer struct. */
+static void qw_ssm_xfer(const pn_qwen35moe_gpu *g, gpu_ssm_layer *d,
+                        pn_qwen35moe_ssm_state *st, int to_dev)
+{
+    if (!d->tp_on) {
+        if (to_dev) {
+            fc_buffer_from_cpu(d->conv_state_g, st->conv_state);
+            fc_buffer_from_cpu(d->ssm_state_g, st->ssm_state);
+        } else {
+            fc_buffer_to_cpu(d->conv_state_g, st->conv_state);
+            fc_buffer_to_cpu(d->ssm_state_g, st->ssm_state);
+        }
+        return;
+    }
+    qw_ssm_xfer_at(g, d, d->conv_state_g, 0, d->ssm_state_g, 0, st, to_dev);
+}
+
+static void qw_ssm_xfer_at(const pn_qwen35moe_gpu *g, const gpu_ssm_layer *d,
+                           fc_buffer *conv_buf, size_t conv_off, fc_buffer *ssm_buf,
+                           size_t ssm_off, pn_qwen35moe_ssm_state *st, int to_dev)
+{
+    const pn_qwen35moe_config *l = &g->tp_cfg;
+    const int km1 = st->conv_minus_1, S = st->state_size, p = d->tp_rank;
+    const size_t conv_n = (size_t)km1 * l->conv_dim, rec = (size_t)S * S;
+    const size_t ssm_n = rec * l->ssm_dt_rank;
+    float *tmp = malloc((conv_n + ssm_n) * sizeof(float));
+    if (!tmp) {
+        fprintf(stderr, "[qwen35moe] TP SSM state transfer: out of host memory\n");
+        return;
+    }
+    if (!to_dev) {
+        fc_buffer_to_cpu_at(conv_buf, tmp, conv_off, conv_n * sizeof(float));
+        fc_buffer_to_cpu_at(ssm_buf, tmp + conv_n, ssm_off, ssm_n * sizeof(float));
+    }
+    for (int c = 0; c < l->conv_dim; c++) {
+        float *h = st->conv_state + (size_t)g->tp_chan[p][c] * km1;
+        if (to_dev)
+            memcpy(tmp + (size_t)c * km1, h, (size_t)km1 * sizeof(float));
+        else
+            memcpy(h, tmp + (size_t)c * km1, (size_t)km1 * sizeof(float));
+    }
+    for (int v = 0; v < l->ssm_dt_rank; v++) {
+        float *h = st->ssm_state + (size_t)g->tp_vhead[p][v] * rec;
+        if (to_dev)
+            memcpy(tmp + conv_n + (size_t)v * rec, h, rec * sizeof(float));
+        else
+            memcpy(h, tmp + conv_n + (size_t)v * rec, rec * sizeof(float));
+    }
+    if (to_dev) {
+        fc_buffer_from_cpu_at(conv_buf, conv_off, tmp, conv_n * sizeof(float));
+        fc_buffer_from_cpu_at(ssm_buf, ssm_off, tmp + conv_n, ssm_n * sizeof(float));
+    }
+    free(tmp);
 }
 
 int pn_qwen35moe_gpu_upload(pn_qwen35moe_model *model)
@@ -2246,6 +3375,10 @@ int pn_qwen35moe_gpu_upload(pn_qwen35moe_model *model)
                     (unsigned long long)(spike >> 20),
                     (unsigned long long)
                         (pn_host_reserve_bytes(mst.host_total_bytes) >> 20));
+            pn_accel_refusal_note("host RAM for the GPU upload: needs ~%llu MiB "
+                                  "beyond the reserve, %llu MiB available",
+                                  (unsigned long long)(spike >> 20),
+                                  (unsigned long long)(mst.host_avail_bytes >> 20));
             return -1;
         }
     }
@@ -2307,6 +3440,9 @@ int pn_qwen35moe_gpu_upload(pn_qwen35moe_model *model)
         goto fail;
     }
 
+    if (gpu_tp_plan(model, g, small_bar) < 0)
+        goto fail;
+
     if (n_die >= 2 && !small_bar) {
         g->bs = bs_init();
         if (!g->bs) {
@@ -2325,6 +3461,8 @@ int pn_qwen35moe_gpu_upload(pn_qwen35moe_model *model)
      * a time, so its second context + gate happen after die 0's upload.) */
     if (gpu_bind_and_gate_dies(model, g, small_bar) < 0)
         goto fail;
+    if (g->tp && gpu_tp_enable_pairs(g) < 0)
+        goto fail;
 
     for (int i = 0; i < n_die; i++) {
         /* Legacy barswap: bind + gate die i now that it can be swapped in. */
@@ -2342,8 +3480,9 @@ int pn_qwen35moe_gpu_upload(pn_qwen35moe_model *model)
                                   0) < 0)
                 goto fail;
         }
-        if (gpu_upload_layer_range(model, g, g->ctx[i], cfg,
-                                   g->layer_lo[i], g->layer_hi[i]) < 0)
+        if (g->tp ? gpu_tp_upload_layer_range(model, g, i, cfg) < 0
+                  : gpu_upload_layer_range(model, g, g->ctx[i], cfg,
+                                           g->layer_lo[i], g->layer_hi[i]) < 0)
             goto fail;
         /* The final norm + LM head ride on the LAST die (which is also die 0
          * when the model is not split). */
@@ -2358,10 +3497,16 @@ int pn_qwen35moe_gpu_upload(pn_qwen35moe_model *model)
         fc_sync_ctx(g->ctx[i]);
     }
     g->head_ctx = (n_die > 1) ? g->ctx[n_die - 1] : NULL;
+    if (mtp_upload(model, g, cfg) < 0) {
+        fprintf(stderr, "qwen35moe: MTP head upload failed\n");
+        goto fail;
+    }
+    gpu_progress_note_dies(g);
 
     if (gpu_setup_vocab_split(model, g, small_bar, n_embd) < 0)
         goto fail;
-    gpu_enable_handoff_peers(g);
+    if (!g->tp)
+        gpu_enable_handoff_peers(g);
 
     for (int i = 0; i < n_die; i++)
         gpu_feed_die_mem_state(g->ctx[i], small_bar ? g->die[i] : i);
@@ -2384,6 +3529,9 @@ int pn_qwen35moe_gpu_upload(pn_qwen35moe_model *model)
     return 0;
 
 fail:
+    if (!pn_accel_refusal_last()[0])
+        pn_accel_refusal_note("the upload to GPU die %d failed (an allocation; "
+                              "see the log above)", g->n_die > 0 ? g->die[0] : -1);
     /* Reuse the public free on a temporarily-attached handle so every uploaded
      * buffer is released. */
     pn_qwen35moe_model_set_gpu(model, g);
@@ -2460,6 +3608,7 @@ void pn_qwen35moe_gpu_free(pn_qwen35moe_model *model)
         return;
     qw_gpu_unregister(g);
     for (int i = 0; i < g->n_ssm; i++) {
+        gpu_progress_note_dies(g);
         gpu_ssm_layer *d = &g->ssm[i];
         gpu_vec_free(&d->attn_norm);
         gpu_weight_free(&d->attn_qkv);
@@ -2479,14 +3628,21 @@ void pn_qwen35moe_gpu_free(pn_qwen35moe_model *model)
         fc_buffer_free(d->ssm_snaps);
         fc_buffer_free(d->conv_slots);
         fc_buffer_free(d->ssm_slots);
+        fc_buffer_free(d->conv_ckpt);
+        fc_buffer_free(d->ssm_ckpt);
         gpu_fused_free(&d->fx_proj);
         gpu_fused_free(&d->fx_out);
+        gpu_fused_free(&d->fx_proj_s);
+        gpu_fused_free(&d->fx_out_s);
         gpu_fused_free(&d->moe.fx_pre);
         gpu_fused_free(&d->moe.fx_post);
+        gpu_fused_free(&d->moe.fx_pre_s);
+        gpu_fused_free(&d->moe.fx_post_s);
         fc_graph_free(d->graph);
         fc_graph_free(d->slots_graph);
     }
     for (int i = 0; i < g->n_attn; i++) {
+        gpu_progress_note_dies(g);
         gpu_attn_layer *d = &g->attn[i];
         gpu_vec_free(&d->attn_norm);
         gpu_weight_free(&d->attn_q);
@@ -2514,21 +3670,52 @@ void pn_qwen35moe_gpu_free(pn_qwen35moe_model *model)
         fc_buffer_free(d->v_sink_slots_g);
         fc_buffer_free(d->k_win_slots_g);
         fc_buffer_free(d->v_win_slots_g);
+        fc_buffer_free(d->k_sink_ckpt);
+        fc_buffer_free(d->v_sink_ckpt);
+        fc_buffer_free(d->k_win_ckpt);
+        fc_buffer_free(d->v_win_ckpt);
         fc_buffer_free(d->dec_slots_m_g);
         fc_buffer_free(d->dec_slots_l_g);
         fc_buffer_free(d->dec_slots_acc_g);
         gpu_fused_free(&d->fx_qkv);
         gpu_fused_free(&d->fx_out);
+        gpu_fused_free(&d->fx_out_s);
         gpu_fused_free(&d->moe.fx_pre);
         gpu_fused_free(&d->moe.fx_post);
+        gpu_fused_free(&d->moe.fx_pre_s);
+        gpu_fused_free(&d->moe.fx_post_s);
         fc_graph_free(d->slots_graph);
     }
     for (int i = 0; i < PN_DIE_LAYER_SPLIT_MAX_DIES; i++) {
         fc_graph_free(g->seg[i].graph);
         fc_event_free(g->as_ev[i]);
     }
+    for (int i = 0; i < PN_DIE_LAYER_SPLIT_MAX_DIES; i++) {   /* QWEN35_TP */
+        for (int l = 0; l < QW_N_LANES; l++) {
+            qw_tp_xset *x = &g->tpx[l];
+            fc_buffer_free(x->core[i]);
+            fc_buffer_free(x->half[i]);
+            fc_buffer_free(x->blk[i]);
+            fc_buffer_free(x->recv[i]);
+            fc_buffer_free(x->hidl[i]);
+            fc_buffer_free(x->hidf[i]);
+            fc_buffer_free(x->mol[i]);
+            fc_buffer_free(x->mof[i]);
+            for (int k = 0; k < TP_N_XCHG; k++)
+                fc_event_free(x->ev[i][k]);
+            fc_buffer_free(x->sync[i]);
+        }
+        fc_event_free(g->tp_gev[i]);
+    }
+    for (int s = 0; s < 2; s++)
+        fc_graph_free(g->tp_sgraph[s]);
+    for (int p = 0; p < 2; p++) {
+        free(g->tp_chan[p]);
+        free(g->tp_vhead[p]);
+    }
     free(g->ssm);
     free(g->attn);
+    mtp_free(g);   /* before g->output: its draft-vocabulary views alias it */
     gpu_vec_free(&g->output_norm);
     gpu_weight_free(&g->output);
     /* T3 vocab-split head buffers (no-ops when the split was never enabled).
@@ -2544,7 +3731,17 @@ void pn_qwen35moe_gpu_free(pn_qwen35moe_model *model)
     for (int i = 0; i < PN_DIE_LAYER_SPLIT_MAX_DIES; i++) {
         gpu_die_scratch_free(&g->scratch[i]);
         gpu_batch_scratch_free(&g->bscratch[i]);
+        gpu_die_scratch_free(&g->scratch_dec[i]);
+        gpu_batch_scratch_free(&g->bscratch_dec[i]);
+        fc_buffer_free_view(g->rows_view[i]);
         fc_buffer_free(g->pos_buf[i]);
+        fc_buffer_free(g->bv_m_g[i]);
+        fc_buffer_free(g->bv_l_g[i]);
+        fc_buffer_free(g->bv_acc_g[i]);
+        fc_buffer_free_view(g->vrows_g[i]);
+        fc_buffer_free(g->vpos_g[i]);
+        for (int r = 0; r < 5; r++)
+            fc_graph_free(g->vgraph[i][r].graph);
     }
     fc_buffer_free(g->spec_logits);
     for (int i = 0; i < 4; i++) {
@@ -2578,8 +3775,16 @@ void pn_qwen35moe_gpu_forget_state_cuda(const pn_qwen35moe_state *s)
     pthread_mutex_lock(&qw_gpu_reg_mtx);
     for (pn_qwen35moe_gpu *g = qw_gpu_reg_head; g;
          g = (pn_qwen35moe_gpu *)g->reg_next) {
+        /* Slot rows: slot_state[] is dereferenced by the slot-row SSM seed
+         * (qw_ssm_seed_shared), so a freed state must leave no row naming it. */
+        for (int r = 0; r < PN_QWEN35MOE_GPU_MAX_SLOTS; r++)
+            if (g->slot_state[r] == (const void *)s)
+                g->slot_state[r] = NULL;
+        for (int r = 0; r < PN_QWEN35MOE_GPU_MAX_SLOTS; r++)
+            if (g->ckpt_state[r] == (const void *)s)
+                g->ckpt_state[r] = NULL;
         /* Attention: the per-slot bind bookkeeping. kv_slot_kv is the pointer
-         * the lazy-mirror park copy dereferences; kv_slot_host_id / kv_gen /
+         * the ring-realloc rescue dereferences; kv_slot_host_id / kv_gen /
          * kv_synced_pos name the same session's ring buffers by ADDRESS, so
          * leaving them behind would let a recycled malloc alias a new
          * session's cache onto this one's stale watermark. Both go together. */
@@ -2638,6 +3843,34 @@ int pn_qwen35moe_gpu_slot_kv_refs_cuda(const void *base, size_t bytes)
     return n;
 }
 
+/* Test hook: how many one-slot fused descriptors of the slots path are built
+ * across every live GPU model (gpu_slots_fused_prepare), and in *possible how
+ * many there are to build (4 per SSM layer, 3 per attention layer). */
+int pn_qwen35moe_gpu_slots_fused_count_cuda(int *possible)
+{
+    int n = 0, all = 0;
+    pthread_mutex_lock(&qw_gpu_reg_mtx);
+    for (pn_qwen35moe_gpu *g = qw_gpu_reg_head; g;
+         g = (pn_qwen35moe_gpu *)g->reg_next) {
+        for (int i = 0; i < g->n_ssm; i++) {
+            const gpu_ssm_layer *d = &g->ssm[i];
+            n += !!d->fx_proj_s.desc + !!d->fx_out_s.desc +
+                 !!d->moe.fx_pre_s.desc + !!d->moe.fx_post_s.desc;
+            all += 4;
+        }
+        for (int i = 0; i < g->n_attn; i++) {
+            const gpu_attn_layer *d = &g->attn[i];
+            n += !!d->fx_out_s.desc + !!d->moe.fx_pre_s.desc +
+                 !!d->moe.fx_post_s.desc;
+            all += 3;
+        }
+    }
+    pthread_mutex_unlock(&qw_gpu_reg_mtx);
+    if (possible)
+        *possible = all;
+    return n;
+}
+
 /* ============================================================
  * GPU matvec dispatch
  *
@@ -2658,6 +3891,10 @@ int pn_qwen35moe_gpu_slot_kv_refs_cuda(const void *base, size_t bytes)
 static void gpu_matvec(const gpu_weight *w, fc_buffer *x, fc_buffer *y,
                        float *x_host, float *y_host)
 {
+    if (w->kpar) {   /* a TP parity slab has no single-token or host form */
+        fprintf(stderr, "[qwen35moe] TP parity weight reached gpu_matvec\n");
+        return;
+    }
     double t0 = 0.0;
     int prof = prof_on();
     if (prof) {
@@ -2885,6 +4122,22 @@ static int gpu_moe_dedup_decode_override(void)
     return v;
 }
 
+/* QWEN35_MOE_DEDUP_Q80 (default on; =0 keeps fc_moe_gateup_nx_ctx): batched
+ * PREFILL gate+up over Q8_0 experts through the expert-grouped kernel
+ * (fc_moe_gateup_q80_dedup), which reads each expert row once per chunk instead
+ * of once per routed token. Bit-exact with the nx kernel per request (foundry
+ * test_moe_q80_dedup). Same width floor as the Q3_K dedup (n * k >= n_expert),
+ * so decode and verify never reach it. */
+static int gpu_moe_dedup_q80_enabled(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *env = getenv("QWEN35_MOE_DEDUP_Q80");
+        v = (env && env[0] == '0') ? 0 : 1;
+    }
+    return v;
+}
+
 /* Fill one plain matvec segment from a resident weight. */
 static fc_fused_seg gpu_seg_mv(const gpu_weight *w, fc_buffer *out, int ep)
 {
@@ -2989,7 +4242,8 @@ static gpu_die_scratch *gpu_get_scratch(pn_qwen35moe_gpu *g, fc_cuda_ctx *ctx,
     int die_idx = gpu_die_index_of_ctx(g, ctx);
     if (die_idx < 0)
         return NULL;
-    gpu_die_scratch *sc = &g->scratch[die_idx];
+    gpu_die_scratch *sc = g->lane == QW_LANE_DECODE ? &g->scratch_dec[die_idx]
+                                                    : &g->scratch[die_idx];
     if (sc->ctx == ctx)
         return sc;
 
@@ -3133,7 +4387,7 @@ static int gpu_ssm_block(gpu_ssm_layer *d, const pn_qwen35moe_config *cfg,
 
     /* 4. Per-token delta-rule recurrence (scale = 1/sqrt(S)). On device. */
     fc_ssm_recurrence_ctx(ctx, ssm_state_g, qg, kg, vg, gbuf, beta, y, n_v_heads,
-                          S, 1.0f / sqrtf((float)S));
+                          S, qw_scale_inv_sqrt(S));
 
     /* 5. gated = RMSNorm(y, ssm_norm) * silu(z), then output projection with
      * the +residual folded into the epilogue (out_buf keeps the pre-residual
@@ -3176,8 +4430,8 @@ static int qw_kv_mirror_lazy(void);
 static int qw_kv_layer_materialize(gpu_attn_layer *d, pn_qwen35moe_kv *kv,
                                    int rows);
 static size_t qw_kv_row_bytes(const pn_qwen35moe_kv *kv);
-static size_t qw_kv_sink_bytes(const pn_qwen35moe_kv *kv);
-static size_t qw_kv_win_bytes(const pn_qwen35moe_kv *kv);
+static size_t qw_kv_sink_bytes(const gpu_attn_layer *d, const pn_qwen35moe_kv *kv);
+static size_t qw_kv_win_bytes(const gpu_attn_layer *d, const pn_qwen35moe_kv *kv);
 static int gpu_attn_slot_ring_ensure(gpu_attn_layer *d,
                                      const pn_qwen35moe_config *cfg,
                                      int q4, int max_seq, int nslots,
@@ -3317,7 +4571,7 @@ static int gpu_attn_block(gpu_attn_layer *d, const pn_qwen35moe_config *cfg,
         float *qhost = h->b;     /* reuse: read q back */
         fc_buffer_to_cpu(qbuf, qhost);
         float *aout = h->a;      /* [n_head*head_dim] */
-        float scale = 1.0f / sqrtf((float)head_dim);
+        float scale = qw_scale_inv_sqrt(head_dim);
         /* per-head GQA softmax attention (mirrors qwen35moe_compute_heads);
          * under q4 the K/V rows are dequantized on the fly. scores is heap
          * scratch (seq_len can reach the 256K cap — too large for the stack). */
@@ -3614,6 +4868,40 @@ static int gpu_ssm_layer_body(gpu_ssm_layer *d, const pn_qwen35moe_config *cfg,
     return 0;
 }
 
+
+/* Seed this SSM layer's SHARED live buffers with state `st` at position `pos`.
+ * A decode slot row whose image is exactly this state's at this position (the
+ * session's own block on the card) is the preferred source — device to device,
+ * so a resumed turn never re-reads its recurrent state from host RAM; the host
+ * mirror is used only for a fresh state (pos 0) or when no row holds it. */
+static void qw_ssm_seed_shared(pn_qwen35moe_gpu *g, gpu_ssm_layer *d,
+                               const pn_qwen35moe_ssm_state *st, int pos)
+{
+    const int idx = qw_ssm_hidx(g, (int)(d - g->ssm));
+    const pn_qwen35moe_config *dc = &g->tp_cfg;   /* read only for a TP half */
+    for (int r = 0; pos > 0 && r < g->n_slots && r < d->slots_cap; r++) {
+        const pn_qwen35moe_state *ps =
+            (const pn_qwen35moe_state *)g->slot_state[r];
+        if (!ps || &ps->ssm[idx] != st || g->slot_pos[r] != pos ||
+            g->slot_gen[r] != (ps->n_attn > 0 ? ps->kv[0].content_gen : 0u) ||
+            !d->conv_slots || !d->ssm_slots)
+            continue;
+        /* QWEN35_TP: a half's images are its local dims. */
+        size_t conv_b = (size_t)st->conv_minus_1 *
+                        (d->tp_on ? dc->conv_dim : st->conv_dim) * sizeof(float);
+        size_t ssm_b = (size_t)st->state_size * st->state_size *
+                       (d->tp_on ? dc->ssm_dt_rank : st->n_v_heads) * sizeof(float);
+        fc_buffer_copy_d2d_ctx(d->ctx, d->conv_state_g, 0, d->conv_slots,
+                               (size_t)r * conv_b, conv_b);
+        fc_buffer_copy_d2d_ctx(d->ctx, d->ssm_state_g, 0, d->ssm_slots,
+                               (size_t)r * ssm_b, ssm_b);
+        d->host_state = (const void *)st;
+        return;
+    }
+    qw_ssm_xfer(g, d, (pn_qwen35moe_ssm_state *)st, 1);
+    d->host_state = (const void *)st;
+}
+
 /* Run one layer on the GPU: attn_norm -> (SSM|attn) -> +residual ->
  * post_attention_norm -> shared-MoE -> +residual. hidden is the GPU residual
  * stream (updated in place). x_norm/block_out are reusable GPU scratch. All of
@@ -3688,11 +4976,8 @@ static int gpu_layer_forward(pn_qwen35moe_model *m, pn_qwen35moe_gpu *g,
         d->ssm_state_g = fc_buffer_alloc_ctx(ctx, ssm_n * sizeof(float));
     if (!d->conv_state_g || !d->ssm_state_g)
         return -1;
-    if (d->host_state != (const void *)st || pos == 0) {
-        fc_buffer_from_cpu(d->conv_state_g, st->conv_state);
-        fc_buffer_from_cpu(d->ssm_state_g, st->ssm_state);
-        d->host_state = (const void *)st;
-    }
+    if (d->host_state != (const void *)st || pos == 0)
+        qw_ssm_seed_shared(g, d, st, pos);
     if (prof_on()) { fc_sync_ctx(ctx); prof_phase[0] += prof_now() - ts0; }
 
     /* Fast path: replay the layer's captured graph (~13 launches -> 1). */
@@ -3871,15 +5156,16 @@ static void gpu_fetch_logits(fc_cuda_ctx *ctx, fc_buffer *logits_g,
     s->topk_filled = 0;             /* logits holds real values everywhere */
 }
 
-/* QWEN35_PERSLOT_FULL_LOGITS=1 — decide top-k vs full logits PER SLOT instead
- * of for the whole batch.  Default OFF: this is a decode-path change that has
- * not been through the agent-client gate on the K80 test machine yet. */
+/* QWEN35_PERSLOT_FULL_LOGITS (default on; =0 decides for the whole batch):
+ * decide top-k vs full logits PER SLOT instead of for the whole batch. Exact:
+ * each slot's sampled stream is unchanged (k80-mtp-tool-grammar, 12/12 identical;
+ * our K80 host has served it since 2026-11-20). */
 static int perslot_full_logits_on(void)
 {
     static int v = -1;
     if (v < 0) {
         const char *env = getenv("QWEN35_PERSLOT_FULL_LOGITS");
-        v = (env && env[0] && env[0] != '0') ? 1 : 0;
+        v = (env && env[0] == '0') ? 0 : 1;
     }
     return v;
 }
@@ -3984,6 +5270,54 @@ static int gpu_present_slots_logits(fc_cuda_ctx *ctx, fc_buffer *logits_all,
     return 0;
 }
 
+static int gpu_get_batch_host(pn_qwen35moe_gpu *g,
+                              const pn_qwen35moe_config *cfg, int n);
+static int tp_batch_walk(pn_qwen35moe_model *m, pn_qwen35moe_gpu *g, const uint32_t *tokens,
+                         int n, pn_qwen35moe_state *st, int pos0, int spec,
+                         fc_cuda_ctx **ctx_out, gpu_batch_scratch **b_out,
+                         gpu_die_scratch **sc_out);
+
+/* QWEN35_TP: commit a decode row the TP walk appended at pos (spec form, so the
+ * attention watermark waits at pos): advance every half still bound to st. The
+ * SSM scans already hold state-after-1. */
+static void tp_commit_row(pn_qwen35moe_gpu *g, pn_qwen35moe_state *st, int pos)
+{
+    for (int i = 0; i < g->n_attn; i++) {
+        gpu_attn_layer *da = &g->attn[i];
+        const pn_qwen35moe_kv *kv = &st->kv[qw_attn_hidx(g, i)];
+        const void *id = kv->q4 ? (const void *)kv->kq : (const void *)kv->k;
+        if (da->kv_host_id == id && da->kv_gen == kv->content_gen && da->kv_synced_pos == pos)
+            da->kv_synced_pos = pos + 1;
+    }
+}
+
+/* QWEN35_TP single-token forward: the TP walk at n = 1 with the decode-form
+ * (verify) kernels, then the single-token head and logits fetch on the head die. */
+static float *tp_forward_token(pn_qwen35moe_model *m, pn_qwen35moe_gpu *g, uint32_t token,
+                               pn_qwen35moe_state *s, int pos)
+{
+    const pn_qwen35moe_config *cfg = pn_qwen35moe_model_config(m);
+    fc_cuda_ctx *ctx = NULL;
+    gpu_batch_scratch *b = NULL;
+    gpu_die_scratch *sc = NULL;
+
+    if (!g->host_ok) {
+        if (gpu_host_scratch_init(&g->host, cfg) < 0)
+            return NULL;
+        g->host_ok = 1;
+    }
+    if ((s->n_attn > 0 && pos + 1 > s->kv[0].max_seq) || gpu_get_batch_host(g, cfg, 1) < 0 ||
+        tp_batch_walk(m, g, &token, 1, s, pos, 1, &ctx, &b, &sc) < 0)
+        return NULL;
+    tp_commit_row(g, s, pos);
+    fc_rms_norm_ctx(ctx, b->hidden, g->output_norm.buf, sc->r_xnorm, cfg->n_embd,
+                    cfg->rms_norm_eps);
+    gpu_matvec(&g->output, sc->r_xnorm, sc->r_logits, g->host.a, g->host.b);
+    fc_sync_ctx(ctx);
+    gpu_fetch_logits(ctx, sc->r_logits, s, cfg->n_vocab);
+    return s->logits;
+}
+
 float *pn_qwen35moe_forward_token_cuda(pn_qwen35moe_model *m, uint32_t token,
                                        pn_qwen35moe_state *s, int pos)
 {
@@ -3992,6 +5326,8 @@ float *pn_qwen35moe_forward_token_cuda(pn_qwen35moe_model *m, uint32_t token,
     pn_qwen35moe_gpu *g = (pn_qwen35moe_gpu *)pn_qwen35moe_model_gpu(m);
     if (!g)
         return NULL; /* not uploaded — caller should fall back to the CPU path */
+    if (g->tp)
+        return tp_forward_token(m, g, token, s, pos);
 
     const pn_qwen35moe_config *cfg = pn_qwen35moe_model_config(m);
     int c = cfg->n_embd;
@@ -4151,8 +5487,8 @@ static void gpu_batch_scratch_free(gpu_batch_scratch *b)
         &b->s_y, &b->s_gated, &b->s_beta, &b->s_alpha, &b->s_g,
         &b->a_qg, &b->a_q, &b->a_z, &b->a_out, &b->a_k, &b->a_v,
         &b->m_logits, &b->m_tidx, &b->m_twt, &b->m_gate, &b->m_up,
-        &b->m_hid, &b->m_out, &b->m_shexp, &b->m_ecount, &b->m_ereq,
-        &b->m_wlist,
+        &b->m_hid, &b->m_out, &b->m_shexp, &b->m_sgate, &b->m_ecount,
+        &b->m_ereq, &b->m_wlist,
     };
     for (size_t i = 0; i < sizeof(bufs) / sizeof(bufs[0]); i++) {
         fc_buffer_free(*bufs[i]);
@@ -4175,7 +5511,15 @@ static gpu_batch_scratch *gpu_get_batch_scratch(pn_qwen35moe_gpu *g,
     int die_idx = gpu_die_index_of_ctx(g, ctx);
     if (die_idx < 0)
         return NULL;
+#ifndef PN_PDO_RED_SHARED_SCRATCH
+    gpu_batch_scratch *b = g->lane == QW_LANE_DECODE ? &g->bscratch_dec[die_idx]
+                                                     : &g->bscratch[die_idx];
+#else
+    /* Red build: the decode lane shares the prefill's batch scratch, so an
+     * overlap cycle's decode stage overwrites a chunk sitting half-way through
+     * a stage. The exactness gates must see it. */
     gpu_batch_scratch *b = &g->bscratch[die_idx];
+#endif
     if (b->ctx == ctx && b->n_cap >= n)
         return b;
     if (b->ctx)
@@ -4190,6 +5534,14 @@ static gpu_batch_scratch *gpu_get_batch_scratch(pn_qwen35moe_gpu *g,
     const size_t nn = (size_t)n;
     size_t ff = (size_t)(cfg->expert_ff > cfg->shared_ff ? cfg->expert_ff
                                                          : cfg->shared_ff);
+    /* Dense-FFN (Bonsai, Ornith) has n_expert == n_expert_used == 0, and a
+     * 0-byte alloc returns NULL, which failed this whole scratch: every batched
+     * decode step and every batched prefill chunk of a dense model died here.
+     * Floor the MoE-only buffers to 1, as gpu_get_scratch does; the dense FFN
+     * never reads them. */
+    const size_t n_exp = (size_t)(cfg->n_expert > 0 ? cfg->n_expert : 1);
+    const size_t k_exp = (size_t)(cfg->n_expert_used > 0 ? cfg->n_expert_used
+                                                         : 1);
 #define BALLOC(field, elems) \
     b->field = fc_buffer_alloc_ctx(ctx, nn * (elems) * sizeof(float))
     BALLOC(hidden, c); BALLOC(x_norm, c); BALLOC(block_out, c);
@@ -4200,19 +5552,19 @@ static gpu_batch_scratch *gpu_get_batch_scratch(pn_qwen35moe_gpu *g,
     BALLOC(a_qg, 2 * attn_dim); BALLOC(a_q, attn_dim); BALLOC(a_z, attn_dim);
     BALLOC(a_out, attn_dim);
     BALLOC(a_k, kv_dim); BALLOC(a_v, kv_dim);
-    BALLOC(m_logits, (size_t)cfg->n_expert);
-    b->m_tidx = fc_buffer_alloc_ctx(ctx, nn * cfg->n_expert_used *
-                                         sizeof(int32_t));
-    BALLOC(m_twt, (size_t)cfg->n_expert_used);
+    BALLOC(m_logits, n_exp);
+    b->m_tidx = fc_buffer_alloc_ctx(ctx, nn * k_exp * sizeof(int32_t));
+    BALLOC(m_twt, k_exp);
     BALLOC(m_gate, ff); BALLOC(m_up, ff);
-    BALLOC(m_hid, (size_t)cfg->n_expert_used * ff);
-    BALLOC(m_out, c); BALLOC(m_shexp, c);
+    BALLOC(m_hid, k_exp * ff);
+    BALLOC(m_out, c); BALLOC(m_shexp, c); BALLOC(m_sgate, 1);
 #undef BALLOC
     /* Expert-union dedup request lists (flag-gated, so the default build
      * allocates nothing here). ereq is capped at n requests per expert: a
      * token's k slots are distinct, so it can appear in an expert's list at
      * most once and R <= n. */
-    if (gpu_moe_dedup_enabled() && cfg->n_expert > 0) {
+    if ((gpu_moe_dedup_enabled() || gpu_moe_dedup_q80_enabled()) &&
+        cfg->n_expert > 0) {
         b->m_ecount = fc_buffer_alloc_ctx(ctx, (size_t)cfg->n_expert *
                                                sizeof(int32_t));
         b->m_ereq = fc_buffer_alloc_ctx(ctx, (size_t)cfg->n_expert * nn *
@@ -4221,6 +5573,9 @@ static gpu_batch_scratch *gpu_get_batch_scratch(pn_qwen35moe_gpu *g,
             gpu_batch_scratch_free(b);
             return NULL;
         }
+    }
+    if ((gpu_moe_dedup_enabled() || gpu_moe_dedup_q80_enabled()) &&
+        cfg->n_expert > 0) {
         /* Compacted work list for the compacted-grid gate+up. Sized at the
          * EXACT host-side bound on the (expert, request-tile) count, which is
          * also the grid.y that launch uses — 352 int2 = 2.8 KB at the prefill
@@ -4239,12 +5594,16 @@ static gpu_batch_scratch *gpu_get_batch_scratch(pn_qwen35moe_gpu *g,
         !b->a_z || !b->a_out || !b->a_k || !b->a_v || !b->m_logits ||
         !b->m_tidx ||
         !b->m_twt || !b->m_gate || !b->m_up || !b->m_hid || !b->m_out ||
-        !b->m_shexp) {
+        !b->m_shexp || !b->m_sgate) {
+        fprintf(stderr, "[qwen35moe] batch scratch for %d rows on die %d: "
+                "alloc failed\n", n, die_idx);
         gpu_batch_scratch_free(b);
         return NULL;
     }
+    static unsigned batch_gen;
     b->ctx = ctx;
     b->n_cap = n;
+    b->gen = ++batch_gen;
     return b;
 }
 
@@ -4279,6 +5638,13 @@ static int gpu_matvec_nx(const gpu_weight *w, fc_buffer *x, fc_buffer *y,
 {
     if (!w->bytes)
         return -1;
+    if (w->kpar) {   /* TP down: this rank's parity partial over its compact input */
+        if ((int)w->type != GGUF_QUANT_Q8_0)
+            return -1;
+        fc_matvec_q80_par_nx_ctx(w->ctx, w->bytes, x, y, w->rows, w->cols / 2,
+                                 w->row_stride, n);
+        return 0;
+    }
     switch ((int)w->type) {
     case GGUF_QUANT_Q3_K:
         fc_matvec_q3k_nx_ctx(w->ctx, w->bytes, x, y, w->rows, w->cols,
@@ -4453,6 +5819,219 @@ static void gpu_moe_dedup_report_union(fc_cuda_ctx *ctx,
  * (n = live slots, ~1.1x reuse — dedup measured 7-9% SLOWER and is what got
  * the whole idea shelved). Reading QWEN35_MOE_DEDUP in here would flip both
  * at once. The callers decide; only prefill passes 1. */
+/* Batched dense FFN (Bonsai, Ornith): the single-token dense SwiGLU of
+ * gpu_moe_block over n rows — gate/up/down in the shexp slots, ffn dim =
+ * ffn_length, no router, no scalar gate — then the residual. Without it a dense
+ * model had no batched FFN at all: every prefill chunk fell back to one forward
+ * per token, and a decode step ran the single-token block once per slot row. */
+static int gpu_dense_ffn_batch(fc_cuda_ctx *ctx, gpu_moe *d,
+                               const pn_qwen35moe_config *cfg,
+                               gpu_batch_scratch *b, int n)
+{
+    double sp_t0 = 0.0;
+    sprof_begin(ctx, &sp_t0);
+    if (gpu_matvec_nx(&d->ffn_gate_shexp, b->x_norm, b->m_gate, n) < 0 ||
+        gpu_matvec_nx(&d->ffn_up_shexp, b->x_norm, b->m_up, n) < 0)
+        return -1;
+    fc_moe_silu_mul_ctx(ctx, b->m_gate, b->m_up, b->m_gate,
+                        n * cfg->ffn_length);
+    if (gpu_matvec_nx(&d->ffn_down_shexp, b->m_gate, b->block_out, n) < 0)
+        return -1;
+    fc_add_ctx(ctx, b->hidden, b->block_out, b->hidden, n * cfg->n_embd);
+    sprof_lap(SPROF_MOE_SHEXP, ctx, &sp_t0);
+    return 0;
+}
+
+/* ============================================================
+ * One-slot fused launches on the batched-decode (slots) path
+ *
+ * At nslots == 1 the slots path runs the single-token path's fused
+ * descriptors (fc_fused_multi) over the batch scratch: proj4 (qkv + z + beta
+ * + alpha, raw — the GDN step applies sigmoid/decay), ssm_out + residual,
+ * attn_output + residual, MoE pre (router + shexp scalar-gate dot + shexp
+ * gate/up SwiGLU) and MoE post (shexp down + gate + combine + residual).
+ * Every segment runs its stand-alone kernel's per-row body (Q8_0 the
+ * fc_matvec_q80/_nx body, F32 fc_matvec_f32's) and every epilogue the small
+ * kernel it replaces, so the step is bit-identical to the unfused slots
+ * sequence. Same QWEN35_FUSE bits as the single-token sites (attn out has
+ * none there either).
+ *
+ * The descriptors point into the batch scratch, so they are keyed on its
+ * generation and built by gpu_slots_fused_prepare, which the layer dispatch
+ * runs before any graph capture (a build allocates and uploads; a capture
+ * cannot contain that). The block bodies only launch a built descriptor and
+ * otherwise run the unfused sequence.
+ * ============================================================ */
+
+static void gpu_fused_reset(gpu_fused *f)
+{
+    gpu_fused_free(f);
+    memset(f, 0, sizeof(*f));
+}
+
+static void gpu_fused_build(fc_cuda_ctx *ctx, gpu_fused *f,
+                            const fc_fused_seg *segs, int nseg)
+{
+    f->tried = 1;
+    f->nseg = nseg;
+    f->desc = fc_fused_build_ctx(ctx, segs, nseg, &f->blocks, &f->sh_bytes);
+}
+
+/* Launch f if it is built for batch scratch generation `gen` and the step
+ * has one slot; -1 = caller runs its unfused sequence. */
+static int gpu_fused_launch_one(fc_cuda_ctx *ctx, const gpu_fused *f,
+                                unsigned f_gen, const gpu_batch_scratch *b,
+                                int nslots, fc_buffer *x)
+{
+    if (nslots != 1 || f_gen != b->gen || !f->desc)
+        return -1;
+    fc_fused_multi_ctx(ctx, f->desc, f->nseg, f->blocks, f->sh_bytes, x);
+    return 0;
+}
+
+static void gpu_moe_slots_fused_prepare(fc_cuda_ctx *ctx, gpu_moe *d,
+                                        const pn_qwen35moe_config *cfg,
+                                        const gpu_batch_scratch *b)
+{
+    if (d->fx_s_gen == b->gen)
+        return;
+    gpu_fused_reset(&d->fx_pre_s);
+    gpu_fused_reset(&d->fx_post_s);
+    d->fx_s_gen = b->gen;
+    if (!d->grouped || cfg->dense_ffn || !(gpu_fuse_mask() & 16) ||
+        d->ffn_gate_shexp.type != d->ffn_up_shexp.type ||
+        d->ffn_gate_shexp.rows != d->ffn_up_shexp.rows ||
+        d->ffn_gate_shexp.row_stride != d->ffn_up_shexp.row_stride)
+        return;
+    fc_fused_seg segs[3];
+    segs[0] = gpu_seg_mv(&d->ffn_gate_inp, b->m_logits, 0);
+    memset(&segs[1], 0, sizeof(segs[1]));      /* scalar-gate dot */
+    segs[1].w = d->ffn_gate_inp_shexp.buf;
+    segs[1].out = b->m_sgate;
+    segs[1].rows = 1;
+    segs[1].cols = cfg->n_embd;
+    segs[1].row_stride = cfg->n_embd * (int)sizeof(float);
+    segs[1].kind = 1;
+    segs[1].ep = 1;                            /* sigmoid */
+    segs[2] = gpu_seg_mv(&d->ffn_gate_shexp, b->m_gate, 0);
+    segs[2].w2 = d->ffn_up_shexp.bytes;
+    segs[2].kind = 2;                          /* gate+up SwiGLU pair */
+    gpu_fused_build(ctx, &d->fx_pre_s, segs, 3);
+    if (!d->fx_pre_s.desc || !(gpu_fuse_mask() & 32))
+        return;
+    fc_fused_seg post = gpu_seg_mv(&d->ffn_down_shexp, b->block_out, 4);
+    post.aux0 = b->m_out;
+    post.aux1 = b->hidden;
+    post.aux2 = b->m_sgate;
+    gpu_fused_build(ctx, &d->fx_post_s, &post, 1);
+}
+
+static void gpu_ssm_slots_fused_prepare(gpu_ssm_layer *d,
+                                        const gpu_batch_scratch *b)
+{
+    if (d->fx_s_gen == b->gen)
+        return;
+    gpu_fused_reset(&d->fx_proj_s);
+    gpu_fused_reset(&d->fx_out_s);
+    d->fx_s_gen = b->gen;
+    if (gpu_fuse_mask() & 1) {
+        fc_fused_seg segs[4];
+        segs[0] = gpu_seg_mv(&d->attn_qkv, b->s_qkv, 0);
+        segs[1] = gpu_seg_mv(&d->attn_gate, b->s_z, 0);
+        segs[2] = gpu_seg_mv(&d->ssm_beta, b->s_beta, 0);
+        segs[3] = gpu_seg_mv(&d->ssm_alpha, b->s_alpha, 0);
+        gpu_fused_build(d->ctx, &d->fx_proj_s, segs, 4);
+    }
+    if (gpu_fuse_mask() & 2) {
+        fc_fused_seg seg = gpu_seg_mv(&d->ssm_out, b->block_out, 3);
+        seg.aux1 = b->hidden;
+        gpu_fused_build(d->ctx, &d->fx_out_s, &seg, 1);
+    }
+}
+
+static void gpu_attn_slots_fused_prepare(gpu_attn_layer *d,
+                                         const gpu_batch_scratch *b)
+{
+    if (d->fx_s_gen == b->gen)
+        return;
+    gpu_fused_reset(&d->fx_out_s);
+    d->fx_s_gen = b->gen;
+    fc_fused_seg seg = gpu_seg_mv(&d->attn_output, b->block_out, 3);
+    seg.aux1 = b->hidden;
+    gpu_fused_build(d->ctx, &d->fx_out_s, &seg, 1);
+}
+
+/* Build (once per batch scratch) the one-slot descriptors of layer `idx`.
+ * Outside any graph capture. */
+static void gpu_slots_fused_prepare(pn_qwen35moe_gpu *g,
+                                    const pn_qwen35moe_config *cfg, int is_attn,
+                                    int idx, const gpu_batch_scratch *b,
+                                    int nslots)
+{
+    if (nslots != 1)
+        return;
+    if (is_attn) {
+        gpu_attn_layer *d = &g->attn[idx];
+        gpu_attn_slots_fused_prepare(d, b);
+        gpu_moe_slots_fused_prepare(d->ctx, &d->moe, cfg, b);
+    } else {
+        gpu_ssm_layer *d = &g->ssm[idx];
+        gpu_ssm_slots_fused_prepare(d, b);
+        gpu_moe_slots_fused_prepare(d->ctx, &d->moe, cfg, b);
+    }
+}
+
+/* Batched routed gate+up into hid ([n*k][ff]): the Q8_0 expert-grouped kernel
+ * over the compacted work list when it applies (QWEN35_MOE_DEDUP_Q80 on, Q8_0
+ * experts, n * k >= n_expert, lists allocated, kernels in the PTX, and
+ * allow_dedup — a prefill caller),
+ * else fc_moe_gateup_nx_ctx. Both write the same bits. Returns 0 on launch. */
+static int gpu_moe_gateup_batch(fc_cuda_ctx *ctx, const pn_qwen35moe_config *cfg,
+                                const gpu_moe *d, gpu_batch_scratch *b,
+                                fc_buffer *hid, int ff, int n, int allow_dedup)
+{
+    const int k = cfg->n_expert_used;
+    const int wmax = fc_moe_dedup_wmax(cfg->n_expert, k, n, n);
+    if (allow_dedup && gpu_moe_dedup_q80_enabled() &&
+        d->gate_all.type == GGUF_QUANT_Q8_0 && n * k >= cfg->n_expert &&
+        b->m_ecount && b->m_ereq && b->m_wlist && wmax > 0 &&
+        fc_moe_dedup_q80_available_ctx(ctx)) {
+        static int announced = 0;
+        if (!announced) {
+            announced = 1;
+            fprintf(stderr, "[qwen35moe] MoE Q8_0 grouped gate+up: ON (n=%d k=%d "
+                    "n_expert=%d ff=%d)\n", n, k, cfg->n_expert, ff);
+        }
+        fc_moe_dedup_build_ctx(ctx, b->m_tidx, b->m_ecount, b->m_ereq,
+                               cfg->n_expert, k, n, n);
+        fc_moe_dedup_build_wl_ctx(ctx, b->m_ecount, b->m_wlist, cfg->n_expert,
+                                  wmax);
+        if (fc_moe_gateup_q80_dedup_ctx(ctx, d->gate_all.bytes, d->up_all.bytes,
+                                        b->x_norm, b->m_ereq, b->m_wlist, hid, k,
+                                        ff, cfg->n_embd, d->gate_all.row_stride,
+                                        wmax, n) == 0)
+            return 0;
+    }
+    return fc_moe_gateup_nx_ctx(ctx, (int)d->gate_all.type, d->gate_all.bytes,
+                                d->up_all.bytes, b->x_norm, b->m_tidx, hid, k, ff,
+                                cfg->n_embd, d->gate_all.row_stride, n);
+}
+
+/* attn_output + residual for the slots path: one fused launch at one slot
+ * when built, else the matvec and the add. */
+static int gpu_attn_out_slots(gpu_attn_layer *d, const pn_qwen35moe_config *cfg,
+                              gpu_batch_scratch *b, int nslots)
+{
+    if (gpu_fused_launch_one(d->ctx, &d->fx_out_s, d->fx_s_gen, b, nslots,
+                             b->a_out) == 0)
+        return 0;
+    if (gpu_matvec_nx(&d->attn_output, b->a_out, b->block_out, nslots) < 0)
+        return -1;
+    fc_add_ctx(d->ctx, b->hidden, b->block_out, b->hidden,
+               nslots * cfg->n_embd);
+    return 0;
+}
+
 static int gpu_moe_block_batch(fc_cuda_ctx *ctx, gpu_moe *d,
                                const pn_qwen35moe_config *cfg,
                                gpu_batch_scratch *b, int n, int allow_dedup)
@@ -4460,6 +6039,8 @@ static int gpu_moe_block_batch(fc_cuda_ctx *ctx, gpu_moe *d,
     const int n_embd = cfg->n_embd;
     const int k = cfg->n_expert_used;
 
+    if (cfg->dense_ffn)
+        return gpu_dense_ffn_batch(ctx, d, cfg, b, n);
     if (!d->grouped)
         return -1;
 
@@ -4467,8 +6048,11 @@ static int gpu_moe_block_batch(fc_cuda_ctx *ctx, gpu_moe *d,
     sprof_begin(ctx, &sp_t0);
     sub_begin(ctx, &sub_t0);
 
-    /* Router logits + per-position softmax/top-k. */
-    if (gpu_matvec_nx(&d->ffn_gate_inp, b->x_norm, b->m_logits, n) < 0)
+    /* Router logits + per-position softmax/top-k. At one slot the fused
+     * pre launch also computes the shexp scalar gate and gate/up SwiGLU. */
+    int pre = gpu_fused_launch_one(ctx, &d->fx_pre_s, d->fx_s_gen, b, n,
+                                   b->x_norm) == 0;
+    if (!pre && gpu_matvec_nx(&d->ffn_gate_inp, b->x_norm, b->m_logits, n) < 0)
         return -1;
     sub_lap(&moed_cum[MOED_ROUTER], &moed_laps[MOED_ROUTER], ctx, &sub_t0);
     fc_moe_router_topk_nx_ctx(ctx, b->m_logits, b->m_tidx, b->m_twt,
@@ -4509,10 +6093,8 @@ static int gpu_moe_block_batch(fc_cuda_ctx *ctx, gpu_moe *d,
                                         n);
         }
     } else {
-        fc_moe_gateup_nx_ctx(ctx, (int)d->gate_all.type, d->gate_all.bytes,
-                             d->up_all.bytes, b->x_norm, b->m_tidx, b->m_hid,
-                             k, cfg->expert_ff, n_embd,
-                             d->gate_all.row_stride, n);
+        gpu_moe_gateup_batch(ctx, cfg, d, b, b->m_hid, cfg->expert_ff, n,
+                             allow_dedup);
     }
     sprof_lap(SPROF_MOE_GATEUP, ctx, &sp_t0);
     fc_moe_down_accum_nx_ctx(ctx, (int)d->down_all.type, d->down_all.bytes,
@@ -4523,13 +6105,24 @@ static int gpu_moe_block_batch(fc_cuda_ctx *ctx, gpu_moe *d,
     sub_begin(ctx, &sub_t0);
 
     /* Shared expert + scalar gate + combine + residual. */
-    if (gpu_matvec_nx(&d->ffn_gate_shexp, b->x_norm, b->m_gate, n) < 0 ||
-        gpu_matvec_nx(&d->ffn_up_shexp, b->x_norm, b->m_up, n) < 0)
-        return -1;
-    sub_lap(&moed_cum[MOED_SH_GATEUP], &moed_laps[MOED_SH_GATEUP], ctx, &sub_t0);
-    fc_moe_silu_mul_ctx(ctx, b->m_gate, b->m_up, b->m_gate,
-                        n * cfg->shared_ff);
-    sub_lap(&moed_cum[MOED_SH_SILU], &moed_laps[MOED_SH_SILU], ctx, &sub_t0);
+    if (!pre) {
+        if (gpu_matvec_nx(&d->ffn_gate_shexp, b->x_norm, b->m_gate, n) < 0 ||
+            gpu_matvec_nx(&d->ffn_up_shexp, b->x_norm, b->m_up, n) < 0)
+            return -1;
+        sub_lap(&moed_cum[MOED_SH_GATEUP], &moed_laps[MOED_SH_GATEUP], ctx,
+                &sub_t0);
+        fc_moe_silu_mul_ctx(ctx, b->m_gate, b->m_up, b->m_gate,
+                            n * cfg->shared_ff);
+        sub_lap(&moed_cum[MOED_SH_SILU], &moed_laps[MOED_SH_SILU], ctx,
+                &sub_t0);
+    }
+    if (pre && gpu_fused_launch_one(ctx, &d->fx_post_s, d->fx_s_gen, b, n,
+                                    b->m_gate) == 0) {
+        sub_lap(&moed_cum[MOED_SH_COMBINE], &moed_laps[MOED_SH_COMBINE], ctx,
+                &sub_t0);
+        sprof_lap(SPROF_MOE_SHEXP, ctx, &sp_t0);
+        return 0;
+    }
     if (gpu_matvec_nx(&d->ffn_down_shexp, b->m_gate, b->m_shexp, n) < 0)
         return -1;
     sub_lap(&moed_cum[MOED_SH_DOWN], &moed_laps[MOED_SH_DOWN], ctx, &sub_t0);
@@ -4579,7 +6172,7 @@ static int gpu_moe_block_slots(fc_cuda_ctx *ctx, gpu_moe *d,
                                gpu_batch_scratch *b, int n,
                                gpu_die_scratch *sc, gpu_host_scratch *h)
 {
-    if (d->grouped)
+    if (d->grouped || cfg->dense_ffn)
         return gpu_moe_block_batch(ctx, d, cfg, b, n,
                                    gpu_moe_dedup_decode_override());
     if (!sc || !h) {
@@ -4625,9 +6218,11 @@ static int gpu_moe_block_slots(fc_cuda_ctx *ctx, gpu_moe *d,
  * is set, the scans additionally write per-position state snapshots into
  * d->conv_snaps / d->ssm_snaps (allocated by the caller) for the partial-
  * accept rollback; the math is unchanged either way. */
+/* core_only (QWEN35_TP): stop at the gated-norm output s_gated, before the out
+ * projection and residual (the TP body gathers both ranks' cores first). */
 static int gpu_ssm_block_batch(gpu_ssm_layer *d,
                                const pn_qwen35moe_config *cfg,
-                               gpu_batch_scratch *b, int n, int spec)
+                               gpu_batch_scratch *b, int n, int spec, int core_only)
 {
     const int conv_dim = cfg->conv_dim;
     const int S = cfg->ssm_state;
@@ -4666,7 +6261,7 @@ static int gpu_ssm_block_batch(gpu_ssm_layer *d,
     ssm_lap(SSMP_QKNORM, ctx, &sst0);
     fc_ssm_recurrence_seq_ctx(ctx, d->ssm_state_g, b->s_qg, b->s_kg, b->s_vg,
                               b->s_g, b->s_beta, b->s_y, n_v_heads, S, n,
-                              1.0f / sqrtf((float)S),
+                              qw_scale_inv_sqrt(S),
                               spec ? d->ssm_snaps : NULL);
     ssm_lap(SSMP_RECUR, ctx, &sst0);
 
@@ -4674,6 +6269,8 @@ static int gpu_ssm_block_batch(gpu_ssm_layer *d,
      * kernel covers the batch with n*n_v_heads head-blocks) + out proj. */
     fc_ssm_gated_norm_ctx(ctx, b->s_y, d->ssm_norm.buf, b->s_z, b->s_gated,
                           n * n_v_heads, S, eps);
+    if (core_only)
+        return 0;
     if (gpu_matvec_nx(&d->ssm_out, b->s_gated, b->block_out, n) < 0)
         return -1;
     fc_add_ctx(ctx, b->hidden, b->block_out, b->hidden, n * cfg->n_embd);
@@ -4759,16 +6356,17 @@ static size_t qw_kv_row_bytes(const pn_qwen35moe_kv *kv)
                   : (size_t)kv->head_dim * sizeof(float);
 }
 
-/* Per-slot fp16 sink / window shadow byte sizes (q4 mode). */
-static size_t qw_kv_sink_bytes(const pn_qwen35moe_kv *kv)
+/* Per-slot fp16 sink / window shadow byte sizes (q4 mode) of layer struct d
+ * (a QWEN35_TP half holds its own heads only). */
+static size_t qw_kv_sink_bytes(const gpu_attn_layer *d, const pn_qwen35moe_kv *kv)
 {
-    return (size_t)kv->n_head_kv * PN_KVQ4_SINKMAX * kv->head_dim *
+    return (size_t)qw_kv_nh(d, kv) * PN_KVQ4_SINKMAX * kv->head_dim *
            sizeof(uint16_t);
 }
 
-static size_t qw_kv_win_bytes(const pn_qwen35moe_kv *kv)
+static size_t qw_kv_win_bytes(const gpu_attn_layer *d, const pn_qwen35moe_kv *kv)
 {
-    return (size_t)kv->n_head_kv * PN_KVQ4_WMAX * kv->head_dim *
+    return (size_t)qw_kv_nh(d, kv) * PN_KVQ4_WMAX * kv->head_dim *
            sizeof(uint16_t);
 }
 
@@ -4785,8 +6383,14 @@ static int qw_kv_layer_materialize(gpu_attn_layer *d, pn_qwen35moe_kv *kv,
     const void *host_id = kv->q4 ? (const void *)kv->kq
                                  : (const void *)kv->k;
     size_t row_b = qw_kv_row_bytes(kv);
-    unsigned char *kdst = kv->q4 ? kv->kq : (unsigned char *)kv->k;
-    unsigned char *vdst = kv->q4 ? kv->vq : (unsigned char *)kv->v;
+    /* QWEN35_TP: this struct's heads [h0, h0 + nh) land at their host rows; the
+     * caller materializes both halves (qw_kv_layer_materialize_all). */
+    const int nh = qw_kv_nh(d, kv), h0 = qw_kv_h0(d, kv);
+    const size_t head_h = (size_t)h0 * kv->max_seq * row_b;
+    const size_t sink_h = (size_t)h0 * PN_KVQ4_SINKMAX * kv->head_dim * sizeof(uint16_t);
+    const size_t win_h = (size_t)h0 * PN_KVQ4_WMAX * kv->head_dim * sizeof(uint16_t);
+    unsigned char *kdst = (kv->q4 ? kv->kq : (unsigned char *)kv->k) + head_h;
+    unsigned char *vdst = (kv->q4 ? kv->vq : (unsigned char *)kv->v) + head_h;
     if (rows < 0) {
         /* "As many rows as the source holds": the caller has no pos at hand
          * (slot bind); take the matching ring's own watermark. */
@@ -4814,7 +6418,7 @@ static int qw_kv_layer_materialize(gpu_attn_layer *d, pn_qwen35moe_kv *kv,
     if (d->k_cache_g && d->v_cache_g && d->cache_cap == kv->max_seq &&
         d->kv_host_id == host_id && d->kv_gen == kv->content_gen &&
         d->kv_synced_pos >= rows) {
-        for (int hd = 0; hd < kv->n_head_kv; hd++) {
+        for (int hd = 0; hd < nh; hd++) {
             size_t off = (size_t)hd * kv->max_seq * row_b;
             fc_buffer_to_cpu_at(d->k_cache_g, kdst + off, off,
                                 (size_t)rows * row_b);
@@ -4822,10 +6426,11 @@ static int qw_kv_layer_materialize(gpu_attn_layer *d, pn_qwen35moe_kv *kv,
                                 (size_t)rows * row_b);
         }
         if (kv->q4 && d->k_sink_g) {
-            fc_buffer_to_cpu(d->k_sink_g, kv->k_sink);
-            fc_buffer_to_cpu(d->v_sink_g, kv->v_sink);
-            fc_buffer_to_cpu(d->k_win_g, kv->k_win);
-            fc_buffer_to_cpu(d->v_win_g, kv->v_win);
+            const size_t sink_b = qw_kv_sink_bytes(d, kv), win_b = qw_kv_win_bytes(d, kv);
+            fc_buffer_to_cpu_at(d->k_sink_g, (unsigned char *)kv->k_sink + sink_h, 0, sink_b);
+            fc_buffer_to_cpu_at(d->v_sink_g, (unsigned char *)kv->v_sink + sink_h, 0, sink_b);
+            fc_buffer_to_cpu_at(d->k_win_g, (unsigned char *)kv->k_win + win_h, 0, win_b);
+            fc_buffer_to_cpu_at(d->v_win_g, (unsigned char *)kv->v_win + win_h, 0, win_b);
         }
         kv->kv_mirror_stale = 0;
         return 0;
@@ -4839,9 +6444,9 @@ static int qw_kv_layer_materialize(gpu_attn_layer *d, pn_qwen35moe_kv *kv,
                 d->kv_slot_gen[su] != kv->content_gen ||
                 d->kv_slot_synced[su] < rows)
                 continue;
-            for (int hd = 0; hd < kv->n_head_kv; hd++) {
+            for (int hd = 0; hd < nh; hd++) {
                 size_t dst_off = (size_t)hd * kv->max_seq * row_b;
-                size_t src_off = ((size_t)su * kv->n_head_kv + hd) *
+                size_t src_off = ((size_t)su * nh + hd) *
                                  kv->max_seq * row_b;
                 fc_buffer_to_cpu_at(d->k_slots_g, kdst + dst_off, src_off,
                                     (size_t)rows * row_b);
@@ -4849,15 +6454,15 @@ static int qw_kv_layer_materialize(gpu_attn_layer *d, pn_qwen35moe_kv *kv,
                                     (size_t)rows * row_b);
             }
             if (kv->q4 && d->k_sink_slots_g) {
-                size_t sink_b = qw_kv_sink_bytes(kv);
-                size_t win_b = qw_kv_win_bytes(kv);
-                fc_buffer_to_cpu_at(d->k_sink_slots_g, kv->k_sink,
+                size_t sink_b = qw_kv_sink_bytes(d, kv);
+                size_t win_b = qw_kv_win_bytes(d, kv);
+                fc_buffer_to_cpu_at(d->k_sink_slots_g, (unsigned char *)kv->k_sink + sink_h,
                                     (size_t)su * sink_b, sink_b);
-                fc_buffer_to_cpu_at(d->v_sink_slots_g, kv->v_sink,
+                fc_buffer_to_cpu_at(d->v_sink_slots_g, (unsigned char *)kv->v_sink + sink_h,
                                     (size_t)su * sink_b, sink_b);
-                fc_buffer_to_cpu_at(d->k_win_slots_g, kv->k_win,
+                fc_buffer_to_cpu_at(d->k_win_slots_g, (unsigned char *)kv->k_win + win_h,
                                     (size_t)su * win_b, win_b);
-                fc_buffer_to_cpu_at(d->v_win_slots_g, kv->v_win,
+                fc_buffer_to_cpu_at(d->v_win_slots_g, (unsigned char *)kv->v_win + win_h,
                                     (size_t)su * win_b, win_b);
             }
             kv->kv_mirror_stale = 0;
@@ -4865,6 +6470,21 @@ static int qw_kv_layer_materialize(gpu_attn_layer *d, pn_qwen35moe_kv *kv,
         }
     }
     return -1;
+}
+
+/* qw_kv_layer_materialize over every half of attention layer struct idx (both
+ * QWEN35_TP ranks; just idx otherwise). The mirror is clean only if all landed. */
+static int qw_kv_layer_materialize_all(pn_qwen35moe_gpu *g, int idx, pn_qwen35moe_kv *kv,
+                                       int rows)
+{
+    if (!g->tp)
+        return qw_kv_layer_materialize(&g->attn[idx], kv, rows);
+    int rc = qw_kv_layer_materialize(&g->attn[idx], kv, rows);
+    if (qw_kv_layer_materialize(&g->attn[idx + g->tp_n_attn], kv, rows) != 0 || rc != 0) {
+        kv->kv_mirror_stale = 1;
+        return -1;
+    }
+    return 0;
 }
 
 /* Ensure this layer's GPU KV ring cache exists and holds rows [0, pos0)
@@ -4883,6 +6503,8 @@ static int gpu_attn_kv_cache_sync(gpu_attn_layer *d,
                       : (size_t)kv->head_dim * sizeof(float);
     size_t head_b = (size_t)kv->max_seq * row_b;
     const void *host_id = q4 ? (const void *)kv->kq : (const void *)kv->k;
+    /* QWEN35_TP: this struct holds heads [h0, h0 + nh) of the host ring. */
+    const int nh = qw_kv_nh(d, kv), h0 = qw_kv_h0(d, kv);
 
     if (!d->k_cache_g || d->cache_cap < kv->max_seq) {
         fc_buffer_free(d->k_cache_g);
@@ -4896,17 +6518,15 @@ static int gpu_attn_kv_cache_sync(gpu_attn_layer *d,
         d->k_sink_g = d->v_sink_g = d->k_win_g = d->v_win_g = NULL;
         d->k_win_snap_g = d->v_win_snap_g = NULL;
         d->spec_win_cap = d->spec_win_n = 0;
-        size_t bytes = (size_t)kv->n_head_kv * head_b;
+        size_t bytes = (size_t)nh * head_b;
         d->k_cache_g = fc_buffer_alloc_ctx(d->ctx, bytes);
         d->v_cache_g = fc_buffer_alloc_ctx(d->ctx, bytes);
         d->cache_cap = (d->k_cache_g && d->v_cache_g) ? kv->max_seq : 0;
         if (q4 && d->cache_cap) {
             /* fp16 sink + recent-window shadow, sized to the maxima (host and
              * device rings are indexed identically). */
-            size_t sink_b = (size_t)kv->n_head_kv * PN_KVQ4_SINKMAX *
-                            kv->head_dim * sizeof(uint16_t);
-            size_t win_b = (size_t)kv->n_head_kv * PN_KVQ4_WMAX *
-                           kv->head_dim * sizeof(uint16_t);
+            size_t sink_b = qw_kv_sink_bytes(d, kv);
+            size_t win_b = qw_kv_win_bytes(d, kv);
             d->k_sink_g = fc_buffer_alloc_ctx(d->ctx, sink_b);
             d->v_sink_g = fc_buffer_alloc_ctx(d->ctx, sink_b);
             d->k_win_g = fc_buffer_alloc_ctx(d->ctx, win_b);
@@ -4973,10 +6593,10 @@ static int gpu_attn_kv_cache_sync(gpu_attn_layer *d,
                     d->kv_slot_gen[su] != kv->content_gen ||
                     d->kv_slot_synced[su] < pos0)
                     continue;
-                for (int hd = 0; hd < kv->n_head_kv; hd++) {
+                for (int hd = 0; hd < nh; hd++) {
                     size_t dst_off = (size_t)hd * head_b +
                                      (size_t)synced * row_b;
-                    size_t src_off = ((size_t)su * kv->n_head_kv + hd) *
+                    size_t src_off = ((size_t)su * nh + hd) *
                                      head_b + (size_t)synced * row_b;
                     size_t bytes = (size_t)(pos0 - synced) * row_b;
                     fc_buffer_copy_d2d_ctx(d->ctx, d->k_cache_g, dst_off,
@@ -4985,8 +6605,8 @@ static int gpu_attn_kv_cache_sync(gpu_attn_layer *d,
                                            d->v_slots_g, src_off, bytes);
                 }
                 if (q4 && d->k_sink_slots_g && d->k_sink_g) {
-                    size_t sink_b = qw_kv_sink_bytes(kv);
-                    size_t win_b = qw_kv_win_bytes(kv);
+                    size_t sink_b = qw_kv_sink_bytes(d, kv);
+                    size_t win_b = qw_kv_win_bytes(d, kv);
                     fc_buffer_copy_d2d_ctx(d->ctx, d->k_sink_g, 0,
                                            d->k_sink_slots_g,
                                            (size_t)su * sink_b, sink_b);
@@ -5018,11 +6638,12 @@ static int gpu_attn_kv_cache_sync(gpu_attn_layer *d,
                                            : (const unsigned char *)kv->k;
             const unsigned char *vsrc = q4 ? kv->vq
                                            : (const unsigned char *)kv->v;
-            for (int hd = 0; hd < kv->n_head_kv; hd++) {
+            for (int hd = 0; hd < nh; hd++) {
                 size_t off_b = (size_t)hd * head_b + (size_t)synced * row_b;
+                size_t host_b = off_b + (size_t)h0 * head_b;
                 size_t bytes = (size_t)(pos0 - synced) * row_b;
-                fc_buffer_from_cpu_at(d->k_cache_g, off_b, ksrc + off_b, bytes);
-                fc_buffer_from_cpu_at(d->v_cache_g, off_b, vsrc + off_b, bytes);
+                fc_buffer_from_cpu_at(d->k_cache_g, off_b, ksrc + host_b, bytes);
+                fc_buffer_from_cpu_at(d->v_cache_g, off_b, vsrc + host_b, bytes);
             }
             host_uploaded = 1;
         }
@@ -5036,14 +6657,14 @@ static int gpu_attn_kv_cache_sync(gpu_attn_layer *d,
      * The incremental append path keeps the shadow live so this is cheap
      * and rare (a few hundred KB/layer, once per sequence start). */
     if (q4 && (host_uploaded || pos0 == 0)) {
-        size_t sink_b = (size_t)kv->n_head_kv * PN_KVQ4_SINKMAX *
-                        kv->head_dim * sizeof(uint16_t);
-        size_t win_b = (size_t)kv->n_head_kv * PN_KVQ4_WMAX *
-                       kv->head_dim * sizeof(uint16_t);
-        fc_buffer_from_cpu_at(d->k_sink_g, 0, (const unsigned char *)kv->k_sink, sink_b);
-        fc_buffer_from_cpu_at(d->v_sink_g, 0, (const unsigned char *)kv->v_sink, sink_b);
-        fc_buffer_from_cpu_at(d->k_win_g, 0, (const unsigned char *)kv->k_win, win_b);
-        fc_buffer_from_cpu_at(d->v_win_g, 0, (const unsigned char *)kv->v_win, win_b);
+        size_t sink_b = qw_kv_sink_bytes(d, kv);
+        size_t win_b = qw_kv_win_bytes(d, kv);
+        size_t sink_h = (size_t)h0 * PN_KVQ4_SINKMAX * kv->head_dim * sizeof(uint16_t);
+        size_t win_h = (size_t)h0 * PN_KVQ4_WMAX * kv->head_dim * sizeof(uint16_t);
+        fc_buffer_from_cpu_at(d->k_sink_g, 0, (const unsigned char *)kv->k_sink + sink_h, sink_b);
+        fc_buffer_from_cpu_at(d->v_sink_g, 0, (const unsigned char *)kv->v_sink + sink_h, sink_b);
+        fc_buffer_from_cpu_at(d->k_win_g, 0, (const unsigned char *)kv->k_win + win_h, win_b);
+        fc_buffer_from_cpu_at(d->v_win_g, 0, (const unsigned char *)kv->v_win + win_h, win_b);
     }
     d->kv_host_id = host_id;
     d->kv_gen = kv->content_gen;
@@ -5160,7 +6781,7 @@ static int gpu_attn_block_decode_flash(gpu_attn_layer *d,
      * appends), append this token's row, split flash over [0, pos]. */
     if (gpu_attn_kv_cache_sync(d, kv, pos) < 0)
         return -1;
-    float scale = 1.0f / sqrtf((float)head_dim);
+    float scale = qw_scale_inv_sqrt(head_dim);
     if (kv->q4) {
         fc_attn_kv_append_q4_ctx(ctx, sc->a_k, sc->a_v, d->k_cache_g,
                                  d->v_cache_g, d->k_sink_g, d->v_sink_g,
@@ -5249,7 +6870,7 @@ static int gpu_attn_layer_body_graph(gpu_attn_layer *d,
     const int attn_dim = n_head * head_dim;
     const int max_seq = kv->max_seq;
     const float eps = cfg->rms_norm_eps;
-    float scale = 1.0f / sqrtf((float)head_dim);
+    float scale = qw_scale_inv_sqrt(head_dim);
     int rc;
 
     fc_rms_norm_ctx(ctx, hidden, d->attn_norm.buf, x_norm, c, eps);
@@ -5434,11 +7055,8 @@ static int gpu_segment_forward(pn_qwen35moe_model *m, pn_qwen35moe_gpu *g,
             pn_qwen35moe_ssm_state *st = &s->ssm[idx];
             /* Session switch: re-seed the GPU dual state CONTENTS (the
              * addresses the graph recorded never change). */
-            if (d->host_state != (const void *)st) {
-                fc_buffer_from_cpu(d->conv_state_g, st->conv_state);
-                fc_buffer_from_cpu(d->ssm_state_g, st->ssm_state);
-                d->host_state = (const void *)st;
-            }
+            if (d->host_state != (const void *)st)
+                qw_ssm_seed_shared(g, d, st, pos);
         }
     }
 
@@ -5637,14 +7255,77 @@ static void qw_spec_win_restore(gpu_attn_layer *d, const pn_qwen35moe_kv *kv,
     d->spec_win_n = 0;
 }
 
+/* QWEN35_BATCH_VERIFY (default ON; =0 off): run a speculative verify's
+ * attention through the R-row decode split kernel
+ * (fc_attn_flash_decode_rows_q4_ctx) instead of the prefill flash kernel. The
+ * prefill kernel walks the whole context serially in one block per (row, kv
+ * head) — 2-10 blocks on a 13-SMX die, ~6x the decode step's per-position
+ * cost — and reduces in a different order than decode. The rows kernel splits
+ * the keys like the decode step, reads each K/V tile once for every row, and
+ * is bit-exact per row against the plain decode step at that row's position.
+ * Latched once. */
+static int batch_verify_on(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *env = getenv("QWEN35_BATCH_VERIFY");
+        v = (env && env[0] == '0') ? 0 : 1;
+    }
+    return v;
+}
+
+/* Verify attention over the single-user ring, rows already appended: a_q ->
+ * a_out for the n rows at pos0.., with the sigmoid output gate folded into the
+ * combine when the slots path folds it (QWEN35_FUSE bit7), exactly as the plain
+ * decode step does. *gated reports which. Returns 0 = ran, 1 = not eligible
+ * (caller runs the prefill kernel), -1 = error. */
+static int gpu_attn_slot_plan_splits(int seq_len, int kps);
+static int gpu_attn_verify_rows(pn_qwen35moe_gpu *g, gpu_attn_layer *d,
+                                const pn_qwen35moe_config *cfg,
+                                const pn_qwen35moe_kv *kv, int pos0,
+                                gpu_batch_scratch *b, int n, int *gated)
+{
+    fc_cuda_ctx *ctx = d->ctx;
+    int di = gpu_die_index_of_ctx(g, ctx);
+    *gated = 0;
+    if (!batch_verify_on() || !kv->q4 || n > FC_ATTN_ROWS_MAX || di < 0 ||
+        attn_window() > 0 || !fc_attn_flash_decode_rows_q4_available_ctx(ctx))
+        return 1;
+    if (!g->bv_acc_g[di]) {
+        size_t np = (size_t)FC_ATTN_ROWS_MAX * cfg->n_head *
+                    PN_QWEN35MOE_DEC_SPLIT_MAX;
+        g->bv_m_g[di] = fc_buffer_alloc_ctx(ctx, np * sizeof(float));
+        g->bv_l_g[di] = fc_buffer_alloc_ctx(ctx, np * sizeof(float));
+        g->bv_acc_g[di] = fc_buffer_alloc_ctx(ctx, np * (size_t)cfg->head_dim *
+                                                   sizeof(float));
+        if (!g->bv_m_g[di] || !g->bv_l_g[di] || !g->bv_acc_g[di])
+            return -1;
+    }
+    int fold = (gpu_fuse_mask() & 128) != 0;
+    if (fc_attn_flash_decode_rows_q4_ctx(
+            ctx, b->a_q, d->k_cache_g, d->v_cache_g, d->k_sink_g, d->v_sink_g,
+            d->k_win_g, d->v_win_g, g->bv_m_g[di], g->bv_l_g[di],
+            g->bv_acc_g[di], fold ? b->a_z : NULL, b->a_out, cfg->n_head,
+            cfg->n_head_kv, cfg->head_dim, kv->max_seq, pos0, n,
+            dec_keys_per_split(), PN_QWEN35MOE_DEC_SPLIT_MAX, pn_kvq4_sink(),
+            pn_kvq4_win(), attn_sink(), attn_window(),
+            qw_scale_inv_sqrt(cfg->head_dim)) != 0)
+        return 1;
+    *gated = fold;
+    return 0;
+}
+
 /* Batched full-attention block, ON-DIE flash path (see section header).
  * Returns 0 on success, 1 if flash cannot run for this call (kernels
  * missing / disabled / ring wrap — caller uses the host path), -1 on
  * error. */
+/* core_only (QWEN35_TP, lazy host KV mirror only): stop at the gated attention
+ * output a_out, before the out projection and residual. */
 static int gpu_attn_block_batch_flash(pn_qwen35moe_gpu *g, gpu_attn_layer *d,
                                       const pn_qwen35moe_config *cfg,
                                       pn_qwen35moe_kv *kv, int pos0,
-                                      gpu_batch_scratch *b, int n, int spec)
+                                      gpu_batch_scratch *b, int n, int spec,
+                                      int core_only)
 {
     const int n_head = cfg->n_head;
     const int n_head_kv = cfg->n_head_kv;
@@ -5680,6 +7361,12 @@ static int gpu_attn_block_batch_flash(pn_qwen35moe_gpu *g, gpu_attn_layer *d,
     fc_rope_neox_partial_nx_ctx(ctx, b->a_k, n_head_kv, head_dim,
                                 cfg->rope_dim, pos0, cfg->rope_theta, n);
     bprof_lap(BPROF_ATTN_ROPE, ctx, &bt0);
+    if (spec) {
+        bv_trace_rows(ctx, "verify", "q", -1, b->a_q, n, attn_dim, NULL, pos0);
+        bv_trace_rows(ctx, "verify", "k", -1, b->a_k, n, kv_dim, NULL, pos0);
+        bv_trace_rows(ctx, "verify", "v", -1, b->a_v, n, kv_dim, NULL, pos0);
+        bv_trace_rows(ctx, "verify", "z", -1, b->a_z, n, attn_dim, NULL, pos0);
+    }
 
     /* 5. On-die attention: sync the GPU KV ring to pos0, append the n new
      * rows, causal GQA flash kernel, sigmoid output gate. */
@@ -5705,24 +7392,36 @@ static int gpu_attn_block_batch_flash(pn_qwen35moe_gpu *g, gpu_attn_layer *d,
      * pn_qwen35moe_spec_commit_cuda advances it by n_accept. A prefill append
      * is durable, so it advances by n immediately. */
     d->kv_synced_pos = spec ? pos0 : pos0 + n;
-    if (kv->q4) {
+    int gated = 0, rows_rc = spec ? gpu_attn_verify_rows(g, d, cfg, kv, pos0,
+                                                         b, n, &gated) : 1;
+    if (rows_rc < 0)
+        return -1;
+    if (rows_rc == 0) {
+        /* verify rows: a_out written by the decode split kernel */
+    } else if (kv->q4) {
         if (fc_attn_flash_prefill_q4_ctx(ctx, b->a_q, d->k_cache_g,
                                          d->v_cache_g, d->k_sink_g, d->v_sink_g,
                                          d->k_win_g, d->v_win_g, b->a_out, n_head,
                                          n_head_kv, head_dim, kv->max_seq,
                                          pos0, n, pn_kvq4_sink(), pn_kvq4_win(),
                                          attn_sink(), attn_window(),
-                                         1.0f / sqrtf((float)head_dim)) < 0)
+                                         qw_scale_inv_sqrt(head_dim)) < 0)
             return -1;
     } else if (fc_attn_flash_prefill_ctx(ctx, b->a_q, d->k_cache_g,
                                          d->v_cache_g, b->a_out, n_head,
                                          n_head_kv, head_dim, kv->max_seq,
                                          pos0, n, attn_sink(), attn_window(),
-                                         1.0f / sqrtf((float)head_dim)) < 0)
+                                         qw_scale_inv_sqrt(head_dim)) < 0)
         return -1;
-    fc_sigmoid_ctx(ctx, b->a_z, n * attn_dim);
-    fc_mul_ctx(ctx, b->a_out, b->a_z, b->a_out, n * attn_dim);
+    if (!gated) {
+        fc_sigmoid_ctx(ctx, b->a_z, n * attn_dim);
+        fc_mul_ctx(ctx, b->a_out, b->a_z, b->a_out, n * attn_dim);
+    }
     bprof_lap(BPROF_ATTN_FLASH, ctx, &bt0);
+    if (spec) {
+        bv_trace_rows(ctx, "verify", "rowsk", rows_rc, b->a_out, n, attn_dim,
+                      NULL, pos0);
+    }
 
     /* 6. Host KV mirror (session-resume source of truth): D2H the roped K/V
      * rows and append them to the host ring cache. This is batched prefill —
@@ -5746,12 +7445,16 @@ static int gpu_attn_block_batch_flash(pn_qwen35moe_gpu *g, gpu_attn_layer *d,
     if (qw_kv_mirror_lazy()) {
         kv->kv_mirror_stale = 1;
         bprof_lap(BPROF_ATTN_XFER, ctx, &bt0);
+        if (core_only)
+            return 0;
         if (gpu_matvec_nx(&d->attn_output, b->a_out, b->block_out, n) < 0)
             return -1;
         fc_add_ctx(ctx, b->hidden, b->block_out, b->hidden, n * cfg->n_embd);
         bprof_lap(BPROF_ATTN_MV, ctx, &bt0);
         return 0;
     }
+    if (core_only)
+        return -1;   /* the eager host mirror has no TP form (tp_refusal) */
     fc_sync_ctx(ctx);
     float *hb_kv = g->bhost[3];
     fc_buffer_to_cpu_n(b->a_k, hb_kv, (size_t)n * kv_dim * sizeof(float));
@@ -5888,7 +7591,7 @@ static int gpu_attn_block_batch(pn_qwen35moe_gpu *g, gpu_attn_layer *d,
     bprof_lap(BPROF_ATTN_XFER, ctx, &bt0);
     {
         float *aout_all = hb_qg;
-        float scale = 1.0f / sqrtf((float)head_dim);
+        float scale = qw_scale_inv_sqrt(head_dim);
         /* heap scratch: max_seq can reach the 256K cap (too large for stack). */
         float *scores = (float *)malloc((size_t)max_seq * sizeof(float));
         float krow[PN_QWEN35MOE_ATTN_HEAD_DIM_MAX];
@@ -6022,7 +7725,7 @@ static int gpu_layer_forward_batch(pn_qwen35moe_model *m, pn_qwen35moe_gpu *g,
         pn_qwen35moe_kv *kv = &s->kv[idx];
         fc_rms_norm_nx_ctx(ctx, b->hidden, d->attn_norm.buf, b->x_norm, c,
                            cfg->rms_norm_eps, n);
-        rc = gpu_attn_block_batch_flash(g, d, cfg, kv, pos0, b, n, spec);
+        rc = gpu_attn_block_batch_flash(g, d, cfg, kv, pos0, b, n, spec, 0);
         if (rc > 0) { /* flash unavailable for this call — host softmax */
             /* ...except under a speculative verify. The host fallback appends
              * into the HOST q4 window ring, which has the same one-lap-back
@@ -6056,11 +7759,8 @@ static int gpu_layer_forward_batch(pn_qwen35moe_model *m, pn_qwen35moe_gpu *g,
             d->ssm_state_g = fc_buffer_alloc_ctx(ctx, ssm_n * sizeof(float));
         if (!d->conv_state_g || !d->ssm_state_g)
             return -1;
-        if (d->host_state != (const void *)st || pos0 == 0) {
-            fc_buffer_from_cpu(d->conv_state_g, st->conv_state);
-            fc_buffer_from_cpu(d->ssm_state_g, st->ssm_state);
-            d->host_state = (const void *)st;
-        }
+        if (d->host_state != (const void *)st || pos0 == 0)
+            qw_ssm_seed_shared(g, d, st, pos0);
 
         /* Spec verify: per-position snapshot buffers, grown to n. */
         if (spec && d->snaps_cap < n) {
@@ -6078,7 +7778,7 @@ static int gpu_layer_forward_batch(pn_qwen35moe_model *m, pn_qwen35moe_gpu *g,
         fc_rms_norm_nx_ctx(ctx, b->hidden, d->attn_norm.buf, b->x_norm, c,
                            cfg->rms_norm_eps, n);
         double st0 = prof_on() ? prof_now() : 0.0;
-        rc = gpu_ssm_block_batch(d, cfg, b, n, spec);
+        rc = gpu_ssm_block_batch(d, cfg, b, n, spec, 0);
         if (rc < 0)
             return rc;
         bprof_lap(BPROF_SSM, ctx, &st0);
@@ -6091,10 +7791,1007 @@ static int gpu_layer_forward_batch(pn_qwen35moe_model *m, pn_qwen35moe_gpu *g,
      * (n = QWEN35_PREFILL_CHUNK positions, wide enough for the expert union
      * to pay) and the speculative VERIFY (n = draft length, a handful of
      * positions — decode-shaped economics, so it stays on _nx). */
+    if (spec)
+        bv_trace_rows(ctx, "verify", "mix", layer, b->hidden, n, c, NULL, pos0);
     double mt0 = prof_on() ? prof_now() : 0.0;
     rc = gpu_moe_block_batch(ctx, moe, cfg, b, n, !spec);
     bprof_lap(BPROF_MOE, ctx, &mt0);
+    if (spec)
+        bv_trace_rows(ctx, "verify", "out", layer, b->hidden, n, c, NULL, pos0);
     return rc;
+}
+
+/* ============================================================
+ * QWEN35_TP — the batched layer body and its exchanges (spec k80_q38_tp2 §3.4)
+ *
+ * Both ranks of a stage hold the identical residual stream; per layer they
+ * exchange three times over the board's peer link:
+ *   E1  core gather: each rank's attention / GDN core output (its heads) into a
+ *       full-width row in the original column order, on both ranks;
+ *   E2  out gather: each rank's out-projection rows into the full n_embd row;
+ *   E3  down reduce: each rank's parity partial V_p + V_(p+2), summed A + B (the
+ *       Q8_0 kernel's own final add; IEEE add commutes, so both ranks agree).
+ * Every copy is PULLED: rank p records tp_ev[die][k] once its source is
+ * written, and its partner waits on it and queues the copy on its OWN stream
+ * (a pushed cross-die copy was seen incomplete after the source stream synced).
+ * Destinations are written only by their own die. A source is rewritten only
+ * after its writer has waited on the partner's NEXT exchange event, which the
+ * partner records after its pull in stream order: E1's source (a_out / s_gated)
+ * is next written in the following layer's core, after E2 and E3; E2's
+ * (tp_half) at the next out projection, after E3 and E1; E3's (block_out) at
+ * the next down, after E1 and E2. So one buffer set per die suffices.
+ *
+ * A MoE layer (spec k80_q36_tp2 §3.4-3.5) replaces E3 with two gathers:
+ *   E3  hid gather: each rank's expert + shared gate/up rows (tp_hidl) into the
+ *       full-ff hidden (tp_hidf) both downs read;
+ *   E4  output gather: each rank's routed + shared down rows (tp_mol) into the
+ *       full rows (tp_mof) the replicated combine reads.
+ * Same rule: tp_hidl is next written at the next layer's gate/up (after E4, E1,
+ * E2), tp_mol at the next down (after E1, E2, E3), and the core / tp_half
+ * sources now also wait on E4 first.
+ * ============================================================ */
+
+/* QWEN35_TP_XCHG (default on; =0 keeps the event handshake + copies) for the
+ * exchanges of at most TP_XCHG_MAX_BYTES a rank: decode and verify (n <= 5 is
+ * <= 45 KiB); a 128-row prefill chunk moves ~1 MiB (copy engine, 8k wide prefill
+ * 41.9 s vs 43.1 s through the kernel). */
+#define TP_XCHG_MAX_BYTES ((size_t)256 << 10)
+static int tp_xchg_on(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("QWEN35_TP_XCHG");
+        v = (e && e[0] == '0') ? 0 : 1;
+    }
+    return v;
+}
+
+/* QWEN35_BS_PD_OVERLAP (default on; =0 turns it off): the MoE TP decode-slots
+ * step runs on the decode lane (QW_LANE_DECODE), the prerequisite for issuing
+ * it between the layers of a prefill chunk. Exact: every gate bit-identical vs
+ * off (#180); our K80 host has served it since 2026-11-21. Read once. */
+static int qw_pd_overlap_on(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("QWEN35_BS_PD_OVERLAP");
+        v = (e && e[0] == '0') ? 0 : 1;
+    }
+    return v;
+}
+
+int pn_qwen35moe_pd_overlap_enabled(void)
+{
+    return qw_pd_overlap_on();
+}
+
+/* Exchange buffers sized for n rows on every die (and the events, once). */
+static int tp_exchange_ready(pn_qwen35moe_gpu *g, const pn_qwen35moe_config *cfg, int n)
+{
+    if (TPX(g)->cap >= n)
+        return 0;
+    int cap = n < 8 ? 8 : n;
+    size_t core = (size_t)cfg->n_head * cfg->head_dim;
+    g->tp_gen++;   /* every exchange buffer moves */
+    if (core < (size_t)cfg->ssm_state * cfg->ssm_dt_rank)
+        core = (size_t)cfg->ssm_state * cfg->ssm_dt_rank;
+    TPX(g)->cap = cap;
+    for (int i = 0; i < 4; i++) {
+        fc_buffer_free(TPX(g)->core[i]);
+        fc_buffer_free(TPX(g)->half[i]);
+        fc_buffer_free(TPX(g)->blk[i]);
+        fc_buffer_free(TPX(g)->recv[i]);
+        TPX(g)->core[i] = fc_buffer_alloc_ctx(g->ctx[i], (size_t)cap * core * sizeof(float));
+        TPX(g)->half[i] = fc_buffer_alloc_ctx(g->ctx[i], (size_t)cap * cfg->n_embd / 2 *
+                                                           sizeof(float));
+        TPX(g)->blk[i] = fc_buffer_alloc_ctx(g->ctx[i], (size_t)cap * cfg->n_embd * sizeof(float));
+        TPX(g)->recv[i] = fc_buffer_alloc_ctx(g->ctx[i], (size_t)cap * cfg->n_embd * sizeof(float));
+        int ok = TPX(g)->core[i] && TPX(g)->half[i] && TPX(g)->blk[i] && TPX(g)->recv[i];
+        if (cfg->n_expert) {
+            /* k expert rows then one shared row of ff per token. */
+            const size_t hrows = (size_t)cap * (cfg->n_expert_used + 1);
+            fc_buffer_free(TPX(g)->hidl[i]);
+            fc_buffer_free(TPX(g)->hidf[i]);
+            fc_buffer_free(TPX(g)->mol[i]);
+            fc_buffer_free(TPX(g)->mof[i]);
+            TPX(g)->hidl[i] = fc_buffer_alloc_ctx(g->ctx[i], hrows * cfg->expert_ff / 2 *
+                                                               sizeof(float));
+            TPX(g)->hidf[i] = fc_buffer_alloc_ctx(g->ctx[i], hrows * cfg->expert_ff * sizeof(float));
+            TPX(g)->mol[i] = fc_buffer_alloc_ctx(g->ctx[i], (size_t)cap * cfg->n_embd * sizeof(float));
+            TPX(g)->mof[i] = fc_buffer_alloc_ctx(g->ctx[i], (size_t)2 * cap * cfg->n_embd *
+                                                              sizeof(float));
+            ok = ok && TPX(g)->hidl[i] && TPX(g)->hidf[i] && TPX(g)->mol[i] && TPX(g)->mof[i];
+        }
+        for (int k = 0; k < TP_N_XCHG; k++) {
+            if (!TPX(g)->ev[i][k])
+                TPX(g)->ev[i][k] = fc_event_create_ctx(g->ctx[i]);
+            ok = ok && TPX(g)->ev[i][k];
+        }
+        if (!g->tp_gev[i])
+            g->tp_gev[i] = fc_event_create_ctx(g->ctx[i]);
+        ok = ok && g->tp_gev[i];
+        if (!ok)
+            TPX(g)->cap = 0;
+    }
+    if (TPX(g)->cap && !TPX(g)->sync[0] && tp_xchg_on()) {
+        /* Counters are allocated once, zeroed on every die together, and never
+         * reset while a step can be in flight (a reset races a partner's wait). */
+        static const uint8_t zero[TP_N_XCHG * FC_XCHG_SYNC_BYTES];
+        int ok = 1;
+        for (int i = 0; i < 4; i++) {
+            TPX(g)->sync[i] = fc_buffer_from_ptr_ctx(g->ctx[i], zero, sizeof(zero));
+            ok = ok && TPX(g)->sync[i];
+        }
+        TPX(g)->xchg = ok;
+        g->tp_gen++;
+    }
+    return TPX(g)->cap ? 0 : -1;
+}
+
+/* Stage s's ranks each mark exchange k's source written, then wait for the
+ * partner's. */
+static int tp_handshake(pn_qwen35moe_gpu *g, int s, int k)
+{
+    for (int p = 0; p < 2; p++)
+        if (fc_event_record_ctx(g->ctx[2 * s + p], TPX(g)->ev[2 * s + p][k]) != 0)
+            return -1;
+    for (int p = 0; p < 2; p++)
+        if (fc_event_wait_ctx(g->ctx[2 * s + p], TPX(g)->ev[2 * s + 1 - p][k]) != 0)
+            return -1;
+    return 0;
+}
+
+/* Gather: rank p's source holds, per row, `chunks` runs of `width` floats; run
+ * r of rank p belongs at column r * (row / chunks) + p * width of the full
+ * `row`-float rows. Each die copies its own runs and pulls its partner's into
+ * dst[die]. */
+static int tp_gather(pn_qwen35moe_gpu *g, int s, int k, fc_buffer *const src[2],
+                     fc_buffer *const *dst, int width, int chunks, int row, int n)
+{
+    const size_t wb = (size_t)width * sizeof(float);
+    const size_t pitch = (size_t)(row / chunks) * sizeof(float);
+    const size_t height = (size_t)n * chunks;
+
+    /* A graph capture cannot hold the peer copy, and a captured cross-die memcpy node
+     * is issued from the launching die (a push); the copy kernel stays a pull. */
+    int (*copy)(fc_buffer *, size_t, size_t, fc_buffer *, size_t, size_t, size_t, size_t,
+                fc_cuda_ctx *) =
+        g->tp_capturing ? fc_buffer_copy_2d_kernel_async : fc_buffer_copy_2d_async;
+
+    if (TPX(g)->xchg && height * wb <= TP_XCHG_MAX_BYTES) {
+        /* One launch a rank: own run, wait for the partner's launch, pull. Larger
+         * (prefill-chunk) exchanges keep the copy engine, which moves them faster;
+         * both schemes order a source's rewrite after the next exchange's wait, so
+         * mixing them per call keeps the hazard rule. */
+        for (int p = 0; p < 2; p++)
+            if (fc_xchg_2d_async(dst[p], p * wb, (1 - p) * wb, pitch, src[p], src[1 - p], wb,
+                                 wb, height, TPX(g)->sync[2 * s + p], TPX(g)->sync[2 * s + 1 - p],
+                                 k, g->ctx[2 * s + p]) != 0)
+                return -1;
+        return 0;
+    }
+    if (tp_handshake(g, s, k) < 0)
+        return -1;
+    for (int p = 0; p < 2; p++) {
+        fc_cuda_ctx *ctx = g->ctx[2 * s + p];
+        if (copy(dst[p], p * wb, pitch, src[p], 0, wb, wb, height, ctx) != 0 ||
+            copy(dst[p], (1 - p) * wb, pitch, src[1 - p], 0, wb, wb, height, ctx) != 0)
+            return -1;
+    }
+    return 0;
+}
+
+/* Down reduce: recv[die] = own partial + the partner's (pulled), [n][c]. */
+static int tp_reduce(pn_qwen35moe_gpu *g, int s, fc_buffer *const part[2],
+                     fc_buffer *const *recv, int c, int n)
+{
+    const size_t bytes = (size_t)n * c * sizeof(float);
+
+    if (tp_handshake(g, s, 2) < 0)
+        return -1;
+    for (int p = 0; p < 2; p++) {
+        fc_cuda_ctx *ctx = g->ctx[2 * s + p];
+        if (fc_buffer_copy_2d_async(recv[p], 0, bytes, part[1 - p], 0, bytes, bytes, 1, ctx) != 0)
+            return -1;
+        fc_add_ctx(ctx, part[p], recv[p], recv[p], n * c);
+    }
+    return 0;
+}
+
+/* QWEN35_TP_SYNC=1: sync both ranks after every exchange (debug arm: the hashes
+ * must not depend on the event ordering). */
+static int tp_sync_on(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("QWEN35_TP_SYNC");
+        v = (e && e[0] == '1') ? 1 : 0;
+    }
+    return v;
+}
+
+/* QWEN35_TP_GRAPH (default on; =0 issues directly): a MoE TP decode-slots step
+ * or verify replays each stage's device work as one captured graph over both ranks. */
+static int tp_graph_on(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("QWEN35_TP_GRAPH");
+        v = (e && e[0] == '0') ? 0 : 1;
+    }
+    return v;
+}
+
+static void tp_sync_stage(pn_qwen35moe_gpu *g, int s)
+{
+    if (tp_sync_on()) {
+        fc_sync_ctx(g->ctx[2 * s]);
+        fc_sync_ctx(g->ctx[2 * s + 1]);
+    }
+}
+
+/* The MoE FFN of gpu_moe_block_batch on both ranks of stage s, n rows of
+ * x_norm (replicated): router + top-k whole on each rank; the rank's expert and
+ * shared gate/up rows; E3; the rank's down output rows over the whole hidden;
+ * E4; the combine + residual whole on each rank (the same unfused launches
+ * gpu_moe_block_batch issues at n > 1). */
+static int tp_moe_block(pn_qwen35moe_gpu *g, const pn_qwen35moe_config *cfg, int s,
+                        gpu_moe *const moe[2], gpu_batch_scratch *const b[2], int n)
+{
+    const int c = cfg->n_embd, k = cfg->n_expert_used, ff = cfg->expert_ff, fh = ff / 2;
+    fc_buffer *hsh[2] = { NULL, NULL }, *fsh[2] = { NULL, NULL };
+    fc_buffer *msh[2] = { NULL, NULL }, *osh[2] = { NULL, NULL };
+    int rc = -1;
+
+    /* Views of the shared-expert rows that follow the n*k expert rows. */
+    for (int p = 0; p < 2; p++) {
+        const int die = 2 * s + p;
+        hsh[p] = fc_buffer_offset_view(TPX(g)->hidl[die], (size_t)n * k * fh * sizeof(float));
+        fsh[p] = fc_buffer_offset_view(TPX(g)->hidf[die], (size_t)n * k * ff * sizeof(float));
+        msh[p] = fc_buffer_offset_view(TPX(g)->mol[die], (size_t)n * (c / 2) * sizeof(float));
+        osh[p] = fc_buffer_offset_view(TPX(g)->mof[die], (size_t)n * c * sizeof(float));
+        if (!hsh[p] || !fsh[p] || !msh[p] || !osh[p])
+            goto out;
+    }
+    for (int p = 0; p < 2; p++) {
+        fc_cuda_ctx *ctx = g->ctx[2 * s + p];
+        gpu_moe *d = moe[p];
+        if (gpu_matvec_nx(&d->ffn_gate_inp, b[p]->x_norm, b[p]->m_logits, n) < 0)
+            goto out;
+        fc_moe_router_topk_nx_ctx(ctx, b[p]->m_logits, b[p]->m_tidx, b[p]->m_twt,
+                                  cfg->n_expert, k, cfg->expert_weights_scale, n);
+        if (gpu_moe_gateup_batch(ctx, cfg, d, b[p], TPX(g)->hidl[2 * s + p], fh, n, 1) != 0)
+            goto out;
+        if (gpu_matvec_nx(&d->ffn_gate_shexp, b[p]->x_norm, b[p]->m_gate, n) < 0 ||
+            gpu_matvec_nx(&d->ffn_up_shexp, b[p]->x_norm, b[p]->m_up, n) < 0)
+            goto out;
+        fc_moe_silu_mul_ctx(ctx, b[p]->m_gate, b[p]->m_up, hsh[p], n * fh);
+    }
+
+    /* E3: the rank halves of every hidden row into the full-ff rows. */
+    if (tp_gather(g, s, 2, TPX(g)->hidl + 2 * s, &TPX(g)->hidf[2 * s], fh, 1, ff, n * (k + 1)) < 0)
+        goto out;
+    tp_sync_stage(g, s);
+    for (int p = 0; p < 2; p++) {
+        fc_cuda_ctx *ctx = g->ctx[2 * s + p];
+        gpu_moe *d = moe[p];
+        fc_moe_down_accum_nx_ctx(ctx, (int)d->down_all.type, d->down_all.bytes,
+                                 TPX(g)->hidf[2 * s + p], b[p]->m_tidx, b[p]->m_twt,
+                                 TPX(g)->mol[2 * s + p], k, c / 2, ff, d->down_all.row_stride, n);
+        if (gpu_matvec_nx(&d->ffn_down_shexp, fsh[p], msh[p], n) < 0)
+            goto out;
+    }
+
+    /* E4: routed then shared down rows into the full rows; combine + residual. */
+    if (tp_gather(g, s, 3, TPX(g)->mol + 2 * s, &TPX(g)->mof[2 * s], c / 2, 1, c, 2 * n) < 0)
+        goto out;
+    tp_sync_stage(g, s);
+    for (int p = 0; p < 2; p++) {
+        fc_cuda_ctx *ctx = g->ctx[2 * s + p];
+        gpu_moe *d = moe[p];
+        fc_buffer *mo = TPX(g)->mof[2 * s + p];
+        if (!(gpu_fuse_mask() & 64) ||
+            fc_moe_shexp_gate_combine_nx_ctx(ctx, d->ffn_gate_inp_shexp.buf, b[p]->x_norm,
+                                             osh[p], mo, b[p]->block_out, b[p]->hidden, c,
+                                             n) != 0) {
+            fc_moe_shexp_dot_gate_nx_ctx(ctx, d->ffn_gate_inp_shexp.buf, b[p]->x_norm, osh[p],
+                                         c, n);
+            fc_add_ctx(ctx, mo, osh[p], b[p]->block_out, n * c);
+            fc_add_ctx(ctx, b[p]->hidden, b[p]->block_out, b[p]->hidden, n * c);
+        }
+    }
+    rc = 0;
+out:
+    for (int p = 0; p < 2; p++) {
+        fc_buffer_free_view(hsh[p]);
+        fc_buffer_free_view(fsh[p]);
+        fc_buffer_free_view(msh[p]);
+        fc_buffer_free_view(osh[p]);
+    }
+    return rc;
+}
+
+/* SSM state buffers of a TP rank's layer half: the local conv / recurrent sizes. */
+static size_t tp_ssm_conv_n(const pn_qwen35moe_gpu *g, const pn_qwen35moe_ssm_state *st)
+{
+    return (size_t)st->conv_minus_1 * g->tp_cfg.conv_dim;
+}
+
+static size_t tp_ssm_rec_n(const pn_qwen35moe_gpu *g, const pn_qwen35moe_ssm_state *st)
+{
+    return (size_t)st->state_size * st->state_size * g->tp_cfg.ssm_dt_rank;
+}
+
+/* The rest of a TP layer once both ranks' cores (core[p], the rank's heads) are
+ * written: E1, out-projection rows, E2, residual, post norm, then the FFN (dense:
+ * parity down + E3 reduce; MoE: tp_moe_block). Shared by the batch and slots
+ * bodies. */
+static int tp_layer_tail(pn_qwen35moe_gpu *g, const pn_qwen35moe_config *cfg, int s,
+                         int is_attn, int idx, fc_buffer *const core[2],
+                         gpu_batch_scratch *const b[2], int n)
+{
+    const pn_qwen35moe_config *lc = &g->tp_cfg;
+    const int c = cfg->n_embd;
+    const gpu_weight *out_w[2];
+    gpu_moe *moe[2];
+    fc_buffer *half[2], *part[2];
+
+    for (int p = 0; p < 2; p++) {
+        if (is_attn) {
+            gpu_attn_layer *d = &g->attn[idx + p * g->tp_n_attn];
+            out_w[p] = &d->attn_output;
+            moe[p] = &d->moe;
+        } else {
+            gpu_ssm_layer *d = &g->ssm[idx + p * g->tp_n_ssm];
+            out_w[p] = &d->ssm_out;
+            moe[p] = &d->moe;
+        }
+        half[p] = TPX(g)->half[2 * s + p];
+        part[p] = b[p]->block_out;
+    }
+
+    /* E1: the core (the rank's heads) into the full row, original order. GDN
+     * rank heads come in groups of n_k/2 heads per v-group: n_v/n_k runs a row. */
+    int rc = is_attn
+        ? tp_gather(g, s, 0, core, &TPX(g)->core[2 * s], lc->n_head * cfg->head_dim, 1,
+                    cfg->n_head * cfg->head_dim, n)
+        : tp_gather(g, s, 0, core, &TPX(g)->core[2 * s], lc->ssm_n_group * cfg->ssm_state,
+                    cfg->ssm_dt_rank / cfg->ssm_n_group, cfg->ssm_dt_rank * cfg->ssm_state, n);
+    if (rc < 0)
+        return -1;
+    tp_sync_stage(g, s);
+    for (int p = 0; p < 2; p++)
+        if (gpu_matvec_nx(out_w[p], TPX(g)->core[2 * s + p], half[p], n) < 0)
+            return -1;
+
+    /* E2: out-projection rows into the full hidden-width row; residual. */
+    if (tp_gather(g, s, 1, half, &TPX(g)->blk[2 * s], c / 2, 1, c, n) < 0)
+        return -1;
+    tp_sync_stage(g, s);
+    for (int p = 0; p < 2; p++) {
+        fc_cuda_ctx *ctx = g->ctx[2 * s + p];
+        const gpu_vec *post = is_attn ? &g->attn[idx + p * g->tp_n_attn].post_attention_norm
+                                      : &g->ssm[idx + p * g->tp_n_ssm].post_attention_norm;
+        fc_add_ctx(ctx, b[p]->hidden, TPX(g)->blk[2 * s + p], b[p]->hidden, n * c);
+        fc_rms_norm_nx_ctx(ctx, b[p]->hidden, post->buf, b[p]->x_norm, c, cfg->rms_norm_eps, n);
+        if (cfg->n_expert)
+            continue;
+        /* The dense FFN of gpu_dense_ffn_batch on the rank's rows k % 2 == p; down
+         * is the parity partial over exactly that SwiGLU output. */
+        if (gpu_matvec_nx(&moe[p]->ffn_gate_shexp, b[p]->x_norm, b[p]->m_gate, n) < 0 ||
+            gpu_matvec_nx(&moe[p]->ffn_up_shexp, b[p]->x_norm, b[p]->m_up, n) < 0)
+            return -1;
+        fc_moe_silu_mul_ctx(ctx, b[p]->m_gate, b[p]->m_up, b[p]->m_gate, n * lc->ffn_length);
+        if (gpu_matvec_nx(&moe[p]->ffn_down_shexp, b[p]->m_gate, part[p], n) < 0)
+            return -1;
+    }
+
+    if (cfg->n_expert)
+        return tp_moe_block(g, cfg, s, moe, b, n);
+
+    /* E3: down = A + B on both ranks; residual. */
+    if (tp_reduce(g, s, part, &TPX(g)->recv[2 * s], c, n) < 0)
+        return -1;
+    tp_sync_stage(g, s);
+    for (int p = 0; p < 2; p++)
+        fc_add_ctx(g->ctx[2 * s + p], b[p]->hidden, TPX(g)->recv[2 * s + p], b[p]->hidden, n * c);
+    return 0;
+}
+
+/* QWEN35_TP: sync BOTH ranks' GPU KV rings of attention layer struct idx to pos0
+ * before either rank runs attention. The two halves read one shared host kv, and
+ * a rank's flash append / verify prep marks that mirror stale (lazy mode) right
+ * after syncing its own ring. After a host restore (sys-prefix snapshot, prefix-
+ * cache turn, warm tier) content_gen is new, so no ring is a D2D source: run one
+ * rank at a time and the second refuses the now-"stale" (still correct) mirror.
+ * The later per-rank syncs are no-ops (watermark == pos0, same generation). */
+static int tp_attn_kv_cache_sync_both(pn_qwen35moe_gpu *g, int idx, const pn_qwen35moe_kv *kv,
+                                      int pos0)
+{
+#ifdef QW_TP_SYNC_RED
+    return 0;   /* red build: the old per-rank order (tests/test_qwen35_tp_restore_sync) */
+#endif
+    if (pos0 == 0)
+        return 0;   /* a restart sources nothing; each rank's own sync re-seeds */
+    for (int p = 0; p < 2; p++)
+        if (gpu_attn_kv_cache_sync(&g->attn[idx + p * g->tp_n_attn], kv, pos0) < 0)
+            return -1;
+    return 0;
+}
+
+/* One layer of stage s on both ranks, batched over n rows (prefill: spec 0;
+ * verify: spec 1). b[p] is rank p's batch scratch (die 2s + p). */
+static int tp_layer_forward_batch(pn_qwen35moe_model *m, pn_qwen35moe_gpu *g, int s, int layer,
+                                  gpu_batch_scratch *const b[2], pn_qwen35moe_state *st,
+                                  int pos0, int n, int spec)
+{
+    const pn_qwen35moe_config *cfg = pn_qwen35moe_model_config(m);
+    const pn_qwen35moe_config *lc = &g->tp_cfg;
+    const int c = cfg->n_embd;
+    const int idx = pn_qwen35moe_model_layer_index(m, layer);
+    const int is_attn = pn_qwen35moe_model_layer_type(m, layer) == PN_QWEN35MOE_LAYER_ATTN;
+    fc_buffer *core[2];
+
+    if (is_attn && tp_attn_kv_cache_sync_both(g, idx, &st->kv[idx], pos0) < 0)
+        return -1;
+    for (int p = 0; p < 2; p++) {
+        fc_cuda_ctx *ctx = g->ctx[2 * s + p];
+        if (is_attn) {
+            gpu_attn_layer *d = &g->attn[idx + p * g->tp_n_attn];
+            fc_rms_norm_nx_ctx(ctx, b[p]->hidden, d->attn_norm.buf, b[p]->x_norm, c,
+                               cfg->rms_norm_eps, n);
+            if (gpu_attn_block_batch_flash(g, d, lc, &st->kv[idx], pos0, b[p], n, spec, 1) != 0)
+                return -1;
+            core[p] = b[p]->a_out;
+        } else {
+            gpu_ssm_layer *d = &g->ssm[idx + p * g->tp_n_ssm];
+            pn_qwen35moe_ssm_state *sst = &st->ssm[idx];
+            size_t conv_n = tp_ssm_conv_n(g, sst), ssm_n = tp_ssm_rec_n(g, sst);
+            if (!d->conv_state_g)
+                d->conv_state_g = fc_buffer_alloc_ctx(ctx, conv_n * sizeof(float));
+            if (!d->ssm_state_g)
+                d->ssm_state_g = fc_buffer_alloc_ctx(ctx, ssm_n * sizeof(float));
+            if (!d->conv_state_g || !d->ssm_state_g)
+                return -1;
+            if (d->host_state != (const void *)sst || pos0 == 0)
+                qw_ssm_seed_shared(g, d, sst, pos0);
+            if (spec && d->snaps_cap < n) {
+                fc_buffer_free(d->conv_snaps);
+                fc_buffer_free(d->ssm_snaps);
+                d->conv_snaps = fc_buffer_alloc_ctx(ctx, (size_t)n * conv_n * sizeof(float));
+                d->ssm_snaps = fc_buffer_alloc_ctx(ctx, (size_t)n * ssm_n * sizeof(float));
+                d->snaps_cap = (d->conv_snaps && d->ssm_snaps) ? n : 0;
+                if (!d->snaps_cap)
+                    return -1;
+            }
+            fc_rms_norm_nx_ctx(ctx, b[p]->hidden, d->attn_norm.buf, b[p]->x_norm, c,
+                               cfg->rms_norm_eps, n);
+            if (gpu_ssm_block_batch(d, lc, b[p], n, spec, 1) < 0)
+                return -1;
+            core[p] = b[p]->s_gated;
+        }
+    }
+    return tp_layer_tail(g, cfg, s, is_attn, idx, core, b, n);
+}
+
+static int tp_verify_stage(pn_qwen35moe_model *m, pn_qwen35moe_gpu *g, int s,
+                           gpu_batch_scratch *const b[2], pn_qwen35moe_state *st, int pos0,
+                           int n);
+
+/* The TP walk of gpu_batch_tokens_core: stage 0 embeds on both ranks, each stage
+ * runs its layers on its pair, the hop to stage 1 is staged through the host
+ * (never a cross-board peer copy), and the head runs on die 3 (head_ctx). On
+ * return *ctx_out / *b_out / *sc_out are the head die's context and scratch. */
+static int tp_batch_walk(pn_qwen35moe_model *m, pn_qwen35moe_gpu *g, const uint32_t *tokens,
+                         int n, pn_qwen35moe_state *st, int pos0, int spec,
+                         fc_cuda_ctx **ctx_out, gpu_batch_scratch **b_out,
+                         gpu_die_scratch **sc_out)
+{
+    const pn_qwen35moe_config *cfg = pn_qwen35moe_model_config(m);
+    const int c = cfg->n_embd;
+    const size_t hidden_bytes = (size_t)n * c * sizeof(float);
+    gpu_batch_scratch *b[2] = { NULL, NULL };
+    gpu_die_scratch *sc = NULL;
+
+    if (tp_exchange_ready(g, cfg, n) < 0)
+        return -1;
+    for (int s = 0; s < 2; s++) {
+        gpu_batch_scratch *prev = b[0];
+        for (int p = 0; p < 2; p++) {
+            b[p] = gpu_get_batch_scratch(g, g->ctx[2 * s + p], cfg, n);
+            sc = gpu_get_scratch(g, g->ctx[2 * s + p], cfg);
+            if (!b[p] || !sc)
+                return -1;
+        }
+        if (s == 0) {
+            for (int t = 0; t < n; t++)
+                pn_qwen35moe_model_embed_row(m, tokens[t], g->bhost[0] + (size_t)t * c);
+        } else {
+            fc_sync_ctx(g->ctx[0]);
+            fc_buffer_to_cpu_n(prev->hidden, g->bhost[0], hidden_bytes);
+        }
+        fc_buffer_from_cpu_n(b[0]->hidden, g->bhost[0], hidden_bytes);
+        fc_buffer_from_cpu_n(b[1]->hidden, g->bhost[0], hidden_bytes);
+        /* A MoE verify runs the device-position bodies as a stage graph. */
+        int vrc = spec && cfg->n_expert ? tp_verify_stage(m, g, s, b, st, pos0, n) : 1;
+        if (vrc < 0)
+            return -1;
+        for (int layer = g->layer_lo[2 * s]; vrc == 1 && layer < g->layer_hi[2 * s]; layer++)
+            if (tp_layer_forward_batch(m, g, s, layer, b, st, pos0, n, spec) < 0)
+                return -1;
+    }
+    *ctx_out = g->ctx[3];
+    *b_out = b[1];
+    *sc_out = sc;
+    return 0;
+}
+
+/* ============================================================
+ * Speculative verify — device-position layer bodies + per-die CUDA graphs
+ *
+ * The verify (spec = 1) runs every position-dependent kernel in its device-position
+ * form — RoPE (fc_rope_neox_partial_pos), the KV append (the slots append, every row
+ * mapped to the single-user ring) and the rows attention (fc_attn_flash_decode_rows_q4_dev)
+ * — with the rows' positions in a device buffer. Those are the kernels the plain decode
+ * step itself runs, so the rows stay byte-exact, and a die's whole layer range becomes
+ * position-invariant: it is captured ONCE per (rows, split-grid width) as a CUDA graph and
+ * replayed with one launch (QWEN35_VERIFY_GRAPH, default on; =0 runs the same bodies
+ * direct). The host-side work of a layer (KV ring watermark, window snapshot, SSM state
+ * seeding / snapshot buffers) runs before the replay, outside the graph.
+ * ============================================================ */
+
+static int verify_graph_on(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *env = getenv("QWEN35_VERIFY_GRAPH");
+        v = (env && env[0] == '0') ? 0 : 1;
+    }
+    return v;
+}
+
+/* Host prep of one layer for a verify of n rows at pos0 (no device work in the common
+ * case). Returns 0, or -1. */
+static int verify_layer_prep(pn_qwen35moe_model *m, pn_qwen35moe_gpu *g, fc_cuda_ctx *ctx,
+                             int layer, pn_qwen35moe_state *s, int pos0, int n)
+{
+    int idx = pn_qwen35moe_model_layer_index(m, layer);
+
+    if (pn_qwen35moe_model_layer_type(m, layer) == PN_QWEN35MOE_LAYER_ATTN) {
+        gpu_attn_layer *d = &g->attn[idx];
+        pn_qwen35moe_kv *kv = &s->kv[idx];
+        if (gpu_attn_kv_cache_sync(d, kv, pos0) < 0 || qw_spec_win_snapshot(d, kv, pos0, n) < 0)
+            return -1;
+        d->kv_synced_pos = pos0;   /* the commit advances it by the accepted rows */
+        kv->kv_mirror_stale = 1;
+        return 0;
+    }
+    gpu_ssm_layer *d = &g->ssm[idx];
+    pn_qwen35moe_ssm_state *st = &s->ssm[idx];
+    size_t conv_n = (size_t)st->conv_minus_1 * st->conv_dim;
+    size_t ssm_n = (size_t)st->state_size * st->state_size * st->n_v_heads;
+    if (!d->conv_state_g)
+        d->conv_state_g = fc_buffer_alloc_ctx(ctx, conv_n * sizeof(float));
+    if (!d->ssm_state_g)
+        d->ssm_state_g = fc_buffer_alloc_ctx(ctx, ssm_n * sizeof(float));
+    if (!d->conv_state_g || !d->ssm_state_g)
+        return -1;
+    if (d->host_state != (const void *)st || pos0 == 0)
+        qw_ssm_seed_shared(g, d, st, pos0);
+    /* Snapshot buffers at the widest verify, so their addresses never move under a graph. */
+    if (d->snaps_cap < FC_ATTN_ROWS_MAX) {
+        fc_buffer_free(d->conv_snaps);
+        fc_buffer_free(d->ssm_snaps);
+        d->conv_snaps = fc_buffer_alloc_ctx(ctx, FC_ATTN_ROWS_MAX * conv_n * sizeof(float));
+        d->ssm_snaps = fc_buffer_alloc_ctx(ctx, FC_ATTN_ROWS_MAX * ssm_n * sizeof(float));
+        d->snaps_cap = (d->conv_snaps && d->ssm_snaps) ? FC_ATTN_ROWS_MAX : 0;
+        if (!d->snaps_cap)
+            return -1;
+    }
+    (void)n;
+    return 0;
+}
+
+/* The attention half of a verify layer, device-position kernels only. */
+static int verify_attn_body(pn_qwen35moe_gpu *g, gpu_attn_layer *d,
+                            const pn_qwen35moe_config *cfg, gpu_batch_scratch *b, int n,
+                            fc_buffer *pos_g, fc_buffer *rows_g, int launch_splits, int di,
+                            int max_seq, int core_only)
+{
+    fc_cuda_ctx *ctx = d->ctx;
+    const int attn_dim = cfg->n_head * cfg->head_dim;
+    int fold = (gpu_fuse_mask() & 128) != 0;
+
+    if (gpu_matvec_nx(&d->attn_q, b->x_norm, b->a_qg, n) < 0 ||
+        gpu_matvec_nx(&d->attn_k, b->x_norm, b->a_k, n) < 0 ||
+        gpu_matvec_nx(&d->attn_v, b->x_norm, b->a_v, n) < 0)
+        return -1;
+    fc_attn_qz_split_ctx(ctx, b->a_qg, b->a_q, b->a_z, cfg->n_head, cfg->head_dim, n);
+    fc_qk_rms_norm_ctx(ctx, b->a_q, d->attn_q_norm.buf, n * cfg->n_head, cfg->head_dim,
+                       cfg->rms_norm_eps);
+    fc_qk_rms_norm_ctx(ctx, b->a_k, d->attn_k_norm.buf, n * cfg->n_head_kv, cfg->head_dim,
+                       cfg->rms_norm_eps);
+    fc_rope_neox_partial_pos_ctx(ctx, b->a_q, cfg->n_head, cfg->head_dim, cfg->rope_dim, pos_g,
+                                 cfg->rope_theta, n);
+    fc_rope_neox_partial_pos_ctx(ctx, b->a_k, cfg->n_head_kv, cfg->head_dim, cfg->rope_dim,
+                                 pos_g, cfg->rope_theta, n);
+    fc_attn_kv_append_slots_q4_ctx(ctx, b->a_k, b->a_v, d->k_cache_g, d->v_cache_g,
+                                   d->k_sink_g, d->v_sink_g, d->k_win_g, d->v_win_g,
+                                   cfg->n_head_kv, cfg->head_dim, max_seq, pos_g, rows_g, n,
+                                   pn_kvq4_sink(), pn_kvq4_win());
+    if (fc_attn_flash_decode_rows_q4_dev_ctx(ctx, b->a_q, d->k_cache_g, d->v_cache_g,
+                                             d->k_sink_g, d->v_sink_g, d->k_win_g, d->v_win_g,
+                                             g->bv_m_g[di], g->bv_l_g[di], g->bv_acc_g[di],
+                                             fold ? b->a_z : NULL, b->a_out, cfg->n_head,
+                                             cfg->n_head_kv, cfg->head_dim, max_seq, pos_g, n,
+                                             launch_splits, dec_keys_per_split(),
+                                             PN_QWEN35MOE_DEC_SPLIT_MAX, pn_kvq4_sink(),
+                                             pn_kvq4_win(),
+                                             qw_scale_inv_sqrt(cfg->head_dim)) != 0)
+        return -1;
+    if (!fold) {
+        fc_sigmoid_ctx(ctx, b->a_z, n * attn_dim);
+        fc_mul_ctx(ctx, b->a_out, b->a_z, b->a_out, n * attn_dim);
+    }
+    if (core_only)      /* QWEN35_TP: a_out holds the rank's heads */
+        return 0;
+    if (gpu_matvec_nx(&d->attn_output, b->a_out, b->block_out, n) < 0)
+        return -1;
+    fc_add_ctx(ctx, b->hidden, b->block_out, b->hidden, n * cfg->n_embd);
+    return 0;
+}
+
+/* One verify layer's device work (after verify_layer_prep): capturable. */
+static int verify_layer_body(pn_qwen35moe_model *m, pn_qwen35moe_gpu *g, fc_cuda_ctx *ctx,
+                             int layer, gpu_batch_scratch *b, int n, fc_buffer *pos_g,
+                             fc_buffer *rows_g, int launch_splits, int di, int max_seq)
+{
+    const pn_qwen35moe_config *cfg = pn_qwen35moe_model_config(m);
+    int c = cfg->n_embd, idx = pn_qwen35moe_model_layer_index(m, layer);
+    gpu_moe *moe;
+
+    if (pn_qwen35moe_model_layer_type(m, layer) == PN_QWEN35MOE_LAYER_ATTN) {
+        gpu_attn_layer *d = &g->attn[idx];
+        fc_rms_norm_nx_ctx(ctx, b->hidden, d->attn_norm.buf, b->x_norm, c, cfg->rms_norm_eps, n);
+        if (verify_attn_body(g, d, cfg, b, n, pos_g, rows_g, launch_splits, di, max_seq, 0) < 0)
+            return -1;
+        fc_rms_norm_nx_ctx(ctx, b->hidden, d->post_attention_norm.buf, b->x_norm, c,
+                           cfg->rms_norm_eps, n);
+        moe = &d->moe;
+    } else {
+        gpu_ssm_layer *d = &g->ssm[idx];
+        fc_rms_norm_nx_ctx(ctx, b->hidden, d->attn_norm.buf, b->x_norm, c, cfg->rms_norm_eps, n);
+        if (gpu_ssm_block_batch(d, cfg, b, n, 1, 0) < 0)
+            return -1;
+        fc_rms_norm_nx_ctx(ctx, b->hidden, d->post_attention_norm.buf, b->x_norm, c,
+                           cfg->rms_norm_eps, n);
+        moe = &d->moe;
+    }
+    /* Decode economics: no dedup unless QWEN35_MOE_DEDUP_DECODE=1 asks to measure it (the
+     * dedup hid is bit-exact with the _nx hid, so the rows stay byte-exact either way). */
+    return gpu_moe_block_batch(ctx, moe, cfg, b, n, gpu_moe_dedup_decode_override());
+}
+
+/* Whether die di's layers can run the device-position verify at all (and be captured). */
+static int verify_dev_eligible(pn_qwen35moe_model *m, pn_qwen35moe_gpu *g, int di,
+                               pn_qwen35moe_state *s, int n)
+{
+    fc_cuda_ctx *ctx = g->ctx[di];
+
+    if (!batch_verify_on() || n > FC_ATTN_ROWS_MAX || attn_window() > 0 || prof_on() ||
+        bv_trace_on() || !qw_kv_mirror_lazy() || s->n_attn < 1 || !s->kv[0].q4 ||
+        !fc_attn_flash_decode_rows_q4_dev_available_ctx(ctx))
+        return 0;
+    for (int layer = g->layer_lo[di]; layer < g->layer_hi[di]; layer++) {
+        int idx = pn_qwen35moe_model_layer_index(m, layer);
+        int attn = pn_qwen35moe_model_layer_type(m, layer) == PN_QWEN35MOE_LAYER_ATTN;
+        if (!(attn ? g->attn[idx].moe.grouped : g->ssm[idx].moe.grouped))
+            return 0;
+    }
+    return 1;
+}
+
+/* A fingerprint of every device address a captured verify graph bakes in. */
+static uint64_t verify_graph_key(pn_qwen35moe_model *m, pn_qwen35moe_gpu *g, int di,
+                                 gpu_batch_scratch *b)
+{
+    uint64_t h = 1469598103934665603ull;
+#define VK_MIX(p) (h = (h ^ (uint64_t)(uintptr_t)(p)) * 1099511628211ull)
+    VK_MIX(b->hidden); VK_MIX(b->x_norm); VK_MIX(b->a_qg); VK_MIX(b->m_hid); VK_MIX(b->s_qkv);
+    VK_MIX(g->bv_acc_g[di]); VK_MIX(g->vpos_g[di]);
+    for (int layer = g->layer_lo[di]; layer < g->layer_hi[di]; layer++) {
+        int idx = pn_qwen35moe_model_layer_index(m, layer);
+        if (pn_qwen35moe_model_layer_type(m, layer) == PN_QWEN35MOE_LAYER_ATTN) {
+            gpu_attn_layer *d = &g->attn[idx];
+            VK_MIX(d->k_cache_g); VK_MIX(d->v_cache_g); VK_MIX(d->k_win_g); VK_MIX(d->k_sink_g);
+            VK_MIX(d->cache_cap);
+        } else {
+            gpu_ssm_layer *d = &g->ssm[idx];
+            VK_MIX(d->conv_state_g); VK_MIX(d->ssm_state_g); VK_MIX(d->conv_snaps);
+            VK_MIX(d->ssm_snaps);
+        }
+    }
+#undef VK_MIX
+    return h;
+}
+
+/* Run die di's layer range of a verify (n rows at pos0) on the device-position bodies,
+ * replaying / capturing its graph. Returns 0, 1 (not eligible: caller runs the classic
+ * per-layer path), or -1. */
+static int verify_segment(pn_qwen35moe_model *m, pn_qwen35moe_gpu *g, int di,
+                          gpu_batch_scratch *b, pn_qwen35moe_state *s, int pos0, int n)
+{
+    const pn_qwen35moe_config *cfg = pn_qwen35moe_model_config(m);
+    fc_cuda_ctx *ctx = g->ctx[di];
+    int32_t posv[2 * FC_ATTN_ROWS_MAX];
+    int launch_splits = 1, max_seq = s->kv[0].max_seq;
+
+    if (!verify_dev_eligible(m, g, di, s, n))
+        return 1;
+    if (!g->vpos_g[di]) {
+        g->vpos_g[di] = fc_buffer_alloc_ctx(ctx, sizeof(posv));
+        g->vrows_g[di] = g->vpos_g[di]
+            ? fc_buffer_offset_view(g->vpos_g[di], FC_ATTN_ROWS_MAX * sizeof(int32_t)) : NULL;
+        if (!g->vrows_g[di])
+            return -1;
+    }
+    if (!g->bv_acc_g[di]) {
+        size_t np = (size_t)FC_ATTN_ROWS_MAX * cfg->n_head * PN_QWEN35MOE_DEC_SPLIT_MAX;
+        g->bv_m_g[di] = fc_buffer_alloc_ctx(ctx, np * sizeof(float));
+        g->bv_l_g[di] = fc_buffer_alloc_ctx(ctx, np * sizeof(float));
+        g->bv_acc_g[di] = fc_buffer_alloc_ctx(ctx, np * (size_t)cfg->head_dim * sizeof(float));
+        if (!g->bv_m_g[di] || !g->bv_l_g[di] || !g->bv_acc_g[di])
+            return -1;
+    }
+    for (int r = 0; r < FC_ATTN_ROWS_MAX; r++) {
+        posv[r] = pos0 + (r < n ? r : n - 1);
+        posv[FC_ATTN_ROWS_MAX + r] = 0;    /* every row appends to the single-user ring */
+        int seq = pos0 + r + 1, sl;
+        if (r < n) {
+            int ns = (seq + dec_keys_per_split() - 1) / dec_keys_per_split();
+            ns = ns < 1 ? 1 : ns > PN_QWEN35MOE_DEC_SPLIT_MAX ? PN_QWEN35MOE_DEC_SPLIT_MAX : ns;
+            sl = (((seq + ns - 1) / ns) + 15) & ~15;
+            if ((seq + sl - 1) / sl > launch_splits)
+                launch_splits = (seq + sl - 1) / sl;
+        }
+    }
+    fc_buffer_from_cpu_n(g->vpos_g[di], posv, sizeof(posv));
+    for (int layer = g->layer_lo[di]; layer < g->layer_hi[di]; layer++)
+        if (verify_layer_prep(m, g, ctx, layer, s, pos0, n) < 0)
+            return -1;
+
+    gpu_verify_graph *vg = &g->vgraph[di][n - 1];
+    uint64_t key = verify_graph_key(m, g, di, b);
+    if (vg->graph && (vg->key != key || vg->splits != launch_splits)) {
+        fc_graph_free(vg->graph);
+        vg->graph = NULL;
+    }
+    if (vg->graph && fc_graph_launch(vg->graph) == 0) {
+        vg->replays++;
+        return 0;
+    }
+    if (vg->graph) {
+        fc_graph_free(vg->graph);
+        vg->graph = NULL;
+    }
+    /* Capture (the replay of this very call runs it); a shape whose capture keeps
+     * failing stops trying after 3 and runs direct. */
+    if (gpu_graph_enabled() && verify_graph_on() && vg->failures < 3 &&
+        fc_graph_begin_ctx(ctx) == 0) {
+        int rc = 0;
+        for (int layer = g->layer_lo[di]; layer < g->layer_hi[di] && rc == 0; layer++)
+            rc = verify_layer_body(m, g, ctx, layer, b, n, g->vpos_g[di], g->vrows_g[di],
+                                   launch_splits, di, max_seq);
+        vg->graph = fc_graph_end_ctx(ctx);
+        if (rc == 0 && vg->graph && fc_graph_launch(vg->graph) == 0) {
+            vg->key = key;
+            vg->splits = launch_splits;
+            vg->captures++;
+            return 0;
+        }
+        if (vg->graph) {
+            fc_graph_free(vg->graph);
+            vg->graph = NULL;
+        }
+        vg->failures++;
+    }
+    for (int layer = g->layer_lo[di]; layer < g->layer_hi[di]; layer++)
+        if (verify_layer_body(m, g, ctx, layer, b, n, g->vpos_g[di], g->vrows_g[di],
+                              launch_splits, di, max_seq) < 0)
+            return -1;
+    return 0;
+}
+
+/* Host prep of rank p's half of one layer for a QWEN35_TP verify (verify_layer_prep
+ * with the half's local state sizes). */
+static int tp_verify_layer_prep(pn_qwen35moe_model *m, pn_qwen35moe_gpu *g, int p, int layer,
+                                pn_qwen35moe_state *s, int pos0, int n)
+{
+    int idx = pn_qwen35moe_model_layer_index(m, layer);
+
+    if (pn_qwen35moe_model_layer_type(m, layer) == PN_QWEN35MOE_LAYER_ATTN) {
+        gpu_attn_layer *d = &g->attn[idx + p * g->tp_n_attn];
+        pn_qwen35moe_kv *kv = &s->kv[idx];
+        if (gpu_attn_kv_cache_sync(d, kv, pos0) < 0 || qw_spec_win_snapshot(d, kv, pos0, n) < 0)
+            return -1;
+        d->kv_synced_pos = pos0;   /* the commit advances it by the accepted rows */
+        kv->kv_mirror_stale = 1;
+        return 0;
+    }
+    gpu_ssm_layer *d = &g->ssm[idx + p * g->tp_n_ssm];
+    pn_qwen35moe_ssm_state *st = &s->ssm[idx];
+    size_t conv_n = tp_ssm_conv_n(g, st), ssm_n = tp_ssm_rec_n(g, st);
+    if (!d->conv_state_g)
+        d->conv_state_g = fc_buffer_alloc_ctx(d->ctx, conv_n * sizeof(float));
+    if (!d->ssm_state_g)
+        d->ssm_state_g = fc_buffer_alloc_ctx(d->ctx, ssm_n * sizeof(float));
+    if (!d->conv_state_g || !d->ssm_state_g)
+        return -1;
+    if (d->host_state != (const void *)st || pos0 == 0)
+        qw_ssm_seed_shared(g, d, st, pos0);
+    if (d->snaps_cap < FC_ATTN_ROWS_MAX) {
+        fc_buffer_free(d->conv_snaps);
+        fc_buffer_free(d->ssm_snaps);
+        d->conv_snaps = fc_buffer_alloc_ctx(d->ctx, FC_ATTN_ROWS_MAX * conv_n * sizeof(float));
+        d->ssm_snaps = fc_buffer_alloc_ctx(d->ctx, FC_ATTN_ROWS_MAX * ssm_n * sizeof(float));
+        d->snaps_cap = (d->conv_snaps && d->ssm_snaps) ? FC_ATTN_ROWS_MAX : 0;
+        if (!d->snaps_cap)
+            return -1;
+        g->tp_gen++;
+    }
+    return 0;
+}
+
+/* Device work of one layer of stage s for a QWEN35_TP verify: verify_layer_body's
+ * device-position cores on each rank's half (local dims), then tp_layer_tail. */
+static int tp_verify_layer_dev(pn_qwen35moe_model *m, pn_qwen35moe_gpu *g, int s, int layer,
+                               gpu_batch_scratch *const b[2], int n, int launch_splits,
+                               int max_seq)
+{
+    const pn_qwen35moe_config *cfg = pn_qwen35moe_model_config(m);
+    const pn_qwen35moe_config *lc = &g->tp_cfg;
+    const int c = cfg->n_embd, idx = pn_qwen35moe_model_layer_index(m, layer);
+    const int is_attn = pn_qwen35moe_model_layer_type(m, layer) == PN_QWEN35MOE_LAYER_ATTN;
+    fc_buffer *core[2];
+
+    for (int p = 0; p < 2; p++) {
+        const int die = 2 * s + p;
+        if (is_attn) {
+            gpu_attn_layer *d = &g->attn[idx + p * g->tp_n_attn];
+            fc_rms_norm_nx_ctx(d->ctx, b[p]->hidden, d->attn_norm.buf, b[p]->x_norm, c,
+                               cfg->rms_norm_eps, n);
+            if (verify_attn_body(g, d, lc, b[p], n, g->vpos_g[die], g->vrows_g[die],
+                                 launch_splits, die, max_seq, 1) < 0)
+                return -1;
+            core[p] = b[p]->a_out;
+        } else {
+            gpu_ssm_layer *d = &g->ssm[idx + p * g->tp_n_ssm];
+            fc_rms_norm_nx_ctx(d->ctx, b[p]->hidden, d->attn_norm.buf, b[p]->x_norm, c,
+                               cfg->rms_norm_eps, n);
+            if (gpu_ssm_block_batch(d, lc, b[p], n, 1, 1) < 0)
+                return -1;
+            core[p] = b[p]->s_gated;
+        }
+    }
+    return tp_layer_tail(g, cfg, s, is_attn, idx, core, b, n);
+}
+
+/* QWEN35_TP verify of stage s (n rows at pos0, both ranks) in verify_segment's
+ * device-position form, replayed as one graph per (stage, n) that spans both ranks
+ * (g->vgraph[2s][n - 1]), fenced against rank 1's stream like the slots stage graph.
+ * Returns 1 when not eligible (the caller runs tp_layer_forward_batch). */
+static int tp_verify_stage(pn_qwen35moe_model *m, pn_qwen35moe_gpu *g, int s,
+                           gpu_batch_scratch *const b[2], pn_qwen35moe_state *st, int pos0,
+                           int n)
+{
+    const pn_qwen35moe_config *cfg = pn_qwen35moe_model_config(m);
+    const int lo = g->layer_lo[2 * s], hi = g->layer_hi[2 * s];
+    fc_cuda_ctx *c0 = g->ctx[2 * s], *c1 = g->ctx[2 * s + 1];
+    fc_event *e0 = g->tp_gev[2 * s], *e1 = g->tp_gev[2 * s + 1];
+    int32_t posv[2 * FC_ATTN_ROWS_MAX];
+    int launch_splits = 1, max_seq = st->kv[0].max_seq;
+
+    for (int p = 0; p < 2; p++)
+        if (!verify_dev_eligible(m, g, 2 * s + p, st, n))
+            return 1;
+    for (int r = 0; r < FC_ATTN_ROWS_MAX; r++) {
+        posv[r] = pos0 + (r < n ? r : n - 1);
+        posv[FC_ATTN_ROWS_MAX + r] = 0;    /* every row appends to the single-user ring */
+        int seq = pos0 + r + 1, sl;
+        if (r < n) {
+            int ns = (seq + dec_keys_per_split() - 1) / dec_keys_per_split();
+            ns = ns < 1 ? 1 : ns > PN_QWEN35MOE_DEC_SPLIT_MAX ? PN_QWEN35MOE_DEC_SPLIT_MAX : ns;
+            sl = (((seq + ns - 1) / ns) + 15) & ~15;
+            if ((seq + sl - 1) / sl > launch_splits)
+                launch_splits = (seq + sl - 1) / sl;
+        }
+    }
+    /* Rank 0's prep marks every layer's mirror stale before rank 1's prep runs. */
+    for (int layer = lo; layer < hi; layer++) {
+        int idx = pn_qwen35moe_model_layer_index(m, layer);
+        if (pn_qwen35moe_model_layer_type(m, layer) == PN_QWEN35MOE_LAYER_ATTN &&
+            tp_attn_kv_cache_sync_both(g, idx, &st->kv[idx], pos0) < 0)
+            return -1;
+    }
+    uint64_t key = 1469598103934665603ull;
+#define TV_MIX(v) (key = (key ^ (uint64_t)(uintptr_t)(v)) * 1099511628211ull)
+    for (int p = 0; p < 2; p++) {
+        const int di = 2 * s + p;
+        fc_cuda_ctx *ctx = g->ctx[di];
+        if (!g->vpos_g[di]) {
+            g->vpos_g[di] = fc_buffer_alloc_ctx(ctx, sizeof(posv));
+            g->vrows_g[di] = g->vpos_g[di]
+                ? fc_buffer_offset_view(g->vpos_g[di], FC_ATTN_ROWS_MAX * sizeof(int32_t))
+                : NULL;
+            if (!g->vrows_g[di])
+                return -1;
+        }
+        if (!g->bv_acc_g[di]) {
+            size_t np = (size_t)FC_ATTN_ROWS_MAX * cfg->n_head * PN_QWEN35MOE_DEC_SPLIT_MAX;
+            g->bv_m_g[di] = fc_buffer_alloc_ctx(ctx, np * sizeof(float));
+            g->bv_l_g[di] = fc_buffer_alloc_ctx(ctx, np * sizeof(float));
+            g->bv_acc_g[di] = fc_buffer_alloc_ctx(ctx, np * (size_t)cfg->head_dim * sizeof(float));
+            if (!g->bv_m_g[di] || !g->bv_l_g[di] || !g->bv_acc_g[di])
+                return -1;
+        }
+        fc_buffer_from_cpu_n(g->vpos_g[di], posv, sizeof(posv));
+        for (int layer = lo; layer < hi; layer++)
+            if (tp_verify_layer_prep(m, g, p, layer, st, pos0, n) < 0)
+                return -1;
+        TV_MIX(b[p]); TV_MIX(b[p]->gen); TV_MIX(g->bv_acc_g[di]); TV_MIX(g->vpos_g[di]);
+        for (int layer = lo; layer < hi; layer++) {
+            int idx = pn_qwen35moe_model_layer_index(m, layer);
+            if (pn_qwen35moe_model_layer_type(m, layer) == PN_QWEN35MOE_LAYER_ATTN) {
+                gpu_attn_layer *d = &g->attn[idx + p * g->tp_n_attn];
+                TV_MIX(d->k_cache_g); TV_MIX(d->v_cache_g); TV_MIX(d->k_win_g);
+                TV_MIX(d->k_sink_g); TV_MIX(d->cache_cap);
+            } else {
+                gpu_ssm_layer *d = &g->ssm[idx + p * g->tp_n_ssm];
+                TV_MIX(d->conv_state_g); TV_MIX(d->ssm_state_g); TV_MIX(d->conv_snaps);
+                TV_MIX(d->ssm_snaps);
+            }
+        }
+    }
+    TV_MIX(g->tp_gen);
+#undef TV_MIX
+
+    gpu_verify_graph *vg = &g->vgraph[2 * s][n - 1];
+    if (vg->graph && (vg->key != key || vg->splits != launch_splits)) {
+        fc_graph_free(vg->graph);
+        vg->graph = NULL;
+    }
+    if (!vg->graph && gpu_graph_enabled() && verify_graph_on() && tp_graph_on() &&
+        !tp_sync_on() && vg->failures < 3 && fc_graph_begin_ctx(c0) == 0) {
+        /* Rank 1's stream joins rank 0's capture and rejoins at the end. */
+        g->tp_capturing = 1;
+        int ok = fc_event_record_ctx(c0, e0) == 0 && fc_event_wait_ctx(c1, e0) == 0;
+        for (int layer = lo; ok && layer < hi; layer++)
+            ok = tp_verify_layer_dev(m, g, s, layer, b, n, launch_splits, max_seq) == 0;
+        ok = fc_event_record_ctx(c1, e1) == 0 && fc_event_wait_ctx(c0, e1) == 0 && ok;
+        g->tp_capturing = 0;
+        fc_graph *gr = fc_graph_end_ctx(c0);
+        if (ok && gr) {
+            vg->graph = gr;
+            vg->key = key;
+            vg->splits = launch_splits;
+            vg->captures++;
+        } else {
+            fc_graph_free(gr);
+            vg->failures++;
+        }
+    }
+    if (vg->graph) {
+        if (fc_event_record_ctx(c1, e1) != 0 || fc_event_wait_ctx(c0, e1) != 0 ||
+            fc_graph_launch(vg->graph) != 0 ||
+            fc_event_record_ctx(c0, e0) != 0 || fc_event_wait_ctx(c1, e0) != 0)
+            return -1;
+        vg->replays++;
+        return 0;
+    }
+    for (int layer = lo; layer < hi; layer++)
+        if (tp_verify_layer_dev(m, g, s, layer, b, n, launch_splits, max_seq) < 0)
+            return -1;
+    return 0;
 }
 
 /* Phase 9b — prefill chunk pipelining (QWEN35_PREFILL_PIPELINE, default OFF).
@@ -6260,7 +8957,9 @@ static float *gpu_batch_tokens_core(pn_qwen35moe_model *m,
     gpu_die_scratch *sc = NULL;
     size_t hidden_bytes = (size_t)n * c * sizeof(float);
 
-    for (int d = 0; d < g->n_die; d++) {
+    if (g->tp && tp_batch_walk(m, g, tokens, n, s, pos0, spec, &ctx, &b, &sc) < 0)
+        return NULL;
+    for (int d = 0; !g->tp && d < g->n_die; d++) {
         if (d > 0)
             gpu_handoff_export(g, d - 1, b->hidden, g->bhost[0], hidden_bytes);
         if (gpu_select_die(g, g->die[d]) < 0)
@@ -6279,7 +8978,10 @@ static float *gpu_batch_tokens_core(pn_qwen35moe_model *m,
                                hidden_bytes);
         }
 
-        for (int layer = g->layer_lo[d]; layer < g->layer_hi[d]; layer++) {
+        int vrc = spec ? verify_segment(m, g, d, bd, s, pos0, n) : 1;
+        if (vrc < 0)
+            return NULL;
+        for (int layer = g->layer_lo[d]; vrc > 0 && layer < g->layer_hi[d]; layer++) {
             if (gpu_layer_forward_batch(m, g, g->ctx[d], layer, bd, s, pos0, n,
                                         spec) < 0)
                 return NULL;
@@ -6294,13 +8996,23 @@ static float *gpu_batch_tokens_core(pn_qwen35moe_model *m,
      * exercise — return without syncing the last die, leaving its segment in
      * flight so the next chunk's die-0 segment overlaps it. Returns the
      * success sentinel; s->logits is deliberately left stale (no caller in
-     * this mode reads it, and the final chunk always refreshes it). */
-    if (no_tail)
+     * this mode reads it, and the final chunk always refreshes it). With the MTP
+     * head on, the chunk's output_norm'd rows are still captured (one norm on the
+     * last die, queued behind its segment) so the serve can feed the head's
+     * backlog; the trunk's state and logits are untouched either way. */
+    if (no_tail) {
+        if (g->mtp.on) {
+            fc_rms_norm_nx_ctx(ctx, b->hidden, g->output_norm.buf, b->x_norm, c,
+                               cfg->rms_norm_eps, n);
+            mtp_capture_rows(g, ctx, b->x_norm, n, c);
+        }
         return s->logits;
+    }
 
     /* ---- Final norm over all positions + LM head. ---- */
     fc_rms_norm_nx_ctx(ctx, b->hidden, g->output_norm.buf, b->x_norm, c,
                        cfg->rms_norm_eps, n);
+    mtp_capture_rows(g, ctx, b->x_norm, n, c);   /* the MTP head's h rows (no-op when off) */
 
     if (spec) {
         /* Per-position greedy argmax without leaving the die: ONE batched
@@ -6320,6 +9032,15 @@ static float *gpu_batch_tokens_core(pn_qwen35moe_model *m,
         }
         if (gpu_matvec_nx(&g->output, b->x_norm, g->spec_logits, n) < 0)
             return NULL;
+        if (g->spec_topk_k > 0) {
+            /* Every row's top-k in ONE batched reduction, per row bit-exact to the plain
+             * decode fetch (fc_topk_logits_slots_ctx): the caller decides the rows. */
+            if (fc_topk_logits_slots_ctx(ctx, g->spec_logits, n, cfg->n_vocab,
+                                         g->spec_topk_k, g->spec_topk_ids,
+                                         g->spec_topk_vals) != 0)
+                return NULL;
+            return s->logits; /* success sentinel — contents NOT updated */
+        }
         for (int t = 0; t < n; t++) {
             int id;
             float val;
@@ -6512,6 +9233,39 @@ int pn_qwen35moe_prefill_chunk_cuda(pn_model *model, const uint32_t *tokens,
     return 0;
 }
 
+/* Weight walk for pn_qwen35moe_dense_batch_prefill_ok: clears *ok on any
+ * present weight whose quant has no batched (_nx) matvec in gpu_matvec_nx. */
+static void qw_nx_quant_check(const pn_qwen35moe_weight_ref *ref, void *user)
+{
+    const pn_qweight *w = ref->w;
+    if (!w || !w->data || w->rows <= 0)
+        return;
+    switch ((int)w->type) {
+    case GGUF_QUANT_Q3_K:
+    case GGUF_QUANT_Q4_K:
+    case GGUF_QUANT_Q5_K:
+    case GGUF_QUANT_Q6_K:
+    case GGUF_QUANT_Q8_0:
+    case GGUF_QUANT_F32:
+        return;
+    default:
+        *(int *)user = 0;
+    }
+}
+
+int pn_qwen35moe_dense_batch_prefill_ok(const pn_model *model)
+{
+    if (!qw_model_uses_qwen35moe_state(model))
+        return 0;
+    pn_qwen35moe_model *m = (pn_qwen35moe_model *)model->weights;
+    if (!m || !pn_qwen35moe_model_gpu(m) ||
+        !pn_qwen35moe_model_config(m)->dense_ffn)
+        return 0;
+    int ok = 1;
+    pn_qwen35moe_for_each_weight(m, qw_nx_quant_check, &ok);
+    return ok;
+}
+
 /* ============================================================
  * Phase 9c — WIDE prefill pipelining: every die busy at once
  *
@@ -6611,6 +9365,59 @@ static inline qw_pipe_chunk qw_pipe_chunk_at(const uint32_t *tokens,
     return k;
 }
 
+/* QWEN35_PIPE_PROF=1: where a pipelined range's wall time goes, without adding a sync —
+ * the host's wait on each die at the step barriers (die d's wait is what it ran past the
+ * dies drained before it), the host's issue time, and the MTP head feed's host time.
+ * QWEN35_PIPE_PROF=2 also drains the last die around the feed, so "mtp feed" is its GPU
+ * time (perturbs the overlap; diagnosis only). */
+typedef struct {
+    int on;
+    double t0, issue_ms, mtp_ms;
+    double wait_ms[PN_DIE_LAYER_SPLIT_MAX_DIES];
+} qw_pipe_prof;
+
+static int qw_pipe_prof_on(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("QWEN35_PIPE_PROF");
+        v = e ? (atoi(e) > 1 ? 2 : 1) : 0;
+    }
+    return v;
+}
+
+/* QWEN35_MTP_PREFILL_FEED=0: the pipeline leaves the MTP head's backlog unfed (profiling
+ * only: the head then drafts from an empty prompt history until a verify feeds it). */
+static int qw_pipe_mtp_feed_on(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("QWEN35_MTP_PREFILL_FEED");
+        v = !(e && atoi(e) == 0);
+    }
+    return v;
+}
+
+static void qw_pipe_prof_report(const qw_pipe_prof *pp, int n_die, int n_total,
+                                int n_chunks)
+{
+    fprintf(stderr, "[pipe_prof] %d tokens %d chunks: wall %.0f ms, issue %.0f, mtp feed "
+                    "%.0f, wait",
+            n_total, n_chunks, (prof_now() - pp->t0) * 1e3, pp->issue_ms, pp->mtp_ms);
+    for (int d = 0; d < n_die; d++)
+        fprintf(stderr, " d%d %.0f", d, pp->wait_ms[d]);
+    fprintf(stderr, "\n");
+}
+
+/* QWEN35_MTP_PROF=2: the head's cumulative KV-rows split (host embed / upload / kernels). */
+static void qw_pipe_prof_report_mtp(const pn_qwen35moe_gpu *g)
+{
+    if (g->mtp.on && mtp_prof_on() > 1)
+        fprintf(stderr, "[pipe_prof] mtp kv rows %ld: embed %.0f ms, upload %.0f, kernels %.0f\n",
+                g->mtp.kv_rows, g->mtp.kv_prof_ms[0], g->mtp.kv_prof_ms[1],
+                g->mtp.kv_prof_ms[2]);
+}
+
 /**
  * Run the whole prefill range as an n_die-stage software pipeline.
  *
@@ -6636,6 +9443,9 @@ static int gpu_prefill_pipeline_run(pn_qwen35moe_model *m,
     pn_qwen35moe_gpu *g = (pn_qwen35moe_gpu *)pn_qwen35moe_model_gpu(m);
     const pn_qwen35moe_config *cfg = pn_qwen35moe_model_config(m);
     const int n_die = g->n_die;
+    /* QWEN35_TP: the pipeline's stages are the two rank pairs; stage d's ranks
+     * are dies 2d and 2d + 1, and the head die (3) closes the last stage. */
+    const int n_stage = g->tp ? 2 : n_die;
     const int c = cfg->n_embd;
     int aborted = 0;
 
@@ -6658,6 +9468,8 @@ static int gpu_prefill_pipeline_run(pn_qwen35moe_model *m,
      * segment still in flight. After this, every call is a cache hit. */
     if (gpu_get_batch_host(g, cfg, chunk) < 0)
         return -1;
+    if (g->tp && tp_exchange_ready(g, cfg, chunk) < 0)
+        return -1;
     gpu_batch_scratch *bs[PN_DIE_LAYER_SPLIT_MAX_DIES];
     gpu_die_scratch   *ds[PN_DIE_LAYER_SPLIT_MAX_DIES];
     for (int d = 0; d < n_die; d++) {
@@ -6671,26 +9483,22 @@ static int gpu_prefill_pipeline_run(pn_qwen35moe_model *m,
 
     const int n_chunks = (n_total + chunk - 1) / chunk;
     int injected = n_chunks;          /* lowered to stop injecting on abort */
+    qw_pipe_prof pp = { .on = qw_pipe_prof_on(), .t0 = prof_now() };
 
-    for (int step = 0; step < injected + n_die - 1; step++) {
+    for (int step = 0; step < injected + n_stage - 1; step++) {
         /* 1. Drain step T-1 before touching any buffer it wrote. */
-        for (int d = 0; d < n_die; d++) {
+        for (int d = 0; d < n_stage; d++) {
             int prev = step - 1 - d;
-            if (prev >= 0 && prev < injected)
-                fc_sync_ctx(g->ctx[d]);
+            double tw = pp.on ? prof_now() : 0.0;
+            if (prev >= 0 && prev < injected) {
+                fc_sync_ctx(g->ctx[g->tp ? 2 * d : d]);
+                if (g->tp)
+                    fc_sync_ctx(g->ctx[2 * d + 1]);
+            }
+            if (pp.on)
+                pp.wait_ms[d] += (prof_now() - tw) * 1e3;
         }
-
-        /* Chunk c is issued to the last die at step c + n_die - 1, so it has
-         * landed once the barrier at step c + n_die has run. At the top of step
-         * T that makes chunks 0 .. T - n_die retired, i.e. T - n_die + 1 of
-         * them. Only the abort path reads this, but it has to be exact: it is
-         * what state->pos advances by. */
-        int retired_chunks = step - n_die + 1;
-        if (retired_chunks > injected)
-            retired_chunks = injected;
-        if (retired_chunks > 0)
-            *retired_out = (retired_chunks * chunk < n_total)
-                         ? retired_chunks * chunk : n_total;
+        double t_issue = pp.on ? prof_now() : 0.0;
 
         if (!aborted && inject_probe && inject_probe(ud)) {
             /* Stop feeding the pipeline, but keep stepping until what is
@@ -6699,17 +9507,23 @@ static int gpu_prefill_pipeline_run(pn_qwen35moe_model *m,
             aborted = 1;
             int in_flight = step;
             injected = in_flight < n_chunks ? in_flight : n_chunks;
-            if (step >= injected + n_die - 1)
+            if (step >= injected + n_stage - 1)
                 break;
         }
 
         /* 2. Boundary hand-offs, highest die first. */
-        for (int d = n_die - 1; d >= 1; d--) {
+        for (int d = n_stage - 1; d >= 1; d--) {
             int ck = step - d;
             if (ck < 0 || ck >= injected)
                 continue;
             qw_pipe_chunk k = qw_pipe_chunk_at(tokens, n_total, pos0, chunk, ck);
             size_t bytes = (size_t)k.n * c * sizeof(float);
+            if (g->tp) {   /* host-staged: stage d-1's rank 0 to both of stage d's ranks */
+                fc_buffer_to_cpu_n(bs[2 * d - 2]->hidden, g->bhost[0], bytes);
+                fc_buffer_from_cpu_n(bs[2 * d]->hidden, g->bhost[0], bytes);
+                fc_buffer_from_cpu_n(bs[2 * d + 1]->hidden, g->bhost[0], bytes);
+                continue;
+            }
             gpu_handoff_export(g, d - 1, bs[d - 1]->hidden, g->bhost[0], bytes);
             if (gpu_select_die(g, g->die[d]) < 0)
                 return -1;
@@ -6728,41 +9542,91 @@ static int gpu_prefill_pipeline_run(pn_qwen35moe_model *m,
                                              g->bhost[0] + (size_t)t * c);
             fc_buffer_from_cpu_n(bs[0]->hidden, g->bhost[0],
                                  (size_t)k.n * c * sizeof(float));
+            if (g->tp)
+                fc_buffer_from_cpu_n(bs[1]->hidden, g->bhost[0],
+                                     (size_t)k.n * c * sizeof(float));
         }
 
         /* 4. Issue every active die's segment. No syncs — this is the overlap. */
-        for (int d = 0; d < n_die; d++) {
-            int ck = step - d;
+        for (int sd = 0; sd < n_stage; sd++) {
+            int ck = step - sd;
             if (ck < 0 || ck >= injected)
                 continue;
             qw_pipe_chunk k = qw_pipe_chunk_at(tokens, n_total, pos0, chunk, ck);
-            if (gpu_select_die(g, g->die[d]) < 0)
-                return -1;
-            for (int layer = g->layer_lo[d]; layer < g->layer_hi[d]; layer++)
-                if (gpu_layer_forward_batch(m, g, g->ctx[d], layer, bs[d], s,
-                                            k.pos0, k.n, 0) < 0)
+            /* d: the die whose scratch carries the stage's output (the head die
+             * on the last TP stage, rank 1). */
+            const int d = g->tp ? (sd == n_stage - 1 ? n_die - 1 : 2 * sd) : sd;
+            if (g->tp) {
+                gpu_batch_scratch *pair[2] = { bs[2 * sd], bs[2 * sd + 1] };
+                for (int layer = g->layer_lo[2 * sd]; layer < g->layer_hi[2 * sd]; layer++)
+                    if (tp_layer_forward_batch(m, g, sd, layer, pair, s, k.pos0, k.n, 0) < 0)
+                        return -1;
+            } else {
+                if (gpu_select_die(g, g->die[d]) < 0)
                     return -1;
+                for (int layer = g->layer_lo[d]; layer < g->layer_hi[d]; layer++)
+                    if (gpu_layer_forward_batch(m, g, g->ctx[d], layer, bs[d], s,
+                                                k.pos0, k.n, 0) < 0)
+                        return -1;
+            }
 
             /* The final chunk's last die also runs the head, so the caller gets
              * real logits from the same activations the sequential path would
              * have produced. Intermediate chunks' heads are discarded by the
-             * serve and are never computed, exactly as in 9b. */
-            if (d == n_die - 1 && !aborted && ck == n_chunks - 1) {
+             * serve and are never computed, exactly as in 9b. With the MTP
+             * head on, every chunk's output_norm'd rows also join the head's
+             * backlog here (stream-ordered on the last die; the serve cannot
+             * feed it chunk by chunk when the model owns the chunking). */
+            /* After an abort the in-flight chunks still clear every die and
+             * count in state->pos, so they still join the MTP backlog; only
+             * the head is skipped (nobody reads those logits). */
+            const int last_chunk = ck == n_chunks - 1;
+            if (sd == n_stage - 1 && ((last_chunk && !aborted) || g->mtp.on)) {
                 fc_rms_norm_nx_ctx(g->ctx[d], bs[d]->hidden,
                                    g->output_norm.buf, bs[d]->x_norm, c,
                                    cfg->rms_norm_eps, k.n);
-                if (!gpu_batch_head_last_row(g, cfg, g->ctx[d], bs[d], ds[d], h,
+                if (g->mtp.on && qw_pipe_mtp_feed_on()) {
+                    if (pp.on > 1)
+                        fc_sync_ctx(g->ctx[d]);   /* PROF=2: time the feed alone */
+                    double tm = pp.on ? prof_now() : 0.0;
+                    mtp_capture_rows(g, g->ctx[d], bs[d]->x_norm, k.n, c);
+                    (void)mtp_push(m, g, s, k.pos0 + k.n, k.tokens, k.n);
+                    if (pp.on > 1)
+                        fc_sync_ctx(g->ctx[d]);
+                    if (pp.on)
+                        pp.mtp_ms += (prof_now() - tm) * 1e3;
+                }
+                if (last_chunk && !aborted &&
+                    !gpu_batch_head_last_row(g, cfg, g->ctx[d], bs[d], ds[d], h,
                                              s, k.n))
                     return -1;
             }
         }
+        if (pp.on)
+            pp.issue_ms += (prof_now() - t_issue) * 1e3;
     }
 
-    for (int d = 0; d < n_die; d++)
+    for (int d = 0; d < n_die; d++) {
+        double tw = pp.on ? prof_now() : 0.0;
         fc_sync_ctx(g->ctx[d]);
+        if (pp.on)
+            pp.wait_ms[d] += (prof_now() - tw) * 1e3;
+    }
+    if (pp.on) {
+        qw_pipe_prof_report(&pp, n_stage, n_total, n_chunks);
+        qw_pipe_prof_report_mtp(g);
+    }
 
-    if (!aborted)
-        *retired_out = n_total;
+    /* Every injected chunk has now cleared the last die (the loop ran until the
+     * last one was issued there, and the barrier above waited for it), so the
+     * session's layers all sit after chunk `injected - 1`. This is what
+     * state->pos advances by, and it has to be exact: a client abort keeps the
+     * state for the next request. (Counting at the top of each step, as this
+     * did before, left the final in-flight chunk out: the layers ran one chunk
+     * past state->pos.) */
+    *retired_out = aborted ? (injected * chunk < n_total ? injected * chunk
+                                                         : n_total)
+                           : n_total;
     return aborted ? 1 : 0;
 }
 
@@ -6818,6 +9682,12 @@ int pn_qwen35moe_prefill_range_pipelined_cuda(pn_model *model,
     /* A one-die placement has no stages to overlap, and barswap holds a single
      * die in its MMIO slot at a time, so no two dies are ever live. */
     if (g->n_die < 2 || g->bs)
+        return -1;
+
+    /* A dense-FFN model whose weights lack a batched kernel (Bonsai's ternary
+     * Q2_0) would fail mid-pipeline with dies already advanced; refuse first. */
+    if (pn_qwen35moe_model_config(m)->dense_ffn &&
+        !pn_qwen35moe_dense_batch_prefill_ok(model))
         return -1;
 
     /* QWEN35_PROF drains the issuing die inside every phase lap, which
@@ -6927,8 +9797,13 @@ int pn_qwen35moe_spec_verify_tokens_cuda(pn_qwen35moe_model *m,
 
     g->spec_n = 0;
     g->spec_state = NULL;
+    double t0 = prof_on() ? prof_now() : 0.0;
+    if (prof_on())
+        memset(bprof_call, 0, sizeof(bprof_call));
     if (!gpu_batch_tokens_core(m, tokens, n, s, pos0, NULL, 1, argmax_out, 0))
         return -1;
+    if (prof_on())   /* QWEN35_PROF: the verify's split, "BPROF call n=<rows>" */
+        bprof_report(n, pos0, prof_now() - t0);
     g->spec_n = n;
     g->spec_state = s;
     g->spec_pos0 = pos0;
@@ -6972,13 +9847,15 @@ int pn_qwen35moe_spec_commit_cuda(pn_qwen35moe_model *m, int n_accept)
                 PN_QWEN35MOE_LAYER_ATTN)
                 continue;
             int idx = pn_qwen35moe_model_layer_index(m, layer);
-            gpu_attn_layer *da = &g->attn[idx];
             pn_qwen35moe_kv *kv = &s->kv[idx];
             const void *host_id = kv->q4 ? (const void *)kv->kq
                                          : (const void *)kv->k;
-            if (da->kv_host_id == host_id && da->kv_gen == kv->content_gen &&
-                da->kv_synced_pos == pos0)
-                da->kv_synced_pos = pos0 + n_accept;
+            for (int p = 0; p < (g->tp ? 2 : 1); p++) {   /* QWEN35_TP: both halves */
+                gpu_attn_layer *da = &g->attn[idx + p * g->tp_n_attn];
+                if (da->kv_host_id == host_id && da->kv_gen == kv->content_gen &&
+                    da->kv_synced_pos == pos0)
+                    da->kv_synced_pos = pos0 + n_accept;
+            }
         }
     }
 
@@ -6986,10 +9863,12 @@ int pn_qwen35moe_spec_commit_cuda(pn_qwen35moe_model *m, int n_accept)
         return 0; /* full accept: the in-place scans already hold state-after-n */
 
     const pn_qwen35moe_config *cfg = pn_qwen35moe_model_config(m);
-    size_t conv_bytes = (size_t)(cfg->ssm_conv - 1) * cfg->conv_dim *
+    /* QWEN35_TP: a rank's snapshots are its local state images. */
+    const pn_qwen35moe_config *scfg = g->tp ? &g->tp_cfg : cfg;
+    size_t conv_bytes = (size_t)(scfg->ssm_conv - 1) * scfg->conv_dim *
                         sizeof(float);
-    size_t ssm_bytes = (size_t)cfg->ssm_state * cfg->ssm_state *
-                       cfg->ssm_dt_rank * sizeof(float);
+    size_t ssm_bytes = (size_t)scfg->ssm_state * scfg->ssm_state *
+                       scfg->ssm_dt_rank * sizeof(float);
     size_t snap = (size_t)(n_accept - 1);
 
     /* Walk the layers in die order (front then back), syncing each die's
@@ -6998,10 +9877,12 @@ int pn_qwen35moe_spec_commit_cuda(pn_qwen35moe_model *m, int n_accept)
      * along to put back the recent-window shadow slots the rejected rows
      * evicted (see qw_spec_win_restore). */
     fc_cuda_ctx *cur = NULL;
-    for (int layer = 0; layer < cfg->n_layer; layer++) {
+    for (int lr = 0; lr < cfg->n_layer * (g->tp ? 2 : 1); lr++) {
+        /* QWEN35_TP: every layer twice, rank 0's half then rank 1's. */
+        int layer = lr % cfg->n_layer, rank = lr / cfg->n_layer;
         int lidx = pn_qwen35moe_model_layer_index(m, layer);
         if (pn_qwen35moe_model_layer_type(m, layer) != PN_QWEN35MOE_LAYER_SSM) {
-            gpu_attn_layer *da = &g->attn[lidx];
+            gpu_attn_layer *da = &g->attn[lidx + rank * g->tp_n_attn];
             if (!s || da->spec_win_n != n)
                 continue;
             if (da->ctx != cur) {
@@ -7014,7 +9895,7 @@ int pn_qwen35moe_spec_commit_cuda(pn_qwen35moe_model *m, int n_accept)
             qw_spec_win_restore(da, &s->kv[lidx], pos0, n, n_accept);
             continue;
         }
-        gpu_ssm_layer *d = &g->ssm[lidx];
+        gpu_ssm_layer *d = &g->ssm[lidx + rank * g->tp_n_ssm];
         if (!d->conv_snaps || !d->ssm_snaps || d->snaps_cap < n)
             return -1;
         if (d->ctx != cur) {
@@ -7073,25 +9954,40 @@ int pn_qwen35moe_spec_commit_cuda(pn_qwen35moe_model *m, int n_accept)
  * the prefill fetch and the decode fetch share ONE tracker for the buffer they
  * both write into (they did not, which is what leaked EOS across turns). */
 
-/* Upload the K users' positions to the die's int32 RoPE buffer (die_idx:
- * 0 = ctx_a, 1 = ctx_b). Returns the buffer or NULL on failure. */
-static fc_buffer *gpu_pos_buf_upload(pn_qwen35moe_gpu *g, fc_cuda_ctx *ctx,
-                                     int die_idx, const int *pos, int nslots)
+/* Upload one group's positions and row map to die `die_idx`'s int32
+ * [pos | rows] buffer (one H2D), and point the group's batch scratch at the
+ * row map: b->rows_h = rows (host), b->rows_g = the on-die copy. `rows` are
+ * the group's absolute persistent rows (g->step_rows + group offset). Returns
+ * the position buffer, or NULL on failure. */
+static fc_buffer *gpu_pos_buf_upload(pn_qwen35moe_gpu *g,
+                                     gpu_batch_scratch *b, fc_cuda_ctx *ctx,
+                                     int die_idx, const int *pos,
+                                     const int *rows, int nslots)
 {
-    if (g->pos_buf[die_idx] && g->pos_buf_cap[die_idx] < nslots) {
-        fc_buffer_free(g->pos_buf[die_idx]);
-        g->pos_buf[die_idx] = NULL;
-        g->pos_buf_cap[die_idx] = 0;
-    }
+    const int cap = PN_QWEN35MOE_GPU_MAX_SLOTS;
+    if (nslots <= 0 || nslots > cap)
+        return NULL;
     if (!g->pos_buf[die_idx]) {
         g->pos_buf[die_idx] =
-            fc_buffer_alloc_ctx(ctx, (size_t)nslots * sizeof(int32_t));
+            fc_buffer_alloc_ctx(ctx, (size_t)2 * cap * sizeof(int32_t));
         if (!g->pos_buf[die_idx])
             return NULL;
-        g->pos_buf_cap[die_idx] = nslots;
+        g->rows_view[die_idx] = fc_buffer_offset_view(
+            g->pos_buf[die_idx], (size_t)cap * sizeof(int32_t));
+        if (!g->rows_view[die_idx]) {
+            fc_buffer_free(g->pos_buf[die_idx]);
+            g->pos_buf[die_idx] = NULL;
+            return NULL;
+        }
     }
-    fc_buffer_from_cpu_n(g->pos_buf[die_idx], pos,
-                         (size_t)nslots * sizeof(int32_t));
+    int32_t staged[2 * PN_QWEN35MOE_GPU_MAX_SLOTS] = { 0 };
+    for (int u = 0; u < nslots; u++) {
+        staged[u] = pos[u];
+        staged[cap + u] = rows[u];
+        b->rows_h[u] = rows[u];
+    }
+    fc_buffer_from_cpu_n(g->pos_buf[die_idx], staged, sizeof(staged));
+    b->rows_g = g->rows_view[die_idx];
     return g->pos_buf[die_idx];
 }
 
@@ -7120,8 +10016,8 @@ int pn_qwen35moe_gpu_ladder_max_slots(void)
 }
 
 int pn_qwen35moe_decode_slot_bind_cuda(pn_qwen35moe_model *m,
-                                       pn_qwen35moe_state *s, int slot,
-                                       int n_slots)
+                                       pn_qwen35moe_state *s, int pos,
+                                       int slot, int n_slots)
 {
     if (!m || !s || slot < 0 || n_slots <= slot ||
         n_slots > PN_QWEN35MOE_GPU_MAX_SLOTS)
@@ -7143,40 +10039,25 @@ int pn_qwen35moe_decode_slot_bind_cuda(pn_qwen35moe_model *m,
         return -1;
 
     const pn_qwen35moe_config *cfg = pn_qwen35moe_model_config(m);
-    size_t conv_bytes = (size_t)(cfg->ssm_conv - 1) * cfg->conv_dim *
+    /* QWEN35_TP: the halves' images and rings use the rank's local dims. */
+    const pn_qwen35moe_config *dcfg = qw_state_cfg(g, g->tp, cfg);
+    size_t conv_bytes = (size_t)(dcfg->ssm_conv - 1) * dcfg->conv_dim *
                         sizeof(float);
-    size_t ssm_bytes = (size_t)cfg->ssm_state * cfg->ssm_state *
-                       cfg->ssm_dt_rank * sizeof(float);
+    size_t ssm_bytes = (size_t)dcfg->ssm_state * dcfg->ssm_state *
+                       dcfg->ssm_dt_rank * sizeof(float);
 
     if (g->n_slots != n_slots) {
         /* Slot count changed: every previously bound slot is void. */
         memset(g->slot_state, 0, sizeof(g->slot_state));
         g->n_slots = n_slots;
     }
+    /* The row already holds THIS state's SSM image at this position (a resume
+     * whose live shared buffers were taken by another session's forward):
+     * the image is current, keep it rather than re-seeding from host RAM. */
+    const unsigned gen = s->n_attn > 0 ? s->kv[0].content_gen : 0;
+    const int ssm_in_row = g->slot_state[slot] == (const void *)s &&
+                           g->slot_gen[slot] == gen && g->slot_pos[slot] == pos;
 
-    /* Phase 10b (lazy mirror): this bind may hand the slot to a DIFFERENT
-     * session. If the outgoing session's only KV copy is this slot's rings,
-     * materialize it into its host mirror now — once the incoming session's
-     * first step re-seeds the ring, those rows are gone. This is the "park"
-     * copy: it is the one lazy-mode host materialization that is not driven
-     * by an explicit consumer, it is bounded by the rows actually decoded,
-     * and it only fires when sessions outnumber ring slots. */
-    if (qw_kv_mirror_lazy()) {
-        for (int i = 0; i < g->n_attn; i++) {
-            gpu_attn_layer *da = &g->attn[i];
-            pn_qwen35moe_kv *okv = da->kv_slot_kv[slot];
-            if (!okv || !da->kv_slot_host_id[slot] || !okv->kv_mirror_stale)
-                continue;
-            if (okv == &s->kv[i])
-                continue;   /* same session re-binding: rows stay valid */
-            const void *oid = okv->q4 ? (const void *)okv->kq
-                                      : (const void *)okv->k;
-            if (oid != da->kv_slot_host_id[slot] ||
-                okv->content_gen != da->kv_slot_gen[slot])
-                continue;   /* bookkeeping no longer describes this kv */
-            qw_kv_layer_materialize(da, okv, da->kv_slot_synced[slot]);
-        }
-    }
 
     /* Walk the layers in die order (front then back) to sync across the
      * die boundary.  No gpu_select_die / bs_acquire here: the K80 strap-quirk
@@ -7186,17 +10067,21 @@ int pn_qwen35moe_decode_slot_bind_cuda(pn_qwen35moe_model *m,
      * (Mirrors the async forward: "No gpu_select_die needed — async requires
      * small-BAR mode, where every die is live behind its own context.") */
     fc_cuda_ctx *cur = NULL;
-    for (int layer = 0; layer < cfg->n_layer; layer++) {
+    for (int lr = 0; lr < cfg->n_layer * (g->tp ? 2 : 1); lr++) {
+        /* QWEN35_TP: every layer twice, rank 0's half then rank 1's. */
+        int layer = lr % cfg->n_layer, rank = lr / cfg->n_layer;
         if (pn_qwen35moe_model_layer_type(m, layer) != PN_QWEN35MOE_LAYER_SSM)
             continue;
-        gpu_ssm_layer *d = &g->ssm[pn_qwen35moe_model_layer_index(m, layer)];
-        pn_qwen35moe_ssm_state *st = &s->ssm[pn_qwen35moe_model_layer_index(m, layer)];
+        int sidx = pn_qwen35moe_model_layer_index(m, layer);
+        gpu_ssm_layer *d = &g->ssm[sidx + rank * g->tp_n_ssm];
+        pn_qwen35moe_ssm_state *st = &s->ssm[sidx];
         if (d->ctx != cur) {
             if (cur)
                 fc_sync_ctx(cur);   /* flush previous die before switching */
             cur = d->ctx;
         }
         if (d->slots_cap < n_slots) {
+            g->tp_gen++;   /* QWEN35_TP slots graphs bake these rows */
             fc_buffer_free(d->conv_slots);
             fc_buffer_free(d->ssm_slots);
             d->conv_slots = fc_buffer_alloc_ctx(d->ctx,
@@ -7216,7 +10101,9 @@ int pn_qwen35moe_decode_slot_bind_cuda(pn_qwen35moe_model *m,
             pn_graph_capture_dropped(&d->slots_graph_capture);
             d->slots_graph_n = 0;
         }
-        if (d->conv_state_g && d->host_state == (const void *)st) {
+        if (ssm_in_row && d->host_state != (const void *)st) {
+            continue;   /* the row's image is already this user's, current */
+        } else if (d->conv_state_g && d->host_state == (const void *)st) {
             /* Live GPU state belongs to this user — D2D snapshot. */
             fc_buffer_copy_d2d_ctx(d->ctx, d->conv_slots,
                                    (size_t)slot * conv_bytes,
@@ -7234,8 +10121,7 @@ int pn_qwen35moe_decode_slot_bind_cuda(pn_qwen35moe_model *m,
                 d->ssm_state_g = fc_buffer_alloc_ctx(d->ctx, ssm_bytes);
             if (!d->conv_state_g || !d->ssm_state_g)
                 return -1;
-            fc_buffer_from_cpu(d->conv_state_g, st->conv_state);
-            fc_buffer_from_cpu(d->ssm_state_g, st->ssm_state);
+            qw_ssm_xfer(g, d, st, 1);
             d->host_state = (const void *)st;
             fc_buffer_copy_d2d_ctx(d->ctx, d->conv_slots,
                                    (size_t)slot * conv_bytes,
@@ -7269,39 +10155,48 @@ int pn_qwen35moe_decode_slot_bind_cuda(pn_qwen35moe_model *m,
          * mirror-upload path works. */
         for (int i = 0; i < g->n_attn; i++) {
             gpu_attn_layer *da = &g->attn[i];
-            pn_qwen35moe_kv *kv = &s->kv[i];
+            pn_qwen35moe_kv *kv = &s->kv[qw_attn_hidx(g, i)];
             const void *id = kv->q4 ? (const void *)kv->kq
                                     : (const void *)kv->k;
-            if (da->kv_slot_host_id[slot] == id &&
-                da->kv_slot_gen[slot] == kv->content_gen)
-                continue;   /* warm rebind: the slot already holds it */
+            /* A warm rebind keeps the rows the slot already holds, but a
+             * resumed turn has just delta-prefilled PAST them into the
+             * single-user ring: top those rows up now too. Leaving them for
+             * the first step lost them whenever another session's prefill
+             * chunk took the single-user ring in between (overlapping turns:
+             * the resumed turn erred out after one token). */
+            int from = (da->kv_slot_host_id[slot] == id &&
+                        da->kv_slot_gen[slot] == kv->content_gen)
+                           ? da->kv_slot_synced[slot] : 0;
             int rows = (da->k_cache_g && da->v_cache_g &&
                         da->cache_cap == kv->max_seq &&
                         da->kv_host_id == id &&
                         da->kv_gen == kv->content_gen)
                            ? da->kv_synced_pos : 0;
+            if (from > 0 && rows <= from)
+                continue;   /* warm rebind: the slot already holds it all */
             int seeded = 0;
             if (rows > 0 &&
-                gpu_attn_slot_ring_ensure(da, cfg, kv->q4, kv->max_seq,
-                                          n_slots, i) == 0 &&
+                gpu_attn_slot_ring_ensure(da, dcfg, kv->q4, kv->max_seq,
+                                          n_slots, qw_attn_hidx(g, i)) == 0 &&
                 da->kv_slots_cap_n > slot &&
                 da->kv_slots_cap_seq == kv->max_seq) {
                 size_t row_b = qw_kv_row_bytes(kv);
                 size_t head_b = (size_t)kv->max_seq * row_b;
-                for (int hd = 0; hd < kv->n_head_kv; hd++) {
-                    size_t src_off = (size_t)hd * head_b;
-                    size_t dst_off = ((size_t)slot * kv->n_head_kv + hd) *
-                                     head_b;
+                const int nh = qw_kv_nh(da, kv);
+                for (int hd = 0; hd < nh; hd++) {
+                    size_t src_off = (size_t)hd * head_b + (size_t)from * row_b;
+                    size_t dst_off = ((size_t)slot * nh + hd) *
+                                     head_b + (size_t)from * row_b;
                     fc_buffer_copy_d2d_ctx(da->ctx, da->k_slots_g, dst_off,
                                            da->k_cache_g, src_off,
-                                           (size_t)rows * row_b);
+                                           (size_t)(rows - from) * row_b);
                     fc_buffer_copy_d2d_ctx(da->ctx, da->v_slots_g, dst_off,
                                            da->v_cache_g, src_off,
-                                           (size_t)rows * row_b);
+                                           (size_t)(rows - from) * row_b);
                 }
                 if (kv->q4 && da->k_sink_g && da->k_sink_slots_g) {
-                    size_t sink_b = qw_kv_sink_bytes(kv);
-                    size_t win_b = qw_kv_win_bytes(kv);
+                    size_t sink_b = qw_kv_sink_bytes(da, kv);
+                    size_t win_b = qw_kv_win_bytes(da, kv);
                     fc_buffer_copy_d2d_ctx(da->ctx, da->k_sink_slots_g,
                                            (size_t)slot * sink_b,
                                            da->k_sink_g, 0, sink_b);
@@ -7322,8 +10217,12 @@ int pn_qwen35moe_decode_slot_bind_cuda(pn_qwen35moe_model *m,
                 seeded = 1;
             }
             if (!seeded) {
-                if (kv->kv_mirror_stale &&
-                    qw_kv_layer_materialize(da, kv, -1) != 0 &&
+                /* QWEN35_TP: both halves at once, on rank 0's turn (a half
+                 * alone would mark the mirror clean). */
+                int both = g->tp ? i < g->tp_n_attn : 1;
+                if (both && kv->kv_mirror_stale &&
+                    (g->tp ? qw_kv_layer_materialize_all(g, i, kv, -1)
+                           : qw_kv_layer_materialize(da, kv, -1)) != 0 &&
                     kv->kv_mirror_stale) {
                     fprintf(stderr, "[attn] slot_bind kv_idx=%d slot=%d: no "
                             "ring source to seed or materialize — first "
@@ -7339,153 +10238,16 @@ int pn_qwen35moe_decode_slot_bind_cuda(pn_qwen35moe_model *m,
     }
 
     g->slot_state[slot] = (const void *)s;
-    return 0;
-}
-
-/* Move a DECODE slot's live SSM state from GPU index `src` to `dst` without
- * going through the host mirror (which is stale for in-flight decode users).
- * Used by the dynamic-width batch scheduler (Phase D2) to compactly remap
- * the active user set to [0, n_active) when a user joins or leaves.
- *
- * Copies conv_slots[src] → conv_slots[dst] and ssm_slots[src] → ssm_slots[dst]
- * (D2D) for every SSM layer, then updates slot_state[dst] = slot_state[src]
- * and clears slot_state[src].  The dst slot's top-k bookkeeping is reset.
- * If src == dst, only updates slot_state bookkeeping (no-op copy).
- *
- * Must be called under gpu_mu (no decode step or bind can interleave).
- * The source state continues to live at slot_state[src] until the caller
- * updates the GPU map; the caller must clear slot_state[src] afterwards
- * (done here: src entry is set to NULL).
- *
- * Returns 0 on success, -1 if the slots are out of range or not allocated. */
-int pn_qwen35moe_decode_slot_move_cuda(pn_qwen35moe_model *m,
-                                       int src, int dst, int n_slots)
-{
-    if (!m || src < 0 || dst < 0 || src >= n_slots || dst >= n_slots ||
-        n_slots > PN_QWEN35MOE_GPU_MAX_SLOTS)
-        return -1;
-    pn_qwen35moe_gpu *g = (pn_qwen35moe_gpu *)pn_qwen35moe_model_gpu(m);
-    if (!g || g->n_slots < n_slots)
-        return -1;
-    if (!g->slot_state[src])
-        return -1;   /* source slot not bound */
-
-    if (src == dst) {
-        /* No data move needed; slot_state bookkeeping is already correct. */
-        return 0;
-    }
-
-    const pn_qwen35moe_config *cfg = pn_qwen35moe_model_config(m);
-    size_t conv_bytes = (size_t)(cfg->ssm_conv - 1) * cfg->conv_dim *
-                        sizeof(float);
-    size_t ssm_bytes  = (size_t)cfg->ssm_state * cfg->ssm_state *
-                        cfg->ssm_dt_rank * sizeof(float);
-
-    fc_cuda_ctx *cur = NULL;
-    for (int layer = 0; layer < cfg->n_layer; layer++) {
-        if (pn_qwen35moe_model_layer_type(m, layer) != PN_QWEN35MOE_LAYER_SSM)
-            continue;
-        int idx = pn_qwen35moe_model_layer_index(m, layer);
-        gpu_ssm_layer *d = &g->ssm[idx];
-        if (!d->conv_slots || !d->ssm_slots || d->slots_cap < n_slots)
-            return -1;   /* slots not allocated */
-        if (d->ctx != cur) {
-            if (cur)
-                fc_sync_ctx(cur);   /* flush previous die */
-            cur = d->ctx;
-        }
-        fc_buffer_copy_d2d_ctx(d->ctx,
-                               d->conv_slots, (size_t)dst * conv_bytes,
-                               d->conv_slots, (size_t)src * conv_bytes,
-                               conv_bytes);
-        fc_buffer_copy_d2d_ctx(d->ctx,
-                               d->ssm_slots, (size_t)dst * ssm_bytes,
-                               d->ssm_slots, (size_t)src * ssm_bytes,
-                               ssm_bytes);
-    }
-    if (cur)
-        fc_sync_ctx(cur);
-
-    /* L7 — attn slot KV rings.
-     *
-     * EAGER mode: invalidate the DST watermark on every attention layer
-     * instead of moving ring bytes; the host mirror is current every step,
-     * so the next flash step re-uploads the moved user's rows [0, pos) from
-     * it — a one-off H2D per join-compaction, not a per-step cost.
-     *
-     * Phase 10b LAZY mode: the mirror does not hold the rows, the ring
-     * does — move them D2D (src slot slice -> dst slot slice, same die) and
-     * carry the (pointer, generation, watermark) bookkeeping, so the moved
-     * user's next step re-uploads nothing at all. */
-    for (int layer = 0; layer < cfg->n_layer; layer++) {
-        if (pn_qwen35moe_model_layer_type(m, layer) != PN_QWEN35MOE_LAYER_ATTN)
-            continue;
-        gpu_attn_layer *da = &g->attn[pn_qwen35moe_model_layer_index(m, layer)];
-        int carried = 0;
-        if (qw_kv_mirror_lazy() && da->k_slots_g && da->v_slots_g &&
-            da->kv_slot_host_id[src] && da->kv_slot_kv[src] &&
-            da->kv_slots_cap_n > src && da->kv_slots_cap_n > dst) {
-            const pn_qwen35moe_kv *mkv = da->kv_slot_kv[src];
-            size_t row_b = qw_kv_row_bytes(mkv);
-            size_t head_b = (size_t)da->kv_slots_cap_seq * row_b;
-            int rows = da->kv_slot_synced[src];
-            if (rows > da->kv_slots_cap_seq)
-                rows = da->kv_slots_cap_seq;
-            for (int hd = 0; rows > 0 && hd < mkv->n_head_kv; hd++) {
-                size_t src_off = ((size_t)src * mkv->n_head_kv + hd) * head_b;
-                size_t dst_off = ((size_t)dst * mkv->n_head_kv + hd) * head_b;
-                fc_buffer_copy_d2d_ctx(da->ctx, da->k_slots_g, dst_off,
-                                       da->k_slots_g, src_off,
-                                       (size_t)rows * row_b);
-                fc_buffer_copy_d2d_ctx(da->ctx, da->v_slots_g, dst_off,
-                                       da->v_slots_g, src_off,
-                                       (size_t)rows * row_b);
-            }
-            if (mkv->q4 && da->k_sink_slots_g) {
-                size_t sink_b = qw_kv_sink_bytes(mkv);
-                size_t win_b = qw_kv_win_bytes(mkv);
-                fc_buffer_copy_d2d_ctx(da->ctx, da->k_sink_slots_g,
-                                       (size_t)dst * sink_b,
-                                       da->k_sink_slots_g,
-                                       (size_t)src * sink_b, sink_b);
-                fc_buffer_copy_d2d_ctx(da->ctx, da->v_sink_slots_g,
-                                       (size_t)dst * sink_b,
-                                       da->v_sink_slots_g,
-                                       (size_t)src * sink_b, sink_b);
-                fc_buffer_copy_d2d_ctx(da->ctx, da->k_win_slots_g,
-                                       (size_t)dst * win_b,
-                                       da->k_win_slots_g,
-                                       (size_t)src * win_b, win_b);
-                fc_buffer_copy_d2d_ctx(da->ctx, da->v_win_slots_g,
-                                       (size_t)dst * win_b,
-                                       da->v_win_slots_g,
-                                       (size_t)src * win_b, win_b);
-            }
-            fc_sync_ctx(da->ctx);
-            da->kv_slot_host_id[dst] = da->kv_slot_host_id[src];
-            da->kv_slot_gen[dst] = da->kv_slot_gen[src];
-            da->kv_slot_kv[dst] = da->kv_slot_kv[src];
-            da->kv_slot_synced[dst] = da->kv_slot_synced[src];
-            carried = 1;
-        }
-        if (!carried)
-            da->kv_slot_host_id[dst] = NULL;
-        da->kv_slot_host_id[src] = NULL;
-        da->kv_slot_kv[src] = NULL;
-    }
-
-    /* Update slot_state bookkeeping. */
-    g->slot_state[dst] = g->slot_state[src];
-    g->slot_state[src] = NULL;
-    /* No sparse-top-k bookkeeping to move: it rides on the user's state, not
-     * on the slot index, so a slot move cannot desynchronise it. */
+    g->slot_gen[slot] = s->n_attn > 0 ? s->kv[0].content_gen : 0;
+    g->slot_pos[slot] = pos;
     return 0;
 }
 
 /* Batched-decode SSM block: identical launch sequence to the prefill
  * gpu_ssm_block_batch except the conv1d and recurrence are SLOT kernels —
  * K independent single-step updates against the layer's slot-major state
- * (no scan; each user advances one position). */
+ * (no scan; each user advances one position). core_only (QWEN35_TP): stop at
+ * s_gated, before the out projection + residual. */
 /* QWEN35_SSM_SLOTS_FUSED (default ON; =0 restores the three-launch chain for
  * A/B): the decode slots path runs beta sigmoid + decay gate + recurrence as
  * fc_ssm_gdn_step_slots_ctx — one warp-per-row launch, bit-exact. */
@@ -7501,7 +10263,8 @@ static int ssm_slots_fused_on(void)
 
 static int gpu_ssm_block_slots(gpu_ssm_layer *d,
                                const pn_qwen35moe_config *cfg,
-                               gpu_batch_scratch *b, int slot_base, int nslots)
+                               gpu_batch_scratch *b, int slot_base, int nslots,
+                               int core_only)
 {
     const int conv_dim = cfg->conv_dim;
     const int S = cfg->ssm_state;
@@ -7513,42 +10276,26 @@ static int gpu_ssm_block_slots(gpu_ssm_layer *d,
     const float eps = cfg->rms_norm_eps;
     fc_cuda_ctx *ctx = d->ctx;
 
-    /* L5 — offset the persistent per-slot SSM rings to this group's base so
-     * the slot kernels (which index conv/ssm state by their block slot idx
-     * 0..nslots) land on rows [slot_base, slot_base+nslots). The batch
-     * scratch (b->*) stays group-local [0,nslots). slot_base==0 => the ring
-     * view is byte-identical to the ring itself (today's behavior). */
-    const size_t conv_stride = (size_t)(cfg->ssm_conv - 1) * conv_dim *
-                               sizeof(float);
-    const size_t ssm_stride  = (size_t)S * S * n_v_heads * sizeof(float);
+    /* Each launch position u reads and writes its user's OWN persistent
+     * state row b->rows_h[u] (the row map rides on the die as b->rows_g), so
+     * the users stepped together need not sit in contiguous rows and nothing
+     * is moved when the active set changes. The batch scratch (b->*) stays
+     * group-local [0,nslots). */
+    (void)slot_base;
     fc_buffer *conv_ring = d->conv_slots;
     fc_buffer *ssm_ring  = d->ssm_slots;
-    fc_buffer *conv_view = NULL, *ssm_view = NULL;
-    if (slot_base > 0) {
-        conv_view = fc_buffer_offset_view(d->conv_slots,
-                                          (size_t)slot_base * conv_stride);
-        ssm_view  = fc_buffer_offset_view(d->ssm_slots,
-                                          (size_t)slot_base * ssm_stride);
-        if (!conv_view || !ssm_view) {
-            fc_buffer_free_view(conv_view);
-            fc_buffer_free_view(ssm_view);
-            return -1;
-        }
-        conv_ring = conv_view;
-        ssm_ring  = ssm_view;
-    }
+    fc_buffer *rows_g = b->rows_g;
 
     double sp_t0 = 0.0;
     sprof_begin(ctx, &sp_t0);
 
-    if (gpu_matvec_nx(&d->attn_qkv, b->x_norm, b->s_qkv, nslots) < 0 ||
-        gpu_matvec_nx(&d->attn_gate, b->x_norm, b->s_z, nslots) < 0 ||
-        gpu_matvec_nx(&d->ssm_beta, b->x_norm, b->s_beta, nslots) < 0 ||
-        gpu_matvec_nx(&d->ssm_alpha, b->x_norm, b->s_alpha, nslots) < 0) {
-        fc_buffer_free_view(conv_view);
-        fc_buffer_free_view(ssm_view);
+    if (gpu_fused_launch_one(ctx, &d->fx_proj_s, d->fx_s_gen, b, nslots,
+                             b->x_norm) != 0 &&
+        (gpu_matvec_nx(&d->attn_qkv, b->x_norm, b->s_qkv, nslots) < 0 ||
+         gpu_matvec_nx(&d->attn_gate, b->x_norm, b->s_z, nslots) < 0 ||
+         gpu_matvec_nx(&d->ssm_beta, b->x_norm, b->s_beta, nslots) < 0 ||
+         gpu_matvec_nx(&d->ssm_alpha, b->x_norm, b->s_alpha, nslots) < 0))
         return -1;
-    }
     sprof_lap(SPROF_DENSE, ctx, &sp_t0);
 
     /* Sub-span clock is SEPARATE from sp_t0 on purpose: the five laps below
@@ -7560,7 +10307,7 @@ static int gpu_ssm_block_slots(gpu_ssm_layer *d,
     /* Per-slot single-step conv1d over the slot-major state. */
     fc_ssm_conv1d_silu_slots_ctx(ctx, b->s_qkv, d->ssm_conv1d.buf,
                                  conv_ring, b->s_conv, conv_dim,
-                                 cfg->ssm_conv, nslots);
+                                 cfg->ssm_conv, nslots, rows_g);
     sub_lap(&ssmd_cum[SSMD_CONV], &ssmd_laps[SSMD_CONV], ctx, &sub_t0);
     fc_ssm_qknorm_gqa_nx_ctx(ctx, b->s_conv, b->s_qg, b->s_kg, b->s_vg,
                              n_k_heads, kv_groups, S, key_dim, val_dim,
@@ -7570,19 +10317,20 @@ static int gpu_ssm_block_slots(gpu_ssm_layer *d,
     /* Beta sigmoid + decay gate + recurrence: one fused warp-per-row launch
      * when available (bit-exact), else the original three. The glue kernels
      * only feed the recurrence, so moving them after conv/qknorm is free. */
-    const float recur_scale = 1.0f / sqrtf((float)S);
+    const float recur_scale = qw_scale_inv_sqrt(S);
     if (!ssm_slots_fused_on() ||
         fc_ssm_gdn_step_slots_ctx(ctx, ssm_ring, b->s_qg, b->s_kg, b->s_vg,
                                   b->s_alpha, d->ssm_dt.buf, d->ssm_a.buf,
                                   b->s_beta, b->s_y, n_v_heads, S, nslots,
-                                  recur_scale) != 0) {
+                                  recur_scale, rows_g) != 0) {
         fc_sigmoid_ctx(ctx, b->s_beta, nslots * n_v_heads);
         fc_ssm_decay_gate_nx_ctx(ctx, b->s_alpha, d->ssm_dt.buf, d->ssm_a.buf,
                                  b->s_g, n_v_heads, nslots);
         sub_lap(&ssmd_cum[SSMD_DECAY], &ssmd_laps[SSMD_DECAY], ctx, &sub_t0);
         fc_ssm_recurrence_slots_ctx(ctx, ssm_ring, b->s_qg, b->s_kg,
                                     b->s_vg, b->s_g, b->s_beta, b->s_y,
-                                    n_v_heads, S, nslots, recur_scale);
+                                    n_v_heads, S, nslots, recur_scale,
+                                    rows_g);
     }
     sub_lap(&ssmd_cum[SSMD_RECUR], &ssmd_laps[SSMD_RECUR], ctx, &sub_t0);
 
@@ -7590,12 +10338,15 @@ static int gpu_ssm_block_slots(gpu_ssm_layer *d,
                           nslots * n_v_heads, S, eps);
     sub_lap(&ssmd_cum[SSMD_GNORM], &ssmd_laps[SSMD_GNORM], ctx, &sub_t0);
     sprof_lap(SPROF_SSM, ctx, &sp_t0);
-    fc_buffer_free_view(conv_view);
-    fc_buffer_free_view(ssm_view);
-    if (gpu_matvec_nx(&d->ssm_out, b->s_gated, b->block_out, nslots) < 0)
-        return -1;
-    fc_add_ctx(ctx, b->hidden, b->block_out, b->hidden,
-               nslots * cfg->n_embd);
+    if (core_only)      /* QWEN35_TP: s_gated holds the rank's heads */
+        return 0;
+    if (gpu_fused_launch_one(ctx, &d->fx_out_s, d->fx_s_gen, b, nslots,
+                             b->s_gated) != 0) {
+        if (gpu_matvec_nx(&d->ssm_out, b->s_gated, b->block_out, nslots) < 0)
+            return -1;
+        fc_add_ctx(ctx, b->hidden, b->block_out, b->hidden,
+                   nslots * cfg->n_embd);
+    }
     sprof_lap(SPROF_DENSE, ctx, &sp_t0);
     return 0;
 }
@@ -8030,14 +10781,13 @@ static void qw_defer_free(pn_qwen35moe_gpu *g)
 /* L10 — host-computed plan for ONE attention layer's on-die slots flash path.
  *
  * Everything the device launch sequence needs that only the host can work out
- * (ring views, cache geometry, the flash grid width) is resolved up front into
- * this struct. That is what leaves the launch sequence itself pure device work
- * — and therefore CUDA-graph capturable. `views` are OWNED (slot_base > 0
- * only); release with attn_slots_plan_free. */
+ * (ring buffers + row map, cache geometry, the flash grid width) is resolved up
+ * front into this struct. That is what leaves the launch sequence itself pure
+ * device work — and therefore CUDA-graph capturable. It owns nothing. */
 typedef struct {
     fc_buffer *k_ring, *v_ring;
     fc_buffer *k_sink, *v_sink, *k_win, *v_win;
-    fc_buffer *views[6];        /* owned offset views, or all NULL */
+    fc_buffer *rows_g;          /* borrowed row map (b->rows_g) */
     int   kv_q4, max_seq;
     int   sink_n, win_n;        /* q4 sink / recent-window row counts */
     int   kv_dim;
@@ -8045,16 +10795,8 @@ typedef struct {
     float scale;
 } qw_attn_slots_plan;
 
-static void attn_slots_plan_free(qw_attn_slots_plan *pl)
-{
-    for (int i = 0; i < 6; i++) {
-        fc_buffer_free_view(pl->views[i]);
-        pl->views[i] = NULL;
-    }
-}
-
 /* Phase 1 of the slots attention block: pure HOST work — the availability
- * checks, the ring allocation, the slot_base ring views, the [synced, pos)
+ * checks, the ring allocation, the row-map bounds check, the [synced, pos)
  * re-sync H2D from the host mirror (a no-op in steady-state decode), and the
  * flash grid width. No device compute is issued, so a refusal leaves nothing
  * half-done and the caller can take the host-softmax path.
@@ -8148,13 +10890,11 @@ static int attn_slots_flash_prep(gpu_attn_layer *d,
     size_t row_b = kv_q4 ? (size_t)pn_kvq4_row_bytes(head_dim)
                          : (size_t)head_dim * sizeof(float);
 
-    /* L5 — offset views of the persistent per-slot KV rings so the slot
-     * kernels (indexed by block slot idx 0..nslots) land on ring rows
-     * [slot_base, slot_base+nslots); the batch scratch (b->a_k etc.) stays
-     * group-local [0,nslots). slot_base==0 => views equal the rings (today).
-     * The per-slot host bookkeeping (kv_slot_host_id/synced) is indexed at
-     * slot_base+u below. */
-    const size_t ring_row_stride  = (size_t)n_head_kv * max_seq * row_b;
+    /* Users decode in their OWN persistent ring rows b->rows_h[u] (row map
+     * on the die: b->rows_g), so the active set need not be contiguous and a
+     * session's rows never move. The batch scratch (b->a_k etc.) stays
+     * group-local [0,nslots). */
+    (void)slot_base;
     const size_t sink_row_stride  = (size_t)n_head_kv * PN_KVQ4_SINKMAX *
                                     head_dim * sizeof(uint16_t);
     const size_t win_row_stride   = (size_t)n_head_kv * PN_KVQ4_WMAX *
@@ -8162,29 +10902,13 @@ static int attn_slots_flash_prep(gpu_attn_layer *d,
     fc_buffer *k_ring = d->k_slots_g, *v_ring = d->v_slots_g;
     fc_buffer *k_sink = d->k_sink_slots_g, *v_sink = d->v_sink_slots_g;
     fc_buffer *k_win = d->k_win_slots_g, *v_win = d->v_win_slots_g;
-    fc_buffer **views = pl->views;
-    if (slot_base > 0) {
-        views[0] = k_ring = fc_buffer_offset_view(d->k_slots_g,
-                                (size_t)slot_base * ring_row_stride);
-        views[1] = v_ring = fc_buffer_offset_view(d->v_slots_g,
-                                (size_t)slot_base * ring_row_stride);
-        int ok = (k_ring && v_ring);
-        if (kv_q4) {
-            views[2] = k_sink = fc_buffer_offset_view(d->k_sink_slots_g,
-                                    (size_t)slot_base * sink_row_stride);
-            views[3] = v_sink = fc_buffer_offset_view(d->v_sink_slots_g,
-                                    (size_t)slot_base * sink_row_stride);
-            views[4] = k_win = fc_buffer_offset_view(d->k_win_slots_g,
-                                    (size_t)slot_base * win_row_stride);
-            views[5] = v_win = fc_buffer_offset_view(d->v_win_slots_g,
-                                    (size_t)slot_base * win_row_stride);
-            ok = ok && k_sink && v_sink && k_win && v_win;
-        }
-        if (!ok) {
-            attn_slots_plan_free(pl);
+    for (int u = 0; u < nslots; u++)
+        if (b->rows_h[u] < 0 || b->rows_h[u] >= d->kv_slots_cap_n) {
+            fprintf(stderr, "[attn] slots_prep kv_idx=%d: row %d outside the "
+                    "%d carved ring rows\n", kv_idx, b->rows_h[u],
+                    d->kv_slots_cap_n);
             return -1;
         }
-    }
 
     /* Sync each slot's ring rows [synced, pos[u]) — a no-op in steady-state
      * decode (watermark == pos); a full [0, pos) seed on the first step
@@ -8195,7 +10919,7 @@ static int attn_slots_flash_prep(gpu_attn_layer *d,
      * move) — both on-die D2D; (3) the host mirror, only when it is
      * authoritative (eager mode, or a snapshot-restored session). */
     for (int u = 0; u < nslots; u++) {
-        int su = slot_base + u;   /* absolute slot for host bookkeeping */
+        int su = b->rows_h[u];    /* this user's persistent ring row */
         const pn_qwen35moe_kv *kv = &sts[u]->kv[kv_idx];
         const void *host_id = kv_q4 ? (const void *)kv->kq
                                     : (const void *)kv->k;
@@ -8286,19 +11010,19 @@ static int attn_slots_flash_prep(gpu_attn_layer *d,
                         "[%d,%d) have no ring source and the host mirror is "
                         "stale — refusing stale attention\n",
                         kv_idx, su, synced, pos[u]);
-                attn_slots_plan_free(pl);
                 return -1;
             }
             if (!seeded) {
-                /* (3) Host mirror upload (authoritative here). */
+                /* (3) Host mirror upload (authoritative here). QWEN35_TP:
+                 * this half's heads start at host head h0. */
+                const int h0 = qw_kv_h0(d, kv);
                 const unsigned char *ksrc = kv_q4
                     ? kv->kq : (const unsigned char *)kv->k;
                 const unsigned char *vsrc = kv_q4
                     ? kv->vq : (const unsigned char *)kv->v;
                 for (int hd = 0; hd < n_head_kv; hd++) {
-                    size_t src_off = ((size_t)hd * max_seq + synced) * row_b;
-                    /* group-relative u into the slot_base-offset ring view */
-                    size_t dst_off = (((size_t)u * n_head_kv + hd) * max_seq +
+                    size_t src_off = ((size_t)(h0 + hd) * max_seq + synced) * row_b;
+                    size_t dst_off = (((size_t)su * n_head_kv + hd) * max_seq +
                                       synced) * row_b;
                     fc_buffer_from_cpu_at(k_ring, dst_off, ksrc + src_off,
                                           seed_bytes);
@@ -8312,14 +11036,16 @@ static int attn_slots_flash_prep(gpu_attn_layer *d,
                                     head_dim * sizeof(uint16_t);
                     size_t win_b = (size_t)n_head_kv * PN_KVQ4_WMAX *
                                    head_dim * sizeof(uint16_t);
-                    fc_buffer_from_cpu_at(k_sink, (size_t)u * sink_b,
-                                          kv->k_sink, sink_b);
-                    fc_buffer_from_cpu_at(v_sink, (size_t)u * sink_b,
-                                          kv->v_sink, sink_b);
-                    fc_buffer_from_cpu_at(k_win, (size_t)u * win_b,
-                                          kv->k_win, win_b);
-                    fc_buffer_from_cpu_at(v_win, (size_t)u * win_b,
-                                          kv->v_win, win_b);
+                    const size_t sink_h = (size_t)h0 * PN_KVQ4_SINKMAX * head_dim;
+                    const size_t win_h = (size_t)h0 * PN_KVQ4_WMAX * head_dim;
+                    fc_buffer_from_cpu_at(k_sink, (size_t)su * sink_b,
+                                          kv->k_sink + sink_h, sink_b);
+                    fc_buffer_from_cpu_at(v_sink, (size_t)su * sink_b,
+                                          kv->v_sink + sink_h, sink_b);
+                    fc_buffer_from_cpu_at(k_win, (size_t)su * win_b,
+                                          kv->k_win + win_h, win_b);
+                    fc_buffer_from_cpu_at(v_win, (size_t)su * win_b,
+                                          kv->v_win + win_h, win_b);
                 }
             }
         }
@@ -8344,6 +11070,7 @@ static int attn_slots_flash_prep(gpu_attn_layer *d,
     pl->k_ring = k_ring;   pl->v_ring = v_ring;
     pl->k_sink = k_sink;   pl->v_sink = v_sink;
     pl->k_win  = k_win;    pl->v_win  = v_win;
+    pl->rows_g = b->rows_g;
     pl->kv_q4 = kv_q4;
     pl->max_seq = max_seq;
     pl->sink_n = kv_sink;
@@ -8351,7 +11078,7 @@ static int attn_slots_flash_prep(gpu_attn_layer *d,
     pl->kv_dim = n_head_kv * head_dim;
     pl->launch_splits = launch_splits;
     pl->kps = kps;
-    pl->scale = 1.0f / sqrtf((float)head_dim);
+    pl->scale = qw_scale_inv_sqrt(head_dim);
     return 0;
 }
 
@@ -8411,6 +11138,14 @@ static int attn_slots_flash_core(gpu_attn_layer *d,
                                  cfg->rope_dim, pos_g, cfg->rope_theta,
                                  nslots);
     sub_lap(&attd_cum[ATTD_ROPE], &attd_laps[ATTD_ROPE], ctx, &sub_t0);
+    bv_trace_rows(ctx, "plain", "q", -1, b->a_q, nslots, attn_dim, NULL,
+                  bv_trace_slots_pos0);
+    bv_trace_rows(ctx, "plain", "k", -1, b->a_k, nslots, n_head_kv * head_dim,
+                  NULL, bv_trace_slots_pos0);
+    bv_trace_rows(ctx, "plain", "v", -1, b->a_v, nslots, n_head_kv * head_dim,
+                  NULL, bv_trace_slots_pos0);
+    bv_trace_rows(ctx, "plain", "z", -1, b->a_z, nslots, attn_dim, NULL,
+                  bv_trace_slots_pos0);
 
     /* 5. Ring append (all K rows, one launch) + per-user split flash +
      * combine into a_out. */
@@ -8419,8 +11154,8 @@ static int attn_slots_flash_core(gpu_attn_layer *d,
                                        v_ring, k_sink,
                                        v_sink, k_win,
                                        v_win, n_head_kv, head_dim,
-                                       max_seq, pos_g, nslots, kv_sink,
-                                       kv_win);
+                                       max_seq, pos_g, pl->rows_g, nslots,
+                                       kv_sink, kv_win);
         sub_lap(&attd_cum[ATTD_KVAPPEND], &attd_laps[ATTD_KVAPPEND], ctx,
                 &sub_t0);
         /* bit7: the sigmoid output gate rides the combine (bit-exact). */
@@ -8429,7 +11164,7 @@ static int attn_slots_flash_core(gpu_attn_layer *d,
                     ctx, b->a_q, k_ring, v_ring, k_sink, v_sink, k_win, v_win,
                     d->dec_slots_m_g, d->dec_slots_l_g, d->dec_slots_acc_g,
                     b->a_out, n_head, n_head_kv, head_dim, max_seq, pos_g,
-                    nslots, launch_splits, kps, PN_QWEN35MOE_DEC_SPLIT_MAX,
+                    pl->rows_g, nslots, launch_splits, kps, PN_QWEN35MOE_DEC_SPLIT_MAX,
                     kv_sink, kv_win, attn_sink(), attn_window(), scale,
                     b->a_z) == 0;
         if (!gated &&
@@ -8442,8 +11177,8 @@ static int attn_slots_flash_core(gpu_attn_layer *d,
                                               d->dec_slots_l_g,
                                               d->dec_slots_acc_g, b->a_out,
                                               n_head, n_head_kv, head_dim,
-                                              max_seq, pos_g, nslots,
-                                              launch_splits, kps,
+                                              max_seq, pos_g, pl->rows_g,
+                                              nslots, launch_splits, kps,
                                               PN_QWEN35MOE_DEC_SPLIT_MAX,
                                               kv_sink, kv_win, attn_sink(),
                                               attn_window(), scale) < 0)
@@ -8451,7 +11186,7 @@ static int attn_slots_flash_core(gpu_attn_layer *d,
     } else {
         fc_attn_kv_append_slots_ctx(ctx, b->a_k, b->a_v, k_ring,
                                     v_ring, n_head_kv, head_dim,
-                                    max_seq, pos_g, nslots);
+                                    max_seq, pos_g, pl->rows_g, nslots);
         sub_lap(&attd_cum[ATTD_KVAPPEND], &attd_laps[ATTD_KVAPPEND], ctx,
                 &sub_t0);
         if (fc_attn_flash_decode_slots_ctx(ctx, b->a_q, k_ring,
@@ -8459,7 +11194,7 @@ static int attn_slots_flash_core(gpu_attn_layer *d,
                                            d->dec_slots_l_g,
                                            d->dec_slots_acc_g, b->a_out,
                                            n_head, n_head_kv, head_dim,
-                                           max_seq, pos_g, nslots,
+                                           max_seq, pos_g, pl->rows_g, nslots,
                                            launch_splits, kps,
                                            PN_QWEN35MOE_DEC_SPLIT_MAX,
                                            attn_sink(), attn_window(),
@@ -8474,6 +11209,8 @@ static int attn_slots_flash_core(gpu_attn_layer *d,
         fc_sigmoid_ctx(ctx, b->a_z, nslots * attn_dim);
         fc_mul_ctx(ctx, b->a_out, b->a_z, b->a_out, nslots * attn_dim);
     }
+    bv_trace_rows(ctx, "plain", "attn", -1, b->a_out, nslots, attn_dim, NULL,
+                  bv_trace_slots_pos0);
     sub_lap(&attd_cum[ATTD_OUTGATE], &attd_laps[ATTD_OUTGATE], ctx, &sub_t0);
     sprof_lap(SPROF_ATTN_FLASH, ctx, &sp_t0);
     return 0;
@@ -8622,14 +11359,10 @@ static int gpu_attn_block_slots_flash(pn_qwen35moe_gpu *g, gpu_attn_layer *d,
         /* 7. Output projection + residual. */
         double sp_t0 = 0.0;
         sprof_begin(ctx, &sp_t0);
-        if (gpu_matvec_nx(&d->attn_output, b->a_out, b->block_out, nslots) < 0)
+        if (gpu_attn_out_slots(d, cfg, b, nslots) < 0)
             rc = -1;
-        else
-            fc_add_ctx(ctx, b->hidden, b->block_out, b->hidden,
-                       nslots * cfg->n_embd);
         sprof_lap(SPROF_DENSE, ctx, &sp_t0);
     }
-    attn_slots_plan_free(&pl);
     return rc;
 }
 
@@ -8728,7 +11461,7 @@ static int gpu_attn_block_slots(pn_qwen35moe_gpu *g, gpu_attn_layer *d,
                        (size_t)nslots * kv_dim * sizeof(float));
     {
         float *aout_all = hb_qg;
-        float scale = 1.0f / sqrtf((float)head_dim);
+        float scale = qw_scale_inv_sqrt(head_dim);
         /* heap scratch: max_seq (same for all slots) can reach the 256K cap —
          * too large for the stack. */
         int scores_cap = (nslots > 0) ? sts[0]->kv[kv_idx].max_seq : 4096;
@@ -8846,9 +11579,8 @@ static int gpu_attn_block_slots(pn_qwen35moe_gpu *g, gpu_attn_layer *d,
     sprof_lap(SPROF_ATTN_HOST, ctx, &sp_t0);
 
     /* 7. Output projection + residual. */
-    if (gpu_matvec_nx(&d->attn_output, b->a_out, b->block_out, nslots) < 0)
+    if (gpu_attn_out_slots(d, cfg, b, nslots) < 0)
         return -1;
-    fc_add_ctx(ctx, b->hidden, b->block_out, b->hidden, nslots * cfg->n_embd);
     sprof_lap(SPROF_DENSE, ctx, &sp_t0);
     return 0;
 }
@@ -8860,7 +11592,8 @@ static int gpu_attn_block_slots(pn_qwen35moe_gpu *g, gpu_attn_layer *d,
  * scratch), so the exact same launch sequence replays every step, and that is
  * the sequence captured into the per-layer slots graph. A non-grouped layer
  * takes the per-row MoE fallback (which does sync + read back the routing) and
- * is never graph-captured — the capture gate already requires moe.grouped.
+ * is never graph-captured — the capture gate requires moe.grouped (or a
+ * dense FFN, whose batched block is equally stream-ordered).
  * Returns 0 on success, <0 on error. */
 static int gpu_ssm_slots_layer_body(gpu_ssm_layer *d, fc_cuda_ctx *ctx,
                                     const pn_qwen35moe_config *cfg,
@@ -8872,7 +11605,7 @@ static int gpu_ssm_slots_layer_body(gpu_ssm_layer *d, fc_cuda_ctx *ctx,
     int rc;
     fc_rms_norm_nx_ctx(ctx, b->hidden, d->attn_norm.buf, b->x_norm, c,
                        cfg->rms_norm_eps, nslots);
-    rc = gpu_ssm_block_slots(d, cfg, b, slot_base, nslots);
+    rc = gpu_ssm_block_slots(d, cfg, b, slot_base, nslots, 0);
     if (rc < 0)
         return rc;
     fc_rms_norm_nx_ctx(ctx, b->hidden, d->post_attention_norm.buf,
@@ -8902,9 +11635,8 @@ static int gpu_attn_slots_layer_body(gpu_attn_layer *d, fc_cuda_ctx *ctx,
                        cfg->rms_norm_eps, nslots);
     if (attn_slots_flash_core(d, cfg, b, pos_g, nslots, pl) < 0)
         return -1;
-    if (gpu_matvec_nx(&d->attn_output, b->a_out, b->block_out, nslots) < 0)
+    if (gpu_attn_out_slots(d, cfg, b, nslots) < 0)
         return -1;
-    fc_add_ctx(ctx, b->hidden, b->block_out, b->hidden, nslots * c);
     fc_rms_norm_nx_ctx(ctx, b->hidden, d->post_attention_norm.buf,
                        b->x_norm, c, cfg->rms_norm_eps, nslots);
     return gpu_moe_block_slots(ctx, &d->moe, cfg, b, nslots, sc, h);
@@ -9021,9 +11753,10 @@ static int gpu_attn_slots_layer_graph(pn_qwen35moe_gpu *g, gpu_attn_layer *d,
             pn_graph_capture_succeeded(&d->slots_graph_capture);
             if (sdiag_on() && !d->moe.sdiag_logged) {
                 d->moe.sdiag_logged = 1;
-                fprintf(stderr, "[sdiag] layer %2d ATTN moe=grouped "
+                fprintf(stderr, "[sdiag] layer %2d ATTN moe=%s "
                         "graph=CAPTURED n=%d base=%d splits=%d\n",
-                        layer, nslots, slot_base, pl.launch_splits);
+                        layer, cfg->dense_ffn ? "dense" : "grouped",
+                        nslots, slot_base, pl.launch_splits);
             }
         } else {
             pn_graph_capture_failed(&d->slots_graph_capture);
@@ -9032,8 +11765,9 @@ static int gpu_attn_slots_layer_graph(pn_qwen35moe_gpu *g, gpu_attn_layer *d,
              * attempt/cooldown make a permanent give-up visibly different from
              * a transient collision that recovers. */
             if (sdiag_on())
-                fprintf(stderr, "[sdiag] layer %2d ATTN moe=grouped "
+                fprintf(stderr, "[sdiag] layer %2d ATTN moe=%s "
                         "graph=%s (body rc=%d) attempt %d/%d -> %s\n", layer,
+                        cfg->dense_ffn ? "dense" : "grouped",
                         begin_ok ? "CAPTURE FAILED" : "BEGIN FAILED", brc,
                         d->slots_graph_capture.consecutive_failures,
                         PN_GRAPH_CAPTURE_MAX_FAILURES,
@@ -9044,15 +11778,12 @@ static int gpu_attn_slots_layer_graph(pn_qwen35moe_gpu *g, gpu_attn_layer *d,
 
     if (!done &&
         gpu_attn_slots_layer_body(d, ctx, cfg, b, pos_g, nslots, &pl,
-                                  sc, h) < 0) {
-        attn_slots_plan_free(&pl);
+                                  sc, h) < 0)
         return -1;
-    }
 
     /* Step 6, outside the graph: b->a_k / b->a_v still hold this layer's roped
      * K/V (nothing in the body after the flash core writes them). */
     attn_slots_mirror(g, d, cfg, kv_idx, sts, pos, b, nslots, &pl, hb[3]);
-    attn_slots_plan_free(&pl);
     return 0;
 }
 
@@ -9076,6 +11807,10 @@ static int gpu_layer_forward_slots(pn_qwen35moe_model *m, pn_qwen35moe_gpu *g,
      * resolving it lazily keeps the grouped (graph-captured) path allocation-
      * free, exactly as before. */
     gpu_host_scratch *host_scr = g->host_ok ? &g->host : NULL;
+    /* Users live in persistent rows anywhere in [0, g->n_slots): size the
+     * rings to every bound row, not to this step's width. */
+    if (total_slots < g->n_slots)
+        total_slots = g->n_slots;
 
     /* Which gate closed the graph path for this layer this step? Evaluated in
      * the same order the graph_ok expressions below test them, so the FIRST
@@ -9083,8 +11818,15 @@ static int gpu_layer_forward_slots(pn_qwen35moe_model *m, pn_qwen35moe_gpu *g,
     pn_graph_ineligible_reason gate_reason = PN_GRAPH_INELIGIBLE_NONE;
     int is_attn = pn_qwen35moe_model_layer_type(m, layer) ==
                   PN_QWEN35MOE_LAYER_ATTN;
-    int layer_grouped = is_attn ? g->attn[idx].moe.grouped
-                                : g->ssm[idx].moe.grouped;
+    /* A dense FFN (Bonsai, Ornith, Qwen3.6/3.8-27B) has grouped = 0 but takes
+     * gpu_dense_ffn_batch — pure stream-ordered launches into the persistent
+     * batch scratch, as capturable as the grouped block. Same rule as the
+     * single-user gpu_segment_forward gate (grouped || dense_ffn). */
+    int layer_grouped = (is_attn ? g->attn[idx].moe.grouped
+                                 : g->ssm[idx].moe.grouped) || cfg->dense_ffn;
+    /* Before any capture below: one-slot fused descriptors build here. */
+    gpu_slots_fused_prepare(g, cfg, is_attn, idx, b, nslots);
+    const char *moe_kind = cfg->dense_ffn ? "dense" : "grouped";
     if (!gpu_graph_enabled())
         gate_reason = PN_GRAPH_INELIGIBLE_GRAPH_OFF;
     else if (!gpu_graph_slots_enabled())
@@ -9109,7 +11851,7 @@ static int gpu_layer_forward_slots(pn_qwen35moe_model *m, pn_qwen35moe_gpu *g,
          * capture-hostile and owns its layer end to end. */
         int graph_ok = gpu_graph_enabled() && gpu_graph_slots_enabled() &&
                        gpu_graph_slots_attn_enabled() && !sprof_active &&
-                       d->moe.grouped && slot_base == 0;
+                       layer_grouped && slot_base == 0;
         if (graph_ok) {
             rc = gpu_attn_slots_layer_graph(g, d, ctx, cfg, idx, sts, pos,
                                             pos_g, b, layer, slot_base, nslots,
@@ -9123,13 +11865,13 @@ static int gpu_layer_forward_slots(pn_qwen35moe_model *m, pn_qwen35moe_gpu *g,
         if (!graph_ok && sdiag_on() && !d->moe.sdiag_logged) {
             d->moe.sdiag_logged = 1;
             fprintf(stderr, "[sdiag] layer %2d ATTN moe=%s graph=%s\n", layer,
-                    d->moe.grouped ? "grouped" : "PER-ROW FALLBACK",
+                    layer_grouped ? moe_kind : "PER-ROW FALLBACK",
                     !gpu_graph_enabled()         ? "off (QWEN35_GRAPH=0)"
                     : !gpu_graph_slots_enabled() ? "off (QWEN35_GRAPH_SLOTS=0)"
                     : !gpu_graph_slots_attn_enabled()
                                        ? "never (QWEN35_GRAPH_SLOTS_ATTN=0)"
                     : sprof_active               ? "disabled (sprof active)"
-                    : !d->moe.grouped            ? "INELIGIBLE (MoE not grouped)"
+                    : !layer_grouped             ? "INELIGIBLE (MoE not grouped)"
                                                  : "skipped (slot_base>0)");
         }
         fc_rms_norm_nx_ctx(ctx, b->hidden, d->attn_norm.buf, b->x_norm, c,
@@ -9148,8 +11890,11 @@ static int gpu_layer_forward_slots(pn_qwen35moe_model *m, pn_qwen35moe_gpu *g,
     gpu_ssm_layer *d = &g->ssm[idx];
     gpu_die_scratch *die_scr = d->moe.grouped ? NULL
                                               : gpu_get_scratch(g, ctx, cfg);
-    if (d->slots_cap < slot_base + nslots || !d->conv_slots || !d->ssm_slots)
+    if (!d->conv_slots || !d->ssm_slots)
         return -1;  /* slots not bound */
+    for (int u = 0; u < nslots; u++)
+        if (b->rows_h[u] < 0 || b->rows_h[u] >= d->slots_cap)
+            return -1;  /* a user's row was never carved */
 
     /* L9 — replay the captured slots graph (~30 launches -> 1) when the graph
      * gate is on, sprof is off (its mid-body syncs would break capture), MoE
@@ -9159,7 +11904,7 @@ static int gpu_layer_forward_slots(pn_qwen35moe_model *m, pn_qwen35moe_gpu *g,
      * recapture every layer every step (thrash). The base-0 group keeps a
      * stable graph across steps; the other group (slot_base>0) runs direct. */
     int graph_ok = gpu_graph_enabled() && gpu_graph_slots_enabled() &&
-                   !sprof_active && d->moe.grouped && slot_base == 0;
+                   !sprof_active && layer_grouped && slot_base == 0;
 
     /* A captured graph bakes in the slot count (launch grids), the batch-
      * scratch buffer addresses AND (L5) the ring-offset baked from slot_base;
@@ -9227,17 +11972,18 @@ static int gpu_layer_forward_slots(pn_qwen35moe_model *m, pn_qwen35moe_gpu *g,
             pn_graph_capture_succeeded(&d->slots_graph_capture);
             if (sdiag_on() && !d->moe.sdiag_logged) {
                 d->moe.sdiag_logged = 1;
-                fprintf(stderr, "[sdiag] layer %2d SSM  moe=grouped "
+                fprintf(stderr, "[sdiag] layer %2d SSM  moe=%s "
                         "graph=CAPTURED n=%d base=%d\n",
-                        layer, nslots, slot_base);
+                        layer, moe_kind, nslots, slot_base);
             }
             return 0;
         }
         pn_graph_capture_failed(&d->slots_graph_capture);
         /* Every failure, bounded by the retry budget — see the ATTN log. */
         if (sdiag_on())
-            fprintf(stderr, "[sdiag] layer %2d SSM  moe=grouped "
+            fprintf(stderr, "[sdiag] layer %2d SSM  moe=%s "
                     "graph=%s (body rc=%d) attempt %d/%d -> %s\n", layer,
+                    moe_kind,
                     begin_ok ? "CAPTURE FAILED" : "BEGIN FAILED", rc,
                     d->slots_graph_capture.consecutive_failures,
                     PN_GRAPH_CAPTURE_MAX_FAILURES,
@@ -9248,11 +11994,11 @@ static int gpu_layer_forward_slots(pn_qwen35moe_model *m, pn_qwen35moe_gpu *g,
     if (!graph_ok && sdiag_on() && !d->moe.sdiag_logged) {
         d->moe.sdiag_logged = 1;
         fprintf(stderr, "[sdiag] layer %2d SSM  moe=%s graph=%s\n", layer,
-                d->moe.grouped ? "grouped" : "PER-ROW FALLBACK",
+                layer_grouped ? moe_kind : "PER-ROW FALLBACK",
                 !gpu_graph_enabled()       ? "off (QWEN35_GRAPH=0)"
                 : !gpu_graph_slots_enabled() ? "off (QWEN35_GRAPH_SLOTS=0)"
                 : sprof_active             ? "disabled (sprof active)"
-                : !d->moe.grouped          ? "INELIGIBLE (MoE not grouped)"
+                : !layer_grouped           ? "INELIGIBLE (MoE not grouped)"
                 : slot_base != 0           ? "skipped (slot_base>0)"
                                            : "direct");
     }
@@ -9849,6 +12595,10 @@ static int gpu_head_from_slots(pn_qwen35moe_gpu *g,
     if (t3p) t3t = prof_now();
     fc_rms_norm_nx_ctx(ctx, b->hidden, g->output_norm.buf, b->x_norm, c,
                        cfg->rms_norm_eps, nslots);
+    /* A solo step's row can join the MTP head's backlog (pn_qwen35moe_mtp_push_rows after
+     * the step), so a solo slot that stepped plain keeps its head history. */
+    if (nslots == 1 && !g->pd_cycle)
+        mtp_capture_rows(g, ctx, b->x_norm, 1, c);
     if (t3p) { fc_sync_ctx(ctx); t3p_lap(T3P_NORM, &t3t); }
 
     if (g->vocab_split_ready && vocab_split_on() && two_die &&
@@ -9868,16 +12618,25 @@ static int gpu_head_from_slots(pn_qwen35moe_gpu *g,
         g->spec_logits = fc_buffer_alloc_ctx(ctx, (size_t)nslots *
                                              cfg->n_vocab * sizeof(float));
         g->spec_logits_cap = g->spec_logits ? nslots : 0;
-        if (!g->spec_logits_cap)
+        if (!g->spec_logits_cap) {
+            fprintf(stderr, "[qwen35moe] decode_slots: LM-head logits buffer "
+                    "(%d x %d) alloc failed\n", nslots, cfg->n_vocab);
             return -1;
+        }
     }
-    if (gpu_matvec_nx(&g->output, b->x_norm, g->spec_logits, nslots) < 0)
+    if (gpu_matvec_nx(&g->output, b->x_norm, g->spec_logits, nslots) < 0) {
+        fprintf(stderr, "[qwen35moe] decode_slots: LM head has no batched "
+                "kernel (quant type %d)\n", (int)g->output.type);
         return -1;
+    }
     if (t3p) { fc_sync_ctx(ctx); t3p_lap(T3P_FULL_MV, &t3t); }
     sprof_lap(SPROF_LM_HEAD, ctx, &sp_t0);
     if (gpu_present_slots_logits(ctx, g->spec_logits, sc, sts, nslots,
-                                 cfg->n_vocab) < 0)
+                                 cfg->n_vocab) < 0) {
+        fprintf(stderr, "[qwen35moe] decode_slots: top-k presentation of %d "
+                "rows failed\n", nslots);
         return -1;
+    }
     if (t3p) {
         t3p_lap(T3P_FULL_PRES, &t3t);
         if (++t3p_nfull >= t3p)
@@ -9896,37 +12655,525 @@ static int gpu_head_from_slots(pn_qwen35moe_gpu *g,
  * sts[u]->logits (device top-k sparse presentation, same as single-user
  * decode). Slot u must be bound to sts[u]. Does NOT advance any position
  * bookkeeping (the pn_model adapter does). Returns 0 on success. */
+/* QWEN35_TP decode step of one bound slot: the TP walk at n = 1 on the live
+ * buffers (the slot row is parking only under TP: qw_ssm_seed_shared and
+ * gpu_attn_kv_cache_sync pull it in when live is stale), the slots head, then
+ * the advanced state parked back in the row. Bind records slot_pos = pos; the
+ * caller (pn_qwen35moe_decode_slots_rows) bumps it with the row. */
+static int tp_decode_slot_step(pn_qwen35moe_model *m, pn_qwen35moe_gpu *g, uint32_t token,
+                               pn_qwen35moe_state *st, int pos, int row, int nslots)
+{
+    const pn_qwen35moe_config *cfg = pn_qwen35moe_model_config(m);
+    fc_cuda_ctx *ctx = NULL;
+    gpu_batch_scratch *b = NULL;
+    gpu_die_scratch *sc = NULL;
+    pn_qwen35moe_state *sts[1] = { st };
+
+    if (nslots != 1) {
+        fprintf(stderr, "[qwen35moe] QWEN35_TP: one decode slot per step, not %d\n", nslots);
+        return -1;
+    }
+    if ((st->n_attn > 0 && pos + 1 > st->kv[0].max_seq) ||
+        tp_batch_walk(m, g, &token, 1, st, pos, 1, &ctx, &b, &sc) < 0)
+        return -1;
+    tp_commit_row(g, st, pos);
+    if (gpu_head_from_slots(g, cfg, ctx, b, sc, sts, 1, 1, 0.0) < 0)
+        return -1;
+    return pn_qwen35moe_decode_slot_bind_cuda(m, st, pos, row, g->n_slots);
+}
+
+/* Device work of one layer of stage s on both ranks for a MoE QWEN35_TP
+ * decode-slots step: the slots core of gpu_layer_forward_slots (on-die flash
+ * attention over the rank's KV heads' slot rings with the plan pl[p] that
+ * attn_slots_flash_prep made / the slot GDN step over the rank's heads' state
+ * rows, local dims) up to the core output, then tp_layer_tail. No host work, so
+ * a stage of these captures as one graph. */
+static int tp_slots_layer_dev(pn_qwen35moe_model *m, pn_qwen35moe_gpu *g, int s, int layer,
+                              gpu_batch_scratch *const b[2], fc_buffer *const pos_g[2],
+                              const qw_attn_slots_plan *pl, int nslots)
+{
+    const pn_qwen35moe_config *cfg = pn_qwen35moe_model_config(m);
+    const pn_qwen35moe_config *lc = &g->tp_cfg;
+    const int c = cfg->n_embd;
+    const int idx = pn_qwen35moe_model_layer_index(m, layer);
+    const int is_attn = pn_qwen35moe_model_layer_type(m, layer) == PN_QWEN35MOE_LAYER_ATTN;
+    fc_buffer *core[2];
+
+    for (int p = 0; p < 2; p++) {
+        fc_cuda_ctx *ctx = g->ctx[2 * s + p];
+        if (is_attn) {
+            gpu_attn_layer *d = &g->attn[idx + p * g->tp_n_attn];
+            fc_rms_norm_nx_ctx(ctx, b[p]->hidden, d->attn_norm.buf, b[p]->x_norm, c,
+                               cfg->rms_norm_eps, nslots);
+            if (attn_slots_flash_core(d, lc, b[p], pos_g[p], nslots, &pl[p]) != 0)
+                return -1;
+            core[p] = b[p]->a_out;
+        } else {
+            gpu_ssm_layer *d = &g->ssm[idx + p * g->tp_n_ssm];
+            fc_rms_norm_nx_ctx(ctx, b[p]->hidden, d->attn_norm.buf, b[p]->x_norm, c,
+                               cfg->rms_norm_eps, nslots);
+            if (gpu_ssm_block_slots(d, lc, b[p], 0, nslots, 1) < 0)
+                return -1;
+            core[p] = b[p]->s_gated;
+        }
+    }
+    return tp_layer_tail(g, cfg, s, is_attn, idx, core, b, nslots);
+}
+
+/* Host work of stage s before its device work: every attention half's ring
+ * re-sync + plan (pls[2 * (layer - lo) + p]) and the SSM row checks. Returns a
+ * key folding everything a captured stage graph bakes in, or 0 on error. */
+static uint64_t tp_slots_stage_prep(pn_qwen35moe_model *m, pn_qwen35moe_gpu *g, int s,
+                                    gpu_batch_scratch *const b[2], fc_buffer *const pos_g[2],
+                                    pn_qwen35moe_state *const *sts, const int *pos,
+                                    int nslots, qw_attn_slots_plan *pls)
+{
+    const pn_qwen35moe_config *lc = &g->tp_cfg;
+    const int lo = g->layer_lo[2 * s], hi = g->layer_hi[2 * s];
+    const int total_slots = nslots > g->n_slots ? nslots : g->n_slots;
+    uint64_t key = 1469598103934665603ULL;
+#define TP_KEY(v) (key = (key ^ (uint64_t)(v)) * 1099511628211ULL)
+    TP_KEY(nslots);
+    TP_KEY(g->tp_gen);
+    for (int p = 0; p < 2; p++) {
+        TP_KEY(b[p]->gen);
+        TP_KEY((uintptr_t)b[p]);
+    }
+    for (int layer = lo; layer < hi; layer++) {
+        const int idx = pn_qwen35moe_model_layer_index(m, layer);
+        for (int p = 0; p < 2; p++) {
+            if (pn_qwen35moe_model_layer_type(m, layer) == PN_QWEN35MOE_LAYER_ATTN) {
+                gpu_attn_layer *d = &g->attn[idx + p * g->tp_n_attn];
+                qw_attn_slots_plan *pl = &pls[2 * (layer - lo) + p];
+                int rc = attn_slots_flash_prep(d, lc, idx, sts, pos, pos_g[p], b[p], 0, nslots,
+                                               total_slots, pl);
+                if (rc > 0)
+                    fprintf(stderr, "[qwen35moe] QWEN35_TP: layer %d slot attention needs "
+                            "the on-die flash path\n", layer);
+                if (rc != 0)
+                    return 0;
+                TP_KEY(d->slots_ring_gen);
+                TP_KEY(pl->launch_splits);
+                TP_KEY(pl->kv_q4);
+                TP_KEY(pl->max_seq);
+            } else {
+                gpu_ssm_layer *d = &g->ssm[idx + p * g->tp_n_ssm];
+                if (!d->conv_slots || !d->ssm_slots)
+                    return 0;  /* slots not bound */
+                for (int u = 0; u < nslots; u++)
+                    if (b[p]->rows_h[u] < 0 || b[p]->rows_h[u] >= d->slots_cap)
+                        return 0;  /* a user's row was never carved */
+            }
+        }
+    }
+#undef TP_KEY
+    return key ? key : 1;
+}
+
+/* Stage s's device work: replay its graph (key unchanged), capture it (second
+ * step with this key; the first runs direct so every lazy buffer exists), or
+ * issue it directly. A graph runs on rank 0's stream; tp_gev fences rank 1's
+ * stream into it before and out of it after. */
+static int tp_slots_stage_run(pn_qwen35moe_model *m, pn_qwen35moe_gpu *g, int s,
+                              gpu_batch_scratch *const b[2], fc_buffer *const pos_g[2],
+                              const qw_attn_slots_plan *pls, int nslots, uint64_t key)
+{
+    const int lo = g->layer_lo[2 * s], hi = g->layer_hi[2 * s];
+    fc_cuda_ctx *c0 = g->ctx[2 * s], *c1 = g->ctx[2 * s + 1];
+    fc_event *e0 = g->tp_gev[2 * s], *e1 = g->tp_gev[2 * s + 1];
+    const int graph = tp_graph_on() && !tp_sync_on() && g->tp_sgraph_fail[s] < 4;
+
+    if (graph && g->tp_sgraph[s] && g->tp_sgraph_key[s] != key) {
+        fc_graph_free(g->tp_sgraph[s]);
+        g->tp_sgraph[s] = NULL;
+    }
+    if (graph && !g->tp_sgraph[s] && g->tp_sgraph_warm[s] == key) {
+        /* Capture: rank 1's stream joins rank 0's capture and rejoins at the end. */
+        int ok = fc_graph_begin_ctx(c0) == 0;
+        if (ok) {
+            g->tp_capturing = 1;
+            ok = fc_event_record_ctx(c0, e0) == 0 && fc_event_wait_ctx(c1, e0) == 0;
+            for (int layer = lo; ok && layer < hi; layer++)
+                ok = tp_slots_layer_dev(m, g, s, layer, b, pos_g, &pls[2 * (layer - lo)],
+                                        nslots) == 0;
+            ok = fc_event_record_ctx(c1, e1) == 0 && fc_event_wait_ctx(c0, e1) == 0 && ok;
+            g->tp_capturing = 0;
+            fc_graph *gr = fc_graph_end_ctx(c0);
+            if (ok && gr) {
+                g->tp_sgraph[s] = gr;
+                g->tp_sgraph_key[s] = key;
+            } else {
+                fc_graph_free(gr);
+                if (++g->tp_sgraph_fail[s] == 4)
+                    fprintf(stderr, "[qwen35moe] QWEN35_TP: stage %d slots graph capture "
+                            "failed 4 times; direct issue from now on\n", s);
+            }
+        }
+    }
+    if (graph && g->tp_sgraph[s]) {
+        if (fc_event_record_ctx(c1, e1) != 0 || fc_event_wait_ctx(c0, e1) != 0 ||
+            fc_graph_launch(g->tp_sgraph[s]) != 0 ||
+            fc_event_record_ctx(c0, e0) != 0 || fc_event_wait_ctx(c1, e0) != 0)
+            return -1;
+        return 0;
+    }
+    g->tp_sgraph_warm[s] = key;
+    for (int layer = lo; layer < hi; layer++)
+        if (tp_slots_layer_dev(m, g, s, layer, b, pos_g, &pls[2 * (layer - lo)], nslots) < 0)
+            return -1;
+    return 0;
+}
+
+/* ============================================================
+ * QWEN35_BS_PD_OVERLAP — stage-alternating prefill/decode overlap (MoE TP2)
+ *
+ * A TP2 decode step runs stage 0 on board (0,1), then stage 1 + the head on
+ * board (2,3), then host sampling, so each board idles for about half of every
+ * step. The prefill cursor fills those halves: it walks a prompt range through
+ * the same 2-stage pipeline the wide prefill uses (chunk m on stage 1 while
+ * chunk m+1 is on stage 0), but issues it a few LAYERS at a time ("pieces"),
+ * and pn_qwen35moe_pd_cycle_cuda issues the pieces inside a decode step:
+ *
+ *   board 0+1:  S0(n)  P0 ................................  S0(n+1)  P0 ...
+ *   board 2+3:  P1 ........  S1(n) + head  P1 ...........  S1(n+1) + head
+ *
+ * P0 is issued after S1 (it runs during S1, the head and sampling); P1 after the
+ * head's logits came back (it runs during sampling and the next S0). Each die
+ * has one stream, so a board runs one or the other, never both at once.
+ *
+ * Exactness: every layer of every chunk runs tp_layer_forward_batch on the same
+ * inputs and in the same per-layer order as gpu_prefill_pipeline_run, and the
+ * decode stages run tp_slots_step's bodies unchanged. Decode is on its own
+ * buffer lane (QW_LANE_DECODE), so the only state the two share is the host
+ * staging set bhost[0], and every use of it is a synchronous copy or an async
+ * upload the driver stages before returning (fc_buffer_from_cpu_n_async).
+ *
+ * A piece is one layer of one chunk on one stage (~36 ms for a GDN layer of 128
+ * tokens, ~2x for an attention layer at ~10k depth). The caller says how many
+ * pieces each board may take per cycle (batch_sched_pd_budget.h: one).
+ * ============================================================ */
+
+struct pn_qwen35moe_pd_cursor {
+    pn_qwen35moe_model *m;
+    pn_qwen35moe_gpu *g;
+    pn_qwen35moe_state *s;
+    pn_state *state;
+    const uint32_t *tokens;
+    int n_total, pos0, chunk, n_chunks;
+    int injected_max;            /* chunks allowed into stage 0 (lowered on abort) */
+    int next_inject;             /* next chunk to enter stage 0 */
+    int ck[2];                   /* chunk on stage s, -1 = none */
+    int layer[2];                /* layers of ck[s] issued on stage s */
+    int handed;                  /* chunks handed to stage 1 */
+    int retired;                 /* chunks every layer of stage 1 was issued for */
+    int normed_last;             /* the last chunk's x_norm is already on die 3 */
+    int aborted;
+    gpu_batch_scratch *bs[4];
+    gpu_die_scratch *ds[4];
+    double ph_ms[PN_QWEN35MOE_PD_PHASES];   /* the last cycle's host time per phase */
+};
+
+static int qw_pd_stage_layers(const pn_qwen35moe_gpu *g, int s)
+{
+    return g->layer_hi[2 * s] - g->layer_lo[2 * s];
+}
+
+/* Upload a staged host row block to a die: async when the driver allows it (the
+ * pageable source is staged before the call returns, so bhost can be reused at
+ * once), else the blocking copy. */
+static void qw_pd_upload(fc_buffer *dst, const float *src, size_t bytes)
+{
+    if (fc_buffer_from_cpu_n_async(dst, src, bytes) != 0)
+        fc_buffer_from_cpu_n(dst, src, bytes);
+}
+
+/* Chunk next_inject enters stage 0: embedded on the host, uploaded to both ranks. */
+static int qw_pd_inject(pn_qwen35moe_pd_cursor *cur)
+{
+    pn_qwen35moe_gpu *g = cur->g;
+    const int c = pn_qwen35moe_model_config(cur->m)->n_embd;
+    qw_pipe_chunk k = qw_pipe_chunk_at(cur->tokens, cur->n_total, cur->pos0, cur->chunk,
+                                       cur->next_inject);
+    const size_t bytes = (size_t)k.n * c * sizeof(float);
+    if (gpu_select_die(g, g->die[0]) < 0)
+        return -1;
+    for (int t = 0; t < k.n; t++)
+        pn_qwen35moe_model_embed_row(cur->m, k.tokens[t], g->bhost[0] + (size_t)t * c);
+    qw_pd_upload(cur->bs[0]->hidden, g->bhost[0], bytes);
+    qw_pd_upload(cur->bs[1]->hidden, g->bhost[0], bytes);
+    cur->ck[0] = cur->next_inject++;
+    cur->layer[0] = 0;
+    return 0;
+}
+
+/* Stage 1 issued the last layer of its chunk: feed the MTP head the chunk's
+ * normed rows (as gpu_prefill_pipeline_run does) and retire it. The final
+ * chunk's head is left to pn_qwen35moe_pd_finish_cuda. */
+static void qw_pd_stage1_chunk_end(pn_qwen35moe_pd_cursor *cur)
+{
+    pn_qwen35moe_gpu *g = cur->g;
+    const pn_qwen35moe_config *cfg = pn_qwen35moe_model_config(cur->m);
+    const int d = g->n_die - 1;
+    qw_pipe_chunk k = qw_pipe_chunk_at(cur->tokens, cur->n_total, cur->pos0, cur->chunk,
+                                       cur->ck[1]);
+    if (g->mtp.on && qw_pipe_mtp_feed_on()) {
+        fc_rms_norm_nx_ctx(g->ctx[d], cur->bs[d]->hidden, g->output_norm.buf,
+                           cur->bs[d]->x_norm, cfg->n_embd, cfg->rms_norm_eps, k.n);
+        mtp_capture_rows(g, g->ctx[d], cur->bs[d]->x_norm, k.n, cfg->n_embd);
+        (void)mtp_push(cur->m, g, cur->s, k.pos0 + k.n, k.tokens, k.n);
+        if (cur->ck[1] == cur->n_chunks - 1)
+            cur->normed_last = 1;
+    }
+    cur->retired++;
+    cur->ck[1] = -1;
+    cur->layer[1] = 0;
+}
+
+/* Issue up to max_pieces of stage s's next layers on the prefill lane (every
+ * ready layer when max_pieces < 0). Stage 0 injects a new chunk only when its
+ * last one was handed on; stage 1 picks up a handed chunk. Returns the number
+ * of layers issued, or -1. */
+static int qw_pd_issue_stage(pn_qwen35moe_pd_cursor *cur, int s, int max_pieces)
+{
+    pn_qwen35moe_gpu *g = cur->g;
+    const int lane = g->lane;
+    const int nl = qw_pd_stage_layers(g, s);
+    int issued = 0;
+
+    g->lane = QW_LANE_PREFILL;
+    for (;;) {
+        if (cur->ck[s] < 0) {
+            if (s == 0) {
+                if (cur->next_inject >= cur->injected_max || qw_pd_inject(cur) < 0)
+                    break;
+            } else {
+                if (cur->handed <= cur->retired)
+                    break;
+                cur->ck[1] = cur->retired;
+                cur->layer[1] = 0;
+            }
+        }
+        if (cur->layer[s] >= nl)
+            break;                       /* stage 0: waiting for its hand-off */
+        if (max_pieces >= 0 && issued >= max_pieces)
+            break;
+        qw_pipe_chunk k = qw_pipe_chunk_at(cur->tokens, cur->n_total, cur->pos0, cur->chunk,
+                                           cur->ck[s]);
+        gpu_batch_scratch *pair[2] = { cur->bs[2 * s], cur->bs[2 * s + 1] };
+        if (tp_layer_forward_batch(cur->m, g, s, g->layer_lo[2 * s] + cur->layer[s], pair,
+                                   cur->s, k.pos0, k.n, 0) < 0) {
+            g->lane = lane;
+            return -1;
+        }
+        cur->layer[s]++;
+        issued++;
+        if (s == 1 && cur->layer[1] == nl)
+            qw_pd_stage1_chunk_end(cur);
+    }
+    g->lane = lane;
+    return issued;
+}
+
+/* Hand stage 0's finished chunk to stage 1 once stage 1 has issued all of its
+ * own: rank 0's rows through the host to both stage-1 ranks, the uploads queued
+ * behind stage 1's issued work. Blocks only on die 0 / die 1's streams.
+ * Returns 1 when a chunk moved, 0 when none could, -1 on error. */
+static int qw_pd_hand_off(pn_qwen35moe_pd_cursor *cur)
+{
+    pn_qwen35moe_gpu *g = cur->g;
+    if (cur->ck[0] < 0 || cur->layer[0] < qw_pd_stage_layers(g, 0))
+        return 0;
+#ifndef PN_PDO_RED_NO_HOP_FENCE
+    if (cur->ck[1] >= 0 || cur->handed > cur->retired)
+        return 0;
+#else
+    /* Red build: the hop may overwrite stage 1's input while stage 1 still has
+     * layers of the previous chunk to issue; the engine gate must fail. */
+    if (cur->handed > cur->retired + 1)
+        return 0;
+#endif
+    const int c = pn_qwen35moe_model_config(cur->m)->n_embd;
+    qw_pipe_chunk k = qw_pipe_chunk_at(cur->tokens, cur->n_total, cur->pos0, cur->chunk,
+                                       cur->ck[0]);
+    const size_t bytes = (size_t)k.n * c * sizeof(float);
+    fc_sync_ctx(g->ctx[0]);
+    fc_buffer_to_cpu_n(cur->bs[0]->hidden, g->bhost[0], bytes);
+    qw_pd_upload(cur->bs[2]->hidden, g->bhost[0], bytes);
+    qw_pd_upload(cur->bs[3]->hidden, g->bhost[0], bytes);
+    cur->handed++;
+    cur->ck[0] = -1;
+    cur->layer[0] = 0;
+    return 1;
+}
+
+/* MoE QWEN35_TP decode-slots step over nslots bound rows (g->step_rows): the
+ * walk of tp_batch_walk with the slots bodies (stage hop host-staged, head on
+ * die 3), then the slots head. The slot rows are the live state, as on the
+ * layer split; the caller bumps slot_pos. With a prefill cursor (overlap
+ * cycle, decode lane), the cursor's pending hand-off happens while die 0 is
+ * drained at the stage hop, stage 0's pieces are issued after stage 1's work
+ * and stage 1's after the head (up to `pieces` each); the solo-step MTP row capture
+ * is skipped (the head's backlog belongs to the prefilling session). */
+static int tp_slots_step(pn_qwen35moe_model *m, pn_qwen35moe_gpu *g, const uint32_t *tokens,
+                         pn_qwen35moe_state *const *sts, const int *pos, int nslots,
+                         pn_qwen35moe_pd_cursor *cur, int pieces)
+{
+    const pn_qwen35moe_config *cfg = pn_qwen35moe_model_config(m);
+    const int c = cfg->n_embd;
+    const size_t hidden_bytes = (size_t)nslots * c * sizeof(float);
+    gpu_batch_scratch *b[2] = { NULL, NULL };
+    fc_buffer *pos_g[2] = { NULL, NULL };
+    gpu_die_scratch *sc = NULL;
+    qw_attn_slots_plan *pls = calloc((size_t)2 * cfg->n_layer, sizeof(*pls));
+    int rc = -1;
+
+    if (!pls)
+        return -1;
+    double t_ph = cur ? prof_now() : 0.0;
+#define QW_PD_PHASE(i) do { if (cur) { const double t_ = prof_now(); \
+                                     cur->ph_ms[i] = 1000.0 * (t_ - t_ph); t_ph = t_; } } while (0)
+    for (int u = 0; u < nslots; u++)
+        if (sts[u]->n_attn > 0 && pos[u] + 1 > sts[u]->kv[0].max_seq)
+            goto out;
+    if (tp_exchange_ready(g, cfg, nslots) < 0)
+        goto out;
+    for (int s = 0; s < 2; s++) {
+        gpu_batch_scratch *prev = b[0];
+        for (int p = 0; p < 2; p++) {
+            const int die = 2 * s + p;
+            b[p] = gpu_get_batch_scratch(g, g->ctx[die], cfg, nslots);
+            sc = gpu_get_scratch(g, g->ctx[die], cfg);
+            pos_g[p] = b[p] ? gpu_pos_buf_upload(g, b[p], g->ctx[die], die, pos, g->step_rows,
+                                                 nslots)
+                            : NULL;
+            if (!b[p] || !sc || !pos_g[p])
+                goto out;
+        }
+        if (s == 0) {
+            for (int u = 0; u < nslots; u++)
+                pn_qwen35moe_model_embed_row(m, tokens[u], g->bhost[0] + (size_t)u * c);
+#ifdef PN_PDO_RED
+            /* Red build, PN_PDO_RED_ULP=1: the exactness gates must see a one-ulp change
+             * on the decode lane. */
+            if (g->lane == QW_LANE_DECODE && getenv("PN_PDO_RED_ULP"))
+                g->bhost[0][0] = nextafterf(g->bhost[0][0], INFINITY);
+#endif
+        } else {
+            QW_PD_PHASE(0);
+            fc_sync_ctx(g->ctx[0]);
+            QW_PD_PHASE(1);
+            if (cur && qw_pd_hand_off(cur) < 0)
+                goto out;
+            fc_buffer_to_cpu_n(prev->hidden, g->bhost[0], hidden_bytes);
+        }
+        fc_buffer_from_cpu_n(b[0]->hidden, g->bhost[0], hidden_bytes);
+        fc_buffer_from_cpu_n(b[1]->hidden, g->bhost[0], hidden_bytes);
+        if (s == 1)
+            QW_PD_PHASE(2);
+        uint64_t key = tp_slots_stage_prep(m, g, s, b, pos_g, sts, pos, nslots, pls);
+        if (!key || tp_slots_stage_run(m, g, s, b, pos_g, pls, nslots, key) < 0) {
+            fprintf(stderr, "[qwen35moe] QWEN35_TP slots step failed on stage %d (n=%d)\n", s,
+                    nslots);
+            goto out;
+        }
+        /* The host KV mirror (lazy under TP: marks it stale). */
+        for (int layer = g->layer_lo[2 * s]; layer < g->layer_hi[2 * s]; layer++) {
+            if (pn_qwen35moe_model_layer_type(m, layer) != PN_QWEN35MOE_LAYER_ATTN)
+                continue;
+            const int idx = pn_qwen35moe_model_layer_index(m, layer);
+            for (int p = 0; p < 2; p++)
+                attn_slots_mirror(g, &g->attn[idx + p * g->tp_n_attn], &g->tp_cfg, idx, sts,
+                                  pos, b[p], nslots,
+                                  &pls[2 * (layer - g->layer_lo[2 * s]) + p], g->bhost[3]);
+        }
+        if (s == 1)
+            QW_PD_PHASE(3);
+        if (cur && s == 1 && qw_pd_issue_stage(cur, 0, pieces) < 0)
+            goto out;
+        if (s == 1)
+            QW_PD_PHASE(4);
+    }
+    g->pd_cycle = cur != NULL;
+    rc = gpu_head_from_slots(g, cfg, g->ctx[3], b[1], sc, sts, nslots, 1, 0.0);
+    g->pd_cycle = 0;
+    QW_PD_PHASE(5);
+    if (rc == 0 && cur && qw_pd_issue_stage(cur, 1, pieces) < 0)
+        rc = -1;
+    QW_PD_PHASE(6);
+#undef QW_PD_PHASE
+out:
+    free(pls);
+    return rc;
+}
+
+/* The checks and host staging every decode-slots step needs before any device
+ * work: each user's row is in range and bound to its state (g->step_rows[u] =
+ * the row), the host scratch exists and the host staging holds nslots rows. */
+static int qw_slots_step_prepare(pn_qwen35moe_gpu *g, const pn_qwen35moe_config *cfg,
+                                 const uint32_t *tokens, pn_qwen35moe_state *const *sts,
+                                 const int *rows, int nslots)
+{
+    /* rows[u] = the persistent slot row user u was bound to (NULL = u). */
+    for (int u = 0; u < nslots; u++) {
+        int r = rows ? rows[u] : u;
+        if (r < 0 || r >= g->n_slots || (int)tokens[u] >= cfg->n_vocab ||
+            !sts[u] || g->slot_state[r] != (const void *)sts[u]) {
+            fprintf(stderr, "[qwen35moe] decode_slots: user %d row %d rejected "
+                    "(n_slots %d, token %u / vocab %d, %s)\n", u, r, g->n_slots,
+                    tokens[u], cfg->n_vocab,
+                    (r >= 0 && r < g->n_slots && sts[u] &&
+                     g->slot_state[r] != (const void *)sts[u])
+                        ? "row not bound to this state" : "out of range");
+            return -1;
+        }
+        g->step_rows[u] = r;
+    }
+
+    if (!g->host_ok) {
+        if (gpu_host_scratch_init(&g->host, cfg) < 0) {
+            fprintf(stderr, "[qwen35moe] decode_slots: host scratch alloc "
+                    "failed\n");
+            return -1;
+        }
+        g->host_ok = 1;
+    }
+    if (gpu_get_batch_host(g, cfg, nslots) < 0) {
+        fprintf(stderr, "[qwen35moe] decode_slots: host staging for %d rows "
+                "failed\n", nslots);
+        return -1;
+    }
+    return 0;
+}
+
 int pn_qwen35moe_decode_slots_tokens_cuda(pn_qwen35moe_model *m,
                                           const uint32_t *tokens,
                                           pn_qwen35moe_state *const *sts,
-                                          const int *pos, int nslots)
+                                          const int *pos, const int *rows,
+                                          int nslots)
 {
     if (!m || !tokens || !sts || !pos || nslots <= 0 ||
         nslots > PN_QWEN35MOE_GPU_MAX_SLOTS)
         return -1;
     pn_qwen35moe_gpu *g = (pn_qwen35moe_gpu *)pn_qwen35moe_model_gpu(m);
-    if (!g || g->n_slots < nslots)
+    if (!g)
         return -1;
 
     const pn_qwen35moe_config *cfg = pn_qwen35moe_model_config(m);
     int c = cfg->n_embd;
     int n_layer = cfg->n_layer;
-    for (int u = 0; u < nslots; u++) {
-        if ((int)tokens[u] >= cfg->n_vocab || !sts[u] ||
-            g->slot_state[u] != (const void *)sts[u])
-            return -1;
-    }
-
+    if (qw_slots_step_prepare(g, cfg, tokens, sts, rows, nslots) < 0)
+        return -1;
     int two_die = (g->head_ctx != NULL);
     int split = g->split_layer;
 
-    if (!g->host_ok) {
-        if (gpu_host_scratch_init(&g->host, cfg) < 0)
-            return -1;
-        g->host_ok = 1;
+    if (g->tp && cfg->n_expert) {
+        g->lane = qw_pd_overlap_on() ? QW_LANE_DECODE : QW_LANE_PREFILL;
+        int rc = tp_slots_step(m, g, tokens, sts, pos, nslots, NULL, 0);
+        g->lane = QW_LANE_PREFILL;
+        return rc;
     }
-    if (gpu_get_batch_host(g, cfg, nslots) < 0)
-        return -1;
+    if (g->tp)
+        return tp_decode_slot_step(m, g, tokens[0], sts[0], pos[0], g->step_rows[0], nslots);
 
     /* QWEN35_ASYNC_KVMIRROR: pre-size + reset each active die's deferred-mirror
      * arena for this step (see qw_kv_defer). Pre-sizing to the full step up
@@ -9993,7 +13240,8 @@ int pn_qwen35moe_decode_slots_tokens_cuda(pn_qwen35moe_model *m,
         /* --- group0 front on die A --- */
         if (gpu_select_die(g, g->die[0]) < 0)
             return -1;
-        fc_buffer *pos_a = gpu_pos_buf_upload(g, g->ctx[0], 0, pos, n0);
+        fc_buffer *pos_a = gpu_pos_buf_upload(g, ba, g->ctx[0], 0, pos,
+                                              g->step_rows, n0);
         if (!pos_a ||
             gpu_group_front(m, g, cfg, tokens, sts, pos, ba, pos_a,
                             0, n0, nslots, hb0, split) < 0)
@@ -10003,7 +13251,8 @@ int pn_qwen35moe_decode_slots_tokens_cuda(pn_qwen35moe_model *m,
         fc_buffer_to_cpu_n(ba->hidden, hb0[0], (size_t)n0 * c * sizeof(float));
 
         /* --- launch group1 front on die A (async, NO sync) --- */
-        pos_a = gpu_pos_buf_upload(g, g->ctx[0], 0, pos + h, n1);
+        pos_a = gpu_pos_buf_upload(g, ba, g->ctx[0], 0, pos + h,
+                                   g->step_rows + h, n1);
         if (!pos_a ||
             gpu_group_front(m, g, cfg, tokens, sts, pos, ba, pos_a,
                             h, n1, nslots, hb1, split) < 0)
@@ -10013,7 +13262,8 @@ int pn_qwen35moe_decode_slots_tokens_cuda(pn_qwen35moe_model *m,
          * concurrently with group1's die-A work just launched above --- */
         if (gpu_select_die(g, g->head_die) < 0)
             return -1;
-        fc_buffer *pos_b = gpu_pos_buf_upload(g, g->head_ctx, 1, pos, n0);
+        fc_buffer *pos_b = gpu_pos_buf_upload(g, bb, g->head_ctx, 1, pos,
+                                              g->step_rows, n0);
         if (!pos_b ||
             gpu_group_back(m, g, cfg, sts, pos, bb, pos_b,
                            0, n0, nslots, hb0, split, n_layer) < 0)
@@ -10033,7 +13283,8 @@ int pn_qwen35moe_decode_slots_tokens_cuda(pn_qwen35moe_model *m,
         /* --- group1 back on die B, then group1 head --- */
         if (gpu_select_die(g, g->head_die) < 0)
             return -1;
-        pos_b = gpu_pos_buf_upload(g, g->head_ctx, 1, pos + h, n1);
+        pos_b = gpu_pos_buf_upload(g, bb, g->head_ctx, 1, pos + h,
+                                   g->step_rows + h, n1);
         if (!pos_b ||
             gpu_group_back(m, g, cfg, sts, pos, bb, pos_b,
                            h, n1, nslots, hb1, split, n_layer) < 0)
@@ -10071,7 +13322,9 @@ int pn_qwen35moe_decode_slots_tokens_cuda(pn_qwen35moe_model *m,
             gpu_batch_scratch *ba = gpu_get_batch_scratch(g, g->ctx[0], cfg,
                                                           nslots);
             gpu_die_scratch *sc_a = gpu_get_scratch(g, g->ctx[0], cfg);
-            fc_buffer *pos_a = gpu_pos_buf_upload(g, g->ctx[0], 0, pos, nslots);
+            fc_buffer *pos_a = ba ? gpu_pos_buf_upload(g, ba, g->ctx[0], 0, pos,
+                                                       g->step_rows, nslots)
+                                  : NULL;
             if (!ba || !sc_a || !pos_a)
                 return -1;
 
@@ -10102,7 +13355,9 @@ int pn_qwen35moe_decode_slots_tokens_cuda(pn_qwen35moe_model *m,
             gpu_batch_scratch *bb = gpu_get_batch_scratch(g, g->head_ctx, cfg,
                                                           nslots);
             gpu_die_scratch *sc_b = gpu_get_scratch(g, g->head_ctx, cfg);
-            fc_buffer *pos_b = gpu_pos_buf_upload(g, g->head_ctx, 1, pos, nslots);
+            fc_buffer *pos_b = bb ? gpu_pos_buf_upload(g, bb, g->head_ctx, 1, pos,
+                                                       g->step_rows, nslots)
+                                  : NULL;
             if (!bb || !sc_b || !pos_b)
                 return -1;
             fc_buffer_from_cpu_n(bb->hidden, g->bhost[0],
@@ -10128,6 +13383,7 @@ int pn_qwen35moe_decode_slots_tokens_cuda(pn_qwen35moe_model *m,
     /* ---- Sequential N-die walk: die 0 embeds all K tokens, each die runs
      * its layer range against its own scratch, and each boundary hands the
      * [K][c] activations to the next die. ---- */
+    bv_trace_slots_pos0 = pos[0];
     fc_cuda_ctx *ctx = NULL;
     gpu_batch_scratch *b = NULL;
     gpu_die_scratch *sc = NULL;
@@ -10148,9 +13404,16 @@ int pn_qwen35moe_decode_slots_tokens_cuda(pn_qwen35moe_model *m,
             return -1;
         gpu_batch_scratch *bd = gpu_get_batch_scratch(g, g->ctx[d], cfg, nslots);
         gpu_die_scratch *scd = gpu_get_scratch(g, g->ctx[d], cfg);
-        fc_buffer *pos_d = gpu_pos_buf_upload(g, g->ctx[d], d, pos, nslots);
-        if (!bd || !scd || !pos_d)
+        fc_buffer *pos_d = bd ? gpu_pos_buf_upload(g, bd, g->ctx[d], d, pos,
+                                                   g->step_rows, nslots)
+                               : NULL;
+        if (!bd || !scd || !pos_d) {
+            fprintf(stderr, "[qwen35moe] decode_slots: die %d scratch for %d "
+                    "rows unavailable (batch %s, die %s, pos %s)\n", g->die[d],
+                    nslots, bd ? "ok" : "FAILED", scd ? "ok" : "FAILED",
+                    pos_d ? "ok" : "FAILED");
             return -1;
+        }
 
         if (d == 0) {
             sprof_begin(g->ctx[d], &sp_t0);
@@ -10172,6 +13435,8 @@ int pn_qwen35moe_decode_slots_tokens_cuda(pn_qwen35moe_model *m,
                         "die %d layer %d (n=%d)\n", g->die[d], layer, nslots);
                 return -1;
             }
+            bv_trace_rows(g->ctx[d], "plain", "out", layer, bd->hidden, nslots,
+                          c, pos, 0);
         }
         ctx = g->ctx[d];
         b = bd;
@@ -10321,6 +13586,29 @@ int pn_qwen35moe_spec_accept(pn_model *model, pn_state *state, int n_accept)
     return 0;
 }
 
+/* Test hook (the batched-verify exactness gate): copy row `row` of the LAST
+ * verify's [n][n_vocab] LM-head output into out[n_vocab]. Every row is
+ * computed by the batched head even when the argmax scan stops early. Call
+ * between verify and accept. Returns 0, or -1 (no verify output / bad row). */
+int pn_qwen35moe_spec_row_logits(pn_model *model, int row, float *out)
+{
+    if (!model || !out || !qw_model_uses_qwen35moe_state(model))
+        return -1;
+    pn_qwen35moe_model *m = (pn_qwen35moe_model *)model->weights;
+    pn_qwen35moe_gpu *g = m ? (pn_qwen35moe_gpu *)pn_qwen35moe_model_gpu(m)
+                            : NULL;
+    if (!g || !g->spec_logits || row < 0 || row >= g->spec_n)
+        return -1;
+    const pn_qwen35moe_config *cfg = pn_qwen35moe_model_config(m);
+    size_t row_bytes = (size_t)cfg->n_vocab * sizeof(float);
+    if (gpu_select_die(g, g->die[g->n_die - 1]) < 0)
+        return -1;
+    fc_sync_ctx(g->ctx[g->n_die - 1]);
+    fc_buffer_to_cpu_at(g->spec_logits, out, (size_t)row * row_bytes,
+                        row_bytes);
+    return 0;
+}
+
 /* Multi-user decode adapters (see the decode-slots section above). bind
  * snapshots `state`'s live SSM images into `slot`; step runs ONE batched
  * forward for all n_users (slot u == states[u]), fills each user's logits
@@ -10335,27 +13623,454 @@ int pn_qwen35moe_decode_slot_bind(pn_model *model, pn_state *state, int slot,
     pn_qwen35moe_state *s = (pn_qwen35moe_state *)state->kv_cache;
     if (!m || !s)
         return -1;
-    return pn_qwen35moe_decode_slot_bind_cuda(m, s, slot, n_slots);
+    return pn_qwen35moe_decode_slot_bind_cuda(m, s, (int)state->pos, slot,
+                                              n_slots);
 }
 
-int pn_qwen35moe_decode_slot_move(pn_model *model, int src, int dst,
-                                  int n_slots)
+
+/* Carve the per-session decode blocks: `n_rows` persistent rows on every die
+ * the model spans, each a full ctx_cap KV ring row (+ q4 sink/window shadows)
+ * per attention layer and a conv + recurrent SSM image per SSM layer. Done ONCE
+ * at load so the VRAM is reserved for the model's life and a request can never
+ * be the thing that discovers it does not fit. `geom` supplies the KV geometry
+ * (q4, max_seq). Returns 0, or -1 after naming the layer that did not fit. */
+int pn_qwen35moe_decode_slots_carve(pn_model *model, pn_state *geom, int n_rows)
 {
-    if (!model || !qw_model_uses_qwen35moe_state(model))
+    if (!model || !geom || n_rows <= 0 || n_rows > PN_QWEN35MOE_GPU_MAX_SLOTS ||
+        !qw_model_uses_qwen35moe_state(model))
         return -1;
     pn_qwen35moe_model *m = (pn_qwen35moe_model *)model->weights;
-    if (!m)
+    pn_qwen35moe_state *s = m ? (pn_qwen35moe_state *)geom->kv_cache : NULL;
+    pn_qwen35moe_gpu *g = m ? (pn_qwen35moe_gpu *)pn_qwen35moe_model_gpu(m)
+                            : NULL;
+    if (!s || !g)
         return -1;
-    return pn_qwen35moe_decode_slot_move_cuda(m, src, dst, n_slots);
+    /* QWEN35_TP: every layer struct is a half; rows use the rank's local dims. */
+    const pn_qwen35moe_config *cfg = qw_state_cfg(g, g->tp, pn_qwen35moe_model_config(m));
+    size_t conv_bytes = (size_t)(cfg->ssm_conv - 1) * cfg->conv_dim *
+                        sizeof(float);
+    size_t ssm_bytes = (size_t)cfg->ssm_state * cfg->ssm_state *
+                       cfg->ssm_dt_rank * sizeof(float);
+
+    memset(g->slot_state, 0, sizeof(g->slot_state));
+    g->n_slots = n_rows;
+    for (int i = 0; i < g->n_ssm; i++) {
+        gpu_ssm_layer *d = &g->ssm[i];
+        if (d->slots_cap >= n_rows)
+            continue;
+        g->tp_gen++;   /* QWEN35_TP slots graphs bake these rows */
+        fc_buffer_free(d->conv_slots);
+        fc_buffer_free(d->ssm_slots);
+        d->conv_slots = fc_buffer_alloc_ctx(d->ctx, (size_t)n_rows * conv_bytes);
+        d->ssm_slots = fc_buffer_alloc_ctx(d->ctx, (size_t)n_rows * ssm_bytes);
+        d->slots_cap = (d->conv_slots && d->ssm_slots) ? n_rows : 0;
+        if (!d->slots_cap) {
+            fprintf(stderr, "[qwen35moe] carve: SSM layer %d: no VRAM for %d "
+                    "session blocks (%zu MiB)\n", i, n_rows,
+                    ((size_t)n_rows * (conv_bytes + ssm_bytes)) >> 20);
+            return -1;
+        }
+        if (d->slots_graph) {
+            fc_graph_free(d->slots_graph);
+            d->slots_graph = NULL;
+        }
+        pn_graph_capture_dropped(&d->slots_graph_capture);
+        d->slots_graph_n = 0;
+    }
+    for (int i = 0; i < g->n_attn; i++) {
+        const pn_qwen35moe_kv *kv = &s->kv[qw_attn_hidx(g, i)];
+        if (gpu_attn_slot_ring_ensure(&g->attn[i], cfg, kv->q4, kv->max_seq,
+                                      n_rows, qw_attn_hidx(g, i)) != 0) {
+            fprintf(stderr, "[qwen35moe] carve: attention layer %d: no VRAM "
+                    "for %d session blocks of %d tokens\n", i, n_rows,
+                    kv->max_seq);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* Does decode row `row` still hold `state` exactly as committed — its SSM
+ * image at state->pos and every attention layer's KV rows [0, pos) — so a
+ * resumed turn can continue from the card without touching host RAM? Pure
+ * bookkeeping, no device work. */
+int pn_qwen35moe_slot_holds_state(pn_model *model, int row, pn_state *state)
+{
+    if (!model || !state || row < 0 || !qw_model_uses_qwen35moe_state(model))
+        return 0;
+    pn_qwen35moe_model *m = (pn_qwen35moe_model *)model->weights;
+    pn_qwen35moe_state *s = m ? (pn_qwen35moe_state *)state->kv_cache : NULL;
+    pn_qwen35moe_gpu *g = m ? (pn_qwen35moe_gpu *)pn_qwen35moe_model_gpu(m)
+                            : NULL;
+    if (!s || !g || row >= g->n_slots || g->slot_state[row] != (const void *)s)
+        return 0;
+    const int pos = (int)state->pos;
+    if (g->slot_pos[row] != pos ||
+        g->slot_gen[row] != (s->n_attn > 0 ? s->kv[0].content_gen : 0u))
+        return 0;
+    for (int i = 0; i < g->n_attn; i++) {
+        const gpu_attn_layer *d = &g->attn[i];
+        const pn_qwen35moe_kv *kv = &s->kv[qw_attn_hidx(g, i)];
+        const void *id = kv->q4 ? (const void *)kv->kq : (const void *)kv->k;
+        int need = pos < kv->max_seq ? pos : kv->max_seq;
+        if (row >= d->kv_slots_cap_n || d->kv_slot_host_id[row] != id ||
+            d->kv_slot_gen[row] != kv->content_gen ||
+            d->kv_slot_synced[row] < need)
+            return 0;
+    }
+    return 1;
+}
+
+/* BENCH ONLY (tests/bench_depth_qwen35, QWEN35_DEPTH_FAKE): advance a bound,
+ * already-stepped decode row by `add` positions WITHOUT computing them, and mark
+ * its ring rows synced so the next step does not seed them. The skipped KV rows
+ * hold whatever the ring held, so the logits are meaningless; what it buys is the
+ * attention cost of a deep context without the hours of prefill. Never called by
+ * the serve. Returns 0, or -1 if the row is not current for this state. */
+int pn_qwen35moe_bench_skip_positions(pn_model *model, pn_state *state, int row,
+                                      int add)
+{
+    if (add <= 0 || !pn_qwen35moe_slot_holds_state(model, row, state))
+        return -1;
+    pn_qwen35moe_model *m = (pn_qwen35moe_model *)model->weights;
+    pn_qwen35moe_state *s = (pn_qwen35moe_state *)state->kv_cache;
+    pn_qwen35moe_gpu *g = (pn_qwen35moe_gpu *)pn_qwen35moe_model_gpu(m);
+    const int pos = (int)state->pos;
+    if (s->n_attn > 0 && pos + add + 1 > s->kv[0].max_seq)
+        return -1;
+    for (int i = 0; i < g->n_attn; i++)
+        g->attn[i].kv_slot_synced[row] = pos + add;
+    g->slot_pos[row] += add;
+    state->pos += add;
+    return 0;
+}
+
+/* ============================================================
+ * Turn-start checkpoints (the serve's rung 1c, QWEN35_TURN_CHECKPOINT).
+ *
+ * A session's block holds its state at the END of its last turn. When the
+ * client drops or rewrites that turn's reply, the recurrent layers cannot be
+ * rewound to the turn's start, so the start is saved before the turn decodes:
+ * the recurrent images and the q4 fp16 sink/window shadows, device to device,
+ * into per-row buffers carved with the blocks. KV rows below the checkpoint
+ * are never rewritten (later tokens only append), so a restore copies the
+ * saved images back into the row and sets the position back.
+ * ============================================================ */
+
+/* Recurrent image sizes of one SSM layer (the bind's own formulas). */
+static void qw_ssm_image_bytes(const pn_qwen35moe_config *cfg,
+                               size_t *conv_bytes, size_t *ssm_bytes)
+{
+    *conv_bytes = (size_t)(cfg->ssm_conv - 1) * cfg->conv_dim * sizeof(float);
+    *ssm_bytes = (size_t)cfg->ssm_state * cfg->ssm_state * cfg->ssm_dt_rank *
+                 sizeof(float);
+}
+
+static void qw_ckpt_free_all(pn_qwen35moe_gpu *g)
+{
+    for (int i = 0; i < g->n_ssm; i++) {
+        fc_buffer_free(g->ssm[i].conv_ckpt);
+        fc_buffer_free(g->ssm[i].ssm_ckpt);
+        g->ssm[i].conv_ckpt = g->ssm[i].ssm_ckpt = NULL;
+        g->ssm[i].ckpt_cap = 0;
+    }
+    for (int i = 0; i < g->n_attn; i++) {
+        gpu_attn_layer *d = &g->attn[i];
+        fc_buffer_free(d->k_sink_ckpt);
+        fc_buffer_free(d->v_sink_ckpt);
+        fc_buffer_free(d->k_win_ckpt);
+        fc_buffer_free(d->v_win_ckpt);
+        d->k_sink_ckpt = d->v_sink_ckpt = d->k_win_ckpt = d->v_win_ckpt = NULL;
+        d->ckpt_cap = 0;
+    }
+    memset(g->ckpt_state, 0, sizeof(g->ckpt_state));
+}
+
+/* Checkpoints are optional, so they may only take VRAM the die gate did not
+ * promise to the serve: after the carve every die must still have the runtime
+ * scratch it was admitted with (allocated lazily, after this) plus the load
+ * margin free. A cuMemAlloc that merely succeeds is not enough — it would let
+ * the checkpoints eat the scratch and fail a later prefill instead. */
+static int qw_ckpt_fit_dies(pn_qwen35moe_gpu *g, const pn_qwen35moe_state *s,
+                            size_t conv_b, size_t ssm_b, int n_rows)
+{
+    uint64_t keep = PN_ADMIT_DIE_SCRATCH_BASE_BYTES + pn_die_load_margin_bytes();
+
+    for (int die = 0; die < g->n_die; die++) {
+        uint64_t bytes = 0;
+        for (int i = 0; i < g->n_ssm; i++)
+            if (g->ssm[i].ctx == g->ctx[die])
+                bytes += (uint64_t)n_rows * (conv_b + ssm_b);
+        for (int i = 0; i < qw_attn_lim(g, s); i++)
+            if (g->attn[i].ctx == g->ctx[die] && s->kv[qw_attn_hidx(g, i)].q4)
+                bytes += (uint64_t)n_rows * 2 *
+                         (qw_kv_sink_bytes(&g->attn[i], &s->kv[qw_attn_hidx(g, i)]) +
+                          qw_kv_win_bytes(&g->attn[i], &s->kv[qw_attn_hidx(g, i)]));
+        size_t free_b = 0, total_b = 0;
+        if (bytes == 0 || fc_mem_info_ctx(g->ctx[die], &free_b, &total_b) != 0)
+            continue;
+        if ((uint64_t)free_b < bytes + keep) {
+            fprintf(stderr, "[qwen35moe] checkpoints: %d rows need %llu MiB on die %d, "
+                    "which has %llu MiB free and keeps %llu MiB for scratch + margin; "
+                    "not carved\n", n_rows, (unsigned long long)(bytes >> 20), g->die[die],
+                    (unsigned long long)(free_b >> 20), (unsigned long long)(keep >> 20));
+            return 0;
+        }
+    }
+    return 1;
+}
+
+int pn_qwen35moe_slot_checkpoints_carve(pn_model *model, pn_state *geom,
+                                        int n_rows)
+{
+    if (!model || !geom || n_rows <= 0 || n_rows > PN_QWEN35MOE_GPU_MAX_SLOTS ||
+        !qw_model_uses_qwen35moe_state(model))
+        return -1;
+    pn_qwen35moe_model *m = (pn_qwen35moe_model *)model->weights;
+    pn_qwen35moe_state *s = m ? (pn_qwen35moe_state *)geom->kv_cache : NULL;
+    pn_qwen35moe_gpu *g = m ? (pn_qwen35moe_gpu *)pn_qwen35moe_model_gpu(m)
+                            : NULL;
+    if (!s || !g)
+        return -1;
+    size_t conv_b, ssm_b;   /* QWEN35_TP: a half's local images */
+    qw_ssm_image_bytes(qw_state_cfg(g, g->tp, pn_qwen35moe_model_config(m)), &conv_b, &ssm_b);
+    if (!qw_ckpt_fit_dies(g, s, conv_b, ssm_b, n_rows))
+        return -1;
+    size_t total = 0;
+    int ok = 1;
+    for (int i = 0; ok && i < g->n_ssm; i++) {
+        gpu_ssm_layer *d = &g->ssm[i];
+        d->conv_ckpt = fc_buffer_alloc_ctx(d->ctx, (size_t)n_rows * conv_b);
+        d->ssm_ckpt = fc_buffer_alloc_ctx(d->ctx, (size_t)n_rows * ssm_b);
+        ok = d->conv_ckpt && d->ssm_ckpt;
+        d->ckpt_cap = ok ? n_rows : 0;
+        total += (size_t)n_rows * (conv_b + ssm_b);
+    }
+    for (int i = 0; ok && i < g->n_attn; i++) {
+        gpu_attn_layer *d = &g->attn[i];
+        const pn_qwen35moe_kv *kv = &s->kv[qw_attn_hidx(g, i)];
+        if (kv->q4) {
+            size_t sink_b = (size_t)n_rows * qw_kv_sink_bytes(d, kv);
+            size_t win_b = (size_t)n_rows * qw_kv_win_bytes(d, kv);
+            d->k_sink_ckpt = fc_buffer_alloc_ctx(d->ctx, sink_b);
+            d->v_sink_ckpt = fc_buffer_alloc_ctx(d->ctx, sink_b);
+            d->k_win_ckpt = fc_buffer_alloc_ctx(d->ctx, win_b);
+            d->v_win_ckpt = fc_buffer_alloc_ctx(d->ctx, win_b);
+            ok = d->k_sink_ckpt && d->v_sink_ckpt && d->k_win_ckpt &&
+                 d->v_win_ckpt;
+            total += 2 * (sink_b + win_b);
+        }
+        d->ckpt_cap = ok ? n_rows : 0;
+    }
+    if (!ok) {
+        qw_ckpt_free_all(g);
+        fprintf(stderr, "[qwen35moe] turn checkpoints: no VRAM for %d rows "
+                "(%zu MiB); running without them\n", n_rows, total >> 20);
+        return -1;
+    }
+    memset(g->ckpt_state, 0, sizeof(g->ckpt_state));
+    /* What the checkpoints cost the sessions: the same bytes as KV rows. */
+    uint64_t kv_tok_b = pn_kv_bytes_per_token(model, s->kv[0].q4 != 0);
+    fprintf(stderr, "[qwen35moe] turn checkpoints: %d rows, %zu MiB on the "
+            "card (all dies), %zu MiB per row; costs %llu tokens of KV room\n",
+            n_rows, total >> 20, (total / (size_t)n_rows) >> 20,
+            kv_tok_b ? (unsigned long long)(total / kv_tok_b) : 0ULL);
+    return 0;
+}
+
+/* Copy checkpoint `ck`'s images, walking the layers in die order (the bind's
+ * pattern). to_ckpt: live shared buffers -> checkpoint `ck`; else checkpoint
+ * `ck` -> decode row `row`'s slot images. */
+static void qw_ckpt_copy(pn_qwen35moe_model *m, pn_qwen35moe_gpu *g,
+                         pn_qwen35moe_state *s, int row, int ck, int to_ckpt)
+{
+    const pn_qwen35moe_config *cfg = pn_qwen35moe_model_config(m);
+    size_t conv_b, ssm_b;   /* QWEN35_TP: a half's local images */
+    qw_ssm_image_bytes(qw_state_cfg(g, g->tp, cfg), &conv_b, &ssm_b);
+    fc_cuda_ctx *cur = NULL;
+    for (int lr = 0; lr < cfg->n_layer * (g->tp ? 2 : 1); lr++) {
+        /* QWEN35_TP: every layer twice, rank 0's half then rank 1's. */
+        int layer = lr % cfg->n_layer, rank = lr / cfg->n_layer;
+        int hidx = pn_qwen35moe_model_layer_index(m, layer);
+        int is_ssm = pn_qwen35moe_model_layer_type(m, layer) ==
+                     PN_QWEN35MOE_LAYER_SSM;
+        int idx = hidx + rank * (is_ssm ? g->tp_n_ssm : g->tp_n_attn);
+        fc_cuda_ctx *ctx = is_ssm ? g->ssm[idx].ctx : g->attn[idx].ctx;
+        if (ctx != cur) {
+            if (cur)
+                fc_sync_ctx(cur);
+            cur = ctx;
+        }
+        if (is_ssm) {
+            gpu_ssm_layer *d = &g->ssm[idx];
+            size_t co = (size_t)ck * conv_b, so = (size_t)ck * ssm_b;
+            size_t rco = (size_t)row * conv_b, rso = (size_t)row * ssm_b;
+            if (to_ckpt) {
+                fc_buffer_copy_d2d_ctx(ctx, d->conv_ckpt, co, d->conv_state_g, 0, conv_b);
+                fc_buffer_copy_d2d_ctx(ctx, d->ssm_ckpt, so, d->ssm_state_g, 0, ssm_b);
+            } else {
+                fc_buffer_copy_d2d_ctx(ctx, d->conv_slots, rco, d->conv_ckpt, co, conv_b);
+                fc_buffer_copy_d2d_ctx(ctx, d->ssm_slots, rso, d->ssm_ckpt, so, ssm_b);
+            }
+            continue;
+        }
+        gpu_attn_layer *d = &g->attn[idx];
+        const pn_qwen35moe_kv *kv = &s->kv[hidx];
+        if (!kv->q4)
+            continue;
+        size_t sink_b = qw_kv_sink_bytes(d, kv), win_b = qw_kv_win_bytes(d, kv);
+        size_t ko = (size_t)ck * sink_b, wo = (size_t)ck * win_b;
+        size_t rko = (size_t)row * sink_b, rwo = (size_t)row * win_b;
+        if (to_ckpt) {
+            fc_buffer_copy_d2d_ctx(ctx, d->k_sink_ckpt, ko, d->k_sink_g, 0, sink_b);
+            fc_buffer_copy_d2d_ctx(ctx, d->v_sink_ckpt, ko, d->v_sink_g, 0, sink_b);
+            fc_buffer_copy_d2d_ctx(ctx, d->k_win_ckpt, wo, d->k_win_g, 0, win_b);
+            fc_buffer_copy_d2d_ctx(ctx, d->v_win_ckpt, wo, d->v_win_g, 0, win_b);
+        } else {
+            fc_buffer_copy_d2d_ctx(ctx, d->k_sink_slots_g, rko, d->k_sink_ckpt, ko, sink_b);
+            fc_buffer_copy_d2d_ctx(ctx, d->v_sink_slots_g, rko, d->v_sink_ckpt, ko, sink_b);
+            fc_buffer_copy_d2d_ctx(ctx, d->k_win_slots_g, rwo, d->k_win_ckpt, wo, win_b);
+            fc_buffer_copy_d2d_ctx(ctx, d->v_win_slots_g, rwo, d->v_win_ckpt, wo, win_b);
+        }
+    }
+    for (int i = 0; i < g->n_die; i++)
+        fc_sync_ctx(g->ctx[i]);
+}
+
+/* Do the live shared buffers hold `s` exactly at `pos` on every layer, with a
+ * checkpoint row to copy it into? */
+static int qw_ckpt_live_is(pn_qwen35moe_model *m, pn_qwen35moe_gpu *g,
+                           pn_qwen35moe_state *s, int row, int pos)
+{
+    for (int i = 0; i < qw_ssm_lim(g, s); i++) {
+        const gpu_ssm_layer *d = &g->ssm[i];
+        if (d->ckpt_cap <= row || d->host_state != (const void *)&s->ssm[qw_ssm_hidx(g, i)] ||
+            !d->conv_state_g || !d->ssm_state_g)
+            return 0;
+    }
+    for (int i = 0; i < qw_attn_lim(g, s); i++) {
+        const gpu_attn_layer *d = &g->attn[i];
+        const pn_qwen35moe_kv *kv = &s->kv[qw_attn_hidx(g, i)];
+        if (d->ckpt_cap <= row)
+            return 0;
+        if (!kv->q4)
+            continue;
+        if (d->kv_host_id != (const void *)kv->kq || d->kv_gen != kv->content_gen ||
+            d->kv_synced_pos != pos || !d->k_sink_g || !d->k_win_g)
+            return 0;
+    }
+    (void)m;
+    return 1;
+}
+
+/* Does row `row` still hold `s`'s KV rows [0, pos) and slot images to restore
+ * checkpoint `ck` into? */
+static int qw_ckpt_row_can_restore(pn_qwen35moe_gpu *g, pn_qwen35moe_state *s,
+                                   int row, int ck, int pos)
+{
+    for (int i = 0; i < qw_ssm_lim(g, s); i++) {
+        const gpu_ssm_layer *d = &g->ssm[i];
+        if (d->ckpt_cap <= ck || d->slots_cap <= row || !d->conv_slots ||
+            !d->ssm_slots)
+            return 0;
+    }
+    for (int i = 0; i < qw_attn_lim(g, s); i++) {
+        const gpu_attn_layer *d = &g->attn[i];
+        const pn_qwen35moe_kv *kv = &s->kv[qw_attn_hidx(g, i)];
+        const void *id = kv->q4 ? (const void *)kv->kq : (const void *)kv->k;
+        int need = pos < kv->max_seq ? pos : kv->max_seq;
+        if (d->ckpt_cap <= ck || row >= d->kv_slots_cap_n ||
+            d->kv_slot_host_id[row] != id ||
+            d->kv_slot_gen[row] != kv->content_gen ||
+            d->kv_slot_synced[row] < need)
+            return 0;
+        if (kv->q4 && (!d->k_sink_slots_g || !d->k_win_slots_g))
+            return 0;
+    }
+    return 1;
+}
+
+int pn_qwen35moe_slot_checkpoint_save(pn_model *model, pn_state *state, int row)
+{
+    return pn_qwen35moe_slot_checkpoint_save_at(model, state, row);
+}
+
+int pn_qwen35moe_slot_checkpoint_save_at(pn_model *model, pn_state *state,
+                                         int ck)
+{
+    const int row = ck;   /* the checkpoint index (bookkeeping arrays, buffers) */
+    if (!model || !state || row < 0 || row >= PN_QWEN35MOE_GPU_MAX_SLOTS ||
+        !qw_model_uses_qwen35moe_state(model) ||
+        pn_qwen35moe_host_kv_mirror_eager())
+        return -1;
+    pn_qwen35moe_model *m = (pn_qwen35moe_model *)model->weights;
+    pn_qwen35moe_state *s = m ? (pn_qwen35moe_state *)state->kv_cache : NULL;
+    pn_qwen35moe_gpu *g = m ? (pn_qwen35moe_gpu *)pn_qwen35moe_model_gpu(m)
+                            : NULL;
+    const int pos = (int)state->pos;
+    if (!s || !g || pos <= 0 || !qw_ckpt_live_is(m, g, s, row, pos))
+        return -1;
+    g->ckpt_state[row] = NULL;   /* void while the copy runs */
+    qw_ckpt_copy(m, g, s, 0, row, 1);
+    g->ckpt_state[row] = (const void *)s;
+    g->ckpt_gen[row] = s->n_attn > 0 ? s->kv[0].content_gen : 0u;
+    g->ckpt_pos[row] = pos;
+    return 0;
+}
+
+int pn_qwen35moe_slot_checkpoint_restore(pn_model *model, pn_state *state,
+                                         int row, int pos)
+{
+    return pn_qwen35moe_slot_checkpoint_restore_from(model, state, row, row, pos);
+}
+
+int pn_qwen35moe_slot_checkpoint_restore_from(pn_model *model, pn_state *state,
+                                              int row, int ck, int pos)
+{
+    if (!model || !state || row < 0 || row >= PN_QWEN35MOE_GPU_MAX_SLOTS ||
+        ck < 0 || ck >= PN_QWEN35MOE_GPU_MAX_SLOTS ||
+        pos <= 0 || !qw_model_uses_qwen35moe_state(model) ||
+        pn_qwen35moe_host_kv_mirror_eager())
+        return -1;
+    pn_qwen35moe_model *m = (pn_qwen35moe_model *)model->weights;
+    pn_qwen35moe_state *s = m ? (pn_qwen35moe_state *)state->kv_cache : NULL;
+    pn_qwen35moe_gpu *g = m ? (pn_qwen35moe_gpu *)pn_qwen35moe_model_gpu(m)
+                            : NULL;
+    if (!s || !g)
+        return -1;
+    const unsigned gen = s->n_attn > 0 ? s->kv[0].content_gen : 0u;
+    if (g->ckpt_state[ck] != (const void *)s || g->ckpt_gen[ck] != gen ||
+        g->ckpt_pos[ck] != pos || row >= g->n_slots ||
+        g->slot_state[row] != (const void *)s || g->slot_gen[row] != gen ||
+        !qw_ckpt_row_can_restore(g, s, row, ck, pos))
+        return -1;
+    qw_ckpt_copy(m, g, s, row, ck, 0);
+    g->slot_pos[row] = pos;
+    for (int i = 0; i < g->n_attn; i++)
+        if (g->attn[i].kv_slot_synced[row] > pos)
+            g->attn[i].kv_slot_synced[row] = pos;   /* rows past it are stale */
+    state->pos = pos;
+    return 0;
 }
 
 int pn_qwen35moe_decode_slots(pn_model *model, const uint32_t *tokens,
                               pn_state **states, int n_users,
                               float **logits_out)
 {
+    return pn_qwen35moe_decode_slots_rows(model, tokens, states, NULL, n_users,
+                                          logits_out);
+}
+
+int pn_qwen35moe_decode_slots_rows(pn_model *model, const uint32_t *tokens,
+                                   pn_state **states, const int *rows,
+                                   int n_users, float **logits_out)
+{
     if (!model || !tokens || !states || n_users <= 0 ||
-        n_users > PN_QWEN35MOE_GPU_MAX_SLOTS || !qw_model_uses_qwen35moe_state(model))
+        n_users > PN_QWEN35MOE_GPU_MAX_SLOTS || !qw_model_uses_qwen35moe_state(model)) {
+        fprintf(stderr, "[qwen35moe] decode_slots: bad call (n=%d, arch %d)\n",
+                n_users, model ? (int)model->config.arch : -1);
         return -1;
+    }
     pn_qwen35moe_model *m = (pn_qwen35moe_model *)model->weights;
     if (!m)
         return -1;
@@ -10363,17 +14078,27 @@ int pn_qwen35moe_decode_slots(pn_model *model, const uint32_t *tokens,
     pn_qwen35moe_state *sts[PN_QWEN35MOE_GPU_MAX_SLOTS];
     int pos[PN_QWEN35MOE_GPU_MAX_SLOTS];
     for (int u = 0; u < n_users; u++) {
-        if (!states[u])
+        if (!states[u] || !states[u]->kv_cache) {
+            fprintf(stderr, "[qwen35moe] decode_slots: user %d has no state\n",
+                    u);
             return -1;
+        }
         sts[u] = (pn_qwen35moe_state *)states[u]->kv_cache;
         pos[u] = states[u]->pos;
-        if (!sts[u])
-            return -1;
     }
 
-    if (pn_qwen35moe_decode_slots_tokens_cuda(m, tokens, sts, pos,
+    pn_qwen35moe_gpu *g = (pn_qwen35moe_gpu *)pn_qwen35moe_model_gpu(m);
+    if (!g) {
+        fprintf(stderr, "[qwen35moe] decode_slots: model has no GPU weights\n");
+        return -1;
+    }
+    g->mtp.ver_n = 0;   /* set again only by a solo step (gpu_head_from_slots) */
+    if (pn_qwen35moe_decode_slots_tokens_cuda(m, tokens, sts, pos, rows,
                                               n_users) != 0)
         return -1;
+    /* Each stepped row's SSM image advanced one position with its user. */
+    for (int u = 0; u < n_users; u++)
+        g->slot_pos[rows ? rows[u] : u]++;
 
     for (int u = 0; u < n_users; u++) {
         states[u]->pos++;
@@ -10382,6 +14107,238 @@ int pn_qwen35moe_decode_slots(pn_model *model, const uint32_t *tokens,
     }
     return 0;
 }
+
+/* ============================================================
+ * QWEN35_BS_PD_OVERLAP — the prefill cursor's public calls (qwen35moe.h).
+ * The pieces and the cycle's choreography are above tp_slots_step.
+ * ============================================================ */
+
+pn_qwen35moe_pd_cursor *pn_qwen35moe_pd_begin_cuda(pn_model *model, pn_state *state,
+                                                   const uint32_t *tokens, int n_total,
+                                                   int chunk)
+{
+    if (!qw_pd_overlap_on() || !qw_prefill_pipeline_wide_on())
+        return NULL;
+    if (!model || !state || !tokens || n_total <= 0 || chunk <= 0 ||
+        !qw_model_uses_qwen35moe_state(model))
+        return NULL;
+    pn_qwen35moe_model *m = (pn_qwen35moe_model *)model->weights;
+    pn_qwen35moe_state *s = m ? (pn_qwen35moe_state *)state->kv_cache : NULL;
+    pn_qwen35moe_gpu *g = m ? (pn_qwen35moe_gpu *)pn_qwen35moe_model_gpu(m) : NULL;
+    if (!s || !g)
+        return NULL;
+    const pn_qwen35moe_config *cfg = pn_qwen35moe_model_config(m);
+    /* The same refusals as pn_qwen35moe_prefill_range_pipelined_cuda, narrowed
+     * to the layout the cycle is built for: MoE TP2 on 4 dies. */
+    if (!g->tp || !cfg->n_expert || g->n_die != 4 || g->bs || prof_on() ||
+        pn_qwen35moe_host_kv_mirror_eager() || !flash_on())
+        return NULL;
+    for (int d = 0; d < g->n_die; d++)
+        if (!fc_attn_flash_available_ctx(g->ctx[d]))
+            return NULL;
+    for (int t = 0; t < n_total; t++)
+        if ((int)tokens[t] >= cfg->n_vocab)
+            return NULL;
+    int cap = qw_batch_row_cap(s);
+    if (cap > 0 && chunk > cap)
+        chunk = cap;
+
+    const int lane = g->lane;
+    g->lane = QW_LANE_PREFILL;
+    pn_qwen35moe_pd_cursor *cur = calloc(1, sizeof(*cur));
+    int ok = cur != NULL;
+    if (ok && !g->host_ok) {
+        ok = gpu_host_scratch_init(&g->host, cfg) == 0;
+        g->host_ok = ok;
+    }
+    ok = ok && gpu_get_batch_host(g, cfg, chunk) == 0 && tp_exchange_ready(g, cfg, chunk) == 0;
+    for (int d = 0; ok && d < g->n_die; d++) {
+        ok = gpu_select_die(g, g->die[d]) == 0;
+        cur->bs[d] = ok ? gpu_get_batch_scratch(g, g->ctx[d], cfg, chunk) : NULL;
+        cur->ds[d] = ok ? gpu_get_scratch(g, g->ctx[d], cfg) : NULL;
+        ok = ok && cur->bs[d] && cur->ds[d];
+    }
+    g->lane = lane;
+    if (!ok) {
+        free(cur);
+        return NULL;
+    }
+    cur->m = m;
+    cur->g = g;
+    cur->s = s;
+    cur->state = state;
+    cur->tokens = tokens;
+    cur->n_total = n_total;
+    cur->pos0 = state->pos;
+    cur->chunk = chunk;
+    cur->n_chunks = (n_total + chunk - 1) / chunk;
+    cur->injected_max = cur->n_chunks;
+    cur->ck[0] = cur->ck[1] = -1;
+    return cur;
+}
+
+int pn_qwen35moe_pd_cycle_cuda(pn_model *model, pn_qwen35moe_pd_cursor *cur,
+                               const uint32_t *tokens, pn_state **states, const int *rows,
+                               int n_users, float **logits_out, int pieces)
+{
+    if (!model || !cur || !tokens || !states || pieces < 0 || n_users <= 0 ||
+        n_users > PN_QWEN35MOE_GPU_MAX_SLOTS || model->weights != (void *)cur->m)
+        return -1;
+    pn_qwen35moe_model *m = cur->m;
+    pn_qwen35moe_gpu *g = cur->g;
+    const pn_qwen35moe_config *cfg = pn_qwen35moe_model_config(m);
+    pn_qwen35moe_state *sts[PN_QWEN35MOE_GPU_MAX_SLOTS];
+    int pos[PN_QWEN35MOE_GPU_MAX_SLOTS];
+    for (int u = 0; u < n_users; u++) {
+        if (!states[u] || !states[u]->kv_cache)
+            return -1;
+        sts[u] = (pn_qwen35moe_state *)states[u]->kv_cache;
+        pos[u] = states[u]->pos;
+    }
+    g->mtp.ver_n = 0;
+    if (qw_slots_step_prepare(g, cfg, tokens, sts, rows, n_users) < 0)
+        return -1;
+    g->lane = QW_LANE_DECODE;
+    int rc = tp_slots_step(m, g, tokens, sts, pos, n_users, cur, pieces);
+    g->lane = QW_LANE_PREFILL;
+    if (rc != 0)
+        return -1;
+    for (int u = 0; u < n_users; u++) {
+        g->slot_pos[rows ? rows[u] : u]++;
+        states[u]->pos++;
+        if (logits_out)
+            logits_out[u] = sts[u]->logits;
+    }
+    return 0;
+}
+
+int pn_qwen35moe_pd_issued_all(const pn_qwen35moe_pd_cursor *cur)
+{
+    return cur && cur->retired >= cur->injected_max;
+}
+
+int pn_qwen35moe_pd_injected_all(const pn_qwen35moe_pd_cursor *cur)
+{
+    return cur && cur->next_inject >= cur->injected_max;
+}
+
+void pn_qwen35moe_pd_phase_ms(const pn_qwen35moe_pd_cursor *cur,
+                              double ms[PN_QWEN35MOE_PD_PHASES])
+{
+    for (int i = 0; i < PN_QWEN35MOE_PD_PHASES; i++)
+        ms[i] = cur ? cur->ph_ms[i] : 0.0;
+}
+
+int pn_qwen35moe_pd_remaining(const pn_qwen35moe_pd_cursor *cur)
+{
+    if (!cur)
+        return 0;
+    const int done = cur->retired * cur->chunk;
+    return done < cur->n_total ? cur->n_total - done : 0;
+}
+
+/* Run the pipeline alone (no decode between pieces) until `target` chunks
+ * retired: stage 1's whole chunk and stage 0's whole chunk are issued together
+ * (the two boards overlap, as in the wide pipeline), then the hand-off. */
+static int qw_pd_run_alone(pn_qwen35moe_pd_cursor *cur, int target)
+{
+    if (target > cur->injected_max)
+        target = cur->injected_max;
+    while (cur->retired < target) {
+        int a = qw_pd_issue_stage(cur, 1, -1);
+        int b = qw_pd_issue_stage(cur, 0, -1);
+        if (a < 0 || b < 0)
+            return -1;
+        if (cur->retired >= target)
+            break;
+        if (cur->ck[1] < 0 && cur->ck[0] >= 0)
+            fc_sync_ctx(cur->g->ctx[1]);   /* rank 1 of the chunk to hand on */
+        int h = qw_pd_hand_off(cur);
+        if (h < 0)
+            return -1;
+        if (!a && !b && !h)
+            return -1;                     /* no progress: a bookkeeping bug */
+    }
+    return 0;
+}
+
+int pn_qwen35moe_pd_advance_cuda(pn_qwen35moe_pd_cursor *cur, int max_chunks)
+{
+    if (!cur || max_chunks <= 0)
+        return -1;
+    return qw_pd_run_alone(cur, cur->retired + max_chunks);
+}
+
+/* Drain every die and publish the retired position. */
+static void qw_pd_drain(pn_qwen35moe_pd_cursor *cur)
+{
+    for (int d = 0; d < cur->g->n_die; d++)
+        fc_sync_ctx(cur->g->ctx[d]);
+    int done = cur->retired * cur->chunk;
+    cur->state->pos = cur->pos0 + (done < cur->n_total ? done : cur->n_total);
+}
+
+int pn_qwen35moe_pd_quiesce_cuda(pn_qwen35moe_pd_cursor *cur)
+{
+    if (!cur)
+        return -1;
+    const int max = cur->injected_max;
+    cur->injected_max = cur->next_inject;   /* nothing new enters */
+    int rc = qw_pd_run_alone(cur, cur->injected_max);
+    cur->injected_max = max;
+    qw_pd_drain(cur);
+    return rc;
+}
+
+int pn_qwen35moe_pd_finish_cuda(pn_qwen35moe_pd_cursor *cur, tm_tensor **logits_out)
+{
+    if (logits_out)
+        *logits_out = NULL;
+    if (!cur)
+        return -1;
+    pn_qwen35moe_gpu *g = cur->g;
+    const pn_qwen35moe_config *cfg = pn_qwen35moe_model_config(cur->m);
+    const int d = g->n_die - 1;
+    int rc = qw_pd_run_alone(cur, cur->injected_max);
+    qw_pd_drain(cur);
+    if (rc == 0) {
+        qw_pipe_chunk k = qw_pipe_chunk_at(cur->tokens, cur->n_total, cur->pos0, cur->chunk,
+                                           cur->n_chunks - 1);
+        const int lane = g->lane;
+        g->lane = QW_LANE_PREFILL;
+        if (!cur->normed_last)
+            fc_rms_norm_nx_ctx(g->ctx[d], cur->bs[d]->hidden, g->output_norm.buf,
+                               cur->bs[d]->x_norm, cfg->n_embd, cfg->rms_norm_eps, k.n);
+        if (!gpu_batch_head_last_row(g, cfg, g->ctx[d], cur->bs[d], cur->ds[d], g->host,
+                                     cur->s, k.n))
+            rc = -1;
+        g->lane = lane;
+    }
+    if (rc == 0 && logits_out) {
+        int64_t shape[1] = { cur->s->n_vocab };
+        tm_tensor *out = tm_empty(shape, 1, TM_F32);
+        if (out)
+            memcpy(tm_data_f32(out), cur->s->logits, (size_t)cur->s->n_vocab * sizeof(float));
+        else
+            rc = -1;
+        *logits_out = out;
+    }
+    free(cur);
+    return rc;
+}
+
+int pn_qwen35moe_pd_abort_cuda(pn_qwen35moe_pd_cursor *cur)
+{
+    if (!cur)
+        return -1;
+    cur->injected_max = cur->next_inject;
+    cur->aborted = 1;
+    int rc = qw_pd_run_alone(cur, cur->injected_max);
+    qw_pd_drain(cur);
+    free(cur);
+    return rc;
+}
+
 
 /* ============================================================
  * PREFIX CACHING — snapshot the live GPU state back to the host (on-evict)
@@ -10422,24 +14379,27 @@ static int qw_state_ssm_shared_to_host(pn_qwen35moe_model *m,
         if (pn_qwen35moe_model_layer_type(m, layer) != PN_QWEN35MOE_LAYER_SSM)
             continue;
         int idx = pn_qwen35moe_model_layer_index(m, layer);
-        gpu_ssm_layer *d = &g->ssm[idx];
         pn_qwen35moe_ssm_state *st = &s->ssm[idx];
-        /* Only copy layers whose GPU buffer currently holds THIS state's
-         * image — otherwise the host copy is already the source of truth. */
-        if (!d->conv_state_g || !d->ssm_state_g ||
-            d->host_state != (const void *)st)
-            continue;
-        if (d->ctx != cur) {
-            if (cur)
-                fc_sync_ctx(cur);
-            if (gpu_select_die(g, gpu_die_of_ctx(g, d->ctx)) < 0) {
-                rc = -1;
-                break;
+        for (int r = 0; rc == 0 && r < (g->tp ? 2 : 1); r++) {   /* QWEN35_TP: both halves */
+            gpu_ssm_layer *d = &g->ssm[idx + r * g->tp_n_ssm];
+            /* Only copy layers whose GPU buffer currently holds THIS state's
+             * image — otherwise the host copy is already the source of truth. */
+            if (!d->conv_state_g || !d->ssm_state_g ||
+                d->host_state != (const void *)st)
+                continue;
+            if (d->ctx != cur) {
+                if (cur)
+                    fc_sync_ctx(cur);
+                if (gpu_select_die(g, gpu_die_of_ctx(g, d->ctx)) < 0) {
+                    rc = -1;
+                    break;
+                }
+                cur = d->ctx;
             }
-            cur = d->ctx;
+            qw_ssm_xfer(g, d, st, 0);
         }
-        fc_buffer_to_cpu(d->conv_state_g, st->conv_state);
-        fc_buffer_to_cpu(d->ssm_state_g, st->ssm_state);
+        if (rc)
+            break;
     }
     if (cur)
         fc_sync_ctx(cur);
@@ -10487,7 +14447,9 @@ int pn_qwen35moe_gpu_state_to_host(pn_model *model, pn_state *state)
             cur = d->ctx;
         }
         int rows = state->pos < kv->max_seq ? state->pos : kv->max_seq;
-        if (qw_kv_layer_materialize(d, kv, rows) != 0) {
+        if (g->tp)
+            fc_sync_ctx(g->attn[idx + g->tp_n_attn].ctx);   /* the rank-1 half's die */
+        if (qw_kv_layer_materialize_all(g, idx, kv, rows) != 0) {
             fprintf(stderr, "[attn] state_to_host kv_idx=%d: host mirror "
                     "stale with no GPU ring source (rows=%d) — mirror left "
                     "stale\n", idx, rows);
@@ -10561,20 +14523,22 @@ int pn_qwen35moe_decode_slot_ssm_to_host(pn_model *model, int gpu_idx,
         return -1;
 
     const pn_qwen35moe_config *cfg = pn_qwen35moe_model_config(m);
-    size_t conv_bytes = (size_t)(cfg->ssm_conv - 1) * cfg->conv_dim *
+    const pn_qwen35moe_config *dcfg = qw_state_cfg(g, g->tp, cfg);   /* QWEN35_TP halves */
+    size_t conv_bytes = (size_t)(dcfg->ssm_conv - 1) * dcfg->conv_dim *
                         sizeof(float);
-    size_t ssm_bytes  = (size_t)cfg->ssm_state * cfg->ssm_state *
-                        cfg->ssm_dt_rank * sizeof(float);
+    size_t ssm_bytes  = (size_t)dcfg->ssm_state * dcfg->ssm_state *
+                        dcfg->ssm_dt_rank * sizeof(float);
 
     int rc = 0;
     fc_cuda_ctx *cur = NULL;
     /* Die-ordered walk (front die then back) so at most one die-select per die,
      * mirroring the B3 loop in pn_qwen35moe_gpu_state_to_host. */
-    for (int layer = 0; layer < cfg->n_layer; layer++) {
+    for (int lr = 0; lr < cfg->n_layer * (g->tp ? 2 : 1); lr++) {
+        int layer = lr % cfg->n_layer, rank = lr / cfg->n_layer;   /* QWEN35_TP halves */
         if (pn_qwen35moe_model_layer_type(m, layer) != PN_QWEN35MOE_LAYER_SSM)
             continue;
         int idx = pn_qwen35moe_model_layer_index(m, layer);
-        gpu_ssm_layer *d = &g->ssm[idx];
+        gpu_ssm_layer *d = &g->ssm[idx + rank * g->tp_n_ssm];
         pn_qwen35moe_ssm_state *st = &s->ssm[idx];
         if (!d->conv_slots || !d->ssm_slots || d->slots_cap <= gpu_idx)
             return -1;   /* slots not allocated for this width */
@@ -10587,10 +14551,15 @@ int pn_qwen35moe_decode_slot_ssm_to_host(pn_model *model, int gpu_idx,
             }
             cur = d->ctx;
         }
-        fc_buffer_to_cpu_at(d->conv_slots, st->conv_state,
-                            (size_t)gpu_idx * conv_bytes, conv_bytes);
-        fc_buffer_to_cpu_at(d->ssm_slots, st->ssm_state,
-                            (size_t)gpu_idx * ssm_bytes, ssm_bytes);
+        if (d->tp_on) {
+            qw_ssm_xfer_at(g, d, d->conv_slots, (size_t)gpu_idx * conv_bytes, d->ssm_slots,
+                           (size_t)gpu_idx * ssm_bytes, st, 0);
+        } else {
+            fc_buffer_to_cpu_at(d->conv_slots, st->conv_state,
+                                (size_t)gpu_idx * conv_bytes, conv_bytes);
+            fc_buffer_to_cpu_at(d->ssm_slots, st->ssm_state,
+                                (size_t)gpu_idx * ssm_bytes, ssm_bytes);
+        }
         /* The slot images are now the source of truth for this state; drop any
          * shared-buffer "live here" binding so a later single-user forward
          * re-seeds from the (now-current) host mirror rather than trusting a
@@ -10617,6 +14586,47 @@ int pn_qwen35moe_decode_slot_ssm_to_host(pn_model *model, int gpu_idx,
  * re-prefilled host mirror).  Host bookkeeping only (no GPU work); the
  * scheduler calls it under the GPU turn right after pn_state_reset, so no
  * forward can race it.  No-op without a GPU handle (CPU path). */
+/* Drop every layer struct's binding to host state s, so the next batch re-seeds SSM state and
+ * re-syncs KV from it. Under QWEN35_TP the doubled arrays hold rank 1's halves at
+ * [i + tp_n_*] (qw_*_lim / qw_*_hidx): both halves must drop. Rank 0's alone left rank 1
+ * seeding its GDN heads from the shared buffers' stale prompt-end state on a session's turn 2
+ * (the reply diverged from the layer split). QW_FORGET_RED (gate red build): rank 0's half. */
+static void qw_forget_state_bindings(pn_qwen35moe_gpu *g, pn_qwen35moe_state *s)
+{
+#ifdef QW_FORGET_RED
+    const int n_ssm = g->tp ? g->tp_n_ssm : qw_ssm_lim(g, s);
+    const int n_attn = g->tp ? g->tp_n_attn : qw_attn_lim(g, s);
+#else
+    const int n_ssm = qw_ssm_lim(g, s), n_attn = qw_attn_lim(g, s);
+#endif
+    for (int i = 0; i < n_ssm; i++)
+        if (g->ssm[i].host_state == (const void *)&s->ssm[qw_ssm_hidx(g, i)])
+            g->ssm[i].host_state = NULL;   /* force SSM re-seed from host */
+    for (int i = 0; i < n_attn; i++) {
+        gpu_attn_layer *d = &g->attn[i];
+        const pn_qwen35moe_kv *kv = &s->kv[qw_attn_hidx(g, i)];
+        const void *host_id = kv->q4 ? (const void *)kv->kq : (const void *)kv->k;
+        if (d->kv_host_id == host_id) {
+            d->kv_host_id    = NULL;   /* force full KV re-sync + shadow */
+            d->kv_synced_pos = 0;
+        }
+    }
+}
+
+void pn_qwen35moe_gpu_forget_ssm(pn_model *model, pn_state *state)
+{
+    if (!model || !state || !qw_model_uses_qwen35moe_state(model))
+        return;
+    pn_qwen35moe_model *m = (pn_qwen35moe_model *)model->weights;
+    pn_qwen35moe_state *s = (pn_qwen35moe_state *)state->kv_cache;
+    pn_qwen35moe_gpu *g = m ? (pn_qwen35moe_gpu *)pn_qwen35moe_model_gpu(m) : NULL;
+    if (!s || !g)
+        return;
+    for (int i = 0; i < qw_ssm_lim(g, s); i++)
+        if (g->ssm[i].host_state == (const void *)&s->ssm[qw_ssm_hidx(g, i)])
+            g->ssm[i].host_state = NULL;
+}
+
 void pn_qwen35moe_gpu_forget_state(pn_model *model, pn_state *state)
 {
     if (!model || !state || !qw_model_uses_qwen35moe_state(model))
@@ -10637,24 +14647,158 @@ void pn_qwen35moe_gpu_forget_state(pn_model *model, pn_state *state)
         g->spec_n = 0;
     }
 
-    const pn_qwen35moe_config *cfg = pn_qwen35moe_model_config(m);
-    for (int layer = 0; layer < cfg->n_layer; layer++) {
-        int idx = pn_qwen35moe_model_layer_index(m, layer);
-        if (pn_qwen35moe_model_layer_type(m, layer) == PN_QWEN35MOE_LAYER_SSM) {
-            gpu_ssm_layer *d = &g->ssm[idx];
-            if (d->host_state == (const void *)&s->ssm[idx])
-                d->host_state = NULL;   /* force SSM re-seed from host */
-        } else {
-            gpu_attn_layer *d = &g->attn[idx];
-            pn_qwen35moe_kv *kv = &s->kv[idx];
-            const void *host_id = kv->q4 ? (const void *)kv->kq
-                                         : (const void *)kv->k;
-            if (d->kv_host_id == host_id) {
-                d->kv_host_id    = NULL;   /* force full KV re-sync + shadow */
-                d->kv_synced_pos = 0;
-            }
-        }
+    qw_forget_state_bindings(g, s);
+}
+
+/* Test hook (tests/test_qwen35_tp_forget): a TP layout of 2 SSM + 2 attention host layers
+ * (4 + 4 layer structs, rank 1's halves at [i + tp_n_*]), every struct bound to the host
+ * state, then the forget. @return the bindings left (0 = correct). */
+int pn_qwen35moe_tp_forget_selftest(void)
+{
+    pn_qwen35moe_gpu *g = calloc(1, sizeof(*g));
+    pn_qwen35moe_state *s = calloc(1, sizeof(*s));
+    gpu_ssm_layer ssm[4];
+    gpu_attn_layer attn[4];
+    pn_qwen35moe_ssm_state hs[2];
+    pn_qwen35moe_kv kv[2];
+    unsigned char kq[2];
+    int left = 0;
+
+    if (!g || !s) {
+        free(g);
+        free(s);
+        return -1;
     }
+    memset(ssm, 0, sizeof(ssm));
+    memset(attn, 0, sizeof(attn));
+    memset(hs, 0, sizeof(hs));
+    memset(kv, 0, sizeof(kv));
+    g->tp = 1;
+    g->tp_n_ssm = g->tp_n_attn = 2;
+    g->n_ssm = g->n_attn = 4;
+    g->ssm = ssm;
+    g->attn = attn;
+    s->n_ssm = s->n_attn = 2;
+    s->ssm = hs;
+    s->kv = kv;
+    for (int i = 0; i < 2; i++) {
+        kv[i].q4 = 1;
+        kv[i].kq = &kq[i];
+    }
+    for (int i = 0; i < 4; i++) {
+        ssm[i].host_state = &hs[i % 2];
+        attn[i].kv_host_id = kv[i % 2].kq;
+        attn[i].kv_synced_pos = 7;
+    }
+    qw_forget_state_bindings(g, s);
+    for (int i = 0; i < 4; i++)
+        left += (ssm[i].host_state != NULL) + (attn[i].kv_host_id != NULL) +
+                (attn[i].kv_synced_pos != 0);
+    free(g);
+    free(s);
+    return left;
+}
+
+/* The bytes of TP half d's GPU K ring rows [0, rows) that differ from the host mirror's. */
+static size_t qw_tp_ring_diff_bytes(gpu_attn_layer *d, const pn_qwen35moe_kv *kv, int rows)
+{
+    size_t row_b = qw_kv_row_bytes(kv), head_b = (size_t)kv->max_seq * row_b, diff = 0;
+    unsigned char *got = malloc((size_t)rows * row_b);
+    if (!got)
+        return (size_t)-1;
+    for (int hd = 0; hd < qw_kv_nh(d, kv); hd++) {
+        const unsigned char *want = kv->kq + (size_t)(qw_kv_h0(d, kv) + hd) * head_b;
+        fc_buffer_to_cpu_at(d->k_cache_g, got, (size_t)hd * head_b, (size_t)rows * row_b);
+        for (size_t i = 0; i < (size_t)rows * row_b; i++)
+            diff += got[i] != want[i];
+    }
+    free(got);
+    return diff;
+}
+
+/* Test hook (tests/test_qwen35_tp_restore_sync): one attention layer as two TP halves on
+ * one die, a q4 host kv. Turn 1 prefills rows [0, 8) on both halves (lazy: mirror stale);
+ * a restore then replaces the mirror (fresh, new content_gen, as snap_kv_restore does) and
+ * turn 2 resumes at pos0 = 6 in the order tp_layer_forward_batch / tp_verify_stage run it.
+ * Needs the lazy mirror (the default). @return refused syncs + differing ring bytes. */
+int pn_qwen35moe_tp_restore_sync_selftest(void)
+{
+    enum { NH = 2, HD = 64, SEQ = 64, POS1 = 8, POS2 = 6 };
+    fc_cuda_ctx *ctx = fc_cuda_init_device(0);
+    if (!ctx || !fc_cuda_ctx_available(ctx))
+        return -2;
+    pn_qwen35moe_gpu *g = calloc(1, sizeof(*g));
+    gpu_attn_layer attn[2];
+    pn_qwen35moe_kv kv;
+    size_t row_b = (size_t)pn_kvq4_row_bytes(HD), ring_b = (size_t)NH * SEQ * row_b;
+    size_t sink_n = (size_t)NH * PN_KVQ4_SINKMAX * HD, win_n = (size_t)NH * PN_KVQ4_WMAX * HD;
+    long bad = 0;
+
+    memset(attn, 0, sizeof(attn));
+    memset(&kv, 0, sizeof(kv));
+    kv.q4 = 1;
+    kv.n_head_kv = NH;
+    kv.head_dim = HD;
+    kv.max_seq = SEQ;
+    kv.kq = malloc(ring_b);
+    kv.vq = malloc(ring_b);
+    kv.k_sink = calloc(sink_n, 2);
+    kv.v_sink = calloc(sink_n, 2);
+    kv.k_win = calloc(win_n, 2);
+    kv.v_win = calloc(win_n, 2);
+    if (!g || !kv.kq || !kv.vq || !kv.k_sink || !kv.v_sink || !kv.k_win || !kv.v_win) {
+        bad = -1;
+        goto out;
+    }
+    g->tp = 1;
+    g->tp_n_attn = 1;
+    g->n_attn = 2;
+    g->attn = attn;
+    for (int p = 0; p < 2; p++) {
+        attn[p].ctx = ctx;
+        attn[p].tp_on = 1;
+        attn[p].tp_rank = p;
+    }
+    for (size_t i = 0; i < ring_b; i++) {
+        kv.kq[i] = (unsigned char)(i * 7 + 1);
+        kv.vq[i] = (unsigned char)(i * 13 + 5);
+    }
+    kv.content_gen = pn_qwen35moe_kv_next_content_gen();
+    for (int p = 0; p < 2; p++) {               /* turn 1: prefill [0, POS1) */
+        bad += gpu_attn_kv_cache_sync(&attn[p], &kv, 0) < 0;
+        attn[p].kv_synced_pos = POS1;
+        kv.kv_mirror_stale = 1;
+    }
+    for (size_t i = 0; i < ring_b; i++)         /* restore: new rows, fresh mirror */
+        kv.kq[i] ^= 0x5a;
+    kv.kv_mirror_stale = 0;
+    kv.content_gen = pn_qwen35moe_kv_next_content_gen();
+    bad += tp_attn_kv_cache_sync_both(g, 0, &kv, POS2) < 0;   /* turn 2 at POS2 */
+    for (int p = 0; p < 2; p++) {
+        bad += gpu_attn_kv_cache_sync(&attn[p], &kv, POS2) < 0;
+        kv.kv_mirror_stale = 1;
+    }
+    for (int p = 0; p < 2; p++)
+        bad += (long)qw_tp_ring_diff_bytes(&attn[p], &kv, POS2);
+out:
+    for (int p = 0; p < 2; p++) {
+        gpu_attn_layer *d = &attn[p];
+        fc_buffer_free(d->k_cache_g);
+        fc_buffer_free(d->v_cache_g);
+        fc_buffer_free(d->k_sink_g);
+        fc_buffer_free(d->v_sink_g);
+        fc_buffer_free(d->k_win_g);
+        fc_buffer_free(d->v_win_g);
+    }
+    free(kv.kq);
+    free(kv.vq);
+    free(kv.k_sink);
+    free(kv.v_sink);
+    free(kv.k_win);
+    free(kv.v_win);
+    free(g);
+    fc_cuda_ctx_free(ctx);
+    return (int)(bad > 1000000 ? 1000000 : bad);
 }
 
 /* ============================================================
@@ -10998,6 +15142,621 @@ int pn_qwen35moe_forward_step_poll(pn_model *model, pn_state *state,
     state->pos++;
     *logits_out = out;
     return 0;
+}
+
+/* ============================================================
+ * MTP draft head (QWEN35_MTP=1)
+ *
+ * The GGUF's trailing NextN block as a draft model on the head die, outside the trunk
+ * (llama.cpp graph_mtp): for the pair (h_j, t_{j+1}) — h_j the trunk's output_norm'd hidden
+ * at position j, t_{j+1} the token after it —
+ *   x  = eh_e . enorm(embed(t_{j+1})) + eh_h . hnorm(h_j)
+ *   x += attn(attn_norm(x)) at position j over the head's OWN KV ring
+ *   x += moe(post_attention_norm(x));  h' = shared_head_norm(x);  logits = head(h')
+ * and the next draft chains on (h', draft).
+ *
+ * Every committed position owes the head one KV row. Only the K/V projections of a row are
+ * needed for that (attention output and MoE feed nothing), so committed rows are caught up
+ * "KV-only" in batches; the LAST row before the seed runs the full block and yields draft 0.
+ * Rows wait in a backlog (h rows on the die + their next tokens) and are flushed in batches,
+ * so a verify that drafts nothing (D = 0) adds no head launches.
+ *
+ * Drafts never change what is emitted: the verify decides every token. The head's numbers
+ * only move acceptance, so it uses the prefill-shaped kernels freely and a draft vocabulary
+ * (ids < QWEN35_MTP_VOCAB, default 65536, plus the special-token tail; 0 = the full head).
+ * ============================================================ */
+
+#define QW_MTP_ROWS_CAP   320   /* backlog + one prefill chunk (<= 256 rows) */
+#define QW_MTP_FLUSH_AT    64   /* backlog rows that trigger a KV-only flush */
+#define QW_MTP_KV_BATCH   128   /* rows per KV-only batch (one q4 window lap) */
+#define QW_MTP_TOPK         8   /* pairs a draft fetches (argmax + confidence) */
+#define QW_MTP_PICK_TOPK   PN_MTP_PICK_PAIRS /* pairs a draft fetches for a pick callback */
+#define QW_MTP_TAIL_FIRST 248044 /* Qwen3.5/3.6 special tokens start here */
+
+/* QWEN35_MTP_PROF=1: sync after each part of a draft and book its wall time (prof_ms). */
+static int mtp_prof_on(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("QWEN35_MTP_PROF");
+        v = e ? (atoi(e) > 1 ? 2 : 1) : 0;
+    }
+    return v;
+}
+
+static void mtp_lap(gpu_mtp *t, int part, double *t0)
+{
+    if (!mtp_prof_on())
+        return;
+    fc_sync_ctx(t->ctx);
+    double now = prof_now();
+    t->prof_ms[part] += (now - *t0) * 1e3;
+    *t0 = now;
+}
+
+/* QWEN35_MTP_PROF=2: a KV-rows part (host embed / upload / kernels), drained. */
+static void mtp_kv_lap(gpu_mtp *t, fc_cuda_ctx *ctx, int part, double *t0)
+{
+    fc_sync_ctx(ctx);
+    double now = prof_now();
+    t->kv_prof_ms[part] += (now - *t0) * 1e3;
+    *t0 = now;
+}
+
+static int mtp_vocab_sub(void)
+{
+    const char *env = getenv("QWEN35_MTP_VOCAB");
+    return env ? atoi(env) : 65536;
+}
+
+/* Upload the head next to the LM head (the last die). No-op without a kept head. */
+static int mtp_upload(pn_qwen35moe_model *model, pn_qwen35moe_gpu *g,
+                      const pn_qwen35moe_config *cfg)
+{
+    const pn_qwen35moe_mtp_head *h = pn_qwen35moe_model_mtp(model);
+    gpu_mtp *t = &g->mtp;
+    fc_cuda_ctx *ctx = g->ctx[g->n_die - 1];
+    int nv = cfg->n_vocab, sub = mtp_vocab_sub();
+
+    if (!h)
+        return 0;
+    t->ctx = ctx;
+    if (gpu_upload_attn_layer(ctx, &t->d, &h->layer, cfg) < 0 ||
+        gpu_weight_upload(ctx, &t->eh_e, &h->eh_e) < 0 ||
+        gpu_weight_upload(ctx, &t->eh_h, &h->eh_h) < 0 ||
+        gpu_vec_upload(ctx, &t->enorm, h->enorm, cfg->n_embd) < 0 ||
+        gpu_vec_upload(ctx, &t->hnorm, h->hnorm, cfg->n_embd) < 0 ||
+        gpu_vec_upload(ctx, &t->head_norm, h->head_norm, cfg->n_embd) < 0 ||
+        !t->eh_e.bytes || !t->eh_h.bytes)
+        return -1;
+    /* Draft vocabulary: a row-prefix of the LM head plus the special tail, as views. */
+    t->head_lo = g->output;
+    t->sub_n = nv;
+    t->n_tail = 0;
+    if (sub > 0 && sub < QW_MTP_TAIL_FIRST && QW_MTP_TAIL_FIRST < nv) {
+        t->head_lo.rows = sub;
+        t->sub_n = sub;
+        t->tail_first = QW_MTP_TAIL_FIRST;
+        t->n_tail = nv - QW_MTP_TAIL_FIRST;
+        t->head_hi = g->output;
+        t->head_hi.rows = t->n_tail;
+        t->head_hi.bytes = fc_buffer_offset_view(g->output.bytes,
+                                                 (size_t)t->tail_first * g->output.row_stride);
+        if (!t->head_hi.bytes)
+            return -1;
+    }
+    t->on = 1;
+    fprintf(stderr, "qwen35moe: MTP draft head on die %d (draft vocabulary %d + %d tail of %d)\n",
+            g->die[g->n_die - 1], t->sub_n, t->n_tail, nv);
+    return 0;
+}
+
+static void mtp_free(pn_qwen35moe_gpu *g)
+{
+    gpu_mtp *t = &g->mtp;
+    gpu_attn_layer *d = &t->d;
+    fc_buffer **bufs[] = { &t->e, &t->en, &t->hn, &t->x, &t->xn, &t->k, &t->v, &t->qg,
+                           &t->q, &t->z, &t->aout, &t->blk, &t->tn, &t->mout, &t->h_chain,
+                           &t->logits, &t->h_pend, &t->h_ver, &t->m_g, &t->l_g, &t->acc_g,
+                           &d->k_cache_g, &d->v_cache_g, &d->k_sink_g, &d->v_sink_g,
+                           &d->k_win_g, &d->v_win_g };
+
+    if (!t->ctx)
+        return;
+    gpu_vec_free(&d->attn_norm);
+    gpu_weight_free(&d->attn_q);
+    gpu_weight_free(&d->attn_k);
+    gpu_weight_free(&d->attn_v);
+    gpu_vec_free(&d->attn_q_norm);
+    gpu_vec_free(&d->attn_k_norm);
+    gpu_weight_free(&d->attn_output);
+    gpu_vec_free(&d->post_attention_norm);
+    gpu_moe_free(&d->moe);
+    gpu_weight_free(&t->eh_e);
+    gpu_weight_free(&t->eh_h);
+    gpu_vec_free(&t->enorm);
+    gpu_vec_free(&t->hnorm);
+    gpu_vec_free(&t->head_norm);
+    fc_buffer_free_view(t->head_hi.bytes);   /* head_lo/head_hi alias g->output */
+    for (size_t i = 0; i < sizeof(bufs) / sizeof(bufs[0]); i++) {
+        fc_buffer_free(*bufs[i]);
+        *bufs[i] = NULL;
+    }
+    free(t->e_host);
+    memset(t, 0, sizeof(*t));
+}
+
+/* pn_mtp_ring_fill_ops on the head die: stream-ordered upload, then on-stream copies. */
+static int mtp_ring_put(void *ops_ctx, void *buf, const void *src, size_t bytes)
+{
+    (void)ops_ctx;
+    if (fc_buffer_from_cpu_n_async((fc_buffer *)buf, src, bytes) != 0)
+        fc_buffer_from_cpu_n((fc_buffer *)buf, src, bytes);
+    return 0;
+}
+
+static int mtp_ring_copy(void *ops_ctx, void *buf, size_t dst_off, size_t src_off,
+                         size_t bytes)
+{
+    fc_buffer_copy_d2d_ctx((fc_cuda_ctx *)ops_ctx, (fc_buffer *)buf, dst_off, (fc_buffer *)buf,
+                           src_off, bytes);
+    return 0;
+}
+
+/* Scratch + the head's KV ring (sized to the session's max_seq). */
+static int mtp_alloc(pn_qwen35moe_gpu *g, const pn_qwen35moe_config *cfg,
+                     const pn_qwen35moe_kv *kv0)
+{
+    gpu_mtp *t = &g->mtp;
+    gpu_attn_layer *d = &t->d;
+    fc_cuda_ctx *ctx = t->ctx;
+    size_t c = (size_t)cfg->n_embd, cap = QW_MTP_ROWS_CAP;
+    size_t attn = (size_t)cfg->n_head * cfg->head_dim, kvd = (size_t)cfg->n_head_kv * cfg->head_dim;
+    size_t np = (size_t)FC_ATTN_ROWS_MAX * cfg->n_head * PN_QWEN35MOE_DEC_SPLIT_MAX;
+
+    /* The head's ring below is its OWN, always q4 (the rows kernel is q4-only), filled
+     * only by mtp_rows_kv from the head's projections: it never reads the trunk's KV,
+     * so an fp32 trunk (Pantheon Local) drafts the same way. Drafts are only proposals;
+     * the trunk verifies every token, so the output does not depend on this ring. */
+    if (!t->x) {
+        t->e = fc_buffer_alloc_ctx(ctx, cap * c * 4);
+        t->en = fc_buffer_alloc_ctx(ctx, cap * c * 4);
+        t->hn = fc_buffer_alloc_ctx(ctx, cap * c * 4);
+        t->x = fc_buffer_alloc_ctx(ctx, cap * c * 4);
+        t->xn = fc_buffer_alloc_ctx(ctx, cap * c * 4);
+        t->k = fc_buffer_alloc_ctx(ctx, cap * kvd * 4);
+        t->v = fc_buffer_alloc_ctx(ctx, cap * kvd * 4);
+        t->h_pend = fc_buffer_alloc_ctx(ctx, cap * c * 4);
+        t->qg = fc_buffer_alloc_ctx(ctx, 2 * attn * 4);
+        t->q = fc_buffer_alloc_ctx(ctx, attn * 4);
+        t->z = fc_buffer_alloc_ctx(ctx, attn * 4);
+        t->aout = fc_buffer_alloc_ctx(ctx, attn * 4);
+        t->blk = fc_buffer_alloc_ctx(ctx, c * 4);
+        t->tn = fc_buffer_alloc_ctx(ctx, c * 4);
+        t->mout = fc_buffer_alloc_ctx(ctx, c * 4);
+        t->h_chain = fc_buffer_alloc_ctx(ctx, c * 4);
+        t->logits = fc_buffer_alloc_ctx(ctx, (size_t)(t->sub_n + t->n_tail) * 4);
+        t->m_g = fc_buffer_alloc_ctx(ctx, np * 4);
+        t->l_g = fc_buffer_alloc_ctx(ctx, np * 4);
+        t->acc_g = fc_buffer_alloc_ctx(ctx, np * cfg->head_dim * 4);
+        t->e_host = malloc(cap * c * sizeof(float));
+        if (!t->e || !t->en || !t->hn || !t->x || !t->xn || !t->k || !t->v || !t->h_pend ||
+            !t->qg || !t->q || !t->z || !t->aout || !t->blk || !t->tn || !t->mout ||
+            !t->h_chain || !t->logits || !t->m_g || !t->l_g || !t->acc_g || !t->e_host)
+            return -1;
+    }
+    if (d->cache_cap != kv0->max_seq) {
+        pn_mtp_ring_sizes rs = pn_mtp_ring_sizes_for(cfg->n_head_kv, cfg->head_dim,
+                                                     kv0->max_seq);
+        pn_mtp_ring_fill_ops zero_ops = { mtp_ring_put, mtp_ring_copy, ctx };
+        fc_buffer **ring[PN_MTP_RING_BUFFERS] = { &d->k_cache_g, &d->v_cache_g, &d->k_sink_g,
+                                                  &d->v_sink_g, &d->k_win_g, &d->v_win_g };
+        void *bufs[PN_MTP_RING_BUFFERS];
+        for (size_t i = 0; i < PN_MTP_RING_BUFFERS; i++) {
+            fc_buffer_free(*ring[i]);
+            *ring[i] = NULL;
+        }
+        d->k_cache_g = fc_buffer_alloc_ctx(ctx, rs.cache_bytes);
+        d->v_cache_g = fc_buffer_alloc_ctx(ctx, rs.cache_bytes);
+        d->k_sink_g = fc_buffer_alloc_ctx(ctx, rs.sink_bytes);
+        d->v_sink_g = fc_buffer_alloc_ctx(ctx, rs.sink_bytes);
+        d->k_win_g = fc_buffer_alloc_ctx(ctx, rs.win_bytes);
+        d->v_win_g = fc_buffer_alloc_ctx(ctx, rs.win_bytes);
+        d->cache_cap = 0;
+        if (!d->k_cache_g || !d->v_cache_g || !d->k_sink_g || !d->v_sink_g || !d->k_win_g ||
+            !d->v_win_g)
+            return -1;
+        /* The head attends [0, pos) while only rows since its last backlog reset are this
+         * session's; rows nothing ever wrote must decode finite (qwen35moe_mtp_ring.h). */
+        for (size_t i = 0; i < PN_MTP_RING_BUFFERS; i++)
+            bufs[i] = *ring[i];
+        if (pn_mtp_ring_clear(bufs, &rs, &zero_ops) != 0)
+            return -1;
+        d->cache_cap = kv0->max_seq;
+    }
+    return 0;
+}
+
+/* Capture the trunk's output_norm'd rows of the batch that just ran (prefill chunk or
+ * verify) on the head die: the backlog's h source. Called from gpu_batch_tokens_core. */
+static void mtp_capture_rows(pn_qwen35moe_gpu *g, fc_cuda_ctx *ctx, fc_buffer *x_norm,
+                             int n, int n_embd)
+{
+    gpu_mtp *t = &g->mtp;
+
+    t->ver_n = 0;
+    if (!t->on || ctx != t->ctx)
+        return;
+    if (t->ver_cap < n) {
+        fc_buffer_free(t->h_ver);
+        t->h_ver = fc_buffer_alloc_ctx(ctx, (size_t)n * n_embd * sizeof(float));
+        t->ver_cap = t->h_ver ? n : 0;
+        if (!t->h_ver)
+            return;
+    }
+    fc_buffer_copy_d2d_ctx(ctx, t->h_ver, 0, x_norm, 0, (size_t)n * n_embd * sizeof(float));
+    t->ver_n = n;
+}
+
+/* x = eh_proj([enorm(embed(next[r])) | hnorm(h[r])]) for n rows, attn_norm into xn, and the
+ * rows' K/V appended to the head's ring at pos0.. (h: [n][c] on the head die). */
+static int mtp_rows_kv(pn_qwen35moe_model *m, pn_qwen35moe_gpu *g,
+                       const pn_qwen35moe_config *cfg, int pos0, int n,
+                       const uint32_t *next, fc_buffer *h)
+{
+    gpu_mtp *t = &g->mtp;
+    gpu_attn_layer *d = &t->d;
+    fc_cuda_ctx *ctx = t->ctx;
+    int c = cfg->n_embd;
+
+    double t0 = prof_now(), tk = t0;
+    const int fine = mtp_prof_on() > 1;
+    if (fine)
+        fc_sync_ctx(ctx);
+    for (int r = 0; r < n; r++)
+        pn_qwen35moe_model_embed_row(m, next[r], t->e_host + (size_t)r * c);
+    if (fine)
+        mtp_kv_lap(t, ctx, 0, &tk);
+    /* Stream-ordered upload: the blocking copy would wait for the head die's whole
+     * queue — during a pipelined prefill that is the in-flight trunk segment, which
+     * serialised the 9b overlap (1k-token TTFT 9.0 s -> 13.8 s with the head fed). */
+    if (fc_buffer_from_cpu_n_async(t->e, t->e_host, (size_t)n * c * sizeof(float)) != 0)
+        fc_buffer_from_cpu_n(t->e, t->e_host, (size_t)n * c * sizeof(float));
+    if (fine)
+        mtp_kv_lap(t, ctx, 1, &tk);
+    fc_rms_norm_nx_ctx(ctx, t->e, t->enorm.buf, t->en, c, cfg->rms_norm_eps, n);
+    fc_rms_norm_nx_ctx(ctx, h, t->hnorm.buf, t->hn, c, cfg->rms_norm_eps, n);
+    if (gpu_matvec_nx(&t->eh_e, t->en, t->x, n) < 0 ||
+        gpu_matvec_nx(&t->eh_h, t->hn, t->e, n) < 0)
+        return -1;
+    fc_add_ctx(ctx, t->x, t->e, t->x, n * c);
+    fc_rms_norm_nx_ctx(ctx, t->x, d->attn_norm.buf, t->xn, c, cfg->rms_norm_eps, n);
+    if (gpu_matvec_nx(&d->attn_k, t->xn, t->k, n) < 0 ||
+        gpu_matvec_nx(&d->attn_v, t->xn, t->v, n) < 0)
+        return -1;
+    fc_qk_rms_norm_ctx(ctx, t->k, d->attn_k_norm.buf, n * cfg->n_head_kv, cfg->head_dim,
+                       cfg->rms_norm_eps);
+    fc_rope_neox_partial_nx_ctx(ctx, t->k, cfg->n_head_kv, cfg->head_dim, cfg->rope_dim, pos0,
+                                cfg->rope_theta, n);
+    fc_attn_kv_append_q4_ctx(ctx, t->k, t->v, d->k_cache_g, d->v_cache_g, d->k_sink_g,
+                             d->v_sink_g, d->k_win_g, d->v_win_g, cfg->n_head_kv,
+                             cfg->head_dim, d->cache_cap, pos0, n, pn_kvq4_sink(),
+                             pn_kvq4_win());
+    if (fine)
+        mtp_kv_lap(t, ctx, 2, &tk);
+    mtp_lap(t, 0, &t0);
+    t->kv_rows += n;
+    return 0;
+}
+
+/* The draft from h_chain: draft-vocabulary logits, top-k, ids mapped back. The draft is the
+ * argmax, or the pick callback's choice from the top QW_MTP_PICK_TOPK pairs; the confidence
+ * is the argmax's softmax over the top QW_MTP_TOPK either way. */
+static int mtp_pick(pn_qwen35moe_gpu *g, uint32_t *draft, float *conf)
+{
+    gpu_mtp *t = &g->mtp;
+    gpu_host_scratch *hs = &g->host;
+    const int k = t->pick ? QW_MTP_PICK_TOPK : QW_MTP_TOPK;
+    int ids[QW_MTP_PICK_TOPK];
+    float vals[QW_MTP_PICK_TOPK];
+    double sum = 0.0;
+
+    gpu_matvec(&t->head_lo, t->h_chain, t->logits, hs->a, hs->b);
+    if (t->n_tail) {
+        fc_buffer *hi = fc_buffer_offset_view(t->logits, (size_t)t->sub_n * sizeof(float));
+        if (!hi)
+            return -1;
+        gpu_matvec(&t->head_hi, t->h_chain, hi, hs->a, hs->b);
+        fc_buffer_free_view(hi);
+    }
+    if (fc_topk_logits_ctx(t->ctx, t->logits, t->sub_n + t->n_tail, k, ids, vals) != 0)
+        return -1;
+    for (int i = 0; i < k; i++)
+        ids[i] = ids[i] < t->sub_n ? ids[i] : t->tail_first + (ids[i] - t->sub_n);
+    for (int i = 0; i < QW_MTP_TOPK; i++)
+        sum += exp((double)(vals[i] - vals[0]));
+    *draft = t->pick ? t->pick(t->pick_ctx, t->pick_index, ids, vals, k) : (uint32_t)ids[0];
+    *conf = sum > 0.0 ? (float)(1.0 / sum) : 1.0f;
+    return 0;
+}
+
+/* The full block for row r of t->x (its K/V already appended at pos): attention, MoE,
+ * shared_head_norm into h_chain, then the draft. */
+static int mtp_row_full(pn_qwen35moe_gpu *g, const pn_qwen35moe_config *cfg, int r, int pos,
+                        uint32_t *draft, float *conf)
+{
+    gpu_mtp *t = &g->mtp;
+    gpu_attn_layer *d = &t->d;
+    fc_cuda_ctx *ctx = t->ctx;
+    gpu_host_scratch *hs = &g->host;
+    gpu_die_scratch *sc = gpu_get_scratch(g, ctx, cfg);
+    size_t row_b = (size_t)cfg->n_embd * sizeof(float);
+    int attn = cfg->n_head * cfg->head_dim, rc = -1;
+    fc_buffer *x = fc_buffer_offset_view(t->x, (size_t)r * row_b);
+    fc_buffer *xn = fc_buffer_offset_view(t->xn, (size_t)r * row_b);
+
+    double t0 = prof_now();
+    if (!sc || !x || !xn)
+        goto done;
+    gpu_matvec(&d->attn_q, xn, t->qg, hs->a, hs->b);
+    fc_attn_qz_split_ctx(ctx, t->qg, t->q, t->z, cfg->n_head, cfg->head_dim, 1);
+    fc_qk_rms_norm_ctx(ctx, t->q, d->attn_q_norm.buf, cfg->n_head, cfg->head_dim,
+                       cfg->rms_norm_eps);
+    fc_rope_neox_partial_nx_ctx(ctx, t->q, cfg->n_head, cfg->head_dim, cfg->rope_dim, pos,
+                                cfg->rope_theta, 1);
+    if (fc_attn_flash_decode_rows_q4_ctx(ctx, t->q, d->k_cache_g, d->v_cache_g, d->k_sink_g,
+                                         d->v_sink_g, d->k_win_g, d->v_win_g, t->m_g, t->l_g,
+                                         t->acc_g, NULL, t->aout, cfg->n_head,
+                                         cfg->n_head_kv, cfg->head_dim, d->cache_cap, pos, 1,
+                                         dec_keys_per_split(), PN_QWEN35MOE_DEC_SPLIT_MAX,
+                                         pn_kvq4_sink(), pn_kvq4_win(), attn_sink(), 0,
+                                         qw_scale_inv_sqrt(cfg->head_dim)) != 0)
+        goto done;
+    fc_sigmoid_ctx(ctx, t->z, attn);
+    fc_mul_ctx(ctx, t->aout, t->z, t->aout, attn);
+    gpu_matvec(&d->attn_output, t->aout, t->blk, hs->a, hs->b);
+    fc_add_ctx(ctx, x, t->blk, x, cfg->n_embd);
+    fc_rms_norm_nx_ctx(ctx, x, d->post_attention_norm.buf, t->tn, cfg->n_embd,
+                       cfg->rms_norm_eps, 1);
+    mtp_lap(t, 1, &t0);
+    if (gpu_moe_block(ctx, &d->moe, cfg, t->tn, t->mout, x, sc, hs) < 0)
+        goto done;
+    mtp_lap(t, 2, &t0);
+    fc_rms_norm_nx_ctx(ctx, x, t->head_norm.buf, t->h_chain, cfg->n_embd, cfg->rms_norm_eps, 1);
+    rc = mtp_pick(g, draft, conf);
+    mtp_lap(t, 3, &t0);
+    t->full_rows++;
+done:
+    fc_buffer_free_view(x);
+    fc_buffer_free_view(xn);
+    return rc;
+}
+
+/* KV-only catch-up of backlog rows [0, n) (their next tokens all known); the rest move down.
+ * Batches of at most QW_MTP_KV_BATCH rows keep one append inside one lap of the q4 window. */
+static int mtp_flush(pn_qwen35moe_model *m, pn_qwen35moe_gpu *g,
+                     const pn_qwen35moe_config *cfg, int n)
+{
+    gpu_mtp *t = &g->mtp;
+    size_t row_b = (size_t)cfg->n_embd * sizeof(float);
+
+    if (n <= 0)
+        return 0;
+    for (int off = 0; off < n; off += QW_MTP_KV_BATCH) {
+        int nb = n - off < QW_MTP_KV_BATCH ? n - off : QW_MTP_KV_BATCH;
+        fc_buffer *h = off ? fc_buffer_offset_view(t->h_pend, (size_t)off * row_b) : t->h_pend;
+        int rc = h ? mtp_rows_kv(m, g, cfg, t->pend_base + off, nb, t->pend_next + off, h) : -1;
+        if (off)
+            fc_buffer_free_view(h);
+        if (rc < 0)
+            return -1;
+    }
+    for (int r = n; r < t->pend_n; r++) {
+        fc_buffer_copy_d2d_ctx(t->ctx, t->h_pend, (size_t)(r - n) * row_b, t->h_pend,
+                               (size_t)r * row_b, row_b);
+        t->pend_next[r - n] = t->pend_next[r];
+    }
+    t->pend_n -= n;
+    t->pend_base += n;
+    return 0;
+}
+
+/* Join the last trunk batch's rows to the backlog: rows at positions state->pos - n.., whose
+ * input tokens were tokens[0..n). Resets the head on a new session or a restart. */
+static int mtp_push(pn_qwen35moe_model *m, pn_qwen35moe_gpu *g, pn_qwen35moe_state *s,
+                    int pos_end, const uint32_t *tokens, int n)
+{
+    const pn_qwen35moe_config *cfg = pn_qwen35moe_model_config(m);
+    gpu_mtp *t = &g->mtp;
+    size_t row_b = (size_t)cfg->n_embd * sizeof(float);
+    int pos0 = pos_end - n;
+
+    if (!t->on || n < 1 || n > QW_MTP_KV_BATCH || n > t->ver_n || s->n_attn < 1 ||
+        mtp_alloc(g, cfg, &s->kv[0]) < 0)
+        return -1;
+    if (t->state != (const void *)s || pos0 == 0 ||
+        (t->pend_n > 0 && t->pend_base + t->pend_n != pos0) ||
+        (t->pend_n == 0 && t->next_pos != pos0)) {
+        t->state = (const void *)s;
+        t->pend_n = 0;
+    }
+    if (t->pend_n > 0)
+        t->pend_next[t->pend_n - 1] = tokens[0];
+    if (t->pend_n + n > QW_MTP_ROWS_CAP && mtp_flush(m, g, cfg, t->pend_n) < 0)
+        return -1;
+    if (t->pend_n == 0)
+        t->pend_base = pos0;
+    fc_buffer_copy_d2d_ctx(t->ctx, t->h_pend, (size_t)t->pend_n * row_b, t->h_ver, 0,
+                           (size_t)n * row_b);
+    for (int r = 0; r < n; r++)
+        t->pend_next[t->pend_n + r] = r + 1 < n ? tokens[r + 1] : 0u;
+    t->pend_n += n;
+    t->next_pos = pos_end;
+    if (t->pend_n > QW_MTP_FLUSH_AT && mtp_flush(m, g, cfg, t->pend_n - 1) < 0)
+        return -1;
+    return 0;
+}
+
+/* Up to kmax drafts for the token after `seed` (which sits at pos_seed): the backlog's
+ * catch-up with its last row in full gives draft 0, then each draft chains on the head's
+ * own output. `more` (NULL = always) decides after each draft whether to draft again. */
+static int mtp_draft(pn_qwen35moe_model *m, pn_qwen35moe_gpu *g, pn_qwen35moe_state *s,
+                     int pos_seed, uint32_t seed, int kmax, uint32_t *drafts, float *confs,
+                     pn_mtp_more_fn more, void *more_ctx, pn_mtp_pick_fn pick, void *pick_ctx)
+{
+    const pn_qwen35moe_config *cfg = pn_qwen35moe_model_config(m);
+    gpu_mtp *t = &g->mtp;
+    double t0 = prof_now();
+    int n = t->pend_n, got = 0;
+
+    if (!t->on || kmax < 1 || n < 1 || t->state != (const void *)s ||
+        t->pend_base + n != pos_seed)
+        return -1;
+    t->pend_next[n - 1] = seed;
+    t->pick = pick;
+    t->pick_ctx = pick_ctx;
+    t->pick_index = 0;
+    if (mtp_rows_kv(m, g, cfg, t->pend_base, n, t->pend_next, t->h_pend) < 0 ||
+        mtp_row_full(g, cfg, n - 1, pos_seed - 1, &drafts[0], &confs[0]) < 0) {
+        t->pick = NULL;
+        return -1;
+    }
+    t->pend_n = 0;
+    for (got = 1; got < kmax; got++) {
+        if (more && !more(more_ctx, got, confs[got - 1]))
+            break;
+        t->pick_index = got;
+        if (mtp_rows_kv(m, g, cfg, pos_seed - 1 + got, 1, &drafts[got - 1], t->h_chain) < 0 ||
+            mtp_row_full(g, cfg, 0, pos_seed - 1 + got, &drafts[got], &confs[got]) < 0)
+            break;
+    }
+    t->pick = NULL;
+    t->drafts += got;
+    t->draft_ms += (prof_now() - t0) * 1e3;
+    return got;
+}
+
+int pn_qwen35moe_mtp_ready(pn_model *model)
+{
+    pn_qwen35moe_model *m = model ? (pn_qwen35moe_model *)model->weights : NULL;
+    pn_qwen35moe_gpu *g = m ? (pn_qwen35moe_gpu *)pn_qwen35moe_model_gpu(m) : NULL;
+
+    return g && g->mtp.on;
+}
+
+int pn_qwen35moe_mtp_push_rows(pn_model *model, pn_state *state, const uint32_t *tokens,
+                               int n)
+{
+    if (!model || !state || !tokens || !qw_model_uses_qwen35moe_state(model))
+        return -1;
+    pn_qwen35moe_model *m = (pn_qwen35moe_model *)model->weights;
+    pn_qwen35moe_gpu *g = m ? (pn_qwen35moe_gpu *)pn_qwen35moe_model_gpu(m) : NULL;
+    pn_qwen35moe_state *s = (pn_qwen35moe_state *)state->kv_cache;
+
+    if (!g || !s)
+        return -1;
+    return mtp_push(m, g, s, state->pos, tokens, n);
+}
+
+int pn_qwen35moe_mtp_rewind(pn_model *model, pn_state *state)
+{
+    if (!model || !state || !qw_model_uses_qwen35moe_state(model))
+        return -1;
+    pn_qwen35moe_model *m = (pn_qwen35moe_model *)model->weights;
+    pn_qwen35moe_gpu *g = m ? (pn_qwen35moe_gpu *)pn_qwen35moe_model_gpu(m) : NULL;
+
+    if (!g || !g->mtp.on)
+        return -1;
+    g->mtp.state = state->kv_cache;
+    g->mtp.pend_n = 0;
+    g->mtp.next_pos = state->pos;
+    return 0;
+}
+
+int pn_qwen35moe_mtp_draft_pick(pn_model *model, pn_state *state, uint32_t seed, int kmax,
+                                uint32_t *drafts, float *confs, pn_mtp_more_fn more,
+                                void *more_ctx, pn_mtp_pick_fn pick, void *pick_ctx)
+{
+    if (!model || !state || !drafts || !confs || !qw_model_uses_qwen35moe_state(model))
+        return -1;
+    pn_qwen35moe_model *m = (pn_qwen35moe_model *)model->weights;
+    pn_qwen35moe_gpu *g = m ? (pn_qwen35moe_gpu *)pn_qwen35moe_model_gpu(m) : NULL;
+    pn_qwen35moe_state *s = (pn_qwen35moe_state *)state->kv_cache;
+
+    if (!g || !s)
+        return -1;
+    if (!g->host_ok) {
+        if (gpu_host_scratch_init(&g->host, pn_qwen35moe_model_config(m)) < 0)
+            return -1;
+        g->host_ok = 1;
+    }
+    return mtp_draft(m, g, s, state->pos, seed, kmax, drafts, confs, more, more_ctx, pick,
+                     pick_ctx);
+}
+
+int pn_qwen35moe_mtp_draft(pn_model *model, pn_state *state, uint32_t seed, int kmax,
+                           uint32_t *drafts, float *confs, pn_mtp_more_fn more,
+                           void *more_ctx)
+{
+    return pn_qwen35moe_mtp_draft_pick(model, state, seed, kmax, drafts, confs, more, more_ctx,
+                                       NULL, NULL);
+}
+
+int pn_qwen35moe_mtp_stats(pn_model *model, pn_mtp_stats *out)
+{
+    pn_qwen35moe_model *m = model ? (pn_qwen35moe_model *)model->weights : NULL;
+    pn_qwen35moe_gpu *g = m ? (pn_qwen35moe_gpu *)pn_qwen35moe_model_gpu(m) : NULL;
+
+    if (!g || !out || !g->mtp.on)
+        return -1;
+    out->drafts = g->mtp.drafts;
+    out->kv_rows = g->mtp.kv_rows;
+    out->full_rows = g->mtp.full_rows;
+    out->draft_ms = g->mtp.draft_ms;
+    for (int i = 0; i < 4; i++)
+        out->prof_ms[i] = g->mtp.prof_ms[i];
+    return 0;
+}
+
+int pn_qwen35moe_verify_graph_stats(pn_model *model, long *captures, long *replays,
+                                    long *failures)
+{
+    pn_qwen35moe_model *m = model ? (pn_qwen35moe_model *)model->weights : NULL;
+    pn_qwen35moe_gpu *g = m ? (pn_qwen35moe_gpu *)pn_qwen35moe_model_gpu(m) : NULL;
+
+    if (!g || !captures || !replays || !failures)
+        return -1;
+    *captures = *replays = *failures = 0;
+    for (int d = 0; d < PN_DIE_LAYER_SPLIT_MAX_DIES; d++)
+        for (int r = 0; r < 5; r++) {
+            *captures += g->vgraph[d][r].captures;
+            *replays += g->vgraph[d][r].replays;
+            *failures += g->vgraph[d][r].failures;
+        }
+    return 0;
+}
+
+int pn_qwen35moe_spec_verify_topk(pn_model *model, const uint32_t *tokens, int n,
+                                  pn_state *state, int k, int *ids, float *vals)
+{
+    if (!model || !state || !ids || !vals || k < 1 || k > FC_TOPK_MAX ||
+        !qw_model_uses_qwen35moe_state(model))
+        return -1;
+    pn_qwen35moe_model *m = (pn_qwen35moe_model *)model->weights;
+    pn_qwen35moe_gpu *g = m ? (pn_qwen35moe_gpu *)pn_qwen35moe_model_gpu(m) : NULL;
+    pn_qwen35moe_state *s = (pn_qwen35moe_state *)state->kv_cache;
+    int32_t argmax_unused[FC_ATTN_ROWS_MAX + 1];
+
+    if (!g || !s || n > FC_ATTN_ROWS_MAX)
+        return -1;
+    g->spec_topk_k = k;
+    g->spec_topk_ids = ids;
+    g->spec_topk_vals = vals;
+    int rc = pn_qwen35moe_spec_verify_tokens_cuda(m, tokens, n, s, state->pos, argmax_unused);
+    g->spec_topk_k = 0;
+    g->spec_topk_ids = NULL;
+    g->spec_topk_vals = NULL;
+    return rc;
 }
 
 #endif /* USE_CUDA */

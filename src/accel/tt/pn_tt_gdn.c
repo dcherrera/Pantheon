@@ -74,6 +74,7 @@
 #ifdef USE_TT
 
 #include "pn_tt_gdn.h"
+#include "tt/ft_tt_launch.h"
 #include "pn_tt_dispatch.h"
 
 #include <math.h>
@@ -84,8 +85,12 @@
 #include "pn_tt_device_internal.h"
 
 #include "pn_tt_fp32_strip.h"
+#include "pn_tt_gdn_conv_share.h"
+#include "pn_tt_gdn_conv_split.h"
 #include "pn_tt_gdn_core_scaling.h"
+#include "pn_tt_gdn_verify_slots.h"
 #include "pn_tt_gdn_layout.h"
+#include "pn_tt_group_pull.h"
 
 #include "tt/ft_tt_op_gdn.h"
 
@@ -107,7 +112,8 @@
 #define PN_TT_CORE_GDN_DEFAULT 90u
 
 /** THE HEAD SPLIT. `PN_TT_GDN_HEAD_CORES=N` arms N-1 EXTRA GDN residencies and gives each
- *  member `v_heads/N` of the 32 v-heads; PHASE CONV stays whole on member 0.
+ *  member `v_heads/N` of the 32 v-heads; PHASE CONV splits by tile column over as many of
+ *  them as its slices fit (`gdn_conv_members()`).
  *
  *  **DEFAULT 4, MEASURED ON THE SHIPPED BLOB** — 2026-08-19, `PN_TT_PROGRAM_DIR` UNSET, so
  *  the embedded program blob a serve runs rather than an arm tree in /tmp. PHASE DELTA
@@ -225,10 +231,9 @@ static int gdn_alloc_in(pn_tt_device *device, uint32_t bank, size_t bytes, bool 
 
     if (bytes == 0u)
         return -1;
-    if (bank == PN_TT_GDN_ANY_BANK)
-        bank = device->strip_bank_cursor++ % device->dram_bank_count;
-    if (ft_tt_buffer_alloc(&device->allocator, FT_TT_MEM_SPACE_DRAM, bank, bytes,
-                           &buffer) != FT_TT_OK) {
+    if (bank == PN_TT_GDN_ANY_BANK ? pn_tt_dram_alloc_any(device, bytes, &buffer) != 0
+                                   : ft_tt_buffer_alloc(&device->allocator, FT_TT_MEM_SPACE_DRAM,
+                                                        bank, bytes, &buffer) != FT_TT_OK) {
         fprintf(stderr, "pn_tt: DRAM full allocating a %zu-byte GDN buffer\n", bytes);
         return -1;
     }
@@ -287,9 +292,14 @@ static int gdn_alloc_regions(pn_tt_device *device, const ft_tt_op_gdn_request *r
         pn_tt_gdn_region *region = &device->gdn_region[layer];
 
         /* The weight is a CONSTANT the caller writes whole, plane by plane, so it needs no
-         * staging; the two pieces of carried state are the recurrence's initial condition. */
-        if (gdn_alloc_in(device, PN_TT_GDN_ANY_BANK, weight, false, &region->weight) != 0 ||
-            gdn_alloc_in(device, PN_TT_GDN_ANY_BANK, window, true, &region->window) != 0 ||
+         * staging; the two pieces of carried state are the recurrence's initial condition.
+         * SHARED (pn_tt_gdn_conv_share.h): the weight is not allocated, but its round-robin
+         * turn is still taken, so the window and state keep main's banks. */
+        if (device->gdn_conv_share == PN_TT_GDN_CONV_PENDING)
+            device->strip_bank_cursor++;
+        else if (gdn_alloc_in(device, PN_TT_GDN_ANY_BANK, weight, false, &region->weight) != 0)
+            return -1;
+        if (gdn_alloc_in(device, PN_TT_GDN_ANY_BANK, window, true, &region->window) != 0 ||
             gdn_alloc_in(device, PN_TT_GDN_ANY_BANK, state, true, &region->state) != 0)
             return -1;
     }
@@ -342,13 +352,37 @@ static int gdn_alloc_regions(pn_tt_device *device, const ft_tt_op_gdn_request *r
                 device->gdn_gate.bank, device->gdn_gate.address, device->gdn_y.bank,
                 device->gdn_y.address);
     }
-    fprintf(stderr, "pn_tt: gdn — %u layers x (%.2f MiB state + %.2f MiB window + %.2f MiB "
-                    "weight) = %.2f MiB of card DRAM\n",
-            device->gdn_shape.layer_count, (double)state / (1024.0 * 1024.0),
-            (double)window / (1024.0 * 1024.0), (double)weight / (1024.0 * 1024.0),
-            (double)((state + window + weight) * device->gdn_shape.layer_count) /
-                (1024.0 * 1024.0));
+    {
+        const size_t own_weight = device->gdn_conv_share == PN_TT_GDN_CONV_PENDING ? 0u : weight;
+
+        fprintf(stderr, "pn_tt: gdn — %u layers x (%.2f MiB state + %.2f MiB window + %.2f MiB "
+                        "weight) = %.2f MiB of card DRAM\n",
+                device->gdn_shape.layer_count, (double)state / (1024.0 * 1024.0),
+                (double)window / (1024.0 * 1024.0), (double)own_weight / (1024.0 * 1024.0),
+                (double)((state + window + own_weight) * device->gdn_shape.layer_count) /
+                    (1024.0 * 1024.0));
+    }
     return 0;
+}
+
+int pn_tt_gdn_alloc_conv_weight(pn_tt_device *device, pn_tt_gdn_buffer *out)
+{
+    const ft_tt_op_gdn_request request = gdn_request(device, FT_TT_OP_GDN_PHASE_CONV);
+
+    return gdn_alloc_in(device, PN_TT_GDN_ANY_BANK, ft_tt_op_gdn_conv_weight_bytes(&request),
+                        false, out);
+}
+
+int pn_tt_gdn_place_regions(pn_tt_device *device)
+{
+    ft_tt_op_gdn_request request;
+
+    if (!device || device->gdn_shape.layer_count == 0u)
+        return -1;
+    request = gdn_request(device, FT_TT_OP_GDN_PHASE_CONV);
+    request.activation_in.tile_bytes = PN_TT_GDN_TILE_BYTES;
+    request.activation_out.tile_bytes = PN_TT_GDN_TILE_BYTES;
+    return gdn_alloc_regions(device, &request);
 }
 
 /** A positive env integer, or `fallback`. */
@@ -397,6 +431,10 @@ static uint32_t gdn_head_member_count(const pn_tt_device *device)
  * continues, because every member's descriptors are complete on their own. It IS reported,
  * because a silent shrink would show up only as a number that did not move.
  */
+static bool gdn_conv_split_enabled(void);
+static uint32_t gdn_conv_members(const pn_tt_device *device);
+static uint32_t gdn_delta_members(const pn_tt_device *device);
+
 static void gdn_arm_head_members(pn_tt_device *device, const ft_tt_op_gdn_request *shape)
 {
     const uint32_t members = gdn_head_member_count(device);
@@ -440,9 +478,10 @@ static void gdn_arm_head_members(pn_tt_device *device, const ft_tt_op_gdn_reques
         fprintf(stderr, "pn_tt: gdn HEAD SPLIT — asked for %u members, %u armed; the split "
                         "runs at %u\n", members, device->gdn_members, device->gdn_members);
     fprintf(stderr, "pn_tt: gdn HEAD SPLIT — PHASE DELTA over %u members from core %u, "
-                    "%u v-heads each; PHASE CONV stays whole on core %u\n",
-            device->gdn_members, device->gdn.core_index,
-            device->gdn_shape.v_heads / device->gdn_members, device->gdn.core_index);
+                    "%u v-heads each; PHASE CONV over %u member(s)\n",
+            gdn_delta_members(device), device->gdn.core_index,
+            device->gdn_shape.v_heads / gdn_delta_members(device),
+            gdn_conv_split_enabled() ? gdn_conv_members(device) : 1u);
 }
 
 int pn_tt_device_arm_gdn(pn_tt_device *device, const pn_tt_gdn_shape *shape)
@@ -478,7 +517,7 @@ int pn_tt_device_arm_gdn(pn_tt_device *device, const pn_tt_gdn_shape *shape)
         pn_tt_residency_release(&device->gdn);
         return 0;
     }
-    if (gdn_alloc_regions(device, &request) != 0 ||
+    if (pn_tt_gdn_place_regions(device) != 0 ||
         gdn_stage_grow(device, ft_tt_op_gdn_conv_stream_bytes(&request)) != 0) {
         fprintf(stderr, "pn_tt: the gdn family could not be staged in card DRAM\n");
         pn_tt_residency_release(&device->gdn);
@@ -611,6 +650,45 @@ int pn_tt_gdn_snapshot_reserve(pn_tt_device *device, uint32_t slots)
     return 0;
 }
 
+int pn_tt_gdn_project_bank_free(pn_tt_device *device, uint32_t slots, bool checkpoint,
+                                uint32_t stacks, uint64_t stack_bytes, uint64_t *out_min_free)
+{
+    int64_t free_bytes[FT_TT_MAX_DRAM_BANKS];
+    uint32_t sets, b, l;
+    size_t window, state;
+    int64_t lowest;
+
+    if (!device || !out_min_free || !pn_tt_gdn_is_armed(device) || device->dram_bank_count == 0u)
+        return -1;
+    for (b = 0; b < device->dram_bank_count; b++)
+        free_bytes[b] = (int64_t)ft_tt_allocator_free_bytes(&device->allocator,
+                                                            FT_TT_MEM_SPACE_DRAM, b);
+    pn_tt_gdn_carried_bytes(device, &window, &state);
+    window = (window + 63u) & ~(size_t)63u;
+    state = (state + 63u) & ~(size_t)63u;
+    sets = (slots > device->gdn_snapshot_slots ? slots - device->gdn_snapshot_slots : 0u) +
+           (checkpoint && !device->gdn_checkpoint ? 1u : 0u);
+    for (l = 0; l < device->gdn_shape.layer_count; l++) {
+        free_bytes[device->gdn_region[l].window.bank] -= (int64_t)(sets * window);
+        free_bytes[device->gdn_region[l].state.bank] -= (int64_t)(sets * state);
+    }
+    /* The stacks go where pn_tt_moe_place_stack puts them: the bank with the most free. */
+    for (uint32_t i = 0; i < stacks; i++) {
+        uint32_t best = 0u;
+
+        for (b = 1; b < device->dram_bank_count; b++)
+            if (free_bytes[b] > free_bytes[best])
+                best = b;
+        free_bytes[best] -= (int64_t)stack_bytes;
+    }
+    lowest = free_bytes[0];
+    for (b = 1; b < device->dram_bank_count; b++)
+        if (free_bytes[b] < lowest)
+            lowest = free_bytes[b];
+    *out_min_free = lowest > 0 ? (uint64_t)lowest : 0u;
+    return 0;
+}
+
 void pn_tt_gdn_carried_bytes(const pn_tt_device *device, size_t *window, size_t *state)
 {
     const ft_tt_op_gdn_request request = gdn_request(device, FT_TT_OP_GDN_PHASE_CONV);
@@ -643,6 +721,56 @@ int pn_tt_gdn_state_out(pn_tt_device *device, int slot)
         return -1;
     device->gdn_state_out_plus1 = slot < 0 ? 0u : (uint32_t)slot + 1u;
     return 0;
+}
+
+void pn_tt_gdn_verify_compact_set(pn_tt_device *device, bool compact)
+{
+    if (device)
+        device->gdn_verify_compact = compact;
+}
+
+uint32_t pn_tt_gdn_verify_slots(const pn_tt_device *device, uint32_t rows)
+{
+    return pn_gdn_verify_slot_count(device && device->gdn_verify_compact, rows);
+}
+
+int pn_tt_gdn_verify_row_out(pn_tt_device *device, uint32_t rows, uint32_t row)
+{
+    if (!device)
+        return -1;
+    return pn_tt_gdn_state_out(device, pn_gdn_verify_row_slot(device->gdn_verify_compact, rows,
+                                                              row));
+}
+
+int pn_tt_gdn_verify_row_trade(pn_tt_device *device, uint32_t layer, uint32_t rows,
+                               uint32_t row, bool window, bool state)
+{
+    int slot;
+
+    if (!device)
+        return -1;
+    slot = pn_gdn_verify_row_slot(device->gdn_verify_compact, rows, row);
+    return slot < 0 ? 0 : pn_tt_gdn_layer_swap_part(device, layer, (uint32_t)slot, window, state);
+}
+
+uint32_t pn_tt_gdn_verify_rollback_slot(const pn_tt_device *device, uint32_t rows,
+                                        uint32_t last_kept)
+{
+    return pn_gdn_verify_rollback_slot(device && device->gdn_verify_compact, rows, last_kept);
+}
+
+/** Multi-row descriptor, row `row` of `rows`: the buffer its state goes to — the slot the map
+ *  names, or the live part itself (compact's last row, into S_0's buffer). */
+static const pn_tt_gdn_buffer *gdn_rows_out_buffer(const pn_tt_device *device, uint32_t layer,
+                                                   uint32_t rows, uint32_t row, bool window)
+{
+    const int slot = pn_gdn_verify_rows_out_slot(device->gdn_verify_compact, rows, row);
+    const pn_tt_gdn_region *r = slot < 0 ? &device->gdn_region[layer]
+                                         : &device->gdn_snapshot[(uint32_t)slot *
+                                                                     device->gdn_shape.layer_count +
+                                                                 layer];
+
+    return window ? &r->window : &r->state;
 }
 
 int pn_tt_gdn_layer_swap_part(pn_tt_device *device, uint32_t layer, uint32_t slot, bool window,
@@ -683,17 +811,27 @@ int pn_tt_gdn_defer(pn_tt_device *device, bool defer)
 
 int pn_tt_gdn_await_deferred(pn_tt_device *device)
 {
+    pn_tt_residency *set[PN_TT_GDN_MAX_MEMBERS];
+    bool bad[PN_TT_GDN_MAX_MEMBERS];
     uint32_t index;
     int failed = 0;
 
     if (!device)
         return -1;
-    for (index = 0; index < device->gdn_pending_members; index++) {
-        pn_tt_residency *r = index == 0u ? &device->gdn : &device->gdn_member[index - 1u];
-
-        if (pn_tt_residency_await(r, PN_TT_OP_TIMEOUT_MS) != 0)
-            failed = 1;
+    memset(bad, 0, sizeof(bad));
+    for (index = 0; index < device->gdn_pending_members && index < PN_TT_GDN_MAX_MEMBERS; index++)
+        set[index] = index == 0u ? &device->gdn : &device->gdn_member[index - 1u];
+    /* S1: when every split of the window pulled, `gdn`'s last completion covers each member's
+     * (member 0 runs its rows in order, and each one waited for the members it split over). */
+    if (device->gdn_pending_pulled && device->gdn_pending_members > 1u) {
+        failed = pn_tt_group_pull_await(&device->gdn_pull, true, set,
+                                        device->gdn_pending_members, bad, NULL);
+    } else {
+        for (index = 0; index < device->gdn_pending_members; index++)
+            if (pn_tt_residency_await(set[index], PN_TT_OP_TIMEOUT_MS) != 0)
+                failed = 1;
     }
+    device->gdn_pending_pulled = false;
     device->gdn_pending_members = 0u;
     device->gdn_pending_depth = 0u;
     return failed ? -1 : 0;
@@ -741,6 +879,11 @@ int pn_tt_gdn_conv_weight_upload(pn_tt_device *device, uint32_t layer, const flo
         return -1;
     if (layer == 0u)
         device->gdn_weight_oracle = weight;
+    /* SHARED: the planes are the chunkwise constant's row 0, which its own upload writes. */
+    if (pn_tt_gdn_conv_weight_is_shared(device)) {
+        free(plane);
+        return 0;
+    }
 
     for (tap = 0; tap < taps && rc == 0; tap++) {
         const uint32_t first = ftg_conv_plane_tile(&shape, tap, 0u);
@@ -854,11 +997,33 @@ static uint32_t gdn_probe_knob(const char *name)
  * `gdn` residency itself and goes through `pn_tt_gdn_rearm()`, which is the same operation
  * spelled against the environment default.
  */
+/** Arm a fresh `gdn` (member 0) or head-split member residency on `core`: load, boot its
+ *  firmware, place the CBs for the shape, GO. The handle must be released (or never armed). */
+static bool gdn_arm_on_core(pn_tt_device *device, uint32_t member_index, uint32_t core)
+{
+    pn_tt_residency *member = member_index == 0u ? &device->gdn : &device->gdn_member[member_index - 1u];
+    ft_tt_launch_cb_entry placed[FT_TT_OP_GDN_CB_COUNT];
+    ft_tt_op_gdn_request request = gdn_request(device, FT_TT_OP_GDN_PHASE_CONV);
+
+    request.activation_in.tile_bytes = PN_TT_GDN_TILE_BYTES;
+    request.activation_out.tile_bytes = PN_TT_GDN_TILE_BYTES;
+    if (!pn_tt_prepare_family_on_core(device, member, PN_TT_GDN_PROGRAM,
+                                      member_index == 0u ? "gdn" : "gdn-member",
+                                      member_index == 0u ? PN_TT_CORE_GDN_ENV
+                                                         : PN_TT_GDN_MEMBER_CORE_FIRST_ENV,
+                                      core, PN_TT_ONCARD_TRIAD_MASK))
+        return false;
+    if (ft_tt_op_gdn_place_cbs(&request, placed, member->cb_buffer, sizeof(member->cb_buffer),
+                               &member->cb_mask) != FT_TT_OK) {
+        pn_tt_residency_release(member);
+        return false;
+    }
+    return pn_tt_start_family(member);
+}
+
 static bool gdn_member_rearm(pn_tt_device *device, uint32_t member_index)
 {
     pn_tt_residency *member;
-    ft_tt_launch_cb_entry placed[FT_TT_OP_GDN_CB_COUNT];
-    ft_tt_op_gdn_request request;
     uint32_t core;
 
     if (member_index == 0u)
@@ -876,20 +1041,47 @@ static bool gdn_member_rearm(pn_tt_device *device, uint32_t member_index)
                         "core %u\n", member_index, core);
         return false;
     }
+    return gdn_arm_on_core(device, member_index, core);
+}
 
-    request = gdn_request(device, FT_TT_OP_GDN_PHASE_CONV);
-    request.activation_in.tile_bytes = PN_TT_GDN_TILE_BYTES;
-    request.activation_out.tile_bytes = PN_TT_GDN_TILE_BYTES;
-    if (!pn_tt_prepare_family_on_core(device, member, PN_TT_GDN_PROGRAM, "gdn-member",
-                                      PN_TT_GDN_MEMBER_CORE_FIRST_ENV, core,
-                                      PN_TT_ONCARD_TRIAD_MASK))
-        return false;
-    if (ft_tt_op_gdn_place_cbs(&request, placed, member->cb_buffer, sizeof(member->cb_buffer),
-                               &member->cb_mask) != FT_TT_OK) {
-        pn_tt_residency_release(member);
-        return false;
+uint32_t pn_tt_gdn_lend_count(const pn_tt_device *device)
+{
+    return pn_tt_gdn_is_armed(device) ? device->gdn_members : 0u;
+}
+
+uint32_t pn_tt_gdn_lend(pn_tt_device *device, uint32_t member_index)
+{
+    pn_tt_residency *member = member_index == 0u ? &device->gdn : &device->gdn_member[member_index - 1u];
+    const uint32_t core = member->core_index;
+
+    /* Running, or idle-retired with its firmware still on the core: both lend (stop is safe
+     * on a residency that is not running). */
+    if (!member->core_booted)
+        return UINT32_MAX;
+    pn_tt_residency_stop(member);
+    /* The retire is asked BEFORE the release: release zeroes the handle and its answer. */
+    if (!pn_tt_residency_retired(member)) {
+        fprintf(stderr, "pn_tt: gdn member %u (core %u) did not retire — NOT lent\n",
+                member_index, core);
+        return UINT32_MAX;
     }
-    return pn_tt_start_family(member);
+    pn_tt_residency_release(member);
+    /* Release keeps `core_booted`, and the core-holder check would then refuse the borrower:
+     * park the exited triad and drop the claim, as pn_tt_attention_grid.c does after its own
+     * retire. The next boot on this core (attention, or the restore) asserts reset again. */
+    if (ft_tt_launch_assert_reset(&device->runtime.noc, member->core_x, member->core_y,
+                                  FT_TT_SOFT_RESET_ALL_RISCS) != FT_TT_OK) {
+        fprintf(stderr, "pn_tt: gdn member %u (core %u) could not be parked — NOT lent\n",
+                member_index, core);
+        return UINT32_MAX;
+    }
+    member->core_booted = false;
+    return core;
+}
+
+bool pn_tt_gdn_restore(pn_tt_device *device, uint32_t member_index, uint32_t core)
+{
+    return gdn_arm_on_core(device, member_index, core);
 }
 
 /**
@@ -968,7 +1160,6 @@ static void gdn_account_phase(pn_tt_device *device, uint32_t phase, double secon
     device->gdn_phase_rearms[phase] += rearms;
 }
 
-/** `PN_TT_GDN_CONV_SPLIT=1`: split PHASE CONV across the gdn members by tile column. */
 static bool gdn_conv_split_enabled(void)
 {
     static int cached = -1;
@@ -986,29 +1177,72 @@ static bool gdn_conv_split_enabled(void)
 }
 
 /** L5: PHASE DELTA may run over FEWER members than CONV — measured 2026-10-05 at 16: CONV
- *  153 -> 120 us but DELTA 147 -> 162 us. `PN_TT_GDN_DELTA_CORES` (default: every member)
- *  caps DELTA's set at the first N members; it must divide v_heads or DELTA uses them all. */
+ *  153 -> 120 us but DELTA 147 -> 162 us, so DELTA stayed at 8. L10 D7 (2026-10-21, under the
+ *  puller): DELTA over all 16 is +1.2% on shipped spec decode, IDENTICAL — DEFAULT every member.
+ *  `PN_TT_GDN_DELTA_CORES=N` caps DELTA's set at the first N members; it must divide v_heads or
+ *  DELTA uses them all. */
 static uint32_t gdn_delta_members(const pn_tt_device *device)
 {
-    const uint32_t asked = pn_tt_env_u32("PN_TT_GDN_DELTA_CORES",
-                                         device->gdn_members > 8u ? 8u : device->gdn_members);
+    const uint32_t asked = pn_tt_env_u32("PN_TT_GDN_DELTA_CORES", device->gdn_members);
 
     if (asked >= 1u && asked < device->gdn_members && device->gdn_shape.v_heads % asked == 0u)
         return asked;
     return device->gdn_members;
 }
 
+/** `PN_TT_GDN_CONV_WIDE` (DEFAULT ON): CONV slices may start and span past column 255
+ *  (foundry's wide column encoding, `kGdnByteColFirstHigh`), so Qwen3.8's 320 columns split
+ *  over all 16 members. Measured 2026-11-17 (p150): k1 11.53 -> 13.22 tok/s, plain 6.98 ->
+ *  7.54, md5-exact on every arm. `=0` keeps the narrow cap (4 members of 80). */
+static uint32_t gdn_conv_col_max(void)
+{
+    static int wide = -1;
+
+    if (wide < 0) {
+        wide = pn_tt_gdn_conv_wide_enabled(getenv(PN_TT_GDN_CONV_WIDE_ENV));
+        fprintf(stderr, "pn_tt: gdn PHASE CONV slices may address %s (%s=%s)\n",
+                wide ? "every column" : "columns 0-255 only", PN_TT_GDN_CONV_WIDE_ENV,
+                wide ? "1, the default; =0 for the narrow cap" : "0");
+    }
+    return wide ? FT_TT_OP_GDN_COL_MAX : PN_TT_GDN_COL_BYTE_MAX;
+}
+
+/** The column count every CONV slice is a multiple of (foundry's slice granule: 4 at
+ *  Qwen3.8's placement). An 18-column slice ran its CONV and broke the DELTA after it on the
+ *  card; the encoder refuses it, so the split never asks for one. */
+static uint32_t gdn_conv_granule(const pn_tt_device *device)
+{
+    return ft_tt_op_gdn_conv_slice_granule(device->gdn_shape.state_size,
+                                           device->gdn_shape.conv_taps);
+}
+
 /** CHARACTERIZATION (2026-10-05): `PN_TT_GDN_CONV_CORES` caps CONV's set like DELTA's, so
- *  armed-but-idle members can be told apart from members that work. */
+ *  armed-but-idle members can be told apart from members that work.
+ *
+ *  A stream wider than 255 tile columns (Qwen3.8: conv_dim 10240 = 320) cannot be split 16
+ *  ways in the narrow encoding — the 14th slice starts at column 260, which failed the first
+ *  decode. Every member count is capped to the largest that divides the stream into slices
+ *  the encoding addresses (narrow: 320 -> 4 members of 80; `PN_TT_GDN_CONV_WIDE=1`: every
+ *  armed member); 1 = the whole-core CONV. */
 static uint32_t gdn_conv_members(const pn_tt_device *device)
 {
     const uint32_t asked = pn_tt_env_u32("PN_TT_GDN_CONV_CORES", device->gdn_members);
     const uint32_t cols = device->gdn_shape.conv_dim / FT_TT_OP_TILE_DIM;
+    const uint32_t members = pn_tt_gdn_conv_member_count(cols, device->gdn_members, asked,
+                                                         gdn_conv_granule(device),
+                                                         gdn_conv_col_max());
 
-    if (asked >= 1u && asked < device->gdn_members && cols % asked == 0u &&
-        (cols / asked) % ft_tt_op_gdn_conv_depth() == 0u)
-        return asked;
-    return device->gdn_members;
+    if (members < device->gdn_members && members != asked) {
+        static bool said;
+
+        if (!said)
+            fprintf(stderr, "pn_tt: gdn PHASE CONV over %u member(s), not %u — %u tile columns "
+                            "do not split %u ways into slices the descriptor's column bytes "
+                            "encode (%s=0 set: the 255-column cap)\n", members,
+                    device->gdn_members, cols, device->gdn_members, PN_TT_GDN_CONV_WIDE_ENV);
+        said = true;
+    }
+    return members;
 }
 
 /** MULTI-ROW DELTA: the per-row state addresses into the slot after the descriptor's own,
@@ -1032,39 +1266,38 @@ static int gdn_submit_delta_split(pn_tt_device *device, const ft_tt_op_gdn_reque
     const uint32_t members = request->phase == FT_TT_OP_GDN_PHASE_CONV
                                  ? gdn_conv_members(device)
                                  : gdn_delta_members(device);
-    /* THIS DESCRIPTOR'S head count, not the shape's — `PN_TT_GDN_HEADS` narrows the request
-     * and the two knobs have to compose or refuse, not silently address heads the descriptor
-     * does not claim. The caller has already checked that they divide. */
     const bool conv = request->phase == FT_TT_OP_GDN_PHASE_CONV;
-    /* DELTA divides by v-head; CONV by TILE COLUMN of the stream (each member convolves its
-     * columns in every tap plane, at the full plane stride — the kernels take an absolute
-     * column). Either way the caller has already checked that the count divides. */
-    const uint32_t per_member = conv ? (request->conv_dim / FT_TT_OP_TILE_DIM) / members
-                                     : request->v_heads / members;
+    /* RED PROOFS on the CONV slices (pn_tt_gdn_conv_split.h): `gdn_conv_col_dup` (every member
+     * takes member 0's columns), `gdn_conv_col_drop` (the last block is never written),
+     * `gdn_conv_col_wrap` (first/count lose their high byte) — each must DIFFER. */
+    const pn_tt_gdn_slice_red red = pn_tt_red("gdn_conv_col_dup")
+                                        ? PN_TT_GDN_SLICE_RED_COL_DUP
+                                    : pn_tt_red("gdn_conv_col_drop")
+                                        ? PN_TT_GDN_SLICE_RED_COL_DROP
+                                    : pn_tt_red("gdn_conv_col_wrap") ? PN_TT_GDN_SLICE_RED_COL_WRAP
+                                                                     : PN_TT_GDN_SLICE_EXACT;
     uint32_t words[PN_TT_GDN_MAX_MEMBERS][FT_TT_OP_GDN_WORDS];
     pn_tt_residency *set[PN_TT_GDN_MAX_MEMBERS];
+    pn_tt_residency *table[PN_TT_GDN_MAX_MEMBERS];
     bool bad[PN_TT_GDN_MAX_MEMBERS];
     double started;
-    uint32_t index;
+    uint32_t index, sequence = 0u;
     uint64_t rearms = 0;
+    bool pulled;
     int failed = 0;
 
     memset(bad, 0, sizeof(bad));
     for (index = 0; index < members; index++) {
-        ft_tt_op_gdn_request sliced = *request;
+        /* THIS DESCRIPTOR'S head count, not the shape's — `PN_TT_GDN_HEADS` narrows the
+         * request and the two knobs have to compose or refuse, not silently address heads the
+         * descriptor does not claim. The caller has already checked that the count divides. */
+        ft_tt_op_gdn_request sliced;
 
-        if (conv) {
-            /* RED PROOF, `PN_TT_RED=gdn_conv_col_dup`: every member convolves member 0's
-             * columns, so columns past the first slice are never written — must DIFFER. */
-            sliced.col_first = pn_tt_red("gdn_conv_col_dup") ? 0u : index * per_member;
-            sliced.col_count = per_member;
-        } else {
-            sliced.head_first = index * per_member;
-            sliced.head_count = per_member;
-        }
-        if (ft_tt_op_gdn_parameters(&sliced, words[index]) != FT_TT_OK) {
-            fprintf(stderr, "pn_tt: the gdn %s slice [%u, %u) is one the family refuses\n",
-                    conv ? "column" : "head", index * per_member, (index + 1u) * per_member);
+        if (pn_tt_gdn_slice(request, members, index, ft_tt_op_gdn_conv_depth(),
+                            conv ? red : PN_TT_GDN_SLICE_EXACT, &sliced) != 0 ||
+            ft_tt_op_gdn_parameters(&sliced, words[index]) != FT_TT_OK) {
+            fprintf(stderr, "pn_tt: the gdn %s slice %u of %u is one the family refuses\n",
+                    conv ? "column" : "head", index, members);
             return -1;
         }
         set[index] = index == 0u ? &device->gdn : &device->gdn_member[index - 1u];
@@ -1083,13 +1316,27 @@ static int gdn_submit_delta_split(pn_tt_device *device, const ft_tt_op_gdn_reque
             fprintf(stderr, "pn_tt: gdn — deferred rows fill the %u-slot ring; draining it "
                             "(flow control)\n", set[0]->queue.capacity);
     }
+    /* S1: `gdn` posts only once every member has (pn_tt_group_pull.h). The table names the
+     * whole set, so CONV and DELTA may split over different counts. */
+    for (index = 0; index < device->gdn_members && index < PN_TT_GDN_MAX_MEMBERS; index++)
+        table[index] = index == 0u ? &device->gdn : &device->gdn_member[index - 1u];
+    pulled = pn_tt_group_pull_decide(&device->gdn_pull, pn_tt_group_pull_decode(device), table,
+                                     device->gdn_members, members, "gdn");
+    if (pulled)
+        sequence = pn_tt_group_pull_next(&device->gdn_pull);
     started = pn_tt_now_seconds();
     for (index = 0; index < members; index++) {
+        const pn_tt_group_pull_words pull = pn_tt_group_pull_words_for(
+            index, members, sequence, pulled && pn_tt_red("group_pull_short"));
+
         /* S2c DEFERRED: a queued descriptor keeps its own parameter block until it runs —
          * the shipped single slot would be overwritten by the next row's. */
         set[index]->param_slot = device->gdn_defer ? 1u + device->gdn_row : 0u;
         if (gdn_write_row_extension(set[index], request) != 0 ||
-            pn_tt_residency_enqueue(set[index], FT_TT_QUEUE_OP_GDN, words[index], 1u) != 0)
+            (pulled ? pn_tt_residency_enqueue_pull(set[index], FT_TT_QUEUE_OP_GDN, words[index],
+                                                   pull.a3, pull.a4, pull.a5)
+                    : pn_tt_residency_enqueue(set[index], FT_TT_QUEUE_OP_GDN, words[index],
+                                              1u)) != 0)
             failed = bad[index] = 1;
         set[index]->param_slot = 0u;
     }
@@ -1098,16 +1345,22 @@ static int gdn_submit_delta_split(pn_tt_device *device, const ft_tt_op_gdn_reque
     if (device->gdn_defer && !failed) {
         if (members > device->gdn_pending_members)
             device->gdn_pending_members = members;
+        device->gdn_pending_pulled = (device->gdn_pending_depth == 0u ||
+                                      device->gdn_pending_pulled) && pulled;
         device->gdn_pending_depth++;
         device->oncard_ops += 1u;
         return 0;
     }
-    /* EVERY member is awaited even after one has failed. An enqueue that got as far as the
-     * ring has a descriptor the card will run whatever this host does next, and leaving it
-     * un-awaited desynchronises that member's cursor for the rest of the run. */
-    for (index = 0; index < members; index++)
-        if (pn_tt_residency_await(set[index], PN_TT_OP_TIMEOUT_MS) != 0)
-            failed = bad[index] = 1;
+    /* EVERY member is awaited even after one has failed (unless the pull vouches for it). An
+     * enqueue that got as far as the ring has a descriptor the card will run whatever this
+     * host does next, and leaving it un-awaited desynchronises that member's cursor for the
+     * rest of the run. */
+    if (pulled)
+        failed = pn_tt_group_pull_await(&device->gdn_pull, true, set, members, bad, NULL) != 0;
+    else
+        for (index = 0; index < members; index++)
+            if (pn_tt_residency_await(set[index], PN_TT_OP_TIMEOUT_MS) != 0)
+                failed = bad[index] = 1;
 
     /* PER-MEMBER RE-ARM AND REPLAY, AND IT RUNS ONLY WHERE THIS FUNCTION USED TO RETURN -1.
      *
@@ -1205,14 +1458,14 @@ static int gdn_submit(pn_tt_device *device, const ft_tt_op_gdn_request *request)
         return gdn_submit_delta_split(device, request);
     /* AND PHASE CONV, by tile column, behind `PN_TT_GDN_CONV_SPLIT` until it is measured: it
      * needs the gdn programs that honour the column range (regenerated 2026-10). The count
-     * must divide the stream into slices the CONV block depth also divides. */
+     * must divide the stream into slices the CONV slice granule also divides. */
     if (gdn_conv_members(device) > 1u && request->phase == FT_TT_OP_GDN_PHASE_CONV &&
         !repeat && gdn_conv_split_enabled()) {
         const uint32_t cols = request->conv_dim / FT_TT_OP_TILE_DIM;
         const uint32_t per = cols / gdn_conv_members(device);
 
-        if (per > 0u && (cols % gdn_conv_members(device)) == 0u &&
-            (per % ft_tt_op_gdn_conv_depth()) == 0u)
+        if (per > 0u && (cols % gdn_conv_members(device)) == 0u && gdn_conv_granule(device) &&
+            (per % gdn_conv_granule(device)) == 0u)
             return gdn_submit_delta_split(device, request);
     }
 
@@ -2298,6 +2551,24 @@ int pn_tt_gdn_gate_upload_rows(pn_tt_device *device, uint32_t rows, const float 
     return rc;
 }
 
+void pn_tt_gdn_table_gate(pn_tt_device *device, uint32_t bank, uint32_t address)
+{
+    if (!device)
+        return;
+    device->gdn_table_gate.bank = bank;
+    device->gdn_table_gate.address = address;
+    device->gdn_table_on = address != 0u;
+}
+
+/** The table gate, when on, in place of the request's staged gate block. */
+static void gdn_table_gate_apply(const pn_tt_device *device, ft_tt_op_gdn_request *request)
+{
+    if (!device->gdn_table_on)
+        return;
+    request->gate = gdn_operand(device, &device->gdn_table_gate);
+    request->flags |= FT_TT_OP_GDN_FLAG_TABLE;
+}
+
 int pn_tt_gdn_delta_descriptor_only(pn_tt_device *device, uint32_t layer)
 {
     if (!pn_tt_gdn_is_armed(device) || layer >= device->gdn_shape.layer_count)
@@ -2307,9 +2578,12 @@ int pn_tt_gdn_delta_descriptor_only(pn_tt_device *device, uint32_t layer)
 
 /**
  * MULTI-ROW DELTA (PM 5): verify rows 0..rows-1 of `layer` in ONE descriptor per member, on the
- * gate blocks pn_tt_gdn_gate_upload_rows() staged. Row r's state goes to snapshot slot r and the
- * slots then trade places with the live state in row order — exactly the bookkeeping the
- * one-row-a-descriptor loop leaves: live = after the last row, slot r = before row r.
+ * gate blocks pn_tt_gdn_gate_upload_rows() staged. Legacy: row r's state goes to snapshot slot r
+ * and the slots then trade places with the live state in row order — exactly the bookkeeping
+ * the one-row-a-descriptor loop leaves: live = after the last row, slot r = before row r.
+ * Compact (pn_tt_gdn_verify_slots.h): rows 0..rows-2 go straight to the slots the per-row walk
+ * leaves them in and the last row into the live buffer (S_0's, which the reader reads per head
+ * at row 0 only, before any write of that head), with no trades.
  *
  * RED `gdn_rows_state_once`: every row's state goes to slot 0's buffer, so the slots the swaps
  * bring live hold stale state — must DIFFER. RED `gdn_rows_row0`: see below.
@@ -2320,29 +2594,29 @@ int pn_tt_gdn_delta_rows_oncard(pn_tt_device *device, uint32_t layer, uint32_t r
     uint32_t r;
 
     if (!pn_tt_gdn_is_armed(device) || layer >= device->gdn_shape.layer_count || rows < 2u ||
-        rows > FT_TT_OP_GDN_MULTI_ROW_MAX || rows > device->gdn_snapshot_slots ||
+        rows > FT_TT_OP_GDN_MULTI_ROW_MAX ||
+        pn_tt_gdn_verify_slots(device, rows) > device->gdn_snapshot_slots ||
         device->gdn_defer || gdn_gate_rows_ensure(device) != 0)
         return -1;
     request = gdn_request(device, FT_TT_OP_GDN_PHASE_DELTA);
     request.activation_in = gdn_operand(device, &device->gdn_stream_out);
     request.activation_out = gdn_operand(device, &device->gdn_y);
     request.gate = gdn_operand(device, &device->gdn_gate_row[0]);
+    gdn_table_gate_apply(device, &request);
     request.state_recurrent = gdn_operand(device, &device->gdn_region[layer].state);
     request.row = 0u;
     request.row_count = rows;
     /* RED `gdn_rows_row0`: the reader stages row 0's q/k/v for every row — must DIFFER. */
     if (pn_tt_red("gdn_rows_row0"))
         request.flags |= FT_TT_OP_GDN_FLAG_RED_ROWS_ROW0;
-    for (r = 0; r < rows; r++) {
-        const uint32_t slot = pn_tt_red("gdn_rows_state_once") ? 0u : r;
-
+    for (r = 0; r < rows; r++)
         request.state_rows_out[r] = gdn_operand(
-            device, &device->gdn_snapshot[slot * device->gdn_shape.layer_count + layer].state);
-    }
+            device, gdn_rows_out_buffer(device, layer, rows,
+                                        pn_tt_red("gdn_rows_state_once") ? 0u : r, false));
     request.state_out = request.state_rows_out[0];
     if (gdn_submit(device, &request) != 0)
         return -1;
-    for (r = 0; r < rows; r++)
+    for (r = 0; pn_gdn_verify_rows_trade(device->gdn_verify_compact) && r < rows; r++)
         if (pn_tt_gdn_layer_swap_part(device, layer, r, false, true) != 0)
             return -1;
     return 0;
@@ -2356,7 +2630,8 @@ int pn_tt_gdn_conv_rows_oncard(pn_tt_device *device, uint32_t layer, uint32_t ro
     uint32_t r;
 
     if (!pn_tt_gdn_is_armed(device) || layer >= device->gdn_shape.layer_count || rows < 2u ||
-        rows > FT_TT_OP_GDN_MULTI_ROW_MAX || rows > device->gdn_snapshot_slots ||
+        rows > FT_TT_OP_GDN_MULTI_ROW_MAX ||
+        pn_tt_gdn_verify_slots(device, rows) > device->gdn_snapshot_slots ||
         device->gdn_defer || pn_tt_env_u32("PN_TT_GDN_CONV_STRIP", 1u) == 0u)
         return -2;
     region = &device->gdn_region[layer];
@@ -2371,21 +2646,19 @@ int pn_tt_gdn_conv_rows_oncard(pn_tt_device *device, uint32_t layer, uint32_t ro
     /* RED `gdn_conv_rows_row0`: every row convolves row 0's stream — must DIFFER. */
     if (pn_tt_red("gdn_conv_rows_row0"))
         request.flags |= FT_TT_OP_GDN_FLAG_RED_ROWS_ROW0;
-    for (r = 0; r < rows; r++) {
-        /* RED `gdn_conv_rows_window_once`: every row's window into slot 0 (the rollback then
-         * restores the wrong window) — must DIFFER. */
-        const uint32_t slot = pn_tt_red("gdn_conv_rows_window_once") ? 0u : r;
-
+    /* RED `gdn_conv_rows_window_once`: every row's window into row 0's buffer (the rollback
+     * then restores the wrong window) — must DIFFER. */
+    for (r = 0; r < rows; r++)
         request.state_rows_out[r] = gdn_operand(
-            device, &device->gdn_snapshot[slot * device->gdn_shape.layer_count + layer].window);
-    }
+            device, gdn_rows_out_buffer(device, layer, rows,
+                                        pn_tt_red("gdn_conv_rows_window_once") ? 0u : r, true));
     request.state_out = request.state_rows_out[0];
     /* Refused by the encoder (a shape the family does not run): nothing ran. */
     if (ft_tt_op_gdn_parameters(&request, words) != FT_TT_OK)
         return -2;
     if (gdn_submit(device, &request) != 0)
         return -1;
-    for (r = 0; r < rows; r++)
+    for (r = 0; pn_gdn_verify_rows_trade(device->gdn_verify_compact) && r < rows; r++)
         if (pn_tt_gdn_layer_swap_part(device, layer, r, true, false) != 0)
             return -1;
     return 0;
@@ -2525,6 +2798,7 @@ static int gdn_delta_descriptor(pn_tt_device *device, uint32_t layer)
     request.gate = gdn_operand(device, device->gdn_defer && device->gdn_row < device->gdn_gate_rows
                                            ? &device->gdn_gate_row[device->gdn_row]
                                            : &device->gdn_gate);
+    gdn_table_gate_apply(device, &request);
     request.state_recurrent = gdn_operand(device, &device->gdn_region[layer].state);
     request.row = device->gdn_row;
     if (gdn_state_out_buffer(device, layer, false))
@@ -2691,6 +2965,11 @@ uint32_t pn_tt_gdn_key_tiles(const pn_tt_device *device)
     if (!device)
         return 0u;
     return 2u * device->gdn_shape.k_heads * (device->gdn_shape.state_size / PN_TT_GDN_TILE_DIM);
+}
+
+uint32_t pn_tt_gdn_v_heads(const pn_tt_device *device)
+{
+    return device ? device->gdn_shape.v_heads : 0u;
 }
 
 uint32_t pn_tt_gdn_value_tiles(const pn_tt_device *device)

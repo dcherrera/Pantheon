@@ -81,14 +81,19 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "../accel/tt/pn_tt_attention_grid.h"
 #include "../accel/tt/pn_tt_dispatch.h"
 #include "../accel/tt/pn_tt_eltwise_group.h"
 #include "../accel/tt/pn_tt_gdn.h"
+#include "../accel/tt/pn_tt_gdnc.h"
 #include "../accel/tt/pn_tt_gdngate.h"
 #include "../accel/tt/pn_tt_head_norm.h"
+#include "../accel/tt/pn_tt_lend_ledger.h"
 #include "../accel/tt/pn_tt_matmul_group.h"
+#include "../accel/tt/pn_tt_prefill_lend.h"
 #include "../accel/tt/pn_tt_replica_map.h"
 #include "../accel/tt/pn_tt_residency.h"
+#include "../accel/tt/pn_tt_strip_placement.h"
 #include "../core/bench.h"
 #include "qwen35moe.h"
 #include "qwen35moe_prefill_tt_wall.h"
@@ -115,6 +120,11 @@
 
 /** Print the transfer / sequential / batched split at the end of the prefill. */
 #define PN_QWEN35_TT_PREFILL_REPORT_ENV "PN_TT_PREFILL_REPORT"
+
+/** Batched rows from which a prefill starts the PHASE G grid (`PN_TT_PREFILL_GRID_MIN_ROWS`).
+ *  The serve warm-up (PN_QWEN35_TT_WARM_ROWS) is above it, so it boots the grid before the
+ *  first request. */
+#define PN_QWEN35_TT_GRID_MIN_ROWS 384
 
 /**
  * `PN_TT_PREFILL_ATTN_CHUNK=0` puts the ATTENTION layers back on the per-position path while
@@ -187,6 +197,15 @@ static bool prefill_red(const char *name)
 }
 
 /** Default ON: only an explicit `0` puts the attention layers back per position. */
+/** `PN_TT_PREFILL_STAGE_ZERO=1`: zero a staged strip's whole span before its upload (the
+ *  pre-2026-10-22 behaviour), not only the bands past it. */
+static bool prefill_stage_zero_all(void)
+{
+    const char *env = getenv("PN_TT_PREFILL_STAGE_ZERO");
+
+    return env && *env && atoi(env) != 0;
+}
+
 static bool prefill_attn_chunk_enabled(void)
 {
     const char *env = getenv(PN_QWEN35_TT_PREFILL_ATTN_CHUNK_ENV);
@@ -307,8 +326,64 @@ static size_t prefill_strips(pn_qwen35_tt *g, pn_tt_activation **out, size_t max
 /* pn_tt_device_internal.h PN_TT_STRIP_MAX_TILE_ROWS; pn_tt_activation_alloc_rows refuses more. */
 #define QWEN35_TT_TALL_MAX_ROWS 64u
 
+/* One band of one bf16 strip tile column: 32 x 32 x 2 B (pn_tt_device_internal.h
+ * PN_TT_TILE_BF16), so a strip of `rows` bands takes `rows` of these a tile column. */
+#define QWEN35_TT_BF16_TILE_BYTES 2048u
+
 /* The span the tall strips' mirrors were last keyed for (prefill_pass); 0 = re-key. */
 static uint32_t g_prefill_published_span;
+
+/**
+ * OUT-PROJECTIONS ON THE GRID (2026-10-27, `PN_TT_OUTPROJ_MIRRORS`, default on; `=0` off):
+ * the tall `ssm_gated` and attention `gated` strips are mirrored like `normed`, so ssm_out
+ * and attn_output (Kt 128 x Nt 128) leave the 16-member decode group, where all 16 read A
+ * from one bank, for the 48-core grid with the M split. Their producers write band by band,
+ * so the mirrors are kept by RANGE records (pn_tt_replica_map.h). Decode strips unchanged.
+ */
+static bool pn_qwen35_tt_outproj_mirrors(void)
+{
+    static int cached = -1;
+
+    if (cached < 0) {
+        const char *env = getenv("PN_TT_OUTPROJ_MIRRORS");
+
+        cached = env && *env ? atoi(env) != 0 : 1;
+    }
+    return cached != 0;
+}
+
+static uint32_t g_card_tall_gated_replicas(const pn_qwen35_tt *g)
+{
+    return g->card_tall.ssm_gated.replica_count;
+}
+
+size_t pn_qwen35_tt_tall_requests(pn_qwen35_tt *g, uint32_t device_replicas,
+                                  bool outproj_mirrors, bool fit_policy,
+                                  pn_tt_strip_request *out, size_t max)
+{
+    pn_tt_activation *small[PN_QWEN35_TT_MAX_STRIPS];
+    const size_t n = prefill_strips_of(&g->card, &g->attn_card, small,
+                                       max < PN_QWEN35_TT_MAX_STRIPS ? max
+                                                                     : PN_QWEN35_TT_MAX_STRIPS,
+                                       true);
+
+    for (size_t i = 0; i < n; i++) {
+        const bool gated = small[i] == &g->card.ssm_gated || small[i] == &g->attn_card.gated;
+        /* OPTION C: the joint `attn_qg` strip is written only by the HOST attention block,
+         * and the batched passes run only with attention on the card (pn_qwen35_tt_prefill
+         * declines otherwise), so its tall copy is never read: 0.047 GiB on Qwen3.8-27B. */
+        const bool unread = fit_policy && small[i] == &g->card.attn_qg && g->attn_on_card;
+
+        out[i].tile_count = small[i]->tile_count;
+        out[i].replicas = small[i]->replica_count;
+        if (small[i] == &g->card.logits || unread)
+            out[i].tile_count = 0u;
+        /* Never the decode strip's own count: its late mirrors (L2) are decode-only. */
+        if (gated)
+            out[i].replicas = outproj_mirrors ? device_replicas : 1u;
+    }
+    return n;
+}
 
 /**
  * PHASE G option 3 — PREFILL-ONLY TALL STRIPS (`PN_TT_PREFILL_TILE_ROWS`, a power of two
@@ -319,14 +394,86 @@ static uint32_t g_prefill_published_span;
  * height and gives the batched passes a SECOND set of the same widths and mirror counts at
  * the tall height, swapped into `card` / `attn_card` for the passes and swapped back before
  * the tail forward. The logit strip is not copied: no batched pass runs the LM head.
+ *
+ * MAIN'S PLACEMENT WHENEVER IT FITS. The set is dry-run first in main's order against the
+ * allocator's real per-bank free bytes and strip cursor (exact: every size is a 64 B
+ * multiple). It fits -> main's loop, byte for byte. It does not, or the load already took the
+ * FIT POLICY (`g->fit_policy`, qwen35moe_tt_fit_plan.h) -> options B and C:
+ *   - B, mirrors first (pn_tt_strip_placement.h): a mirrored strip has a copy pinned to every
+ *     bank and the allocator cannot reclaim, so the mirrors go before any unmirrored strip
+ *     can fill a bank they need; each unmirrored strip then goes to the emptiest bank. On
+ *     Qwen3.8-27B at 16k main's order failed with 1.870 GiB free.
+ *   - C, no tall `attn_qg` with attention on the card (pn_qwen35_tt_tall_requests).
  */
-int pn_qwen35_tt_prefill_tall_alloc(pn_qwen35_tt *g)
+static bool qwen35_tt_tall_main_fits(const pn_qwen35_tt *g, const pn_tt_strip_request *requests,
+                                     size_t n, uint32_t rows)
 {
-    pn_tt_activation *small[PN_QWEN35_TT_MAX_STRIPS], *tall[PN_QWEN35_TT_MAX_STRIPS];
+    uint64_t free_bytes[PN_TT_FIT_MAX_BANKS];
+    size_t order[PN_QWEN35_TT_MAX_STRIPS];
+    const uint32_t banks = pn_tt_device_dram_free_banks(g->device, free_bytes,
+                                                        PN_TT_FIT_MAX_BANKS);
+    uint32_t cursor = pn_tt_device_strip_cursor(g->device);
+
+    for (size_t i = 0; i < n; i++)
+        order[i] = i;
+    return banks > 0u &&
+           pn_tt_strip_placement_simulate(requests, order, n, PN_TT_STRIP_POLICY_ROUND_ROBIN,
+                                          (uint64_t)rows * QWEN35_TT_BF16_TILE_BYTES,
+                                          free_bytes, banks, &cursor, NULL) == 0;
+}
+
+/** The set's allocation order: main's input order, or mirrors first under the fit policy. */
+static size_t qwen35_tt_tall_order(pn_qwen35_tt *g, uint32_t rows, bool outproj_mirrors,
+                                   pn_tt_strip_request *requests, size_t *order)
+{
+    const uint32_t replicas = pn_tt_activation_replica_count(g->device);
+    size_t n = pn_qwen35_tt_tall_requests(g, replicas, outproj_mirrors, false, requests,
+                                          PN_QWEN35_TT_MAX_STRIPS);
+
+    if (!g->fit_policy && !qwen35_tt_tall_main_fits(g, requests, n, rows)) {
+        fprintf(stderr, "qwen35_tt: main's tall-strip placement does not fit this card — FIT "
+                        "POLICY on: mirrors first, unmirrored strips in the emptiest bank, no "
+                        "tall attn_qg\n");
+        g->fit_policy = true;
+    }
+    if (!g->fit_policy) {
+        for (size_t i = 0; i < n; i++)
+            order[i] = i;
+        return n;
+    }
+    n = pn_qwen35_tt_tall_requests(g, replicas, outproj_mirrors, true, requests,
+                                   PN_QWEN35_TT_MAX_STRIPS);
+    return pn_tt_strip_placement_order(requests, n, order);
+}
+
+uint32_t pn_qwen35_tt_tall_rows_wanted(void)
+{
     /* DEFAULT 64 (G option 3, shipped with on-card dispatch: run_d_ceilings.sh). */
     const char *env = getenv("PN_TT_PREFILL_TILE_ROWS");
     const uint32_t rows = env ? (uint32_t)strtoul(env, NULL, 10) : 64u;
-    size_t n, i;
+
+    return rows >= 2u && (rows & (rows - 1u)) == 0u && rows <= QWEN35_TT_TALL_MAX_ROWS ? rows
+                                                                                       : 0u;
+}
+
+bool pn_qwen35_tt_outproj_mirrors_wanted(void)
+{
+    return pn_qwen35_tt_outproj_mirrors();
+}
+
+int pn_qwen35_tt_prefill_tall_alloc(pn_qwen35_tt *g)
+{
+    pn_tt_activation *tall[PN_QWEN35_TT_MAX_STRIPS];
+    pn_tt_strip_request requests[PN_QWEN35_TT_MAX_STRIPS];
+    size_t order[PN_QWEN35_TT_MAX_STRIPS];
+    /* DEFAULT 64 (G option 3, shipped with on-card dispatch: run_d_ceilings.sh). */
+    const char *env = getenv("PN_TT_PREFILL_TILE_ROWS");
+    /* The fit's levers G and F when it picked them (the env pins them there too). */
+    const uint32_t rows = env ? (uint32_t)strtoul(env, NULL, 10)
+                              : g->fit_levers ? g->fit_tall_rows : 64u;
+    const bool outproj_mirrors = g->fit_levers ? g->fit_outproj_mirrors
+                                               : pn_qwen35_tt_outproj_mirrors();
+    size_t n;
 
     g->tall_rows = 0u;
     if (rows == 0u)
@@ -340,24 +487,39 @@ int pn_qwen35_tt_prefill_tall_alloc(pn_qwen35_tt *g)
     }
     memset(&g->card_tall, 0, sizeof(g->card_tall));
     memset(&g->attn_card_tall, 0, sizeof(g->attn_card_tall));
-    n = prefill_strips_of(&g->card, &g->attn_card, small, PN_QWEN35_TT_MAX_STRIPS, true);
     (void)prefill_strips_of(&g->card_tall, &g->attn_card_tall, tall, PN_QWEN35_TT_MAX_STRIPS,
                             true);
-    for (i = 0; i < n; i++) {
-        if (small[i]->tile_count == 0u || small[i] == &g->card.logits)
+    n = qwen35_tt_tall_order(g, rows, outproj_mirrors, requests, order);
+    for (size_t step = 0; step < n; step++) {
+        const pn_tt_strip_request *strip = &requests[order[step]];
+        pn_tt_activation *out = tall[order[step]];
+
+        if (strip->tile_count == 0u)
             continue;
-        if (pn_tt_activation_alloc_replicated_rows(g->device, small[i]->tile_count,
-                                                   small[i]->replica_count, rows,
-                                                   tall[i]) != 0) {
+        if ((strip->replicas > 1u || !g->fit_policy
+                 ? pn_tt_activation_alloc_replicated_rows(g->device, strip->tile_count,
+                                                          strip->replicas, rows, out)
+                 : pn_tt_activation_alloc_rows_emptiest(g->device, strip->tile_count, rows,
+                                                        out)) != 0) {
             fprintf(stderr, "qwen35_tt: the prefill-only tall strips did not allocate\n");
             return -1;
         }
+    }
+    if (outproj_mirrors) {
+        const pn_tt_activation *gated[2] = { &g->card.ssm_gated, &g->attn_card.gated };
+
+        pn_tt_replica_map_set_ranged(true, gated, 2u);
+        fprintf(stderr, "qwen35_tt: OUT-PROJECTIONS ON THE GRID — tall ssm_gated / attention "
+                        "gated mirrored x%u (range records); PN_TT_OUTPROJ_MIRRORS=0 off\n",
+                g_card_tall_gated_replicas(g));
     }
     g->tall_rows = rows;
     pn_tt_device_set_prefill_tile_rows(g->device, rows);
     fprintf(stderr, "qwen35_tt: prefill-only TALL strips — %u bands for the batched passes, "
                     "decode keeps %u\n", rows, g->card.hidden[0].tile_rows);
-    return 0;
+    /* S3b: the tall `ffn_swiglu` now exists; put its record on the matmul members so a verify's
+     * fused SwiGLU fans out into its mirrors (a no-op with PN_TT_FUSE_SWIGLU off). */
+    return pn_tt_replica_map_publish_fused(g->device);
 }
 
 static void prefill_tall_swap(pn_qwen35_tt *g)
@@ -724,11 +886,17 @@ static int prefill_zero(pn_qwen35_tt *g, const pn_tt_activation *const *strips, 
     return 0;
 }
 
-/** hidden = hidden + project, on the card, into the spare strip. Per tile, so all 32 rows. */
+/** hidden = hidden + project, on the card, into the spare strip. Per tile, so all 32 rows.
+ *  When a verify's out-projection already did that (S3a, prefill_project_out), only the flip. */
 static int prefill_residual(pn_qwen35_tt *g)
 {
     int rc;
 
+    if (g->residual_fused) {
+        g->residual_fused = 0;
+        g->card.slot ^= 1;
+        return 0;
+    }
     PREFILL_WALL_OPEN(g, PN_PREFILL_WALL_RESIDUAL);
     rc = pn_tt_add(g->device, &g->card.hidden[g->card.slot], &g->card.project,
                    &g->card.hidden[g->card.slot ^ 1]);
@@ -737,6 +905,16 @@ static int prefill_residual(pn_qwen35_tt *g)
         return -1;
     g->card.slot ^= 1;
     return 0;
+}
+
+/** An out-projection into `project`, which prefill_residual() adds next. S3a: the VERIFY rows
+ *  (MTP k1's verify runs this pass) take the fused residual add when it fits; a prefill pass
+ *  proper keeps the projection and the add. */
+static int prefill_project_out(pn_qwen35_tt *g, const pn_tt_weight *w, const pn_tt_activation *in)
+{
+    if (g_verify_mode)
+        return pn_qwen35_tt_project_out(g, w, in);
+    return pn_qwen35_tt_project(g, w, in, &g->card.project, true);
 }
 
 /**
@@ -749,11 +927,13 @@ static void prefill_chain_settle(pn_qwen35_tt *g)
 {
     g->gdn_chunk_defer_gate = false;
     g->gdn_card_gate = false;
+    g->gdn_table_gate = false;
     (void)pn_qwen35_tt_gdn_pipe_drain(g);
     g->gdn_pipe = false;
+    g->gdn_pipe2 = false;
     (void)pn_tt_eltwise_group_settle(g->device);
     (void)prefill_stream_close();
-    (void)pn_qwen35_tt_overlap_drain(g);
+    pn_qwen35_tt_overlap_abort(g);
     pn_qwen35_tt_ab_reader_abandon(g);
     pn_qwen35_tt_overlap_forget();
 }
@@ -777,6 +957,17 @@ static bool prefill_gdn_pipe_wanted(void)
     const char *env = getenv("PN_TT_GDN_PIPE");
 
     return !(env && *env && atoi(env) == 0);
+}
+
+/** Prefill lane PIPE 2 — band b's DELTA left in flight under band b+1's widen + CONV, on two
+ *  buffer parities (qwen35moe_gdn_strip_tt.c). DEFAULT (run_pg_pipe2.sh, 2026-10-22: serve warm
+ *  1,630 TTFT 2,258 -> 2,196 ms, 730 1,152 -> 1,127, IDENTICAL, reds DIFFER); `PN_TT_GDN_PIPE=1`
+ *  is the PM 7 pipeline, `=0` the serial chain. */
+static bool prefill_gdn_pipe2_wanted(void)
+{
+    const char *env = getenv("PN_TT_GDN_PIPE");
+
+    return !(env && *env && atoi(env) != 2);
 }
 
 /** The verify's deferred GDN rows (`PN_TT_SPEC_DEFER=0` off) — gdn_strip_rows' own reading. */
@@ -803,8 +994,17 @@ static bool prefill_card_decode_gates(void)
 static bool prefill_card_gates_begin(pn_qwen35_tt *g, int ssm_index, int rows,
                                      bool gates_prepared)
 {
-    if (g_verify_mode || !pn_tt_gdngate_enabled(g->device) ||
-        !pn_qwen35_tt_gdn_card_gate_possible())
+    g->gdn_table_gate = false;
+    if (g_verify_mode || !pn_qwen35_tt_gdn_card_gate_possible())
+        return false;
+    /* THE EXACT CARD GATES: nothing to issue — each DELTA looks its gates up from the strips.
+     * The layer's table block is bound to the strips here, before the stream opens. */
+    if (!g->gdn_det_gates && pn_tt_gdnc_table_ready(g->device)) {
+        g->gdn_table_gate = pn_tt_gdnc_table_bind(g->device, (uint32_t)ssm_index,
+                                                  &g->card.ssm_alpha, &g->card.ssm_beta) == 0;
+        return g->gdn_table_gate;
+    }
+    if (!pn_tt_gdngate_enabled(g->device))
         return false;
     if (!gates_prepared &&
         pn_tt_gdngate_issue(g->device, (uint32_t)ssm_index, &g->card.ssm_alpha,
@@ -869,13 +1069,19 @@ static int prefill_ssm_layer(pn_qwen35_tt *g, pn_qwen35moe_model *m,
         return -1;
     pn_qwen35_tt_overlap_forget();
     mark = prefill_now();
+    /* O.0: alpha/beta may go to the grid by rows — no stream is open here, so the flush below
+     * is a real host wait and any reader posted after it reads finished rows. */
+    pn_tt_matmul_grid_unsplit_allow(g->device, !g_prefill_streaming);
     if (!prepared &&
         (pn_qwen35_tt_project(g, &d->attn_qkv, &s->normed, &s->ssm_qkv, false) != 0 ||
          pn_qwen35_tt_project(g, &d->attn_gate, &s->normed, &s->ssm_z, false) != 0 ||
          pn_qwen35_tt_project(g, &d->ssm_alpha, &s->normed, &s->ssm_alpha, false) != 0 ||
          pn_qwen35_tt_project(g, &d->ssm_beta, &s->normed, &s->ssm_beta, false) != 0 ||
-         pn_tt_matvec_flush(g->device) != 0))
+         pn_tt_matvec_flush(g->device) != 0)) {
+        pn_tt_matmul_grid_unsplit_allow(g->device, false);
         return -1;
+    }
+    pn_tt_matmul_grid_unsplit_allow(g->device, false);
     prefill_batched_add(b, 0, prefill_now() - mark); /* ssm-in-proj */
 
     /* STEP 4 S2: THE VERIFY. Row r of the pass goes through the DECODE GDN kernels exactly as
@@ -895,8 +1101,9 @@ static int prefill_ssm_layer(pn_qwen35_tt *g, pn_qwen35moe_model *m,
          * the stream keeps flowing; gdn_strip_rows waits for them before the host math. The
          * S2 row-copy path still reads inline. */
         /* ITEM 6: det gates computed on the card for a deferred verify — no reads at all. */
-        const bool card = g->gdn_det_gates && !getenv("PN_TT_SPEC_ROWCOPY") &&
-                          prefill_spec_defer() && prefill_card_decode_gates();
+        const bool card = !getenv("PN_TT_SPEC_ROWCOPY") && prefill_spec_defer() &&
+                          ((g->gdn_det_gates && prefill_card_decode_gates()) ||
+                           pn_qwen35_tt_table_decode_gates(g, ssm_index));
 
         if (!card &&
             (getenv("PN_TT_SPEC_ROWCOPY") ||
@@ -927,9 +1134,10 @@ static int prefill_ssm_layer(pn_qwen35_tt *g, pn_qwen35moe_model *m,
             rc = (pn_tt_row_copy(g->device, &v->ssm_qkv, (uint32_t)r, &g->card.ssm_qkv, 0u) != 0 ||
                   pn_tt_row_copy(g->device, &v->ssm_z, (uint32_t)r, &g->card.ssm_z, 0u) != 0)
                      ? -1 : 0;
-            /* Row r's new state goes to slot r, then trades places with the live one. */
+            /* Row r's new state goes to the slot the verify map names (legacy: slot r), then
+             * trades places with the live one. */
             if (rc == 0)
-                rc = pn_tt_gdn_state_out(g->device, r);
+                rc = pn_tt_gdn_verify_row_out(g->device, (uint32_t)rows, (uint32_t)r);
             if (rc == 0) {
                 pn_tt_device_set_single_row(g->device, true);
                 rc = pn_qwen35_tt_gdn_strip_layer(g, l, cfg, ssm_index, &g->card.ssm_qkv,
@@ -942,7 +1150,9 @@ static int prefill_ssm_layer(pn_qwen35_tt *g, pn_qwen35moe_model *m,
             if (rc == 0 && pn_tt_matvec_flush(g->device) != 0)
                 rc = -1;
             if (pn_tt_gdn_state_out(g->device, -1) != 0 ||
-                (rc == 0 && pn_tt_gdn_layer_swap(g->device, (uint32_t)ssm_index, (uint32_t)r) != 0))
+                (rc == 0 && pn_tt_gdn_verify_row_trade(g->device, (uint32_t)ssm_index,
+                                                       (uint32_t)rows, (uint32_t)r, true,
+                                                       true) != 0))
                 rc = -1;
             if (rc == 0)
                 rc = pn_tt_row_copy(g->device, &g->card.ssm_gated, 0u, &v->ssm_gated,
@@ -953,7 +1163,7 @@ static int prefill_ssm_layer(pn_qwen35_tt *g, pn_qwen35moe_model *m,
         }
         g->spec_ssm_rows_ms += pn_time_ms() - rows_started;
         mark = prefill_now();
-        if (pn_qwen35_tt_project(g, &d->ssm_out, &s->ssm_gated, &s->project, true) != 0)
+        if (prefill_project_out(g, &d->ssm_out, &s->ssm_gated) != 0)
             return -1;
         prefill_batched_add(b, 1, prefill_now() - mark); /* ssm-out-proj */
         return 0;
@@ -990,19 +1200,28 @@ static int prefill_ssm_layer(pn_qwen35_tt *g, pn_qwen35moe_model *m,
                             ((prepared && pn_qwen35_tt_ab_reader_promote(ssm_index)) ||
                              pn_qwen35_tt_ab_reader_post(g, rows, b->ssm_alpha, alpha_w,
                                                          b->ssm_beta, beta_w));
-        const uint32_t overlap_bands = pn_qwen35_tt_overlap_bands();
-        const bool overlap = pn_qwen35_tt_overlap_layer(g, ssm_index, bands);
+        bool overlap = pn_qwen35_tt_overlap_layer(g, ssm_index, bands);
 
         /* The layer's gate blocks, settled ONCE before the first band, by the HOST and before
          * the stream opens: as a puller AWAIT inside the stream it stalled ~8.5 s a layer
          * (run_pm7_item5_gates.sh round 2: TTFT 204 s), while a host await is the gate time
          * itself — and a prepared layer's blocks are long done. */
-        if (card_gates && pn_tt_gdngate_settle(g->device) != 0)
+        if (card_gates && !g->gdn_table_gate && pn_tt_gdngate_settle(g->device) != 0)
+            return -1;
+        /* Prefill lane: each DELTA member's heads of this layer's state in its own bank for
+         * the band loop (`PN_TT_GDNC_STATE_BANKS`; a card copy, so before the stream opens). */
+        if (pn_tt_gdnc_state_split_enter(g->device, (uint32_t)ssm_index, bands) != 0)
             return -1;
         prefill_stream_open(g);
         g->gdn_card_gate = card_gates;
         /* PM 7 ITEM 7 step 1: the pipelined band (`PN_TT_GDN_PIPE=0` off). */
         g->gdn_pipe = card_gates && g_prefill_streaming && prefill_gdn_pipe_wanted();
+        g->gdn_pipe2 = g->gdn_pipe && prefill_gdn_pipe2_wanted();
+        /* O.1: the super-band jobs' steps placed behind the chain's gates (PIPE 2 trails 2). */
+        if (overlap && pn_qwen35_tt_overlap_layer_begin(g, d, bands,
+                                                        g->gdn_pipe2 ? 2u : g->gdn_pipe ? 1u : 0u,
+                                                        &next, &s->ssm_gated, &d->ssm_out) != 0)
+            overlap = false;
         pn_qwen35_tt_overlap_set_card_gates(card_gates);
         /* PM 7: streamed, each band's output gate is left pending (its AWAIT moves to the next
          * band's narrow, or to the settles below); `PN_TT_ELTWISE_DEFER=0` off. */
@@ -1075,35 +1294,26 @@ static int prefill_ssm_layer(pn_qwen35_tt *g, pn_qwen35moe_model *m,
              * a puller COPY, which refuses mid-stream: the stream closes around it. */
             if (g_prefill_streaming && g->ckpt.pending_at == base_pos + done) {
                 if (pn_qwen35_tt_gdn_pipe_drain(g) != 0 ||
-                    pn_tt_eltwise_group_settle(g->device) != 0 || prefill_stream_finish(g) != 0) {
+                    pn_tt_eltwise_group_settle(g->device) != 0 || prefill_stream_finish(g) != 0 ||
+                    pn_tt_gdnc_state_split_sync(g->device, (uint32_t)ssm_index) != 0) {
                     prefill_chain_settle(g);
                     return -1;
                 }
                 pn_qwen35_tt_ckpt_band_done(g, ssm_index, base_pos + done);
                 prefill_stream_open(g);
             } else {
-                pn_qwen35_tt_ckpt_band_done(g, ssm_index, base_pos + done);
-            }
-            /* PHASE W2: a finished super-band's FFN goes to the grid; otherwise the job in
-             * flight takes its next step if its projections are done. */
-            /* STREAMED, a poll is answered at once and its AWAIT stalls the puller there, so
-             * the job's next step is SCHEDULED instead: mid-super-band (the SwiGLU + down) and
-             * at its close (the residual) — the grid runs under the chain ops issued between. */
-            if (overlap) {
-                const bool boundary = (band + 1u) % overlap_bands == 0u && band + 1u < bands &&
-                                      done < rows;
-                const bool step = !g_prefill_streaming ||
-                                  (band + 1u) % overlap_bands == overlap_bands / 2u;
-
-                /* The job reads `gated` (out-proj) and the grid rewrites z: gate settled. */
-                if ((boundary || step) && (pn_qwen35_tt_gdn_pipe_drain(g) != 0 ||
-                                           pn_tt_eltwise_group_settle(g->device) != 0)) {
+                if (!g_prefill_streaming && g->ckpt.pending_at == base_pos + done &&
+                    pn_tt_gdnc_state_split_sync(g->device, (uint32_t)ssm_index) != 0) {
                     prefill_chain_settle(g);
                     return -1;
                 }
-                rc = boundary ? pn_qwen35_tt_overlap_superband(g, d, band + 1u - overlap_bands,
-                                                               overlap_bands, &next)
-                     : step   ? pn_qwen35_tt_overlap_advance(g) : 0;
+                pn_qwen35_tt_ckpt_band_done(g, ssm_index, base_pos + done);
+            }
+            /* PHASE W2 / O.1: the super-band jobs' steps due after this band (plan in
+             * qwen35moe_prefill_ov_plan.h). Streamed, each one's waits are puller AWAITs, and
+             * the plan places them bands after the grid work they wait on. */
+            if (overlap) {
+                rc = pn_qwen35_tt_overlap_tick(g, band);
                 prefill_batched_add(b, 4, pn_qwen35_tt_overlap_take_seconds());
                 if (rc != 0) {
                     prefill_chain_settle(g);
@@ -1114,22 +1324,36 @@ static int prefill_ssm_layer(pn_qwen35_tt *g, pn_qwen35moe_model *m,
         pn_qwen35_tt_ab_prefetch_reset();
         g->gdn_chunk_defer_gate = false;
         g->gdn_card_gate = false;
-        if (pn_qwen35_tt_gdn_pipe_drain(g) != 0 || pn_tt_eltwise_group_settle(g->device) != 0 ||
-            prefill_stream_finish(g) != 0) {
+        g->gdn_table_gate = false;
+        if (pn_qwen35_tt_gdn_pipe_drain(g) != 0 || pn_tt_eltwise_group_settle(g->device) != 0) {
+            g->gdn_pipe = false;
+            prefill_chain_settle(g);
+            return -1;
+        }
+        /* O.1: the layer's last jobs (the tail of the plan) INSIDE the stream. */
+        if (overlap) {
+            const int orc = pn_qwen35_tt_overlap_tick(g, bands);
+
+            prefill_batched_add(b, 4, pn_qwen35_tt_overlap_take_seconds());
+            if (orc != 0) {
+                g->gdn_pipe = false;
+                prefill_chain_settle(g);
+                return -1;
+            }
+        }
+        if (prefill_stream_finish(g) != 0) {
             g->gdn_pipe = false;
             prefill_chain_settle(g);
             return -1;
         }
         g->gdn_pipe = false;
+        g->gdn_pipe2 = false;
         pn_qwen35_tt_ab_reader_end(g);
+        /* The state back where the decode family, the tail forward and the next turn read it. */
+        if (pn_tt_gdnc_state_split_exit(g->device, (uint32_t)ssm_index) != 0)
+            return -1;
         if (overlap) {
-            const uint32_t last = ((bands - 1u) / overlap_bands) * overlap_bands;
-            int orc = pn_qwen35_tt_overlap_superband(g, d, last, bands - last, &next);
-
-            if (orc == 0)
-                orc = pn_qwen35_tt_overlap_drain(g);
-            prefill_batched_add(b, 4, pn_qwen35_tt_overlap_take_seconds());
-            if (orc != 0 || prefill_seek(g, 0u, bands) != 0)
+            if (prefill_seek(g, 0u, bands) != 0)
                 return -1;
             return 1;
         }
@@ -1137,7 +1361,7 @@ static int prefill_ssm_layer(pn_qwen35_tt *g, pn_qwen35moe_model *m,
             return -1;
 
         mark = prefill_now();
-        if (pn_qwen35_tt_project(g, &d->ssm_out, &s->ssm_gated, &s->project, true) != 0)
+        if (prefill_project_out(g, &d->ssm_out, &s->ssm_gated) != 0)
             return -1;
         prefill_batched_add(b, 1, prefill_now() - mark); /* ssm-out-proj */
         return 0;
@@ -1178,7 +1402,7 @@ static int prefill_ssm_layer(pn_qwen35_tt *g, pn_qwen35moe_model *m,
         return -1;
 
     mark = prefill_now();
-    if (pn_qwen35_tt_project(g, &d->ssm_out, &s->ssm_gated, &s->project, true) != 0)
+    if (prefill_project_out(g, &d->ssm_out, &s->ssm_gated) != 0)
         return -1;
     prefill_batched_add(b, 1, prefill_now() - mark); /* ssm-out-proj */
     return 0;
@@ -1186,9 +1410,266 @@ static int prefill_ssm_layer(pn_qwen35_tt *g, pn_qwen35moe_model *m,
 
 /** One attention layer over `rows` positions. Same shape as the SSM one: project once,
  *  rotate/append/attend `rows` times, project out once. */
+/** Prefill lane ATTENTION PIPE (`PN_TT_ATTN_PIPE=0` off): band b's attention in flight while
+ *  band b+1's QK norms + RoPE run; its K/V appends wait for it (no append under a running
+ *  attention), its sigmoid gate is left pending. Same ops on the same band rows: bit-exact.
+ *  DEFAULT ON from 2 bands (run_pg_attnpipe.sh, 2026-10-22: serve warm 1,630 TTFT 2,103 ->
+ *  2,050 ms, IDENTICAL, red DIFFERS); one band has nothing to overlap. */
+static bool prefill_attn_pipe_wanted(uint32_t bands)
+{
+    const char *env = getenv("PN_TT_ATTN_PIPE");
+
+    return bands >= 2u && !(env && *env && atoi(env) == 0);
+}
+
+static bool prefill_attn_deep_wanted(const pn_qwen35_tt *g, uint32_t bands);
+static double g_prefill_attn_grid_seconds;
+static uint32_t g_prefill_attn_grid_swaps;
+/* Deep attention's host phases (prep + append, queue, drain, gates), cumulative: is a long
+ * prompt's attention enqueue-bound or card-bound? Timing only. */
+static double g_prefill_attn_deep_seconds[4];
+static uint32_t g_prefill_attn_deep_passes;
+
+/** C: `PN_TT_ATTN_GRID_DEPTH=N` (default 0, off) lends the
+ *  48 grid cores to the deep attention of every layer-pass whose first position is at least N
+ *  (break-even ~26k at 2,048-row passes). Needs `PN_TT_ATTN_DEEP=1`. */
+static uint32_t prefill_attn_grid_depth(void)
+{
+    const char *env = getenv("PN_TT_ATTN_GRID_DEPTH");
+
+    return env && *env ? (uint32_t)strtoul(env, NULL, 10) : 0u;
+}
+
+/** Lend the grid to this layer-pass's attention when C applies. @return members borrowed */
+static uint32_t prefill_attn_grid_borrow(pn_qwen35_tt *g, int base_pos, uint32_t bands)
+{
+    const uint32_t depth = prefill_attn_grid_depth();
+    uint32_t cores[PN_TT_ATTN_GRID_MAX_CORES];
+    uint32_t lent, armed;
+    double at;
+
+    /* L1a's lent cores already fill the borrowed set for this prompt. */
+    if (depth == 0u || (uint32_t)base_pos < depth || !prefill_attn_deep_wanted(g, bands) ||
+        pn_tt_prefill_lend_active(g->device))
+        return 0u;
+    at = prefill_now();
+    lent = pn_tt_matmul_grid_lend(g->device, cores, PN_TT_ATTN_GRID_MAX_CORES);
+    armed = lent ? pn_tt_attention_grid_arm(g->device, cores, lent) : 0u;
+    g_prefill_attn_grid_seconds += prefill_now() - at;
+    if (lent && !armed)
+        (void)pn_tt_matmul_grid_begin(g->device);
+    return armed;
+}
+
+/** Park the borrowed members and boot the grid again. @return 0, -1 when a member did not exit */
+static int prefill_attn_grid_return(pn_qwen35_tt *g)
+{
+    const double at = prefill_now();
+    int rc = pn_tt_attention_grid_park_all(g->device, NULL, NULL);
+
+    /* A member that did not exit leaves its core unbootable: the grid then refuses by name
+     * (pn_tt_core_holder / the boot guard) and the decode group serves the projections. */
+    (void)pn_tt_matmul_grid_begin(g->device);
+    g_prefill_attn_grid_seconds += prefill_now() - at;
+    g_prefill_attn_grid_swaps++;
+    return rc;
+}
+
+/** DEEP-QUEUED ATTENTION (pn_tt_attn_deep.h):
+ *  `PN_TT_ATTN_DEEP=0|1`; unset, on exactly while this prompt has L1a's lent cores (alone it only
+ *  loses the FFN overlap: 8k 25.06 -> 26.77 s). */
+static bool prefill_attn_deep_wanted(const pn_qwen35_tt *g, uint32_t bands)
+{
+    return bands >= 2u &&
+           pn_tt_lend_deep_on(getenv("PN_TT_ATTN_DEEP"), pn_tt_prefill_lend_active(g->device));
+}
+
+/**
+ * The attention layer-pass with every band's K/V appended before any band's attention: prep +
+ * append band by band, then every (band, head) descriptor queued over the members with no
+ * barrier, one drain, then the gates. Each descriptor is the shipped one; a band's later rows
+ * sit past its live length and take the dead mask, as the stale rows they replace did.
+ *
+ * A failed drain re-runs the ATTENTION ONLY through the shipped per-band call, which re-arms a
+ * member that refused (the norms ran in place and must not run twice).
+ */
+static int prefill_attn_deep(pn_qwen35_tt *g, const pn_qwen35_tt_layer *d,
+                             const pn_qwen35moe_config *cfg, int attn_index, int base_pos,
+                             int rows, uint32_t bands)
+{
+    pn_qwen35_tt_strips *s = &g->card;
+    pn_qwen35_tt_attn_strips *a = &g->attn_card;
+    prefill_sequential_bracket bracket;
+    /* RED `attn_deep_skip`: the last band is never queued, so its attention output is the
+     * previous layer's — must DIFFER. (Queueing a band before its own append would race the
+     * append and is not a deterministic red.) */
+    const bool skip_last = prefill_red("attn_deep_skip");
+    double mark = prefill_now(), now;
+    uint32_t band;
+    int done, rc = 0;
+
+    prefill_sequential_open(g, &bracket);
+    for (band = 0, done = 0; rc == 0 && band < bands && done < rows; band++) {
+        const int take = (rows - done) < 32 ? (rows - done) : 32;
+        const int chunk_base = prefill_red("prefill_pos") ? 0 : base_pos + done;
+
+        if (prefill_seek(g, band, 1u) != 0 ||
+            pn_qwen35_tt_attn_chunk_prep(g, d, cfg, chunk_base, take) != 0 ||
+            pn_qwen35_tt_attn_chunk_append(g, attn_index, chunk_base, take) != 0)
+            rc = -1;
+        done += take;
+    }
+    now = prefill_now();
+    g_prefill_attn_deep_seconds[0] += now - mark;
+    mark = now;
+    for (band = 0, done = 0; rc == 0 && band < bands && done < rows; band++) {
+        const int take = (rows - done) < 32 ? (rows - done) : 32;
+        const int chunk_base = prefill_red("prefill_pos") ? 0 : base_pos + done;
+        const bool last = band + 1u == bands || done + take >= rows;
+
+        if (!(skip_last && last) &&
+            (prefill_seek(g, band, 1u) != 0 ||
+             pn_qwen35_tt_attn_chunk_queue(g, attn_index, chunk_base, take) != 0))
+            rc = -1;
+        done += take;
+    }
+    if (rc != 0)
+        fprintf(stderr, "qwen35_tt: deep attention could not queue layer %d (prep, append or a "
+                        "member's enqueue failed)\n", attn_index);
+    now = prefill_now();
+    g_prefill_attn_deep_seconds[1] += now - mark;
+    mark = now;
+    if (pn_tt_attention_chunk_drain(g->device) != 0 && rc == 0) {
+        fprintf(stderr, "qwen35_tt: deep attention drain failed at layer %d — re-running the "
+                        "layer's attention band by band\n", attn_index);
+        for (band = 0, done = 0; rc == 0 && band < bands && done < rows; band++) {
+            const int take = (rows - done) < 32 ? (rows - done) : 32;
+            const int chunk_base = prefill_red("prefill_pos") ? 0 : base_pos + done;
+
+            if (prefill_seek(g, band, 1u) != 0 ||
+                pn_tt_attention_chunk(g->device, (uint32_t)attn_index, &a->q_rot, &s->attn_out,
+                                      (uint32_t)chunk_base, (uint32_t)take) != 0)
+                rc = -1;
+            done += take;
+        }
+    }
+    now = prefill_now();
+    g_prefill_attn_deep_seconds[2] += now - mark;
+    mark = now;
+    for (band = 0, done = 0; rc == 0 && band < bands && done < rows; band++) {
+        const int take = (rows - done) < 32 ? (rows - done) : 32;
+
+        if (prefill_seek(g, band, 1u) != 0)
+            rc = -1;
+        if (rc == 0) {
+            pn_tt_eltwise_group_defer_next(g->device);
+            rc = pn_tt_sigmoid_mul(g->device, &a->z, &s->attn_out, &a->gate, &a->gated);
+        }
+        done += take;
+    }
+    if (pn_tt_eltwise_group_settle(g->device) != 0)
+        rc = -1;
+    g_prefill_attn_deep_seconds[3] += prefill_now() - mark;
+    g_prefill_attn_deep_passes++;
+    prefill_sequential_close(g, &bracket);
+    return rc;
+}
+
+static int prefill_attn_pipelined(pn_qwen35_tt *g, const pn_qwen35_tt_layer *d,
+                                  const pn_qwen35moe_config *cfg, int attn_index, int base_pos,
+                                  int rows, uint32_t bands, bool overlap)
+{
+    struct pn_qwen35_tt_batch *b = g->batch;
+    pn_qwen35_tt_strips *s = &g->card;
+    pn_qwen35_tt_attn_strips *a = &g->attn_card;
+    prefill_sequential_bracket bracket;
+    int done = 0, rc = 0;
+
+    prefill_sequential_open(g, &bracket);
+    if (prefill_seek(g, 0u, 1u) != 0 ||
+        pn_qwen35_tt_attn_chunk_prep(g, d, cfg, prefill_red("prefill_pos") ? 0 : base_pos,
+                                     rows < 32 ? rows : 32) != 0)
+        rc = -1;
+    for (uint32_t band = 0; rc == 0 && band < bands && done < rows; band++) {
+        const int take = (rows - done) < 32 ? (rows - done) : 32;
+        const int chunk_base = prefill_red("prefill_pos") ? 0 : base_pos + done;
+        pn_tt_activation z, out, gate, gated;
+
+        if (prefill_seek(g, band, 1u) != 0 ||
+            pn_qwen35_tt_attn_chunk_issue(g, attn_index, chunk_base, take) != 0) {
+            rc = -1;
+            break;
+        }
+        z = a->z;
+        out = s->attn_out;
+        gate = a->gate;
+        gated = a->gated;
+        done += take;
+        if (band + 1u < bands && done < rows) {
+            const int next = (rows - done) < 32 ? (rows - done) : 32;
+
+            if (prefill_seek(g, band + 1u, 1u) != 0 ||
+                pn_qwen35_tt_attn_chunk_prep(g, d, cfg,
+                                             prefill_red("prefill_pos") ? 0 : base_pos + done,
+                                             next) != 0)
+                rc = -1;
+        }
+        if (pn_tt_attention_settle(g->device) != 0)
+            rc = -1;
+        /* RED `attn_pipe_gate_shift`: band b's gate runs on whatever band the strips are
+         * seeked to now (b+1 after a prep) — must DIFFER. */
+        if (rc == 0 && prefill_red("attn_pipe_gate_shift")) {
+            z = a->z;
+            out = s->attn_out;
+            gate = a->gate;
+            gated = a->gated;
+        }
+        if (rc == 0) {
+            pn_tt_eltwise_group_defer_next(g->device);
+            rc = pn_tt_sigmoid_mul(g->device, &z, &out, &gate, &gated);
+        }
+        /* A: the super-band jobs' steps due after this band (the gate just issued is band
+         * b's, so the plan's pipe depth is 0). */
+        if (rc == 0 && overlap) {
+            rc = pn_qwen35_tt_overlap_tick(g, band);
+            prefill_batched_add(b, 4, pn_qwen35_tt_overlap_take_seconds());
+        }
+    }
+    (void)pn_tt_attention_settle(g->device);
+    if (pn_tt_eltwise_group_settle(g->device) != 0)
+        rc = -1;
+    prefill_sequential_close(g, &bracket);
+    return rc;
+}
+
+/** A: the overlap of an attention layer's out-proj and FFN under its band loop, planned; the
+ *  wavefront prepares the next SSM layer only under the exact table gates (nothing waits on a
+ *  reader then). @return true when the plan runs. */
+static bool prefill_attn_overlap_begin(pn_qwen35_tt *g, const pn_qwen35_tt_layer *d, int rows,
+                                       uint32_t bands, const pn_qwen35_tt_layer *next_d,
+                                       int next_ssm_index)
+{
+    struct pn_qwen35_tt_batch *b = g->batch;
+    const bool table = !g_verify_mode && pn_qwen35_tt_gdn_card_gate_possible() &&
+                       !g->gdn_det_gates && pn_tt_gdnc_table_ready(g->device);
+    pn_qwen35_tt_overlap_next next = { NULL, -1, rows, NULL, NULL, 0u, 0u };
+
+    /* The plan's FFN steps are the dense SwiGLU's. */
+    if (g->moe || !pn_qwen35_tt_overlap_attention(g, bands))
+        return false;
+    if (table && next_d)
+        next = (pn_qwen35_tt_overlap_next){ next_d, next_ssm_index, rows, b->ssm_alpha,
+                                            b->ssm_beta, prefill_width(&g->card.ssm_alpha),
+                                            prefill_width(&g->card.ssm_beta) };
+    pn_qwen35_tt_overlap_set_card_gates(table);
+    return pn_qwen35_tt_overlap_layer_begin(g, d, bands, 0u, &next, &g->attn_card.gated,
+                                            &d->attn_output) == 0;
+}
+
 static int prefill_attn_layer(pn_qwen35_tt *g, const pn_qwen35_tt_layer *d,
                               const pn_qwen35moe_config *cfg, int attn_index, int base_pos,
-                              int rows)
+                              int rows, bool allow_overlap, const pn_qwen35_tt_layer *next_d,
+                              int next_ssm_index)
 {
     struct pn_qwen35_tt_batch *b = g->batch;
     pn_qwen35_tt_strips *s = &g->card;
@@ -1220,11 +1701,13 @@ static int prefill_attn_layer(pn_qwen35_tt *g, const pn_qwen35_tt_layer *d,
             pn_tt_rope_rows(g->device, &a->q, &a->q_rot, (uint32_t)cfg->n_head,
                             (uint32_t)base_pos, (uint32_t)rows) != 0 ||
             pn_tt_rope_rows(g->device, &s->attn_k, &a->k_rot, (uint32_t)cfg->n_head_kv,
-                            (uint32_t)base_pos, (uint32_t)rows) != 0)
+                            (uint32_t)base_pos, (uint32_t)rows) != 0 ||
+            pn_qwen35_tt_attn_rotate(g, cfg) != 0)
             return -1;
         for (int r = 0; rc == 0 && r < rows; r++)
-            rc = (pn_tt_kv_append_row(g->device, (uint32_t)attn_index, false, &a->k_rot,
-                                      (uint32_t)r, (uint32_t)(base_pos + r)) != 0 ||
+            rc = (pn_tt_kv_append_row(g->device, (uint32_t)attn_index, false,
+                                      pn_qwen35_tt_attn_key(g), (uint32_t)r,
+                                      (uint32_t)(base_pos + r)) != 0 ||
                   pn_tt_kv_append_row(g->device, (uint32_t)attn_index, true, &s->attn_v,
                                       (uint32_t)r, (uint32_t)(base_pos + r)) != 0)
                      ? -1 : 0;
@@ -1232,7 +1715,8 @@ static int prefill_attn_layer(pn_qwen35_tt *g, const pn_qwen35_tt_layer *d,
          * row ends in the same position tile (`PN_TT_SPEC_ATTN_MULTI=0`: one a row). */
         if (rc == 0 && base_pos / 32 == (base_pos + rows - 1) / 32 && base_pos + rows < max_seq &&
             !(getenv("PN_TT_SPEC_ATTN_MULTI") && atoi(getenv("PN_TT_SPEC_ATTN_MULTI")) == 0)) {
-            rc = pn_tt_attention_rows(g->device, (uint32_t)attn_index, &a->q_rot, &s->attn_out,
+            rc = pn_tt_attention_rows(g->device, (uint32_t)attn_index,
+                                      pn_qwen35_tt_attn_query(g), &s->attn_out,
                                       (uint32_t)base_pos, (uint32_t)rows);
             rows_done = rows;
         }
@@ -1240,7 +1724,8 @@ static int prefill_attn_layer(pn_qwen35_tt *g, const pn_qwen35_tt_layer *d,
             const int pos = base_pos + r;
             const int seq_len = (pos + 1 < max_seq) ? pos + 1 : max_seq;
 
-            rc = (pn_tt_row_copy(g->device, &a->q_rot, (uint32_t)r, &da->q_rot, 0u) != 0 ||
+            rc = (pn_tt_row_copy(g->device, pn_qwen35_tt_attn_query(g), (uint32_t)r,
+                                 &da->q_rot, 0u) != 0 ||
                   pn_tt_attention(g->device, (uint32_t)attn_index, &da->q_rot, &ds->attn_out,
                                   (uint32_t)seq_len) != 0 ||
                   pn_tt_row_copy(g->device, &ds->attn_out, 0u, &s->attn_out, (uint32_t)r) != 0)
@@ -1251,7 +1736,7 @@ static int prefill_attn_layer(pn_qwen35_tt *g, const pn_qwen35_tt_layer *d,
             return -1;
         g->spec_attn_rows_ms += pn_time_ms() - rows_started;
         mark = prefill_now();
-        if (pn_qwen35_tt_project(g, &d->attn_output, &a->gated, &s->project, true) != 0)
+        if (prefill_project_out(g, &d->attn_output, &a->gated) != 0)
             return -1;
         prefill_batched_add(b, 3, prefill_now() - mark); /* attn-out-proj */
         return 0;
@@ -1289,7 +1774,7 @@ static int prefill_attn_layer(pn_qwen35_tt *g, const pn_qwen35_tt_layer *d,
         }
         g->spec_attn_rows_ms += pn_time_ms() - rows_started;
         mark = prefill_now();
-        if (pn_qwen35_tt_project(g, &d->attn_output, &a->gated, &s->project, true) != 0)
+        if (prefill_project_out(g, &d->attn_output, &a->gated) != 0)
             return -1;
         prefill_batched_add(b, 3, prefill_now() - mark); /* attn-out-proj */
         return 0;
@@ -1323,7 +1808,44 @@ static int prefill_attn_layer(pn_qwen35_tt *g, const pn_qwen35_tt_layer *d,
         const uint32_t bands = prefill_span_for(g, rows);
         int done = 0;
 
+        const double mixer_mark = prefill_now();
+
+        /* C: the grid is lent BEFORE the streamed segment opens and returned after it ends —
+         * parking, booting and resets are host NoC writes, not puller entries. */
+        const uint32_t borrowed = prefill_attn_grid_borrow(g, base_pos, bands);
+
         prefill_stream_open(g);
+        if (g_prefill_streaming && prefill_attn_pipe_wanted(bands)) {
+            /* Deep-queued attention (PN_TT_ATTN_DEEP) has no band loop for A's FFN to sit
+             * under: it runs without the overlap, and the out-proj follows it. */
+            const bool deep = prefill_attn_deep_wanted(g, bands);
+            const bool overlap =
+                !deep && allow_overlap &&
+                prefill_attn_overlap_begin(g, d, rows, bands, next_d, next_ssm_index);
+            int rc = deep ? prefill_attn_deep(g, d, cfg, attn_index, base_pos, rows, bands)
+                          : prefill_attn_pipelined(g, d, cfg, attn_index, base_pos, rows, bands,
+                                                   overlap);
+
+            /* A: the layer's last jobs (the plan's tail) INSIDE the stream. */
+            if (rc == 0 && overlap) {
+                rc = pn_qwen35_tt_overlap_tick(g, bands);
+                prefill_batched_add(b, 4, pn_qwen35_tt_overlap_take_seconds());
+            }
+            if (rc != 0 || prefill_stream_finish(g) != 0 ||
+                (borrowed && prefill_attn_grid_return(g) != 0) || prefill_seek(g, 0u, bands) != 0) {
+                (void)prefill_stream_close();
+                pn_qwen35_tt_overlap_abort(g);
+                return -1;
+            }
+            mark = prefill_now();
+            pn_prefill_wall_attn_mixer(mark - mixer_mark);
+            if (overlap)
+                return 1; /* the plan ran the out-proj, residuals, post-norm and FFN */
+            if (prefill_project_out(g, &d->attn_output, &a->gated) != 0)
+                return -1;
+            prefill_batched_add(b, 3, prefill_now() - mark); /* attn-out-proj */
+            return 0;
+        }
         /* ONE BAND AT A TIME, for a reason the GDN loop does not have: the chunk-mode
          * attention descriptor REFUSES a non-zero `query_row` (ft_tt_op_attention.c) and there
          * is no tile-row field in the protocol at all, so the second band is reached the only
@@ -1354,7 +1876,7 @@ static int prefill_attn_layer(pn_qwen35_tt *g, const pn_qwen35_tt_layer *d,
             return -1;
 
         mark = prefill_now();
-        if (pn_qwen35_tt_project(g, &d->attn_output, &a->gated, &s->project, true) != 0)
+        if (prefill_project_out(g, &d->attn_output, &a->gated) != 0)
             return -1;
         prefill_batched_add(b, 3, prefill_now() - mark); /* attn-out-proj */
         return 0;
@@ -1397,7 +1919,7 @@ static int prefill_attn_layer(pn_qwen35_tt *g, const pn_qwen35_tt_layer *d,
         return -1;
 
     mark = prefill_now();
-    if (pn_qwen35_tt_project(g, &d->attn_output, &a->gated, &s->project, true) != 0)
+    if (prefill_project_out(g, &d->attn_output, &a->gated) != 0)
         return -1;
     prefill_batched_add(b, 3, prefill_now() - mark); /* attn-out-proj */
     return 0;
@@ -1411,14 +1933,62 @@ static int prefill_ffn(pn_qwen35_tt *g, const pn_qwen35_tt_layer *d)
     double mark = prefill_now();
     int rc = -1;
 
-    if (pn_qwen35_tt_project(g, &d->ffn_gate, &s->normed, &s->ffn_gate, false) == 0 &&
-        pn_qwen35_tt_project(g, &d->ffn_up, &s->normed, &s->ffn_up, false) == 0 &&
-        pn_tt_matvec_flush(g->device) == 0 &&
-        pn_tt_silu_mul(g->device, &s->ffn_gate, &s->ffn_up, &s->ffn_swiglu) == 0 &&
-        pn_qwen35_tt_project(g, &d->ffn_down, &s->ffn_swiglu, &s->project, true) == 0)
+    /* S3b: the VERIFY rows (MTP k1's verify runs this pass) take the fused SwiGLU when it is
+     * armed; a prefill pass proper keeps the three ops. */
+    if (g_verify_mode) {
+        if (pn_qwen35_tt_swiglu(g, &d->ffn_gate, &d->ffn_up, &s->normed, &s->ffn_gate,
+                                &s->ffn_up, &s->ffn_swiglu) == 0 &&
+            prefill_project_out(g, &d->ffn_down, &s->ffn_swiglu) == 0)
+            rc = 0;
+    } else if (pn_qwen35_tt_project(g, &d->ffn_gate, &s->normed, &s->ffn_gate, false) == 0 &&
+               pn_qwen35_tt_project(g, &d->ffn_up, &s->normed, &s->ffn_up, false) == 0 &&
+               pn_tt_matvec_flush(g->device) == 0 &&
+               pn_tt_silu_mul(g->device, &s->ffn_gate, &s->ffn_up, &s->ffn_swiglu) == 0 &&
+               pn_qwen35_tt_project(g, &d->ffn_down, &s->ffn_swiglu, &s->project, true) == 0) {
         rc = 0;
+    }
     prefill_batched_add(b, 4, prefill_now() - mark); /* ffn */
     return rc;
+}
+
+/** The MoE FFN of a pass (plan S1), timed as the dense FFN site. */
+static int prefill_moe_ffn(pn_qwen35_tt *g, const pn_qwen35_tt_layer *d, int layer, int rows)
+{
+    double mark = prefill_now();
+    /* A verify (one band of draft rows) routes CONCAT so each row is the decode token's.
+     * RED moe_verify_list: the verify takes the prefill's union LIST instead (ascending expert
+     * order), which is NOT the decode token's sum order — speculation must then DIFFER. */
+    const int rc = g_verify_mode && rows <= 32 && !prefill_red("moe_verify_list")
+                       ? pn_qwen35_tt_moe_verify_ffn(g, d, layer, (uint32_t)rows)
+                       : pn_qwen35_tt_moe_prefill_ffn(g, d, layer, prefill_span_for(g, rows));
+
+    prefill_batched_add(g->batch, 4, prefill_now() - mark); /* ffn */
+    return rc;
+}
+
+/** PHASE G: TALL strips (a whole prompt a pass) key their mirrors by the span the pass's
+ *  producers write (pn_tt_replica_map.c), so a pass whose span differs republishes. */
+static int prefill_publish_tall_span(pn_qwen35_tt *g, uint32_t bands)
+{
+    pn_qwen35_tt_strips *s = &g->card;
+    const pn_tt_activation *mirrored[2] = { &s->normed, &s->ffn_swiglu };
+
+    if (prefill_bands(g) <= 4u || bands == g_prefill_published_span)
+        return 0;
+    pn_tt_replica_map_set_span(bands);
+    pn_tt_replica_map_set_superband(pn_qwen35_tt_overlap_span(bands));
+    if (pn_tt_publish_replica_map(g->device, mirrored, 2u, &s->ffn_swiglu) != 0)
+        return -1;
+    g_prefill_published_span = bands;
+    return 0;
+}
+
+/** `PN_TT_PREFILL_GRID_MIN_ROWS`: the batched rows from which the prefill grid boots. */
+static int prefill_grid_min_rows(void)
+{
+    const char *env = getenv("PN_TT_PREFILL_GRID_MIN_ROWS");
+
+    return env ? atoi(env) : PN_QWEN35_TT_GRID_MIN_ROWS;
 }
 
 /** ONE batched pass: `rows` consecutive positions from `base_pos` through the whole stack,
@@ -1443,9 +2013,16 @@ static int prefill_mtp_layer(pn_qwen35_tt *g, pn_qwen35moe_model *m,
 
     for (int r = 0; r < rows; r++)
         pn_qwen35moe_model_embed_row(m, next[r], b->hidden + (size_t)r * (size_t)cfg->n_embd);
+    /* Prefill lane: as the hidden stage — the upload below rewrites bands [0, bands). */
     if (prefill_seek(g, 0u, bands) != 0 ||
         (!(g_verify_mode && bands == 1u) &&
-         pn_tt_activation_zero_bands(g->device, e, prefill_bands(g) > 4u ? b->max_span : 0u) != 0))
+         (prefill_stage_zero_all()
+              ? pn_tt_activation_zero_bands(g->device, e,
+                                            prefill_bands(g) > 4u ? b->max_span : 0u)
+              : pn_tt_activation_zero_band_range(g->device, e, bands,
+                                                 prefill_bands(g) > 4u ? b->max_span
+                                                                       : prefill_bands(g))) !=
+             0))
         return -1;
     for (uint32_t band = 0; band < bands && staged < rows; band++) {
         const int take = (rows - staged) < 32 ? (rows - staged) : 32;
@@ -1464,17 +2041,47 @@ static int prefill_mtp_layer(pn_qwen35_tt *g, pn_qwen35moe_model *m,
         prefill_residual(g) != 0)
         return -1;
     if (pn_tt_rms_norm(g->device, &d->attn_norm, &s->hidden[s->slot], &s->normed) != 0 ||
-        prefill_attn_layer(g, d, cfg, g->mtp.attn_index, base_pos, rows) != 0 ||
+        prefill_attn_layer(g, d, cfg, g->mtp.attn_index, base_pos, rows, false, NULL, -1) != 0 ||
         prefill_residual(g) != 0 ||
         pn_tt_rms_norm(g->device, &d->post_norm, &s->hidden[s->slot], &s->normed) != 0 ||
-        prefill_ffn(g, d) != 0 || prefill_residual(g) != 0)
+        (g->moe ? (g->moe_mtp ? prefill_moe_ffn(g, d, cfg->n_layer, rows) : -1)
+                : prefill_ffn(g, d)) != 0 ||
+        prefill_residual(g) != 0)
         return -1;
     return 0;
 }
 
+int pn_qwen35_tt_prefill_mtp_prompt_run(pn_qwen35_tt *g, pn_qwen35moe_model *m,
+                                        const pn_qwen35moe_config *cfg, const uint32_t *next,
+                                        int rows, int base_pos)
+{
+    int rc;
+
+    if (!g || g->tall_rows == 0u || g->tall_active || !g->batch || g->batch->rows < rows)
+        return -1;
+    if (!pn_tt_matmul_grid_is_running(g->device) && rows >= prefill_grid_min_rows())
+        (void)pn_tt_matmul_grid_begin(g->device);
+    prefill_tall_enter(g);
+    rc = prefill_publish_tall_span(g, prefill_span_for(g, rows));
+    if (rc == 0)
+        rc = prefill_mtp_layer(g, m, cfg, next, rows, base_pos);
+    if (rc == 0 && pn_tt_matvec_flush(g->device) != 0)
+        rc = -1;
+    pn_tt_matmul_grid_end(g->device);
+    if (prefill_seek(g, 0u, 1u) != 0)
+        rc = -1;
+    if (prefill_tall_exit(g) != 0)
+        rc = -1;
+    pn_tt_matmul_group_param_cache_reset(g->device);
+    /* Issued outside the dispatch model's per-token shape (as a verify is): re-learn it before
+     * any plain forward replays again. */
+    pn_tt_dispatch_sequence_reset();
+    return rc;
+}
+
 static int prefill_pass(pn_qwen35_tt *g, pn_qwen35moe_model *m,
                         const pn_qwen35moe_config *cfg, const uint32_t *tokens, int rows,
-                        int base_pos)
+                        int base_pos, bool last)
 {
     struct pn_qwen35_tt_batch *b = g->batch;
     pn_qwen35_tt_strips *s = &g->card;
@@ -1483,17 +2090,8 @@ static int prefill_pass(pn_qwen35_tt *g, pn_qwen35moe_model *m,
     const uint32_t bands = prefill_span_for(g, rows);
     int staged = 0;
 
-    /* PHASE G: TALL strips (a whole prompt a pass) key their mirrors by the span the pass's
-     * producers write (pn_tt_replica_map.c), so a pass whose span differs republishes. */
-    if (prefill_bands(g) > 4u && bands != g_prefill_published_span) {
-        const pn_tt_activation *mirrored[2] = { &s->normed, &s->ffn_swiglu };
-
-        pn_tt_replica_map_set_span(bands);
-        pn_tt_replica_map_set_superband(pn_qwen35_tt_overlap_bands());
-        if (pn_tt_publish_replica_map(g->device, mirrored, 2u, &s->ffn_swiglu) != 0)
-            return -1;
-        g_prefill_published_span = bands;
-    }
+    if (prefill_publish_tall_span(g, bands) != 0)
+        return -1;
 
     PREFILL_WALL_OPEN(g, PN_PREFILL_WALL_EMBED);
     for (int r = 0; r < rows; r++)
@@ -1515,10 +2113,19 @@ static int prefill_pass(pn_qwen35_tt *g, pn_qwen35moe_model *m,
      * tile (rows above the count zero) and no op reads a band it does not span — the zeroing
      * was the prompt's whole span (51 bands after a 1,629-row prompt) every cycle. */
     PREFILL_WALL_OPEN(g, PN_PREFILL_WALL_STAGE);
+    /* Prefill lane: the band-by-band upload below rewrites EVERY tile of bands [0, bands)
+     * (the tilizer zeroes the rows above a band's count), so only the bands past the pass's
+     * span need the zero — a 1,630-row prompt zeroed 13 MB over the link (0.045 s) for
+     * nothing. `PN_TT_PREFILL_STAGE_ZERO=1` zeroes the whole span as before. */
     if (prefill_seek(g, 0u, bands) != 0 ||
         (!(g_verify_mode && bands == 1u) && !prefill_red("prefill_stage_skip_band1") &&
-         pn_tt_activation_zero_bands(g->device, &s->hidden[0],
-                                     prefill_bands(g) > 4u ? b->max_span : 0u) != 0))
+         (prefill_stage_zero_all()
+              ? pn_tt_activation_zero_bands(g->device, &s->hidden[0],
+                                            prefill_bands(g) > 4u ? b->max_span : 0u)
+              : pn_tt_activation_zero_band_range(g->device, &s->hidden[0], bands,
+                                                 prefill_bands(g) > 4u ? b->max_span
+                                                                       : prefill_bands(g))) !=
+             0))
         return -1;
     /* THE UPLOAD IS PER BAND AND THE TILIZER IS WHY. `ft_tt_tilize_strip()` takes `valid_rows`
      * 1..32 and writes ONE tile-row, zeroing the rows above the count — which is the strip
@@ -1548,8 +2155,9 @@ static int prefill_pass(pn_qwen35_tt *g, pn_qwen35moe_model *m,
     for (int layer = 0; layer < cfg->n_layer; layer++) {
         const pn_qwen35_tt_layer *d = &g->layers[layer];
         int idx = pn_qwen35moe_model_layer_index(m, layer);
+        const double layer_mark = prefill_now();
 
-        mark = prefill_now();
+        mark = layer_mark;
         /* (W wavefront: a prepared SSM layer's attn-norm already ran, super-band by super-band.) */
         if (!(!d->is_attention && !g_verify_mode &&
               pn_qwen35_tt_overlap_prepared(idx, prefill_span_for(g, rows))) &&
@@ -1558,9 +2166,21 @@ static int prefill_pass(pn_qwen35_tt *g, pn_qwen35moe_model *m,
         prefill_batched_add(b, 5, prefill_now() - mark); /* attn-norm */
 
         if (d->is_attention) {
+            const bool next_ssm = layer + 1 < cfg->n_layer && !g->layers[layer + 1].is_attention;
+            int arc;
+
             pn_qwen35_tt_overlap_forget();
-            if (prefill_attn_layer(g, d, cfg, idx, base_pos, rows) != 0)
+            arc = prefill_attn_layer(
+                g, d, cfg, idx, base_pos, rows, true, next_ssm ? &g->layers[layer + 1] : NULL,
+                next_ssm ? pn_qwen35moe_model_layer_index(m, layer + 1) : -1);
+            if (arc < 0)
                 return -1;
+            if (arc == 1) { /* A: the band loop already ran the rest of the layer */
+                if (!g_verify_mode)
+                    (void)pn_tt_device_keepalive(g->device, PN_QWEN35_TT_KEEPALIVE_IDLE_S);
+                pn_prefill_wall_layer(true, prefill_now() - layer_mark);
+                continue;
+            }
         } else {
             const bool next_ssm = layer + 1 < cfg->n_layer && !g->layers[layer + 1].is_attention;
             const int src = prefill_ssm_layer(
@@ -1572,6 +2192,7 @@ static int prefill_pass(pn_qwen35_tt *g, pn_qwen35moe_model *m,
             if (src == 1) { /* PHASE W2: the band loop already ran the rest of the layer */
                 if (!g_verify_mode)
                     (void)pn_tt_device_keepalive(g->device, PN_QWEN35_TT_KEEPALIVE_IDLE_S);
+                pn_prefill_wall_layer(false, prefill_now() - layer_mark);
                 continue;
             }
         }
@@ -1583,21 +2204,30 @@ static int prefill_pass(pn_qwen35_tt *g, pn_qwen35moe_model *m,
             return -1;
         prefill_batched_add(b, 6, prefill_now() - mark); /* post-norm */
 
-        if (prefill_ffn(g, d) != 0 || prefill_residual(g) != 0)
+        if ((g->moe ? prefill_moe_ffn(g, d, layer, rows) : prefill_ffn(g, d)) != 0 ||
+            prefill_residual(g) != 0)
             return -1;
         /* PM 5 KEEPALIVE, per layer: one tall pass is seconds (tens at 8k) during which the
          * decode-only families (gdn, topk, ...) would idle past the retire limit. */
         if (!g_verify_mode)
             (void)pn_tt_device_keepalive(g->device, PN_QWEN35_TT_KEEPALIVE_IDLE_S);
+        pn_prefill_wall_layer(d->is_attention, prefill_now() - layer_mark);
     }
     PREFILL_WALL_CLOSE(g, PN_PREFILL_WALL_LAYERS);
     /* A prompt pass never holds the prompt's last token, so every row has a next one. */
     /* `PN_TT_MTP_PROMPT=0`: no MTP KV for the prompt (prices what the prefill cost buys). */
+    /* TTFT lane: the LAST pass only RECORDS it (qwen35moe_mtp_prompt_defer_tt.c) — it runs
+     * after the first token, on the hidden this pass leaves in the tall set. */
     PREFILL_WALL_OPEN(g, PN_PREFILL_WALL_MTP);
     if (g->mtp.on && !g_verify_mode &&
-        !(getenv("PN_TT_MTP_PROMPT") && atoi(getenv("PN_TT_MTP_PROMPT")) == 0) &&
-        prefill_mtp_layer(g, m, cfg, tokens + 1, rows, base_pos) != 0)
-        return -1;
+        !(getenv("PN_TT_MTP_PROMPT") && atoi(getenv("PN_TT_MTP_PROMPT")) == 0)) {
+        if (last && pn_qwen35_tt_mtp_prompt_defer_wanted(g)) {
+            if (pn_qwen35_tt_mtp_prompt_owe(g, tokens + 1, rows, base_pos) != 0)
+                return -1;
+        } else if (prefill_mtp_layer(g, m, cfg, tokens + 1, rows, base_pos) != 0) {
+            return -1;
+        }
+    }
     PREFILL_WALL_CLOSE(g, PN_PREFILL_WALL_MTP);
     b->passes++;
     b->rows_done += (uint64_t)rows;
@@ -1675,23 +2305,18 @@ static tm_tensor *prefill_declined(const char *reason)
     return NULL;
 }
 
-/**
- * THE OTHER CLASS, AND IT IS NOT THE SAME EVENT. A pass that failed part way has already
+/* THE OTHER CLASS, AND IT IS NOT THE SAME EVENT. A pass that failed part way has already
  * written the card's conv window, recurrent state and K/V for the positions it did complete,
- * and `state->pos` has already advanced for every pass that succeeded before it. The caller
- * cannot tell this from a refusal — it sees the same NULL — so its per-token replay runs the
- * prompt again over state that is neither empty nor complete.
- *
- * @param reason         what failed
- * @param positions_done positions whose state is already on the card
- */
-static tm_tensor *prefill_aborted(const char *reason, int positions_done)
+ * and `state->pos` has already advanced for every pass that succeeded before it. A per-token
+ * replay over that state would be a wrong answer, so every such site below calls
+ * pn_qwen35_tt_prefill_abort(): the session is invalidated and the request fails (the callers
+ * ask pn_qwen35moe_prefill_tt_aborted). */
+
+/** FAULT INJECTION `PN_TT_RED=prefill_pass_fail`: the second batched pass of a prompt (the
+ *  first if the prompt has one) reports failure after the first wrote its state. */
+static bool prefill_fault(int done)
 {
-    fprintf(stderr, "qwen35_tt: BATCHED PREFILL ABORTED after %d positions — %s. The card's "
-                    "carried state and K/V are PARTLY WRITTEN; the caller's per-token replay "
-                    "cannot undo them, so this answer is WRONG and not merely slow.\n",
-            positions_done, reason);
-    return NULL;
+    return prefill_red("prefill_pass_fail") && done > 0;
 }
 
 /**
@@ -1758,7 +2383,7 @@ tm_tensor *pn_qwen35moe_prefill_tt(pn_model *model, const uint32_t *tokens, int 
     pn_qwen35_tt *g;
     tm_tensor *last = NULL;
     int rows, done, base, batched;
-    bool resumed, tail_aborted = false;
+    bool resumed;
 
     /* NOT A DECLINE THIS FILE OWNS: the caller asks every model, and a prompt of one token
      * has no batch in it. Saying so on every llama turn would be noise. */
@@ -1769,12 +2394,17 @@ tm_tensor *pn_qwen35moe_prefill_tt(pn_model *model, const uint32_t *tokens, int 
     m = (pn_qwen35moe_model *)model->weights;
     g = (pn_qwen35_tt *)pn_qwen35moe_model_gpu(m);
     cfg = pn_qwen35moe_model_config(m);
-    if (g)
+    if (g) {
         g->prefill_last_batched = -1;
+        g->prefill_aborted = false;
+    }
     if (!prefill_enabled())
         return prefill_declined(PN_QWEN35_TT_PREFILL_ENV "=0 was asked for");
     if (!g || !cfg || !g->resident)
         return prefill_declined("the model is not resident on the card");
+    if (g->moe && !pn_qwen35_tt_moe_prefill_ready(g))
+        return prefill_declined("the MoE batched prefill is off (PN_TT_MOE_PREFILL=0) or has no "
+                                "DRAM for its strips");
     /* REFUSALS, each of which hands the prompt back UNTOUCHED so the caller's per-token loop
      * runs. A refusal that half-ran a pass would be a wrong answer with no symptom.
      *
@@ -1797,6 +2427,12 @@ tm_tensor *pn_qwen35moe_prefill_tt(pn_model *model, const uint32_t *tokens, int 
     if (state->pos != 0 && !resumed)
         return prefill_declined("the sequence does not start at position 0");
     base = state->pos;
+    /* TTFT lane: a layer the previous prompt still owes runs first when this prompt RESUMES
+     * that sequence (its MTP K/V below the checkpoint is that layer's); any other prefill
+     * starts a sequence, which rewrites all of it. */
+    if (resumed)
+        (void)pn_qwen35_tt_mtp_prompt_settle(g, m, cfg, state->kv_cache);
+    pn_qwen35_tt_mtp_prompt_drop(g, "a new sequence started on the card");
     pn_qwen35_tt_ckpt_note(g, state, state->pos);
     /* PHASE G0 MEASURE: one synthetic projection on layer 0's ffn_up, then the prefill as
      * usual (G0 uses its own buffers). Run several times for a best-of. */
@@ -1869,9 +2505,10 @@ tm_tensor *pn_qwen35moe_prefill_tt(pn_model *model, const uint32_t *tokens, int 
      * IDENTICAL, run_prefill_ab_prefetch.sh), so a resumed tail may skip the boot. */
     /* DEFAULT 768 (run_prefill_grid_min.sh): at 508 rows the grid LOST 40 ms, at 1,629 it wins
      * 0.32 s; a resumed 113-row tail without it: TTFT 618 -> 453 ms, IDENTICAL. */
-    if (n_tokens - 1 >= (getenv("PN_TT_PREFILL_GRID_MIN_ROWS")
-                             ? atoi(getenv("PN_TT_PREFILL_GRID_MIN_ROWS")) : 768))
-    {
+    /* Prefill lane (run_pg_park.sh, run_pg_defaults.sh): with the grid kept booted
+     * (`PN_TT_PREFILL_GRID_PARK` default 0) its begin is 0.038 s; at 514 rows the grid wins
+     * ~60 ms, at 298 it loses ~17-30, at 154 ~65 — floor 384. */
+    if (n_tokens - 1 >= prefill_grid_min_rows()) {
         PREFILL_WALL_OPEN(g, PN_PREFILL_WALL_GRID_BEGIN);
         (void)pn_tt_matmul_grid_begin(g->device);
         PREFILL_WALL_CLOSE(g, PN_PREFILL_WALL_GRID_BEGIN);
@@ -1881,53 +2518,85 @@ tm_tensor *pn_qwen35moe_prefill_tt(pn_model *model, const uint32_t *tokens, int 
     /* Batch everything but the LAST token; that one goes through the ordinary forward, which
      * is what produces the logits and what keeps the head unmodified. */
     batched = prefill_batched_rows(g, base, n_tokens);
+    /* L1a: the decode GDN cores serve this prompt's deep attention (PN_TT_PREFILL_LEND; on by
+     * default for a dense-FFN model's long prompt, pn_tt_lend_min_rows). */
+    (void)pn_tt_prefill_lend_begin(
+        g->device, (uint32_t)batched,
+        pn_tt_lend_min_rows(getenv("PN_TT_PREFILL_LEND"), pn_qwen35moe_dense_ffn(model) != 0),
+        pn_tt_lend_deep_on(getenv("PN_TT_ATTN_DEEP"), true));
     pn_qwen35_tt_ckpt_plan(g, state, base, base + batched);
     done = 0;
     while (batched - done >= rows) {
-        if (prefill_pass(g, m, cfg, tokens + done, rows, state->pos) != 0) {
+        if (prefill_fault(done) ||
+            prefill_pass(g, m, cfg, tokens + done, rows, state->pos, done + rows == batched) !=
+                0) {
+            (void)pn_tt_prefill_lend_end(g->device);
             pn_tt_matmul_grid_end(g->device);
             (void)prefill_tall_exit(g);
-            return prefill_aborted("a batched pass failed on the card", done);
+            return pn_qwen35_tt_prefill_abort(g, state, "a batched pass failed on the card",
+                                              done);
         }
         done += rows;
         state->pos += rows;
         /* PM 5 KEEPALIVE: a long prompt leaves the decode-only families idle for seconds. */
         (void)pn_tt_device_keepalive(g->device, PN_QWEN35_TT_KEEPALIVE_IDLE_S);
     }
-    /* THE SHORT TAIL PASS IS THE ONE FAILURE THIS FUNCTION ABSORBS, and absorbing it silently
-     * was wrong: a pass that failed part way has already written some of those positions, and
-     * the tail loop below then runs them AGAIN on top of that state. Loud, and it keeps the
-     * old behaviour rather than turning a working prompt into a refusal. */
+    /* THE SHORT TAIL PASS IS AN ABORT LIKE ANY OTHER. It used to be absorbed: the tail loop
+     * below then ran its positions per token on top of the state the failed pass half wrote,
+     * and Qwen3.8 at 34,816 served that corrupted answer on the p150. */
     if (batched - done > 0) {
-        if (prefill_pass(g, m, cfg, tokens + done, batched - done, state->pos) == 0) {
-            state->pos += batched - done;
-            done = batched;
-        } else {
-            tail_aborted = true;
-            (void)prefill_aborted("the short tail pass failed; the remaining positions run "
-                                  "per token OVER the state it half wrote", done);
+        if (prefill_fault(done) ||
+            prefill_pass(g, m, cfg, tokens + done, batched - done, state->pos, true) != 0) {
+            (void)pn_tt_prefill_lend_end(g->device);
+            pn_tt_matmul_grid_end(g->device);
+            (void)prefill_tall_exit(g);
+            return pn_qwen35_tt_prefill_abort(g, state, "the short tail pass failed", done);
         }
+        state->pos += batched - done;
+        done = batched;
     }
     pn_qwen35_tt_ckpt_commit(g, state, tokens, base, pn_qwen35moe_model_n_ssm(m));
     PREFILL_WALL_OPEN(g, PN_PREFILL_WALL_FLUSH);
     if (pn_tt_matvec_flush(g->device) != 0) {
+        pn_qwen35_tt_mtp_prompt_drop(g, "the last pass did not complete");
+        (void)pn_tt_prefill_lend_end(g->device);
         pn_tt_matmul_grid_end(g->device);
         (void)prefill_tall_exit(g);
-        return prefill_aborted("the last pass did not complete", done);
+        return pn_qwen35_tt_prefill_abort(g, state, "the last pass did not complete", done);
     }
     PREFILL_WALL_CLOSE(g, PN_PREFILL_WALL_FLUSH);
+    /* L1a: every lent core back to its decode residency before anything decodes. */
+    if (pn_tt_prefill_lend_end(g->device) != 0) {
+        pn_qwen35_tt_mtp_prompt_drop(g, "a lent decode core did not come back");
+        pn_tt_matmul_grid_end(g->device);
+        (void)prefill_tall_exit(g);
+        return pn_qwen35_tt_prefill_abort(g, state, "a lent decode core did not come back", done);
+    }
+    /* TTFT lane: a deferred MTP layer keeps the grid running for its projections. */
     PREFILL_WALL_OPEN(g, PN_PREFILL_WALL_GRID_END);
-    pn_tt_matmul_grid_end(g->device);
+    if (!g->mtp.prompt_pending)
+        pn_tt_matmul_grid_end(g->device);
     PREFILL_WALL_CLOSE(g, PN_PREFILL_WALL_GRID_END);
+    if (pn_tt_device_dram_report_wanted()) {
+        char tag[64];
+
+        snprintf(tag, sizeof(tag), "after prefill to position %d", state->pos);
+        pn_tt_device_report_dram(g->device, tag);
+    }
     PREFILL_WALL_OPEN(g, PN_PREFILL_WALL_RESTAGE);
     if (prefill_restage(g) != 0) {
+        pn_qwen35_tt_mtp_prompt_drop(g, "the strips could not be re-zeroed");
         (void)prefill_tall_exit(g);
-        return prefill_aborted("the strips could not be re-zeroed after the last pass", done);
+        return pn_qwen35_tt_prefill_abort(
+            g, state, "the strips could not be re-zeroed after the last pass", done);
     }
     PREFILL_WALL_CLOSE(g, PN_PREFILL_WALL_RESTAGE);
     PREFILL_WALL_OPEN(g, PN_PREFILL_WALL_TALL_EXIT);
-    if (prefill_tall_exit(g) != 0)
-        return prefill_aborted("the decode strips' mirror map did not republish", done);
+    if (prefill_tall_exit(g) != 0) {
+        pn_qwen35_tt_mtp_prompt_drop(g, "the decode mirror map did not republish");
+        return pn_qwen35_tt_prefill_abort(
+            g, state, "the decode strips' mirror map did not republish", done);
+    }
     PREFILL_WALL_CLOSE(g, PN_PREFILL_WALL_TALL_EXIT);
     /* STEP 3a: everything is flushed (restage zeroes through the flush); give decode a clean
      * parameter cache rather than one full of this prefill's blocks. */
@@ -1939,12 +2608,17 @@ tm_tensor *pn_qwen35moe_prefill_tt(pn_model *model, const uint32_t *tokens, int 
     for (int i = done; i < n_tokens; i++) {
         if (last) tm_free(last);
         last = pn_qwen35moe_forward_tt(model, tokens[i], state);
-        if (!last)
-            return prefill_aborted("the tail forward that produces the logits failed",
-                                   state->pos);
+        if (!last) {
+            pn_qwen35_tt_mtp_prompt_drop(g, "the tail forward failed");
+            return pn_qwen35_tt_prefill_abort(
+                g, state, "the tail forward that produces the logits failed", state->pos);
+        }
     }
     PREFILL_WALL_CLOSE(g, PN_PREFILL_WALL_TAIL);
-    g->prefill_last_batched = tail_aborted ? -1 : done;
+    /* TTFT lane: the logits exist; the prompt's MTP layer is now owed (the first draft, the
+     * next forward or a resumed prefill runs it — qwen35moe_mtp_prompt_defer_tt.c). */
+    pn_qwen35_tt_mtp_prompt_arm(g, state->kv_cache);
+    g->prefill_last_batched = done;
     pn_sample_profiler_window(0);
     if (getenv(PN_QWEN35_TT_PREFILL_REPORT_ENV)) {
         prefill_report(g);
@@ -1955,8 +2629,33 @@ tm_tensor *pn_qwen35moe_prefill_tt(pn_model *model, const uint32_t *tokens, int 
                 (unsigned long long)pn_tt_eltwise_group_deferred(g->device));
         pn_tt_gdngate_report(g->device);
         pn_prefill_wall_report(n_tokens, prefill_accounted(g));
+        if (g_prefill_attn_grid_swaps)
+            fprintf(stderr, "qwen35_tt: prefill ATTENTION GRID (C) — %u layer-passes on the "
+                            "borrowed grid cores, %.4f s lending and returning (cumulative)\n",
+                    g_prefill_attn_grid_swaps, g_prefill_attn_grid_seconds);
+        if (g_prefill_attn_deep_passes)
+            fprintf(stderr, "qwen35_tt: prefill DEEP ATTENTION — %u layer-passes: prep+append "
+                            "%.4f s, queue %.4f s, drain %.4f s, gates %.4f s (host, "
+                            "cumulative)\n", g_prefill_attn_deep_passes,
+                    g_prefill_attn_deep_seconds[0], g_prefill_attn_deep_seconds[1],
+                    g_prefill_attn_deep_seconds[2], g_prefill_attn_deep_seconds[3]);
+        pn_tt_dispatch_census_print(); /* the prompt's own AWAIT census */
+        /* The streamed segments so far (cumulative over the process): puller busy vs AWAIT,
+         * starved launches (`PN_TT_HOST_GAP_STARVE=N`), boundaries — host- or card-bound. */
+        pn_tt_dispatch_stream_report(1.0);
     }
+    pn_tt_dispatch_census_restart(); /* the AWAIT census then covers decode only */
     return last;
+}
+
+int pn_qwen35moe_prefill_tt_aborted(const pn_model *model)
+{
+    const pn_qwen35_tt *g = NULL;
+
+    if (model && model->weights && model->forward == pn_qwen35moe_forward_tt)
+        g = (const pn_qwen35_tt *)pn_qwen35moe_model_gpu(
+            (const pn_qwen35moe_model *)model->weights);
+    return g && g->prefill_aborted ? 1 : 0;
 }
 
 int pn_qwen35moe_prefill_tt_last_batched(const pn_model *model)
@@ -1979,7 +2678,8 @@ int pn_qwen35moe_prefill_tt_last_batched(const pn_model *model)
  * attention mixers are the DECODE kernels run row by row (S0: bit-identical to per-token),
  * then each row's head through the DECODE head path (its hidden row copied to row 0), giving
  * each row's exact greedy token in `argmax_out[r]`. Leaves the carried state after the LAST
- * row; snapshots of every earlier row are in slots 0..rows-2 for pn_qwen35_tt_spec_rollback().
+ * row; the earlier rows' states are in the slots pn_tt_gdn_verify_slots.h names, for
+ * pn_qwen35_tt_spec_rollback().
  * K/V for every row is written at its position (a rejected row's is overwritten later).
  * @return 0, or -1 (nothing is reliable; the caller must stop speculating)
  */
@@ -1994,7 +2694,12 @@ int pn_qwen35_tt_spec_verify(pn_qwen35_tt *g, pn_qwen35moe_model *m,
     if (!g || !m || !cfg || !st || !tokens || rows < 1 || rows > 16 || !argmax_out ||
         g->tall_rows == 0u)
         return -1;
-    if (pn_tt_gdn_snapshot_reserve(g->device, (uint32_t)rows) != 0)
+    /* TTFT lane: the pass overwrites the tall hidden an owed MTP prompt layer reads. The
+     * first draft always runs it before any verify (both entry points draft first); a verify
+     * runs inside its stream, where a prompt-sized layer must not, so here it is dropped. */
+    pn_qwen35_tt_mtp_prompt_forget(g, "a verify ran before the first draft");
+    if (pn_tt_gdn_snapshot_reserve(g->device, pn_tt_gdn_verify_slots(g->device,
+                                                                     (uint32_t)rows)) != 0)
         return -1;
     prefill_tall_enter(g);
     if (prefill_alloc(g, cfg, rows) != 0) {
@@ -2013,7 +2718,7 @@ int pn_qwen35_tt_spec_verify(pn_qwen35_tt *g, pn_qwen35moe_model *m,
         pn_tt_device_set_verify_rows(g->device,
                                      (!getenv("PN_TT_SPEC_HALF") ||
                                       atoi(getenv("PN_TT_SPEC_HALF")) != 0) ? (uint32_t)rows : 0u);
-        rc = prefill_pass(g, m, cfg, tokens, rows, base_pos);
+        rc = prefill_pass(g, m, cfg, tokens, rows, base_pos, false);
         pn_tt_device_set_verify_rows(g->device, 0u);
         g_verify_mode = false;
         n1 = pn_tt_device_card_clocks(g->device, names1, sec1, PN_TT_CARD_CLOCKS_MAX);
@@ -2068,16 +2773,20 @@ int pn_qwen35_tt_spec_verify(pn_qwen35_tt *g, pn_qwen35moe_model *m,
     return rc;
 }
 
-/** Restore the carried state after row `last_kept` (0-based) of the last verify, every layer:
- *  slot last_kept+1 holds the state before row last_kept+1, i.e. after row last_kept. */
-int pn_qwen35_tt_spec_rollback(pn_qwen35_tt *g, const pn_qwen35moe_config *cfg, int last_kept)
+/** Restore the carried state after row `last_kept` (0-based) of the last verify of `rows` rows,
+ *  every layer: the state before row last_kept+1, i.e. after row last_kept, is in the slot the
+ *  verify map names (legacy: slot last_kept+1). */
+int pn_qwen35_tt_spec_rollback(pn_qwen35_tt *g, const pn_qwen35moe_config *cfg, int rows,
+                               int last_kept)
 {
+    const uint32_t slot = pn_tt_gdn_verify_rollback_slot(g->device, (uint32_t)rows,
+                                                         (uint32_t)last_kept);
     int layer, ssm = 0;
 
     for (layer = 0; layer < cfg->n_layer; layer++) {
         if (g->layers[layer].is_attention)
             continue;
-        if (pn_tt_gdn_layer_swap(g->device, (uint32_t)ssm, (uint32_t)last_kept + 1u) != 0)
+        if (pn_tt_gdn_layer_swap(g->device, (uint32_t)ssm, slot) != 0)
             return -1;
         ssm++;
     }
@@ -2094,6 +2803,7 @@ int pn_qwen35_tt_mtp_catchup_rows(pn_qwen35_tt *g, pn_qwen35moe_model *m,
 
     if (!g->mtp.on || rows < 1 || rows > 16 || g->tall_rows == 0u)
         return -1;
+    pn_qwen35_tt_mtp_prompt_forget(g, "a catch-up ran before the first draft");
     /* The verify set holds the committed rows' hiddens: enter it as it was left. */
     prefill_tall_enter(g);
     if (prefill_alloc(g, cfg, rows) != 0) {
@@ -2135,9 +2845,10 @@ int pn_qwen35_tt_mtp_catchup_rows(pn_qwen35_tt *g, pn_qwen35moe_model *m,
 /* PM 7: 192 rows, not 48. The prompt's SwiGLU must reach the WIDE eltwise members (W1a: a
  * descriptor of >= 2,048 tiles; 192 rows = 6 tile rows x 384 = 2,304): 48 rows (768 tiles)
  * left all 13 idle since the load, so the first long request retired and re-armed them
- * (run_serve_warm.sh: first 1,630 TTFT 2.73 s vs 2.65 after). `PN_TT_WARM_ROWS` (2..192)
- * overrides, for the A/B. */
-#define PN_QWEN35_TT_WARM_ROWS 192
+ * (run_serve_warm.sh: first 1,630 TTFT 2.73 s vs 2.65 after). Prefill lane: 390, so its 389
+ * batched rows pass the grid floor (PN_QWEN35_TT_GRID_MIN_ROWS) and the warm-up BOOTS the grid,
+ * which then stays booted for the first request. `PN_TT_WARM_ROWS` (2..390) overrides. */
+#define PN_QWEN35_TT_WARM_ROWS 390
 
 static void warm_discard_token(const char *token, void *user_data)
 {
@@ -2194,7 +2905,10 @@ int pn_qwen35moe_keepalive_tt(pn_model *model)
     if (!model || !model->weights || model->forward != pn_qwen35moe_forward_tt)
         return 0;
     g = (pn_qwen35_tt *)pn_qwen35moe_model_gpu((pn_qwen35moe_model *)model->weights);
-    return g && g->device ? pn_tt_device_keepalive(g->device, PN_QWEN35_TT_KEEPALIVE_IDLE_S) : 0;
+    if (!g || !g->device)
+        return 0;
+    pn_qwen35_tt_mtp_prompt_idle(g);
+    return pn_tt_device_keepalive(g->device, PN_QWEN35_TT_KEEPALIVE_IDLE_S);
 }
 
 #endif /* USE_TT */

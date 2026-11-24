@@ -339,6 +339,9 @@ void pn_gguf_close(pn_gguf_file *file) {
     if (file->mmap_base) {
         munmap(file->mmap_base, file->mmap_size);
     }
+    if (file->overlay_base) {
+        munmap(file->overlay_base, file->overlay_size);
+    }
     if (file->fd >= 0) {
         close(file->fd);
     }

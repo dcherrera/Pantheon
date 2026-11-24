@@ -1,0 +1,8 @@
+{"endpoint":"POST /local/keys","class":"device",
+ "request":{"label":"scripts"},
+ "status":200,
+ "response":{"key":"pnk_…","id":"k9f8e7d6c","kind":"inference","role":"inference","label":"scripts",
+             "person":{"id":"p1a2b3c4d","handle":"david","name":"David"}},
+ "errors":[{"when":"\"role\":\"admin\" (device keys come from pairing)","status":400,"type":"invalid_request_error"},
+           {"when":"a non-admin names another person","status":403,"type":"forbidden"},
+           {"when":"an admin names an unknown person","status":404,"type":"not_found"}]}

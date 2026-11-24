@@ -1,0 +1,6 @@
+{"endpoint":"POST /local/keys/revoke","class":"device",
+ "request":{"id":"k9f8e7d6c"},
+ "status":200,
+ "response":{"revoked":"k9f8e7d6c"},
+ "errors":[{"when":"a non-admin revokes another person's key","status":403,"type":"forbidden"},
+           {"when":"no key with that id","status":404,"type":"not_found"}]}

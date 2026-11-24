@@ -4,7 +4,7 @@
  * @file   pixtral_vision.h
  * @brief  Pixtral-style vision encoder with a LightOnOCR-style projector (clip mmproj GGUF).
  *
- * Written from a behaviour specification (plans/cleanroom_r2_pixtral_spec.md); no ggml or
+ * Written from a behaviour specification (cleanroom_r2_pixtral_spec.md, recorded in docs/cleanroom/README.md); no ggml or
  * llama.cpp source was consulted.
  *
  * @status None

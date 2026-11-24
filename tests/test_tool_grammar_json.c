@@ -888,6 +888,38 @@ static void test_required_think_gated_reasoning_is_free(void) {
     jr_free(tools);
 }
 
+/* Qwen3.8 eval run 3 (2026-11-14): reasoning about a test, the model wrote the C
+ * string "\n</think>\n" out of ORDINARY tokens — `</` 510, `think` 26003, `>\`
+ * 8189 — while its real close is one token (248069).  The text match ended
+ * reasoning there and compelled the call from the next token: the model, mid-string,
+ * could only take the whitespace the opener allows and wrote "   \r" to max_tokens. */
+static const char *const SPELLED_CLOSE[] = {
+    "\"<think>\\n\" + trim(reasoning) + \"\\n", "</", "think", ">\\", "n\");",
+};
+#define N_SPELLED_CLOSE ((int)(sizeof(SPELLED_CLOSE) / sizeof(SPELLED_CLOSE[0])))
+
+static void test_required_spelled_think_close_is_reasoning(void) {
+    jr_value *tools = jr_parse(TOOLS_JSON);
+    tgj_grammar *g = tgj_build(tools);
+    tgj_state *st = tgj_state_new_required(g, true);
+
+    tgj_set_think_close_token(st);
+    for (int i = 0; i < N_SPELLED_CLOSE; i++) {
+        ASSERT_TRUE(tgj_token_allowed(st, SPELLED_CLOSE[i]));
+        tgj_advance(st, SPELLED_CLOSE[i]);
+        ASSERT_FALSE(tgj_mask_active(st));
+    }
+    ASSERT_FALSE(tgj_forced_reasoning_ended(st));
+
+    tgj_advance(st, "</think>");
+    ASSERT_TRUE(tgj_forced_reasoning_ended(st));
+    ASSERT_TRUE(tgj_mask_active(st));
+    ASSERT_FALSE(tgj_token_allowed(st, "n\");"));
+    tgj_state_free(st);
+    tgj_free(g);
+    jr_free(tools);
+}
+
 /* "required" with NO open think block (thinking off): compelled from token 0. */
 static void test_required_without_think_compels_from_start(void) {
     jr_value *tools = jr_parse(TOOLS_JSON);
@@ -1028,6 +1060,7 @@ int main(void) {
     RUN_TEST(enum_over_cap_degrades);
     RUN_TEST(build_guards);
     RUN_TEST(required_think_gated_reasoning_is_free);
+    RUN_TEST(required_spelled_think_close_is_reasoning);
     RUN_TEST(required_without_think_compels_from_start);
     RUN_TEST(required_think_gated_external_end);
     RUN_TEST(first_char_prefilter_is_sound);

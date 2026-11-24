@@ -37,6 +37,7 @@
 
 #include "../accel/simd.h"
 #include "../core/engine.h"
+#include "../core/load_guard.h"
 #include "../core/qweight.h"
 /* Foundry headers resolve through -I$(FOUNDRY), NOT a hardcoded ../../foundry:
  * relative to this file that path is Pantheon/foundry, which exists only where
@@ -245,8 +246,10 @@ int pn_llama_gpu_upload(pn_model *model)
     if (!qw->is_quantized)
         return -1;                     /* F32 legacy path stays on the CPU */
     pn_config *cfg = &model->config;
-    if (cfg->n_experts > 0)
-        return -1;                     /* MoE not handled here */
+    if (cfg->n_experts > 0) {
+        pn_accel_refusal_note("this build has no GPU forward for a MoE llama-family model");
+        return -1;
+    }
     if (!fc_available())
         return 0;                      /* graceful skip (no GPU) */
     if (model->gpu)
@@ -263,6 +266,7 @@ int pn_llama_gpu_upload(pn_model *model)
     g->ctx = fc_cuda_init_device(die);
     if (!g->ctx || !fc_cuda_ctx_available(g->ctx)) {
         fprintf(stderr, "llama: fc_cuda_init_device(%d) failed\n", die);
+        pn_accel_refusal_note("no CUDA context on GPU die %d", die);
         free(g);
         return -1;
     }
@@ -344,6 +348,8 @@ int pn_llama_gpu_upload(pn_model *model)
     return 0;
 
 fail:
+    pn_accel_refusal_note("the upload to GPU die %d failed (an allocation; see the log "
+                          "above)", die);
     model->gpu = g;          /* let pn_llama_gpu_free reclaim partial state */
     pn_llama_gpu_free(model);
     return -1;
@@ -525,6 +531,10 @@ tm_tensor *pn_llama_forward_cuda(pn_model *model, uint32_t token, pn_state *stat
         fc_buffer_to_cpu(g->d_q, g->h_q);
         fc_buffer_to_cpu(g->d_k, g->h_k);
         fc_buffer_to_cpu(g->d_v, g->h_v);
+
+        /* Biases (Qwen2) + per-head Q/K RMSNorm (Qwen3), the CPU oracle's own code.
+         * Skipping it ran Qwen3 attention on un-normed q/k: garbage text. */
+        pn_llama_qkv_finish(&qw->layers[layer], cfg, g->h_q, g->h_k, g->h_v);
 
         if (cfg->arch == PN_ARCH_QWEN3) {
             llama_rope_neox(g->h_q, cfg->n_head, head_dim, cfg->rope_dim, pos, cfg->rope_theta);

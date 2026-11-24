@@ -8,6 +8,7 @@
 #include "../memory/arena.h"
 #include "../accel/simd.h"
 #include "../formats/gguf_dequant.h"
+#include "../core/mem/pn_host_admission.h"
 #ifdef USE_THREADS
 #include "threadpool/threadpool.h"
 #endif
@@ -621,6 +622,10 @@ static float* sf_load_bf16(fs_file *sf, const char *name, int expected_numel) {
         return NULL;
     }
 
+    if (pn_host_admit_weight_copy((uint64_t)numel * sizeof(float), name) != 0) {
+        fs_free_info(info);
+        return NULL;
+    }
     float *out = malloc(numel * sizeof(float));
     if (!out) { fs_free_info(info); return NULL; }
 
@@ -886,7 +891,8 @@ pn_llama_qweights* pn_llama_load_safetensors(const char *model_path,
     if (!qw->output.data) {
         /* Tied embeddings */
         size_t sz = (size_t)config->n_vocab * n_embd * sizeof(float);
-        qw->output_f32 = malloc(sz);
+        qw->output_f32 = pn_host_admit_weight_copy(sz, "tied output (lm_head)") == 0
+                             ? malloc(sz) : NULL;
         if (!qw->output_f32) {
             pn_llama_qweights_free(qw);
             fs_close(sf);
@@ -1384,6 +1390,24 @@ static void apply_rope_raw(float *data, int n_heads, int head_dim,
     }
 }
 
+void pn_llama_qkv_finish(const pn_llama_qlayer *l, const pn_config *cfg,
+                         float *q, float *k, float *v)
+{
+    int head_dim = pn_head_dim(cfg);
+
+    if (l->bq) pn_vadd_f32(q, l->bq, q, l->wq.rows);
+    if (l->bk) pn_vadd_f32(k, l->bk, k, l->wk.rows);
+    if (l->bv) pn_vadd_f32(v, l->bv, v, l->wv.rows);
+    if (l->attn_q_norm)
+        for (int h = 0; h < cfg->n_head; h++)
+            pn_vrms_norm_f32(q + (size_t)h * head_dim, l->attn_q_norm,
+                             q + (size_t)h * head_dim, head_dim, cfg->rms_norm_eps);
+    if (l->attn_k_norm)
+        for (int h = 0; h < cfg->n_kv_head; h++)
+            pn_vrms_norm_f32(k + (size_t)h * head_dim, l->attn_k_norm,
+                             k + (size_t)h * head_dim, head_dim, cfg->rms_norm_eps);
+}
+
 /* NEOX-style RoPE: pairs dim i with i+half (half = rot/2). Qwen3 GGUF weights
  * are stored unpermuted, so the rotation is NEOX (matching HF), unlike the
  * interleaved layout the permuted Llama/Qwen2 GGUFs above expect. */
@@ -1637,22 +1661,8 @@ tm_tensor* pn_llama_forward(pn_model *model, uint32_t token, pn_state *state) {
             pn_qmv_group(qkv_w, qkv_vec, qkv_out, 3);
         }
 
-        /* Optional attention biases (Qwen2) */
-        if (l->bq) pn_vadd_f32(q, l->bq, q, l->wq.rows);
-        if (l->bk) pn_vadd_f32(k, l->bk, k, l->wk.rows);
-        if (l->bv) pn_vadd_f32(v, l->bv, v, l->wv.rows);
-
-        /* Per-head Q/K RMSNorm before RoPE (Qwen3) */
-        if (l->attn_q_norm) {
-            for (int h = 0; h < cfg->n_head; h++)
-                pn_vrms_norm_f32(q + (size_t)h * head_dim, l->attn_q_norm,
-                                 q + (size_t)h * head_dim, head_dim, cfg->rms_norm_eps);
-        }
-        if (l->attn_k_norm) {
-            for (int h = 0; h < cfg->n_kv_head; h++)
-                pn_vrms_norm_f32(k + (size_t)h * head_dim, l->attn_k_norm,
-                                 k + (size_t)h * head_dim, head_dim, cfg->rms_norm_eps);
-        }
+        /* Optional biases (Qwen2) + per-head Q/K RMSNorm (Qwen3), before RoPE */
+        pn_llama_qkv_finish(l, cfg, q, k, v);
 
         /* Apply RoPE to Q and K (NEOX for Qwen3's unpermuted GGUF weights) */
         if (cfg->arch == PN_ARCH_QWEN3) {
@@ -2121,7 +2131,15 @@ static int llama_batch_forward_seq(pn_model *model, const uint32_t *tokens,
     int vdim = qw->layers[0].wv.rows;
 
     /* Batched activation buffers (malloc'd; the per-token arena is sized for
-     * a single token and may be too small for P rows). */
+     * a single token and may be too small for P rows). They scale with the
+     * whole prompt, so the host must be able to hold them first. */
+    uint64_t batch_bytes = ((uint64_t)P * (4ull * n_embd + 2ull * qdim + kdim + vdim +
+                                           3ull * n_ff) +
+                            (uint64_t)n_head * max_seq) * sizeof(float);
+    if (batch_bytes >= PN_HOST_ADMIT_THRESHOLD_BYTES &&
+        pn_host_admit_check(batch_bytes, "batched prefill buffers", "shorten the "
+                            "prompt or free host memory", NULL, 0) != 0)
+        return -1;
     float *hidden     = malloc((size_t)P * n_embd * sizeof(float));
     float *normed     = malloc((size_t)P * n_embd * sizeof(float));
     float *q_buf      = malloc((size_t)P * qdim   * sizeof(float));

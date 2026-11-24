@@ -123,7 +123,8 @@ typedef struct {
 
 /* Re-render a reply into the assistant `content` string the SERVE will build
  * from the client's next request — i.e. what combine_assistant_tool_calls does
- * to the tool_calls array the client echoes back.  Owned; caller frees. */
+ * to the content and tool_calls array the client echoes back (it calls
+ * tc_join_assistant_history).  Owned; caller frees. */
 static char *client_assistant_content(const reply_case *rc, const jr_value *tools)
 {
     if (!rc->tool_raw)
@@ -150,21 +151,10 @@ static char *client_assistant_content(const reply_case *rc, const jr_value *tool
     }
     jw_raw(&jw, "]");
     jr_value *dom = jr_parse(jw.data);
-    bool content_empty = !rc->content || !rc->content[0];
-    char *rendered = tc_render_assistant_tool_calls(dom, content_empty,
-                                                    TC_DIALECT_QWEN_XML);
+    char *joined = tc_join_assistant_history(rc->content, dom, TC_DIALECT_QWEN_XML);
     jr_free(dom);
     jw_free(&jw);
     tc_tool_calls_free(calls, n_calls);
-    if (!rendered)
-        return NULL;
-    size_t clen = content_empty ? 0 : strlen(rc->content);
-    char *joined = malloc(clen + strlen(rendered) + 1);
-    if (joined) {
-        if (clen) memcpy(joined, rc->content, clen);
-        memcpy(joined + clen, rendered, strlen(rendered) + 1);
-    }
-    free(rendered);
     return joined;
 }
 
@@ -512,6 +502,106 @@ static void test_think_block_projects_nothing_when_the_builder_renders_none(void
 }
 
 /* ============================================================
+ * Verify: history think block matches the jinja chat template exactly
+ *
+ * The template writes:  + two newlines.  We must reproduce that byte-for-byte:
+ *  go in as SPECIAL ids, the middle as ONE text push.
+ * ============================================================ */
+static void test_history_think_block_matches_template(void)
+{
+    printf("case: history think block matches the jinja template\n");
+    ft_tokenizer *tok = make_serve_tok();
+    pn_model model = {0};
+    model.tokenizer = tok;
+    model.chat_style = PN_CHAT_CHATML_THINK;
+
+    int open_id = ft_token_to_id(tok, "<think>");
+    ASSERT_TRUE(open_id >= 0);
+    int close_id = ft_token_to_id(tok, "</think>");
+    ASSERT_TRUE(close_id >= 0);
+
+    /* Three reasoning variants - trimmed by Jinja|trim, all produce the
+     * same middle string: "\nI should call get_weather for Paris.\n" (38 bytes). */
+    const char *reasonings[] = {
+        "I should call get_weather for Paris.",                          /* R1 */
+        "I should call get_weather for Paris.\n",                        /* R2 */
+        "  I should call get_weather for Paris. \n\n",                   /* R3 */
+    };
+    const char *expected_middle = "\nI should call get_weather for Paris.\n";
+    int mid_n = 0;
+    uint32_t *mid_ids = sampled_ids(tok, expected_middle, &mid_n);
+
+    /* Trailing \n\n after closing tag */
+    int tail_n = 0;
+    uint32_t *tail_ids = sampled_ids(tok, "\n\n", &tail_n);
+
+    /* Expected full sequence: [open] ++ mid_ids ++ [close] ++ tail_ids */
+    int expected_n = 1 + mid_n + 1 + tail_n;
+    ASSERT_INT_EQ(expected_n, 42);
+
+    for (int r = 0; r < 3; r++) {
+        printf("  reasoning[%d] (R%d): %s\n", r, r + 1, reasonings[r]);
+        int n = 0;
+        uint32_t *ids = sg_encode_history_think_block(&model, reasonings[r], &n);
+        ASSERT_NOT_NULL(ids);
+
+        ASSERT_INT_EQ(n, expected_n);
+
+        for (int i = 0; i < n; i++) {
+            uint32_t want;
+            if (i == 0)
+                want = (uint32_t)open_id;
+            else if (i == 1 + mid_n)
+                want = (uint32_t)close_id;
+            else if (i > 1 + mid_n)
+                want = tail_ids[i - (1 + mid_n) - 1];
+            else
+                want = mid_ids[i - 1];
+            ASSERT_INT_EQ(ids[i], want);
+        }
+        free(ids);
+    }
+
+    /* Prompt-level check: build a prompt with a reasoning assistant turn and
+     * verify the expected ids occur as a contiguous run. */
+    sg_message msgs[3] = {
+        { "user",     "What's the weather in Paris?", NULL },
+        { "assistant", "Done.",                        reasonings[0] },
+        { "user",     "Thanks",                       NULL },
+    };
+    int prompt_n = 0;
+    uint32_t *prompt = sg_build_prompt_tokens(&model, msgs, 3,
+                                              SG_THINKING_DEFAULT, &prompt_n,
+                                              NULL, NULL);
+    ASSERT_NOT_NULL(prompt);
+
+    /* The expected think-block ids: [open] ++ mid_ids ++ [close] ++ tail_ids */
+    int block_n = 1 + mid_n + 1 + tail_n;
+    uint32_t *block_expected = malloc((size_t)block_n * sizeof(uint32_t));
+    block_expected[0] = (uint32_t)open_id;
+    for (int i = 0; i < mid_n; i++)
+        block_expected[1 + i] = mid_ids[i];
+    block_expected[1 + mid_n] = (uint32_t)close_id;
+    for (int i = 0; i < tail_n; i++)
+        block_expected[1 + mid_n + 1 + i] = tail_ids[i];
+
+    bool found = false;
+    for (int i = 0; i + block_n <= prompt_n; i++) {
+        bool match = true;
+        for (int j = 0; j < block_n; j++)
+            if (prompt[i + j] != block_expected[j]) { match = false; break; }
+        if (match) { found = true; break; }
+    }
+    ASSERT_TRUE(found);
+
+    free(block_expected);
+    free(prompt);
+    free(mid_ids);
+    free(tail_ids);
+    ft_free(tok);
+}
+
+/* ============================================================
  * A THIRD convention: a SUMMARY of the reasoning
  *
  * The harness wants OFF / SUMMARY / FULL per turn.  Two of those are recorded
@@ -527,6 +617,7 @@ static void test_think_block_projects_nothing_when_the_builder_renders_none(void
  * recorded projection works — provided the summary comes from a source both
  * sides share.
  * ============================================================ */
+
 
 #define TURN_1_SUMMARY "Decided to call the tool instead of guessing."
 
@@ -700,6 +791,38 @@ static void test_one_encoder_for_both_sides(void)
     ft_free(tok);
 }
 
+/* The tools preamble (a system turn) spells "<tool_call>" out in its format
+ * instructions; the chat template tokenizes that as the special id, so the
+ * builder must too.  A user turn with the same literal text stays bytes. */
+static void test_system_turn_tool_markers_are_special(void)
+{
+    printf("case: system-turn <tool_call> is the special id, user-turn is bytes\n");
+    ft_tokenizer *tok = make_serve_tok();
+    pn_model model = {0};
+    model.tokenizer = tok;
+    model.chat_style = PN_CHAT_CHATML_THINK;
+    int open_id = ft_token_to_id(tok, "<tool_call>");
+    int close_id = ft_token_to_id(tok, "</tool_call>");
+
+    const char *text = "reply as <tool_call>\nx\n</tool_call>";
+    const char *roles[2] = { "system", "user" };
+    for (int r = 0; r < 2; r++) {
+        sg_message msgs[1] = { { roles[r], text, NULL } };
+        int n = 0;
+        uint32_t *prompt = sg_build_prompt_tokens(&model, msgs, 1, SG_THINKING_DEFAULT, &n, NULL, NULL);
+        ASSERT_TRUE(prompt != NULL);
+        int opens = 0, closes = 0;
+        for (int i = 0; i < n; i++) {
+            if ((int)prompt[i] == open_id) opens++;
+            if ((int)prompt[i] == close_id) closes++;
+        }
+        ASSERT_INT_EQ(opens, r == 0 ? 1 : 0);
+        ASSERT_INT_EQ(closes, r == 0 ? 1 : 0);
+        free(prompt);
+    }
+    ft_free(tok);
+}
+
 /* Does `enable_thinking` actually REACH THE MODEL?
  *
  * A test that only checks the field parses would pass while the feature does
@@ -722,7 +845,6 @@ static void assert_prefill_for_style(int chat_style, const char *label)
 
     int close_id = ft_token_to_id(tok, "</think>");
     int open_id  = ft_token_to_id(tok, "<think>");
-    ASSERT_TRUE(close_id >= 0 && open_id >= 0);
 
     sg_message msgs[1] = { { "user", "hi", NULL } };
 
@@ -811,6 +933,273 @@ static void test_enable_thinking_is_inert_on_a_plain_model(void)
     ft_free(tok);
 }
 
+/* ============================================================
+ * Turn start (rung 1c, the turn-start checkpoint)
+ *
+ * The serve saves the slot's state at sg_prompt_bounds.turn_start, and resumes
+ * there when the next request starts with prompt[0, turn_start). That holds for
+ * every way a client can treat the turn just generated — drop it (Argus with a
+ * reasoning-only or interrupted turn), resend it empty (an OpenAI-style client
+ * that keeps an empty assistant message), or resend a partial reply — and for
+ * nothing that changes an earlier message.
+ * ============================================================ */
+
+static void test_turn_start_survives_a_dropped_reply(void)
+{
+    printf("case: turn_start is a prefix of every next request that keeps the history\n");
+    ft_tokenizer *tok = make_serve_tok();
+    pn_model model = {0};
+    model.tokenizer = tok;
+    model.chat_style = PN_CHAT_CHATML_THINK_NL;   /* Qwen3.6: "<think>\n" */
+
+    sg_message turn1[2] = {
+        { "system", SYS_PROMPT,  NULL },
+        { "user",   USER_TURN_1, NULL },
+    };
+    int n1 = 0;
+    sg_prompt_bounds b;
+    uint32_t *p1 = sg_build_prompt_tokens_bounded(&model, turn1, 2,
+                                                  SG_THINKING_DEFAULT, &n1, &b);
+    ASSERT_TRUE(p1 != NULL);
+    /* "<|im_start|>" + "assistant\n" (10 bytes) + "<think>" + "\n". */
+    ASSERT_INT_EQ(b.think_prefill, 2);
+    ASSERT_INT_EQ(n1 - b.turn_start, 1 + 10 + b.think_prefill);
+    ASSERT_INT_EQ((int)p1[b.turn_start], ft_token_to_id(tok, "<|im_start|>"));
+    /* The old entry point reports the same boundaries. */
+    int sys_len = 0, think_prefill = 0, n1b = 0;
+    uint32_t *p1b = sg_build_prompt_tokens(&model, turn1, 2, SG_THINKING_DEFAULT,
+                                           &n1b, &sys_len, &think_prefill);
+    ASSERT_INT_EQ(n1b, n1);
+    ASSERT_INT_EQ(sys_len, b.sys_len);
+    ASSERT_INT_EQ(think_prefill, b.think_prefill);
+    ASSERT_INT_EQ(memcmp(p1, p1b, (size_t)n1 * sizeof(uint32_t)), 0);
+
+    /* Dropped reply: the rescue note follows the user turn directly. */
+    sg_message dropped[3] = {
+        { "system", SYS_PROMPT,  NULL },
+        { "user",   USER_TURN_1, NULL },
+        { "user",   USER_TURN_2, NULL },
+    };
+    /* Empty reply kept, and a partial reply kept. */
+    sg_message empty[4] = {
+        { "system",    SYS_PROMPT,  NULL },
+        { "user",      USER_TURN_1, NULL },
+        { "assistant", "",          NULL },
+        { "user",      USER_TURN_2, NULL },
+    };
+    sg_message partial[4] = {
+        { "system",    SYS_PROMPT,  NULL },
+        { "user",      USER_TURN_1, NULL },
+        { "assistant", "Item 1 is",  NULL },
+        { "user",      USER_TURN_2, NULL },
+    };
+    const sg_message *nexts[3] = { dropped, empty, partial };
+    const int n_msgs[3] = { 3, 4, 4 };
+    for (int i = 0; i < 3; i++) {
+        int n2 = 0;
+        uint32_t *p2 = sg_build_prompt_tokens(&model, nexts[i], n_msgs[i],
+                                              SG_THINKING_DEFAULT, &n2, NULL, NULL);
+        ASSERT_TRUE(p2 != NULL);
+        ASSERT_TRUE(is_strict_prefix(p1, b.turn_start, p2, n2));
+        /* NEGATIVE CONTROL: the generation prefix is not on the next request,
+         * so the full prompt (what rung 1 needs) is not a prefix of it. */
+        ASSERT_TRUE(!is_strict_prefix(p1, n1, p2, n2));
+        free(p2);
+    }
+
+    /* A rewritten earlier message breaks it, as it must. */
+    sg_message rewritten[3] = {
+        { "system", SYS_PROMPT,         NULL },
+        { "user",   "What is item 9?",  NULL },
+        { "user",   USER_TURN_2,        NULL },
+    };
+    int n3 = 0;
+    uint32_t *p3 = sg_build_prompt_tokens(&model, rewritten, 3,
+                                          SG_THINKING_DEFAULT, &n3, NULL, NULL);
+    ASSERT_TRUE(!is_strict_prefix(p1, b.turn_start, p3, n3));
+
+    free(p3);
+    free(p1b);
+    free(p1);
+    ft_free(tok);
+}
+
+/* ============================================================
+ * Tool loop (card 1.8: consecutive tool results share ONE user turn, content
+ * is |trim'd as the Qwen3.5+ templates do, <tool_response> goes in as its id)
+ *
+ * The think-elided projection, the prefix cache and the turn-start checkpoint
+ * all compare prefixes of the token stream ONE builder produces, so a layout
+ * change is safe exactly when every earlier message renders the same whatever
+ * follows it.  The one message whose rendering depends on what follows is a
+ * tool result (it closes the user turn only before a non-tool message); both a
+ * generated assistant turn and the generation prompt close it, so every prefix
+ * the serve records still holds.  These cases check that end to end.
+ * ============================================================ */
+
+/* A Qwen3.6-like model: "<think>\n" prefill, content |trim, and the
+ * <tool_response> pair as added tokens. */
+static void make_qwen36_like_model(pn_model *model, bool with_tool_response_ids)
+{
+    ft_tokenizer *tok = make_serve_tok();
+    if (with_tool_response_ids) {
+        ft_add_token(tok, "<tool_response>");
+        ft_add_token(tok, "</tool_response>");
+    }
+    memset(model, 0, sizeof(*model));
+    model->tokenizer = tok;
+    model->chat_style = PN_CHAT_CHATML_THINK_NL;
+    model->chat_trim_content = 1;
+}
+
+/* Text of ids[0,n): a byte id is its byte, any other id its token string. */
+static char *ids_as_text(ft_tokenizer *tok, const uint32_t *ids, int n)
+{
+    size_t cap = (size_t)n * 24 + 1, at = 0;
+    char *text = malloc(cap);
+    for (int i = 0; i < n; i++) {
+        if (ids[i] < 256) { text[at++] = (char)ids[i]; continue; }
+        const char *spelling = ft_id_to_token(tok, (int)ids[i]);
+        size_t len = strlen(spelling);
+        memcpy(text + at, spelling, len);
+        at += len;
+    }
+    text[at] = '\0';
+    return text;
+}
+
+static int count_id(const uint32_t *ids, int n, int id)
+{
+    int count = 0;
+    for (int i = 0; i < n; i++) count += (int)ids[i] == id;
+    return count;
+}
+
+static const char TOOL_RAW_TWO_CALLS[] =
+    "<tool_call>\n<function=attempt_completion>\n<parameter=result>\n"
+    "first\n</parameter>\n</function>\n</tool_call>\n"
+    "<tool_call>\n<function=attempt_completion>\n<parameter=result>\n"
+    "second\n</parameter>\n</function>\n</tool_call>";
+
+static void test_tool_loop_prefixes_hold_with_merged_results(void)
+{
+    printf("case: projection and turn_start stay prefixes across a merged tool turn\n");
+    pn_model model;
+    make_qwen36_like_model(&model, true);
+    ft_tokenizer *tok = model.tokenizer;
+    jr_value *tools = jr_parse(TOOLS_JSON);
+
+    sg_message turn1[2] = { { "system", SYS_PROMPT, NULL }, { "user", USER_TURN_1, NULL } };
+    int n1 = 0;
+    sg_prompt_bounds b1;
+    uint32_t *p1 = sg_build_prompt_tokens_bounded(&model, turn1, 2, SG_THINKING_DEFAULT, &n1, &b1);
+    ASSERT_TRUE(p1 != NULL);
+
+    /* The reply: untrimmed prose (the template trims it) + two calls. */
+    reply_case rc = { "two calls", "  Let me check.\n", TOOL_RAW_TWO_CALLS };
+    int rerender_n = 0;
+    uint32_t *rerender = sg_project_client_rerender(&model, rc.content, rc.tool_raw, tools,
+                                                    TC_DIALECT_QWEN_XML, &rerender_n);
+    ASSERT_TRUE(rerender != NULL);
+    int head_n = n1 - b1.think_prefill, vis_n = head_n + rerender_n;
+    uint32_t *vis = malloc((size_t)vis_n * sizeof(uint32_t));
+    memcpy(vis, p1, (size_t)head_n * sizeof(uint32_t));
+    memcpy(vis + head_n, rerender, (size_t)rerender_n * sizeof(uint32_t));
+
+    char *assistant_content = client_assistant_content(&rc, tools);
+    ASSERT_TRUE(assistant_content != NULL);
+    sg_message turn2[5] = {
+        { "system", SYS_PROMPT, NULL }, { "user", USER_TURN_1, NULL },
+        { "assistant", assistant_content, NULL },
+        { "tool", "  first done.\n", NULL }, { "tool", "{\"second\": 2}", NULL },
+    };
+    int n2 = 0;
+    sg_prompt_bounds b2;
+    uint32_t *p2 = sg_build_prompt_tokens_bounded(&model, turn2, 5, SG_THINKING_DEFAULT, &n2, &b2);
+    ASSERT_TRUE(p2 != NULL);
+    ASSERT_TRUE(is_strict_prefix(vis, vis_n, p2, n2));      /* the projection rung */
+
+    /* The tail after the projection: ONE user turn holding both results, as ids. */
+    int im_start = ft_token_to_id(tok, "<|im_start|>");
+    ASSERT_INT_EQ(count_id(p2 + vis_n, n2 - vis_n, im_start), 2);   /* user + generation */
+    ASSERT_INT_EQ(count_id(p2, n2, ft_token_to_id(tok, "<tool_response>")), 2);
+    ASSERT_INT_EQ(count_id(p2, n2, ft_token_to_id(tok, "</tool_response>")), 2);
+    char *tail = ids_as_text(tok, p2 + vis_n, b2.turn_start - vis_n);
+    ASSERT_STR_EQ(tail, "<|im_end|>\n<|im_start|>user\n<tool_response>\nfirst done.\n"
+                        "</tool_response>\n<tool_response>\n{\"second\": 2}\n"
+                        "</tool_response><|im_end|>\n");
+
+    /* The turn-start checkpoint of turn 2 is a prefix of turn 3. */
+    sg_message turn3[7] = {
+        turn2[0], turn2[1], turn2[2], turn2[3], turn2[4],
+        { "assistant", "Both done.", NULL }, { "user", USER_TURN_2, NULL },
+    };
+    int n3 = 0;
+    uint32_t *p3 = sg_build_prompt_tokens(&model, turn3, 7, SG_THINKING_DEFAULT, &n3, NULL, NULL);
+    ASSERT_TRUE(is_strict_prefix(p2, b2.turn_start, p3, n3));
+
+    /* NEGATIVE CONTROL: a request that sent only the first result closes the
+     * user turn after it, so its turn_start is NOT a prefix of the merged
+     * layout — the checkpoint misses (safe) rather than resuming wrongly. */
+    int n2a = 0;
+    sg_prompt_bounds b2a;
+    uint32_t *p2a = sg_build_prompt_tokens_bounded(&model, turn2, 4, SG_THINKING_DEFAULT, &n2a, &b2a);
+    ASSERT_TRUE(!is_strict_prefix(p2a, b2a.turn_start, p2, n2));
+
+    free(p2a); free(p3); free(tail); free(p2); free(assistant_content);
+    free(vis); free(rerender); free(p1);
+    jr_free(tools);
+    ft_free(tok);
+}
+
+static void test_tool_response_ids_only_when_the_vocab_has_them(void)
+{
+    printf("case: <tool_response> is one id with the added tokens, the same text without\n");
+    sg_message msgs[4] = {
+        { "system", SYS_PROMPT, NULL }, { "user", USER_TURN_1, NULL },
+        { "assistant", "", NULL }, { "tool", "ok", NULL },
+    };
+    char *texts[2];
+    for (int with_ids = 0; with_ids < 2; with_ids++) {
+        pn_model model;
+        make_qwen36_like_model(&model, with_ids);
+        int n = 0;
+        uint32_t *p = sg_build_prompt_tokens(&model, msgs, 4, SG_THINKING_DEFAULT, &n, NULL, NULL);
+        ASSERT_TRUE(p != NULL);
+        int open_id = ft_token_to_id(model.tokenizer, "<tool_response>");
+        ASSERT_INT_EQ(open_id >= 0, with_ids);
+        ASSERT_INT_EQ(open_id >= 0 ? count_id(p, n, open_id) : 1, 1);
+        texts[with_ids] = ids_as_text(model.tokenizer, p, n);
+        free(p);
+        ft_free(model.tokenizer);
+    }
+    ASSERT_STR_EQ(texts[0], texts[1]);
+    ASSERT_TRUE(strstr(texts[0], "user\n<tool_response>\nok\n</tool_response><|im_end|>\n") != NULL);
+    free(texts[0]);
+    free(texts[1]);
+}
+
+/* A whitespace-only reply before a call: the template drops the "\n\n"
+ * separator (trim(content) is empty); and padded prose with no call, which the
+ * builder |trims.  The projection must agree with both. */
+static void test_whitespace_only_content_projects_like_the_builder(void)
+{
+    printf("case: whitespace-only content + a call projects what the builder renders\n");
+    pn_model model;
+    make_qwen36_like_model(&model, true);
+    model.chat_style = PN_CHAT_CHATML_THINK;   /* test_projection_case wants a 1-id prefill */
+    jr_value *tools = jr_parse(TOOLS_JSON);
+    reply_case rc = { "blank prose", " \n\n ", TOOL_RAW_WRAPPED };
+    test_projection_case(&model, tools, &rc);
+    char *content = client_assistant_content(&rc, tools);
+    ASSERT_TRUE(content != NULL && strncmp(content, "<tool_call>", 11) == 0);
+    free(content);
+    reply_case padded = { "padded prose, no call", "\n Item 1 is a widget. \n", NULL };
+    test_projection_case(&model, NULL, &padded);
+    jr_free(tools);
+    ft_free(model.tokenizer);
+}
+
 int main(void)
 {
     printf("\n=== prefix-cache projection agreement ===\n\n");
@@ -820,6 +1209,8 @@ int main(void)
     RUN_TEST(prose_turn);
     RUN_TEST(unreproducible_turn_projects_nothing);
     RUN_TEST(one_encoder_for_both_sides);
+    RUN_TEST(system_turn_tool_markers_are_special);
+    RUN_TEST(history_think_block_matches_template);
     printf("\n=== reasoning-bearing projection (the client sends reasoning back) ===\n\n");
     RUN_TEST(reasoning_projection_prose);
     RUN_TEST(reasoning_projection_tool_call);
@@ -828,6 +1219,12 @@ int main(void)
     printf("\n=== per-request thinking control ===\n\n");
     RUN_TEST(enable_thinking_reaches_the_prompt);
     RUN_TEST(enable_thinking_is_inert_on_a_plain_model);
+    printf("\n=== turn start (rung 1c) ===\n\n");
+    RUN_TEST(turn_start_survives_a_dropped_reply);
+    printf("\n=== tool loop: merged results, content trim, <tool_response> ids ===\n\n");
+    RUN_TEST(tool_loop_prefixes_hold_with_merged_results);
+    RUN_TEST(tool_response_ids_only_when_the_vocab_has_them);
+    RUN_TEST(whitespace_only_content_projects_like_the_builder);
     TEST_REPORT();
     return __ft_failed != 0;
 }

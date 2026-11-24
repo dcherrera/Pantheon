@@ -34,8 +34,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Literal whose appearance in the raw stream ends the reasoning grace. */
-static const char THINK_CLOSE[] = "</think>";
+#include "think_close_rule.h"
 
 /* Longest literal the walk ever matches char-by-char ("false"). */
 #define RFG_LIT_MAX 8
@@ -66,7 +65,8 @@ typedef enum {
 struct rfg_state {
     rfg_phase phase;
     bool      reasoning_ended;
-    int       think_term;              /* rolling prefix of THINK_CLOSE matched */
+    int       think_term;              /* rolling prefix of "</think>" matched */
+    bool      think_close_token;       /* only the "</think>" TOKEN ends reasoning */
 
     unsigned char stack[RFG_MAX_DEPTH]; /* RFG_C_OBJECT / RFG_C_ARRAY per level */
     int           depth;                /* open containers (0 before '{') */
@@ -166,17 +166,10 @@ static void step_char(rfg_state *st, char c, bool *reconsume);
 static void step_reason(rfg_state *st, char c) {
     /* Self-detect "</think>" in the raw stream (the serve emitter's think flag
      * is not reliable on every model — see the tool grammars' BUG 1 note). */
-    if (c == THINK_CLOSE[st->think_term]) {
-        st->think_term++;
-        if (THINK_CLOSE[st->think_term] == '\0') {
-            st->think_term      = 0;
-            st->reasoning_ended = true;
-            st->phase           = RFG_P_PRE;
-        }
-        return;
+    if (think_close_text_step(&st->think_term, c, st->think_close_token)) {
+        st->reasoning_ended = true;
+        st->phase           = RFG_P_PRE;
     }
-    /* Restart the rolling match, allowing an overlap ("<</think>"). */
-    st->think_term = (c == THINK_CLOSE[0]) ? 1 : 0;
 }
 
 static void step_char(rfg_state *st, char c, bool *reconsume) {
@@ -309,6 +302,11 @@ static void step_char(rfg_state *st, char c, bool *reconsume) {
 
 /* Walk `text` char by char, honouring the reconsume signal. */
 static void walk(rfg_state *st, const char *text) {
+    if (st->phase == RFG_P_REASON && think_close_token_piece(text, st->think_close_token)) {
+        st->reasoning_ended = true;
+        st->phase           = RFG_P_PRE;
+        return;
+    }
     for (const char *p = text; *p; p++) {
         bool reconsume = true;
         /* At most two passes: a number/literal end reconsumes exactly once, and
@@ -332,6 +330,19 @@ rfg_state *rfg_state_new(rfg_format format, bool reasoning_grace) {
 }
 
 void rfg_state_free(rfg_state *st) { free(st); }
+
+rfg_state *rfg_state_clone(const rfg_state *st) {
+    if (!st) return NULL;
+    rfg_state *copy = malloc(sizeof(*copy));
+    if (copy) *copy = *st;
+    return copy;
+}
+
+void rfg_state_copy(rfg_state *dst, const rfg_state *src) { *dst = *src; }
+
+void rfg_set_think_close_token(rfg_state *st) {
+    if (st) st->think_close_token = true;
+}
 
 void rfg_reasoning_end(rfg_state *st) {
     if (!st || st->reasoning_ended) return;

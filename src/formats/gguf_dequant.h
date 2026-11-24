@@ -4,7 +4,8 @@
  * @file   gguf_dequant.h
  * @brief  GGUF tensor block layouts, dequantization to float32, and size helpers.
  *
- * Rewritten from a behaviour specification and public GGUF format documentation;
+ * Rewritten from a behaviour specification
+ * (cleanroom_bpe_dequant_spec.md, recorded in docs/cleanroom/README.md) and public GGUF format documentation;
  * the implementer did not see the previous code.
  *
  * @status None

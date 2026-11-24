@@ -38,6 +38,7 @@ typedef struct {
     int      dies[PN_DM_MAX_DIES];
     int      n_dies;
     uint64_t bytes_per_die;
+    uint64_t serial;             /* names this binding in a pn_dm_binding_ref */
 } dm_binding;
 
 typedef struct {
@@ -49,9 +50,11 @@ typedef struct {
 static struct {
     pthread_mutex_t lock;
     bool            running;
+    bool            hardware;   /* dies probed from CUDA / Tenstorrent, not logical */
     int             n_dies;
     dm_die          die[PN_DM_MAX_DIES];
     dm_binding      binding[PN_DM_MAX_BINDINGS];
+    uint64_t        next_serial; /* never reset, so a stale ref never matches */
 } g_dm = { .lock = PTHREAD_MUTEX_INITIALIZER };
 
 /* --- init / shutdown --------------------------------------------------- */
@@ -72,6 +75,7 @@ int pn_dm_init_logical(int n_dies, uint64_t budget_bytes)
         g_dm.die[i].present = true;
         g_dm.die[i].vram_budget = budget_bytes;
     }
+    g_dm.hardware = false;
     g_dm.running = true;
     pthread_mutex_unlock(&g_dm.lock);
     return 0;
@@ -125,6 +129,7 @@ int pn_dm_init_cuda(int n_dies)
         return -1;
     }
     g_dm.n_dies = found;
+    g_dm.hardware = true;
     g_dm.running = true;
     pthread_mutex_unlock(&g_dm.lock);
     fprintf(stderr, "die_manager: tracking %d CUDA die%s\n",
@@ -213,6 +218,7 @@ int pn_dm_init_tt(int n_devices)
         return -1;
     }
     g_dm.n_dies = found;
+    g_dm.hardware = true;
     g_dm.running = true;
     pthread_mutex_unlock(&g_dm.lock);
     fprintf(stderr, "die_manager: tracking %d Tenstorrent device%s (one die each)\n",
@@ -225,6 +231,7 @@ void pn_dm_shutdown(void)
 {
     pthread_mutex_lock(&g_dm.lock);
     g_dm.running = false;
+    g_dm.hardware = false;
     g_dm.n_dies = 0;
     memset(g_dm.die, 0, sizeof(g_dm.die));
     memset(g_dm.binding, 0, sizeof(g_dm.binding));
@@ -232,6 +239,14 @@ void pn_dm_shutdown(void)
 }
 
 /* --- queries ------------------------------------------------------------ */
+
+bool pn_dm_is_hardware(void)
+{
+    pthread_mutex_lock(&g_dm.lock);
+    bool hw = g_dm.running && g_dm.hardware;
+    pthread_mutex_unlock(&g_dm.lock);
+    return hw;
+}
 
 int pn_dm_count(void)
 {
@@ -250,6 +265,16 @@ static bool binding_has_die(const dm_binding *b, int id)
     return false;
 }
 
+/* Locked helper: bytes the bindings hold on die `id`. */
+static uint64_t die_bound_bytes(int id)
+{
+    uint64_t bound = 0;
+    for (int i = 0; i < PN_DM_MAX_BINDINGS; i++)
+        if (g_dm.binding[i].used && binding_has_die(&g_dm.binding[i], id))
+            bound += g_dm.binding[i].bytes_per_die;
+    return bound;
+}
+
 int pn_dm_get(int die_id, pn_dm_die *out)
 {
     if (!out)
@@ -264,6 +289,7 @@ int pn_dm_get(int die_id, pn_dm_die *out)
     out->id = die_id;
     out->vram_budget = g_dm.die[die_id].vram_budget;
     out->vram_used = g_dm.die[die_id].vram_used;
+    out->vram_bound = die_bound_bytes(die_id);
     for (int i = 0; i < PN_DM_MAX_BINDINGS; i++) {
         if (!g_dm.binding[i].used || !binding_has_die(&g_dm.binding[i], die_id))
             continue;
@@ -274,6 +300,22 @@ int pn_dm_get(int die_id, pn_dm_die *out)
         }
         out->n_models++;
     }
+    pthread_mutex_unlock(&g_dm.lock);
+    return 0;
+}
+
+int pn_dm_note_external(int die_id, uint64_t external)
+{
+    pthread_mutex_lock(&g_dm.lock);
+    if (!g_dm.running || die_id < 0 || die_id >= g_dm.n_dies ||
+        !g_dm.die[die_id].present) {
+        pthread_mutex_unlock(&g_dm.lock);
+        return -1;
+    }
+    dm_die *d = &g_dm.die[die_id];
+    uint64_t bound = die_bound_bytes(die_id);
+    uint64_t room = d->vram_budget > bound ? d->vram_budget - bound : 0;
+    d->vram_used = bound + (external < room ? external : room);
     pthread_mutex_unlock(&g_dm.lock);
     return 0;
 }
@@ -373,6 +415,14 @@ int pn_dm_place(uint64_t need_bytes, int n_dies_wanted, int *dies_out)
 int pn_dm_bind(const int *dies, int n, const char *model_name,
                uint64_t total_bytes)
 {
+    return pn_dm_bind_ref(dies, n, model_name, total_bytes, NULL);
+}
+
+int pn_dm_bind_ref(const int *dies, int n, const char *model_name,
+                   uint64_t total_bytes, pn_dm_binding_ref *out)
+{
+    if (out)
+        *out = PN_DM_BINDING_NONE;
     if (!dies || n < 1 || n > PN_DM_MAX_DIES || !model_name || !*model_name)
         return -1;
 
@@ -384,8 +434,8 @@ int pn_dm_bind(const int *dies, int n, const char *model_name,
      * DISJOINT die-sets (one binding per card) for load-balanced serving.
      * Overlapping dies are still rejected by the per-die room check below, so
      * here we only need a free binding slot — no duplicate-name refusal. Each
-     * placement gets its own binding; the registry releases one per entry on
-     * unload (pn_dm_release is by-name, first-match — N entries → N releases). */
+     * placement gets its own binding, so a name does not say WHICH one: the
+     * registry releases by the ref this returns (pn_dm_release_ref). */
     dm_binding *slot = NULL;
     for (int i = 0; i < PN_DM_MAX_BINDINGS; i++) {
         if (!g_dm.binding[i].used) { slot = &g_dm.binding[i]; break; }
@@ -406,9 +456,14 @@ int pn_dm_bind(const int *dies, int n, const char *model_name,
     slot->name[PN_DM_NAME_MAX - 1] = '\0';
     slot->n_dies = n;
     slot->bytes_per_die = per_die;
+    slot->serial = ++g_dm.next_serial;
     for (int i = 0; i < n; i++) {
         slot->dies[i] = dies[i];
         g_dm.die[dies[i]].vram_used += per_die;
+    }
+    if (out) {
+        out->slot = (int)(slot - g_dm.binding);
+        out->serial = slot->serial;
     }
     pthread_mutex_unlock(&g_dm.lock);
     return 0;
@@ -420,6 +475,22 @@ refuse:
 
 int pn_dm_release(const char *model_name)
 {
+    return pn_dm_release_on(model_name, -1);
+}
+
+/* Locked helper: return `b`'s bytes to each of its dies and free the slot. */
+static void binding_release_locked(dm_binding *b)
+{
+    for (int j = 0; j < b->n_dies; j++) {
+        dm_die *d = &g_dm.die[b->dies[j]];
+        d->vram_used = d->vram_used > b->bytes_per_die
+                     ? d->vram_used - b->bytes_per_die : 0;
+    }
+    memset(b, 0, sizeof(*b));
+}
+
+int pn_dm_release_on(const char *model_name, int first_die)
+{
     if (!model_name)
         return -1;
     pthread_mutex_lock(&g_dm.lock);
@@ -427,15 +498,31 @@ int pn_dm_release(const char *model_name)
         dm_binding *b = &g_dm.binding[i];
         if (!b->used || strncmp(b->name, model_name, PN_DM_NAME_MAX) != 0)
             continue;
-        for (int j = 0; j < b->n_dies; j++) {
-            dm_die *d = &g_dm.die[b->dies[j]];
-            d->vram_used = d->vram_used > b->bytes_per_die
-                         ? d->vram_used - b->bytes_per_die : 0;
-        }
-        memset(b, 0, sizeof(*b));
+        if (first_die >= 0 && (b->n_dies < 1 || b->dies[0] != first_die))
+            continue;
+        binding_release_locked(b);
         pthread_mutex_unlock(&g_dm.lock);
         return 0;
     }
     pthread_mutex_unlock(&g_dm.lock);
     return -1;
+}
+
+int pn_dm_release_ref(pn_dm_binding_ref *ref)
+{
+    int rc = -1;
+
+    if (!ref)
+        return -1;
+    pthread_mutex_lock(&g_dm.lock);
+    if (ref->slot >= 0 && ref->slot < PN_DM_MAX_BINDINGS) {
+        dm_binding *b = &g_dm.binding[ref->slot];
+        if (b->used && b->serial == ref->serial) {
+            binding_release_locked(b);
+            rc = 0;
+        }
+    }
+    pthread_mutex_unlock(&g_dm.lock);
+    *ref = PN_DM_BINDING_NONE;
+    return rc;
 }

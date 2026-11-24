@@ -4,7 +4,7 @@
  * @file   qwen35moe_ssm.c
  * @brief  Gated-Delta-Net SSM block for Qwen3.5-MoE, one token at a time.
  *
- * Written from a behaviour specification (plans/cleanroom_r2_qwen35_spec.md); no ggml or llama.cpp source was consulted.
+ * Written from a behaviour specification (cleanroom_r2_qwen35_spec.md, recorded in docs/cleanroom/README.md); no ggml or llama.cpp source was consulted.
  *
  * @status None
  * @issues The state struct's own dims are ignored (the config's are used). ssm_conv == 1
@@ -68,6 +68,19 @@ void pn_qwen35moe_l2_norm(float *data, int head_dim, float eps) {
 void pn_qwen35moe_beta_sigmoid(const float *beta_raw, int n_v_heads, float *beta_out) {
     for (int h = 0; h < n_v_heads; h++)
         beta_out[h] = 1.0f / (1.0f + expf(-beta_raw[h]));
+}
+
+/* ONE compiled body for the TT host gates and the exact card gates' tables
+ * (qwen35moe_gate_tables.c): noinline so -O3 -ffast-math (and libmvec) cannot give the two
+ * callers two different instruction sequences for the same head. */
+__attribute__((noinline)) void pn_qwen35moe_gdn_gates(const pn_qwen35moe_ssm_layer *layer,
+                                                      const float *alpha, const float *beta_raw,
+                                                      int n_v_heads, float *decay, float *beta)
+{
+    pn_qwen35moe_beta_sigmoid(beta_raw, n_v_heads, beta);
+    pn_qwen35moe_decay_gate(layer, alpha, n_v_heads, decay);
+    for (int h = 0; h < n_v_heads; h++)
+        decay[h] = expf(decay[h]);
 }
 
 void pn_qwen35moe_decay_gate(const pn_qwen35moe_ssm_layer *layer,

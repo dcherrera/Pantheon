@@ -28,10 +28,23 @@
  *        ./tests/bench_depth_qwen35 <model.gguf> <K> <depth> [n_gen] [chunk]
  * Env: QWEN35_DEPTHS="1024,8192,32768,131072" runs the whole sweep in one
  *      model load at the given K (overrides the <depth> arg's single point).
+ *      QWEN35_DEPTH_KS="1,2,3,4" seeds K users ONCE per depth, then times each
+ *      listed batch width k (users [0,k) step, the rest idle in their rows).
+ *      QWEN35_DEPTH_PROFILE_K=1,4 brackets those widths' timed decode with
+ *      cuProfilerStart/Stop (run under nvprof --profile-from-start off).
+ *      QWEN35_DEPTH_RESEED=1 re-seeds every user before each width, so user u
+ *      decodes the SAME positions at every width: its digest must then match
+ *      across widths (batching changes speed, never a row's logits).
+ *      QWEN35_DEPTH_FAKE=<n> prefills n real tokens and skips to depth
+ *      (garbage KV, real attention cost; timing only, for 64k-128k points).
  *      QWEN35_DEPTH_DIGEST=1 folds an FNV-1a over every decode step's full
- *      per-user logits and prints it with the greedy token stream, so two
- *      BUILDS can be diffed for bit-exactness at depth (costs a host pass over
- *      the logits per step; leave it off for timing arms).
+ *      logits per user and prints one digest per user, so two BUILDS (or two
+ *      batch widths) can be diffed for bit-exactness at depth (costs a host
+ *      pass over the logits per step; leave it off for timing arms).
+ *      QWEN35_DEPTH_FULL="0,1,4" times each width once per listed count f:
+ *      users [0,f) carry full_logits (the serve's tool-grammar row, every
+ *      step), the rest the top-k row. Prices the constrained slots' fallback
+ *      (QWEN35_PERSLOT_FULL_LOGITS picks which one). Unset: one pass, f = 0.
  * NOT part of the test suite (needs the model + a CUDA GPU). */
 #include "../include/pantheon.h"
 #include "../src/core/engine.h"
@@ -41,6 +54,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <dlfcn.h>
 
 #ifndef USE_CUDA
 int main(void) { fprintf(stderr, "built without USE_CUDA\n"); return 1; }
@@ -64,6 +78,27 @@ static uint64_t fnv1a(uint64_t h, const void *p, size_t n)
         h *= 1099511628211ULL;
     }
     return h;
+}
+
+/* QWEN35_DEPTH_PROFILE_K=k[,k2..]: bracket ONLY the timed decode of these widths
+ * with cuProfilerStart/Stop, so `nvprof --profile-from-start off` sees decode
+ * kernels and none of the seeding prefill.  libcuda is already loaded by
+ * foundry; look the symbols up without linking it. */
+static void profiler_mark(int k, int start)
+{
+    const char *e = getenv("QWEN35_DEPTH_PROFILE_K");
+    char want[16];
+    snprintf(want, sizeof(want), ",%d,", k);
+    char list[64];
+    snprintf(list, sizeof(list), ",%s,", e ? e : "");
+    if (!strstr(list, want))
+        return;
+    void *h = dlopen("libcuda.so.1", RTLD_NOW | RTLD_NOLOAD);
+    int (*fn)(void) = h ? (int (*)(void))dlsym(h, start ? "cuProfilerStart"
+                                                       : "cuProfilerStop")
+                        : NULL;
+    int rc = fn ? fn() : -1;
+    fprintf(stderr, "profiler %s for K=%d: rc=%d\n", start ? "start" : "stop", k, rc);
 }
 
 static int argmax(const float *x, int n)
@@ -104,20 +139,15 @@ static int prefill_depth(pn_model *model, pn_state *st, const uint32_t *seed,
     return last;
 }
 
-/* Run one (K, depth) point: seed K users to `depth`, then time n_gen batched
- * decode steps.  Fills *per_user and *agg (tok/s), *ok=1 on success. */
-static void run_point(pn_model *model, int K, int depth, int n_gen, int chunk,
-                      int n_vocab, double *per_user, double *agg, int *ok,
-                      double *prefill_s)
+/* Seed users [0,K) to `depth` (untimed chunked prefill) and bind each to
+ * its slot row in a K-row layout.  Fills sts[] and toks[] (the next token per
+ * user).  Returns 0, or -1 with the failure logged. */
+static int seed_users(pn_model *model, int K, int depth, int chunk,
+                      int n_vocab, pn_state **sts, uint32_t *toks)
 {
-    pn_state *sts[USERS_MAX] = { 0 };
-    uint32_t  toks[USERS_MAX];
-    float    *logits[USERS_MAX];
-    uint32_t *seed = malloc((size_t)depth * sizeof(uint32_t));
-    *ok = 0; *per_user = 0; *agg = 0; *prefill_s = 0;
-    if (!seed) { fprintf(stderr, "  OOM host seed buf (depth=%d)\n", depth); return; }
-
-    double pf0 = now_s();
+    uint32_t *seed = malloc((size_t)depth * sizeof(*seed));
+    int rc = -1;
+    if (!seed) { fprintf(stderr, "  OOM host seed buf (depth=%d)\n", depth); return -1; }
     for (int u = 0; u < K; u++) {
         fill_seed(seed, depth, n_vocab, u);
         sts[u] = pn_state_new(model);
@@ -129,37 +159,172 @@ static void run_point(pn_model *model, int K, int depth, int n_gen, int chunk,
         }
         toks[u] = (uint32_t)s;
     }
-    *prefill_s = now_s() - pf0;
+    rc = 0;
+done:
+    free(seed);
+    return rc;
+}
 
+/* Time n_gen-1 batched decode steps over users [0,k) (already seeded and
+ * bound).  With QWEN35_DEPTH_DIGEST set, folds an FNV-1a over each user's
+ * full logits row every step and prints one digest PER USER, so a user's
+ * stream can be compared across builds and across batch widths.  Returns
+ * the elapsed seconds, or a negative value on failure. */
+static double time_decode(pn_model *model, pn_state **sts, uint32_t *toks,
+                          int k, int depth, int n_gen, int n_vocab)
+{
+    float *logits[USERS_MAX];
+    uint64_t dg[USERS_MAX];
     int want_digest = getenv("QWEN35_DEPTH_DIGEST") != NULL;
-    uint64_t dg = 1469598103934665603ULL;
-    if (want_digest)
-        printf("DIGEST_TOKENS depth=%d u0:", depth);
+    for (int u = 0; u < k; u++)
+        dg[u] = 1469598103934665603ULL;
+    profiler_mark(k, 1);
     double t0 = now_s();
     for (int i = 1; i < n_gen; i++) {
-        if (pn_qwen35moe_decode_slots(model, toks, sts, K, logits) != 0) {
-            fprintf(stderr, "  decode_slots FAIL @step %d depth=%d\n", i, depth); goto done;
+        if (pn_qwen35moe_decode_slots(model, toks, sts, k, logits) != 0) {
+            fprintf(stderr, "  decode_slots FAIL @step %d depth=%d\n", i, depth);
+            return -1.0;
         }
-        for (int u = 0; u < K; u++) {
+        for (int u = 0; u < k; u++) {
             if (want_digest)
-                dg = fnv1a(dg, logits[u], (size_t)n_vocab * sizeof(float));
+                dg[u] = fnv1a(dg[u], logits[u], (size_t)n_vocab * sizeof(float));
             toks[u] = (uint32_t)argmax(logits[u], n_vocab);
         }
-        if (want_digest)
-            printf(" %u", toks[0]);
     }
     double dt = now_s() - t0;
-    if (want_digest)
-        printf("\nDIGEST K=%d depth=%d steps=%d logits_fnv1a=%016llx\n", K,
-               depth, n_gen - 1, (unsigned long long)dg);
-    *per_user = (n_gen - 1) / dt;
-    *agg = (double)K * (n_gen - 1) / dt;
-    *ok = 1;
+    profiler_mark(k, 0);
+    for (int u = 0; u < k && want_digest; u++)
+        printf("DIGEST K=%d depth=%d user=%d steps=%d logits_fnv1a=%016llx\n", k,
+               depth, u, n_gen - 1, (unsigned long long)dg[u]);
+    return dt;
+}
 
+static void report_point(int K, int depth, int n_gen, double dt, double prefill_s)
+{
+    if (dt <= 0.0) {
+        fprintf(stderr, "DEPTH K=%d depth=%d: FAILED/OOM (boundary)\n", K, depth);
+        printf("DEPTHBENCH K=%d depth=%d FAILED\n", K, depth);
+        return;
+    }
+    double per_user = (n_gen - 1) / dt;
+    double agg = (double)K * (n_gen - 1) / dt;
+    fprintf(stderr, "DEPTH K=%d depth=%d: per-user %.2f tok/s | aggregate %.2f tok/s | "
+            "step %.1f ms | prefill %.1fs | %s8/user\n", K, depth, per_user, agg,
+            1000.0 * dt / (n_gen - 1), prefill_s, per_user >= 8.0 ? ">=" : "<");
+    printf("DEPTHBENCH K=%d depth=%d per_user=%.2f agg=%.2f step_ms=%.1f prefill_s=%.1f\n",
+           K, depth, per_user, agg, 1000.0 * dt / (n_gen - 1), prefill_s);
+    fflush(stdout); fflush(stderr);
+}
+
+/* Time width k once per count in QWEN35_DEPTH_FULL (default "0"): users [0,f) carry
+ * full_logits, as a tool-grammar slot does for its whole turn. Returns 0, or -1 when a
+ * pass failed. */
+static int time_full_sweep(pn_model *model, pn_state **sts, uint32_t *toks, int k,
+                           int depth, int n_gen, int n_vocab, double prefill_s)
+{
+    const char *env = getenv("QWEN35_DEPTH_FULL");
+    char list[64];
+    char *save = NULL;
+
+    snprintf(list, sizeof(list), "%s", env && env[0] ? env : "0");
+    for (char *tk = strtok_r(list, ",", &save); tk; tk = strtok_r(NULL, ",", &save)) {
+        int f = atoi(tk);
+        if (f < 0 || f > k)
+            continue;
+        for (int u = 0; u < k; u++)
+            pn_qwen35moe_state_set_full_logits(sts[u], u < f);
+        double dt = time_decode(model, sts, toks, k, depth, n_gen, n_vocab);
+        if (env)
+            printf("FULLROWS K=%d full=%d ", k, f);
+        report_point(k, depth, n_gen, dt, prefill_s);
+        if (dt <= 0.0)
+            return -1;
+    }
+    return 0;
+}
+
+/* QWEN35_DEPTH_FAKE=<n>: prefill only n real tokens per user, then skip each
+ * user to `depth` with pn_qwen35moe_bench_skip_positions (garbage KV, real
+ * attention cost). Timing only: digests are meaningless in this mode. */
+static int fake_real_tokens(void)
+{
+    const char *e = getenv("QWEN35_DEPTH_FAKE");
+    return e ? atoi(e) : 0;
+}
+
+static int seed_depth(int depth)
+{
+    int n = fake_real_tokens();
+    return n > 0 && n < depth ? n : depth;
+}
+
+/* Step every user once (so its ring watermarks are current), then skip it to
+ * `depth`. No-op unless QWEN35_DEPTH_FAKE is set. Returns 0 / -1. */
+static int fake_depth(pn_model *model, pn_state **sts, uint32_t *toks, int K,
+                      int depth, int n_vocab)
+{
+    float *logits[USERS_MAX];
+    if (seed_depth(depth) == depth)
+        return 0;
+    if (pn_qwen35moe_decode_slots(model, toks, sts, K, logits) != 0)
+        return -1;
+    for (int u = 0; u < K; u++) {
+        toks[u] = (uint32_t)argmax(logits[u], n_vocab);
+        int add = depth - (int)sts[u]->pos;
+        if (add > 0 && pn_qwen35moe_bench_skip_positions(model, sts[u], u, add) != 0) {
+            fprintf(stderr, "  fake depth: skip to %d failed for user %d\n", depth, u);
+            return -1;
+        }
+    }
+    fprintf(stderr, "  fake depth: %d real tokens, skipped to %d (timing only)\n",
+            seed_depth(depth), depth);
+    return 0;
+}
+
+/* One depth point: seed K users once, then time the batch widths listed in
+ * QWEN35_DEPTH_KS (e.g. "1,2,3,4": users [0,k) step together, the rest idle
+ * in their rows — the serve's layout), or just width K when it is unset. */
+static void run_point(pn_model *model, int K, int depth, int n_gen, int chunk,
+                      int n_vocab)
+{
+    pn_state *sts[USERS_MAX] = { 0 };
+    uint32_t  toks[USERS_MAX];
+    double pf0 = now_s();
+    if (seed_users(model, K, seed_depth(depth), chunk, n_vocab, sts, toks) != 0) {
+        report_point(K, depth, n_gen, -1.0, 0.0);
+        goto done;
+    }
+    double prefill_s = now_s() - pf0;
+    if (fake_depth(model, sts, toks, K, depth, n_vocab) != 0)
+        goto done;
+    const char *ks_env = getenv("QWEN35_DEPTH_KS");
+    char ks[64];
+    snprintf(ks, sizeof(ks), "%s", ks_env && ks_env[0] ? ks_env : "");
+    if (!ks[0])
+        snprintf(ks, sizeof(ks), "%d", K);
+    int reseed = getenv("QWEN35_DEPTH_RESEED") != NULL;
+    int first = 1;
+    char *save = NULL;
+    for (char *tk = strtok_r(ks, ",", &save); tk; tk = strtok_r(NULL, ",", &save)) {
+        int k = atoi(tk);
+        if (k < 1 || k > K)
+            continue;
+        if (reseed && !first) {
+            for (int u = 0; u < K; u++) {
+                pn_state_free(sts[u]);
+                sts[u] = NULL;
+            }
+            if (seed_users(model, K, seed_depth(depth), chunk, n_vocab, sts, toks) != 0 ||
+                fake_depth(model, sts, toks, K, depth, n_vocab) != 0)
+                break;
+        }
+        first = 0;
+        if (time_full_sweep(model, sts, toks, k, depth, n_gen, n_vocab, prefill_s) != 0)
+            break;
+    }
 done:
     for (int u = 0; u < K; u++)
         if (sts[u]) pn_state_free(sts[u]);
-    free(seed);
 }
 
 int main(int argc, char **argv)
@@ -192,21 +357,7 @@ int main(int argc, char **argv)
     for (char *tk = strtok(list, ","); tk; tk = strtok(NULL, ",")) {
         int depth = atoi(tk);
         if (depth < 1) continue;
-        double per_user = 0, agg = 0, prefill_s = 0; int ok = 0;
-        run_point(model, K, depth, n_gen, chunk, n_vocab,
-                  &per_user, &agg, &ok, &prefill_s);
-        if (ok) {
-            fprintf(stderr,
-                    "DEPTH K=%d depth=%d: per-user %.2f tok/s | aggregate "
-                    "%.2f tok/s | prefill %.1fs | %s8/user\n",
-                    K, depth, per_user, agg, prefill_s,
-                    per_user >= 8.0 ? ">=" : "<");
-            printf("DEPTHBENCH K=%d depth=%d per_user=%.2f agg=%.2f prefill_s=%.1f\n",
-                   K, depth, per_user, agg, prefill_s);
-        } else {
-            fprintf(stderr, "DEPTH K=%d depth=%d: FAILED/OOM (boundary)\n", K, depth);
-            printf("DEPTHBENCH K=%d depth=%d FAILED\n", K, depth);
-        }
+        run_point(model, K, depth, n_gen, chunk, n_vocab);
         fflush(stdout); fflush(stderr);
     }
 

@@ -1,6 +1,6 @@
 # qwen35moe — Forward-Pass Design (Pantheon port)
 
-Implementation blueprint for `src/models/qwen35moe.{h,c}`. Hybrid **Gated-Delta-Net SSM + sparse full-attention + shared-expert MoE** (Qwen3-Next lineage). Synthesized from llama.cpp `qwen35moe.cpp` + `delta-net-base.cpp` (math reference) and Pantheon `rwkvx.c` (structural template).
+Implementation blueprint for `src/models/qwen35moe.{h,c}`. Hybrid **Gated-Delta-Net SSM + sparse full-attention + shared-expert MoE** (Qwen3-Next lineage). The model's math was cross-checked against llama.cpp's implementation of this architecture; no llama.cpp code is included. Pantheon `rwkvx.c` is the structural template.
 
 **Structure clones `rwkvx.c`; loading follows the GGUF/llama path (`pn_qweight`, `gguf.c`), NOT rwkvx's safetensors path.** Hybrid of both.
 

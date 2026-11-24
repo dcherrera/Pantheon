@@ -9,6 +9,7 @@
  */
 
 #include "rwkvx.h"
+#include "../core/mem/pn_host_admission.h"
 #include "tensor/tensor.h"
 #include "safetensors/safetensors.h"
 
@@ -1341,6 +1342,14 @@ static tm_tensor* load_weight(fs_file *f, const char *name) {
 
     fs_tensor_info *info = fs_get_info(f, name);
     if (!info) return NULL;
+
+    /* Every weight becomes an anonymous fp32 clone: admit it first. */
+    int64_t clone_numel = 1;
+    for (int d = 0; d < info->ndim; d++) clone_numel *= info->shape[d];
+    if (pn_host_admit_weight_copy((uint64_t)clone_numel * sizeof(float), name) != 0) {
+        fs_free_info(info);
+        return NULL;
+    }
 
     tm_tensor *t = NULL;
 

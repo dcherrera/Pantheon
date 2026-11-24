@@ -33,6 +33,11 @@ void pn_tt_dispatch_token_end(pn_tt_device *device, uint64_t forward);
 
 /** A new sequence (the carried state was zeroed): the model is re-learned on its forwards. */
 void pn_tt_dispatch_sequence_reset(void);
+/** The coming forward's SHAPE KEY, before pn_tt_dispatch_token_begin: a value that changes
+ *  exactly where a token's queue traffic stops being the linear continuation of the last
+ *  (pn_tt_attention_splitk_shape_key). A change re-learns the model like a new sequence, so
+ *  a replay never crosses it. 0 (the default) never changes. */
+void pn_tt_dispatch_shape_key(uint64_t key);
 /** No stream, no replay and no recording is in progress: the host may issue outside a token
  *  (the keepalive's NOPs). */
 bool pn_tt_dispatch_quiet(void);
@@ -61,8 +66,26 @@ void pn_tt_move_stats(uint64_t *rows, double *row_ms);
  *  `PN_TT_SPEC_STREAM=0` off. begin returns false when not streaming; end returns false if a
  *  segment failed on the card (the caller must then treat its work as failed). */
 bool pn_tt_dispatch_stream_begin(pn_tt_device *device);
+/** The same, for a DECODE-time stream (the verify, MTP drafting): S2 on-card completion
+ *  (`PN_TT_ONCARD_COMPLETION=1`, pn_tt_precondition.h) may rewrite its AWAITs. A prefill
+ *  stream uses pn_tt_dispatch_stream_begin() and never does. */
+bool pn_tt_dispatch_stream_begin_decode(pn_tt_device *device);
 bool pn_tt_dispatch_stream_end(void);
 void pn_tt_dispatch_stream_report(double cycles);
+/** Zero the puller AWAIT census (`PN_TT_PULLER_AWAIT_CENSUS`): called at the end of a batched
+ *  prefill, so the census printed with the SPEC report is that request's decode alone. */
+void pn_tt_dispatch_census_restart(void);
+
+/**
+ * Streamed: the puller AWAITs queue (x, y) reaching `count` (an issued count the host recorded
+ * earlier — a step mark, not necessarily the queue's last). No host read.
+ * @return 1 emitted, 0 not streaming (the caller waits for real), -1 the stream cannot express
+ *         it (unknown queue, a count past its issued, a failed stream: the caller waits for real)
+ */
+int pn_tt_dispatch_stream_await(uint16_t x, uint16_t y, uint32_t count);
+/** Print the AWAIT census now (totals since the last restart; nothing unless
+ *  `PN_TT_PULLER_AWAIT_CENSUS=1`). The prefill report prints the prompt's own census. */
+void pn_tt_dispatch_census_print(void);
 /** PM 6: launch what the stream has captured so far WITHOUT waiting (the card starts on it
  *  while the host waits on something else). true when nothing was streaming or the launch
  *  went; false if the stream has failed. */

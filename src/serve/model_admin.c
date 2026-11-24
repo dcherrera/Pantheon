@@ -19,19 +19,26 @@
 #include "attn_residency_json.h"
 #include "graph_residency_json.h"
 
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "../accel/die_manager.h"
+#include "../core/load_guard.h"
+#include "../core/mem/pn_host_admission.h"
 #include "../core/prefix_cache.h"
 #include "../core/session_snapshot.h"
 #include "base64.h"
 #include "http_server.h"
 #include "json_reader.h"
 #include "json_writer.h"
+#include "load_env_scope.h"
 #include "model_session.h"
+#include "replica_affinity.h"
+#include "replica_pin.h"
 #include "serve_registry.h"
+#include "serve_spec_mtp_cuda.h"
 
 /* Map a registry refusal reason to an HTTP status: duplicates conflict (409),
  * capacity refusals are 507 (insufficient storage), a missing file is 404,
@@ -52,12 +59,33 @@ static int status_for_reason(const char *reason)
     if (strstr(reason, "already loaded") || strstr(reason, "already unloading") ||
         strstr(reason, "model is busy"))
         return 409;
+    /* The load guard's refusals (load_guard.h): the accelerator or the host
+     * cannot hold it — a capacity answer, like admission. */
     if (strstr(reason, "admission") || strstr(reason, "binding") ||
-        strstr(reason, "table full"))
+        strstr(reason, "table full") || strstr(reason, "CPU fallback") ||
+        strstr(reason, "host RAM"))
         return 507;
     if (strstr(reason, "not found") || strstr(reason, "no such"))
         return 404;
     return 500;
+}
+
+/* ,"sampling_defaults":{...} with only the fields the model has (A4); nothing
+ * when it has none. */
+static void write_sampling_defaults(json_writer *jw, const pn_model_sampling *d)
+{
+    if (!d->has_temperature && !d->has_top_p && !d->has_top_k && !d->has_min_p &&
+        !d->has_presence_penalty)
+        return;
+    jw_raw(jw, ",\"sampling_defaults\":{");
+    const char *sep = "";
+    if (d->has_temperature) { jw_printf(jw, "%s\"temperature\":%g", sep, d->temperature); sep = ","; }
+    if (d->has_top_p) { jw_printf(jw, "%s\"top_p\":%g", sep, d->top_p); sep = ","; }
+    if (d->has_top_k) { jw_printf(jw, "%s\"top_k\":%d", sep, d->top_k); sep = ","; }
+    if (d->has_min_p) { jw_printf(jw, "%s\"min_p\":%g", sep, d->min_p); sep = ","; }
+    if (d->has_presence_penalty)
+        jw_printf(jw, "%s\"presence_penalty\":%g", sep, d->presence_penalty);
+    jw_raw(jw, "}");
 }
 
 /* Write one model row {"id":..,"object":"model","dies":[..],"vram_bytes":..}.
@@ -73,7 +101,7 @@ static void write_model_row(json_writer *jw, const mr_info *m)
 {
     jw_raw(jw, "{\"id\":");
     jw_string(jw, m->name);
-    jw_raw(jw, ",\"object\":\"model\",\"path\":");
+    jw_printf(jw, ",\"object\":\"model\",\"replica\":%d,\"path\":", m->replica);
     jw_string(jw, m->path);
     jw_raw(jw, ",\"dies\":[");
     for (int i = 0; i < m->n_dies; i++)
@@ -86,9 +114,11 @@ static void write_model_row(json_writer *jw, const mr_info *m)
      * memory-pressure ladder clamped the slot count — and seeing them differ IS
      * the signal. The incident serve reported max_concurrent 2 with a NULL
      * scheduler and an actual served concurrency of 1. */
-    jw_printf(jw, "],\"vram_bytes\":%llu,\"max_sessions\":%d,"
+    jw_printf(jw, "],\"vram_bytes\":%llu,\"max_sessions\":%d,\"sessions_used\":%d,"
+                  "\"slots_held\":%d,\"seat_free\":%s,"
                   "\"max_concurrent\":%d,\"max_concurrent_configured\":%d",
-              (unsigned long long)m->vram_bytes, m->max_sessions,
+              (unsigned long long)m->vram_bytes, m->max_sessions, m->sessions_used,
+              m->slots_held, m->seat_free ? "true" : "false",
               m->served_concurrency, m->max_concurrent);
     if (m->context_window > 0)
         jw_printf(jw, ",\"context_window\":%d", m->context_window);
@@ -99,12 +129,170 @@ static void write_model_row(json_writer *jw, const mr_info *m)
      * model at live 38/40 with capture_failures 2 lost two layers' graphs to
      * something transient, which is a completely different story from a model
      * reporting 40 ineligible layers because its experts are not Q3_K. */
+    write_sampling_defaults(jw, &m->sampling);
     gr_write_detail(jw, &m->graphs);
     /* And which attention path each layer is actually on. `host` > 0 is the
      * fault; `reasons` names it, and `gave_up` says the layer has stopped
      * trying to get back on-die at this geometry. */
     ar_write_detail(jw, &m->attn);
     jw_raw(jw, "}");
+}
+
+/* QWEN35_MTP, PN_TT_KV_TYPE, PN_TT_KV_LONG and PN_TT_SPEC are read from the environment
+ * during the load, so two loads must not race on them. */
+static pthread_mutex_t g_load_env_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Whether the newest registry entry loaded from `path` carries an uploaded MTP
+ * head; its name and first die go to `name` / `first_die` for an unload. */
+static bool entry_has_mtp(mr_registry *reg, const char *path, char *name, size_t cap,
+                          int *first_die)
+{
+    bool has = false;
+    uint64_t newest = 0;
+
+    pthread_mutex_lock(&reg->lock);
+    for (int i = 0; i < MR_MAX_MODELS; i++) {
+        mr_entry *e = &reg->entries[i];
+        if (!e->used || !e->model || !e->path || strcmp(e->path, path) != 0 ||
+            e->serial < newest)
+            continue;
+        newest = e->serial;
+        snprintf(name, cap, "%s", e->name);
+        *first_die = e->n_dies > 0 ? e->dies[0] : -1;
+#ifdef USE_CUDA
+        has = sg_mtp_cuda_available(e->model);
+#endif
+    }
+    pthread_mutex_unlock(&reg->lock);
+    return has;
+}
+
+/* --mtp asked for a head the loaded model does not have: unload it (a failed
+ * load leaves nothing resident) and say which of the two causes it is. */
+static int refuse_mtp_without_head(mr_registry *reg, const ma_load_request *lr, char *err,
+                                   size_t errlen)
+{
+    char name[MR_MAX_NAME] = "", why[160];
+    int first_die = -1;
+
+    if (entry_has_mtp(reg, lr->path, name, sizeof(name), &first_die))
+        return 0;
+    if (name[0] && mr_unload_replica(reg, name, first_die, why, sizeof(why)) != 0)
+        fprintf(stderr, "admin: could not unload %s after --mtp refused: %s\n", name, why);
+    if (lr->opts.cpu_only)
+        snprintf(err, errlen, "--mtp needs the model on a GPU; this load runs on the CPU");
+    else
+        snprintf(err, errlen, "--mtp: no MTP head on this model (needs a CUDA build and a "
+                              "qwen35 GGUF with a NextN block)");
+    return -1;
+}
+
+/* Apply the per-model defaults (sampling, reasoning reserve) to the model loaded
+ * from `path` when no explicit name was given (mr_load derived the name from the
+ * file name). */
+static void ma_set_defaults_by_path(mr_registry *reg, const char *path,
+                                    const pn_model_sampling *d, int reserve)
+{
+    mr_info info[MR_MAX_MODELS];
+    int n = mr_snapshot(reg, info, MR_MAX_MODELS);
+
+    for (int i = 0; i < n; i++)
+        if (strcmp(info[i].path, path) == 0) {
+            mr_set_sampling_defaults(reg, info[i].name, d);
+            mr_set_reasoning_reserve(reg, info[i].name, reserve);
+        }
+}
+
+int ma_load_model(mr_registry *reg, const ma_load_request *lr, char *err, size_t errlen)
+{
+    pn_load_env_var env[] = {
+        { "QWEN35_MTP", lr->mtp ? "1" : NULL, NULL },
+        { "PN_TT_KV_TYPE", lr->tt_kv_type, NULL },
+        { "PN_TT_KV_LONG", lr->tt_kv_long, NULL },
+        { "PN_TT_SPEC", lr->tt_spec, NULL },
+    };
+    const size_t n_env = sizeof(env) / sizeof(env[0]);
+    int rc = 0;
+
+    if (pn_model_sampling_validate(&lr->sampling, err, errlen) != 0)
+        return -1;
+    pthread_mutex_lock(&g_load_env_lock);
+    pn_load_env_apply(env, n_env);
+    rc = mr_load_replica(reg, lr->path, lr->name, &lr->opts, lr->n_dies > 0 ? lr->dies : NULL,
+                         lr->n_dies, lr->reasoning_budget, lr->max_sessions,
+                         lr->max_concurrent, lr->replica, err, errlen);
+    pn_load_env_restore(env, n_env);
+    pthread_mutex_unlock(&g_load_env_lock);
+    if (rc != 0)
+        return -1;
+
+    const char *name = lr->name && *lr->name ? lr->name : NULL;
+    if (lr->mtp && refuse_mtp_without_head(reg, lr, err, errlen) != 0)
+        return -1;
+    if (name) {
+        mr_set_sampling_defaults(reg, name, &lr->sampling);
+        mr_set_reasoning_reserve(reg, name, lr->reasoning_reserve);
+    } else {
+        ma_set_defaults_by_path(reg, lr->path, &lr->sampling, lr->reasoning_reserve);
+    }
+    return 0;
+}
+
+int ma_parse_load_request(const jr_value *root, ma_load_request *out, char *err, size_t errlen)
+{
+    memset(out, 0, sizeof(*out));
+    if (!root || jr_kind(root) != JR_OBJECT) {
+        snprintf(err, errlen, "malformed JSON");
+        return -1;
+    }
+    out->path = jr_as_string(jr_object_get(root, "path"));
+    out->name = jr_as_string(jr_object_get(root, "name"));
+    if (!out->path || !*out->path) {
+        snprintf(err, errlen, "'path' is required");
+        return -1;
+    }
+    const jr_value *jd = jr_object_get(root, "dies");
+    if (jr_kind(jd) == JR_ARRAY) {
+        int len = jr_array_len(jd);
+        if (len > PN_MODEL_MAX_DIES) {
+            snprintf(err, errlen, "too many dies");
+            return -1;
+        }
+        for (int i = 0; i < len; i++)
+            out->dies[out->n_dies++] = (int)jr_as_number(jr_array_get(jd, i), -1);
+    }
+    out->opts.quantize = jr_as_bool(jr_object_get(root, "quantize"), false);
+    /* The host CPU forward, asked for; an accelerator build never falls back to it. */
+    out->opts.cpu_only = jr_as_bool(jr_object_get(root, "cpu"), false);
+
+    /* Per-model context cap (KV Phase 1): the KV ring is sized to this window at
+     * load, so it must be in the load opts. Absent/<=0 = engine default
+     * (QWEN35_MAX_SEQ / PN_SESSION_MAX_CTX). This is how ornith gets a 40K
+     * window without moving saber's. */
+    int ctx_cap = (int)jr_as_number(jr_object_get(root, "ctx_cap"), 0);
+    out->opts.ctx_cap = ctx_cap > 0 ? ctx_cap : 0;
+
+    /* Per-model AUTO-path reasoning cap (tokens); absent/<=0 = disabled. */
+    int rb = (int)jr_as_number(jr_object_get(root, "reasoning_budget"), 0);
+    out->reasoning_budget = rb > 0 ? rb : 0;
+    /* Tokens of max_tokens kept for the answer after a forced close;
+     * absent/<=0 = PN_REASONING_RESERVE_DEFAULT (reasoning_budget.h). */
+    int rr = (int)jr_as_number(jr_object_get(root, "reasoning_reserve"), 0);
+    out->reasoning_reserve = rr > 0 ? rr : 0;
+
+    /* Per-model live-session (RESIDENCY) cap; absent/<=0 = the engine default
+     * (BS_MAX_USERS). mr_load clamps into [1, BS_MAX_USERS]. */
+    int ms = (int)jr_as_number(jr_object_get(root, "max_sessions"), 0);
+    out->max_sessions = ms > 0 ? ms : 0;
+
+    /* Per-model CONCURRENCY cap = the batch scheduler's decode slots;
+     * absent/<=0 = max_sessions. mr_load clamps into [1, BS_MAX_USERS]. */
+    int mc = (int)jr_as_number(jr_object_get(root, "max_concurrent"), 0);
+    out->max_concurrent = mc > 0 ? mc : 0;
+
+    out->mtp = jr_as_bool(jr_object_get(root, "mtp"), false);
+    pn_model_sampling_from_json(root, &out->sampling);
+    return pn_model_sampling_validate(&out->sampling, err, errlen);
 }
 
 void ma_handle_load(int client_fd, mr_registry *reg, const char *body)
@@ -114,70 +302,20 @@ void ma_handle_load(int client_fd, mr_registry *reg, const char *body)
         return;
     }
     jr_value *root = jr_parse(body);
-    if (!root || jr_kind(root) != JR_OBJECT) {
-        hs_send_error(client_fd, 400, "invalid_request_error", "malformed JSON");
+    ma_load_request lr;
+    char reason[PN_LOAD_REFUSAL_LEN] = "";
+    if (ma_parse_load_request(root, &lr, reason, sizeof(reason)) != 0) {
+        hs_send_error(client_fd, 400, "invalid_request_error", reason);
         jr_free(root);
         return;
     }
-    const char *path = jr_as_string(jr_object_get(root, "path"));
-    const char *name = jr_as_string(jr_object_get(root, "name"));
-    if (!path || !*path) {
-        hs_send_error(client_fd, 400, "invalid_request_error", "'path' is required");
-        jr_free(root);
-        return;
-    }
-
-    int dies[PN_MODEL_MAX_DIES];
-    int n_dies = 0;
-    const jr_value *jd = jr_object_get(root, "dies");
-    if (jr_kind(jd) == JR_ARRAY) {
-        int len = jr_array_len(jd);
-        if (len > PN_MODEL_MAX_DIES) {
-            hs_send_error(client_fd, 400, "invalid_request_error", "too many dies");
-            jr_free(root);
-            return;
-        }
-        for (int i = 0; i < len; i++)
-            dies[n_dies++] = (int)jr_as_number(jr_array_get(jd, i), -1);
-    }
-
-    pn_load_opts opts = {
-        .quantize = jr_as_bool(jr_object_get(root, "quantize"), false),
-    };
-
-    /* Per-model context cap (KV Phase 1): the KV ring is sized to this window at
-     * load, so it must be in the load opts. Absent/<=0 = engine default
-     * (QWEN35_MAX_SEQ / PN_SESSION_MAX_CTX). This is how ornith gets a 40K
-     * window without moving saber's. */
-    int ctx_cap = (int)jr_as_number(jr_object_get(root, "ctx_cap"), 0);
-    if (ctx_cap < 0) ctx_cap = 0;
-    opts.ctx_cap = ctx_cap;
-
-    /* Per-model AUTO-path reasoning cap (tokens); absent/<=0 = disabled. */
-    int reasoning_budget = (int)jr_as_number(
-        jr_object_get(root, "reasoning_budget"), 0);
-    if (reasoning_budget < 0) reasoning_budget = 0;
-
-    /* Per-model live-session (RESIDENCY) cap; absent/<=0 = the engine default
-     * (BS_MAX_USERS). mr_load clamps into [1, BS_MAX_USERS]. */
-    int max_sessions = (int)jr_as_number(
-        jr_object_get(root, "max_sessions"), 0);
-    if (max_sessions < 0) max_sessions = 0;
-
-    /* Per-model CONCURRENCY cap = the batch scheduler's decode slots;
-     * absent/<=0 = max_sessions. mr_load clamps into [1, BS_MAX_USERS]. */
-    int max_concurrent = (int)jr_as_number(
-        jr_object_get(root, "max_concurrent"), 0);
-    if (max_concurrent < 0) max_concurrent = 0;
-
-    char reason[160] = "";
-    if (mr_load(reg, path, name, &opts, n_dies ? dies : NULL, n_dies,
-                reasoning_budget, max_sessions, max_concurrent,
-                reason, sizeof(reason)) != 0) {
+    if (ma_load_model(reg, &lr, reason, sizeof(reason)) != 0) {
         hs_send_error(client_fd, status_for_reason(reason), "load_failed", reason);
         jr_free(root);
         return;
     }
+    const char *path = lr.path;
+    const char *name = lr.name;
 
     /* Answer with the freshly-registered row (resolve the served name — it
      * may have been derived from the basename). */
@@ -258,15 +396,30 @@ static void session_export_reply(int client_fd, pn_arch arch, void *snap,
 {
     unsigned char *blob = NULL;
     size_t blob_len = 0;
+    uint64_t refusals = pn_host_admit_thread_refusals();
     if (pn_session_snapshot_serialize(arch, snap, weights_version, &blob,
                                       &blob_len) != 0) {
         pn_session_snapshot_free(arch, snap);
         free(tokens);
-        hs_send_error(client_fd, 500, "server_error", "snapshot serialize failed");
+        if (pn_host_admit_thread_refusals() != refusals)
+            hs_send_error(client_fd, 503, "server_memory_constrained",
+                          pn_host_admit_last_refusal());
+        else
+            hs_send_error(client_fd, 500, "server_error", "snapshot serialize failed");
         return;
     }
     pn_session_snapshot_free(arch, snap);
 
+    /* The base64 text is 4/3 of the blob, alongside it until it is freed. */
+    char reason[PN_HOST_ADMIT_REASON_LEN];
+    if (pn_host_admit_check((uint64_t)blob_len / 3 * 4 + 4, "session export base64",
+                            "shorten the session or free host memory", reason,
+                            sizeof(reason)) != 0) {
+        free(blob);
+        free(tokens);
+        hs_send_error(client_fd, 503, "server_memory_constrained", reason);
+        return;
+    }
     char *b64 = pn_base64_encode(blob, blob_len);
     free(blob);
     if (!b64) {
@@ -317,10 +470,20 @@ void ma_handle_session_export(int client_fd, mr_registry *reg, const char *body)
         return;
     }
 
-    mr_entry *entry = mr_acquire(reg, name);
+    mr_entry *entry = mr_acquire_session(reg, name, sid);
     if (!entry) {
         hs_send_error(client_fd, 404, "model_not_found",
                       "the requested model is not loaded (see GET /v1/models)");
+        jr_free(root);
+        return;
+    }
+    pn_replica_pin_announce(entry);
+    /* Pantheon Local: only the session's own person; one opened before people
+     * (unbound) only for an admin (§4.8). */
+    if (ms_session_principal_check(entry, sid, hs_thread_principal(),
+                                   hs_thread_principal_admin(), MS_PRINCIPAL_EXPORT) != MS_OK) {
+        mr_release(reg, entry);
+        hs_send_error(client_fd, 403, "session_not_yours", MS_NOT_YOURS_MESSAGE);
         jr_free(root);
         return;
     }
@@ -373,6 +536,14 @@ void ma_handle_session_export(int client_fd, mr_registry *reg, const char *body)
         return;
     }
 
+    /* The snapshot is a host copy now, so a closing client's slot can go back
+     * before the slow part (serialize, base64, send). */
+    if (jr_as_bool(jr_object_get(root, "release"), false)) {
+        ms_session_release(entry, sid);
+        pn_replica_affinity_forget(sid);
+        fprintf(stderr, "[session_export] released sid=%s model=%s after its snapshot "
+                "(%d tokens)\n", sid, entry->name, n_tok);
+    }
     session_export_reply(client_fd, arch, snap, weights_version, sid, n_tok,
                          tokens);
     mr_release(reg, entry);

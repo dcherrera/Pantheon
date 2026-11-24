@@ -22,6 +22,10 @@
  * bytes the parser ends a value on, so grammar and parser cannot disagree about
  * where a value ended.
  *
+ * EACH KEY AT MOST ONCE.  A key this call has already written cannot be opened
+ * again, and once every key is written "</function>" is the only way on, so a
+ * call cannot loop on its own keys until max_tokens.  Same in the JSON dialect.
+ *
  * REQUIRED ARGUMENTS.  Every key in that tool's schema `required` list must be
  * emitted before `</function>` becomes a legal continuation — so a call that
  * OMITS a required argument (the bare `<function=NAME>\n</function>`, which the
@@ -76,6 +80,20 @@
  * `[{"wrong_key":1}]` is well-formed, reaches the tool, and is refused there.
  * Every other schema keyword (minLength, pattern, const, numeric bounds) is
  * still dropped, and `type` still does not constrain a SCALAR VALUE.
+ *
+ * FIELD PATTERNS.  The request field `field_patterns` (tool -> property ->
+ * pattern, field_pattern.h syntax; tg_apply_field_patterns) puts a whole-value
+ * regex on one free-text string value.  It is a request field, not the schema
+ * `pattern` keyword, because the schema is rendered into the prompt.  The value
+ * judged is the one the parser hands the client: the bytes between
+ * "<parameter=KEY>" and "</parameter>", whitespace-trimmed at both ends
+ * (tool_calling.c dup_trim) — so the trained "\nVALUE\n" framing newlines are
+ * not part of it.  Every byte that leaves no way to a matching value is masked
+ * (whitespace is allowed while a close could still follow it, since trailing
+ * whitespace is trimmed), and "</parameter>" closes only on a match.  It never
+ * forces the key present.  A value wrapped in "<value>…</value>" (MiniCPM; the
+ * parser peels it) is judged with the wrapper, the same unmodelled shape as the
+ * empty-value floor's known gap.
  *
  * A constrained sampler asks, for each candidate token, `tg_token_allowed()`
  * ("does appending this token's text keep a valid grammar prefix?") and masks
@@ -184,13 +202,69 @@ tg_state *tg_state_new_forced(const tg_grammar *g, const char *forced_name);
  *   - think_open: everything before the model's own "</think>" is reasoning and
  *     is never judged — no opener tracking and no char budget (max_tokens and
  *     the serve's reasoning_budget force-close bound it; an injected close
- *     still gets the landing window, tg_reasoning_end_injected).  From the
- *     token after "</think>" the opener is compelled as in tg_state_new_forced.
+ *     gets NO landing window, tg_reasoning_end_injected).  From the token
+ *     after "</think>" the opener is compelled as in tg_state_new_forced.
  *   - !think_open: compelled from the first token.
  * The legacy tg_state_new_forced grace (opener tracking + TG_REASON_BUDGET) is
  * kept for the named-function form.  NULL on OOM / NULL grammar.
  */
 tg_state *tg_state_new_required(const tg_grammar *g, bool think_open);
+
+/**
+ * Apply the request field `required_if_reasoned` (a JSON array of property
+ * names) to a built grammar.  For each listed name, on every tool whose
+ * properties have it, the key is REQUIRED (like a schema `required` key, so
+ * "</function>" is unreachable without it) on the reply's FIRST call when the
+ * reply REASONED — its think block held a non-whitespace char before its close
+ * (reasoned_reply_tracker.h).  Otherwise the key stays optional: allowed, never
+ * forced, never blocked.  Unknown names, non-string members and a non-array
+ * value are ignored; NULL or an empty array leaves the grammar unchanged.  Call
+ * once, after tg_build and before any state walks.
+ */
+void tg_require_if_reasoned(tg_grammar *g, const jr_value *names);
+
+/**
+ * Apply the request field `field_patterns` (a JSON object: tool name -> object
+ * of property name -> pattern string, field_pattern.h syntax) to a built
+ * grammar.  Each pattern binds the free-text value of that property of that
+ * tool: see "FIELD PATTERNS" above.  Unknown tools and properties, non-string
+ * patterns, and properties that are not free-text strings (a non-string `type`,
+ * an `enum`, a container) are ignored; NULL or an empty object leaves the
+ * grammar unchanged.  Call once, after tg_build and before any state walks.
+ * Returns false when a pattern does not compile or on OOM (the request parse
+ * refuses a bad pattern first: field_patterns_request.h).
+ */
+bool tg_apply_field_patterns(tg_grammar *g, const jr_value *field);
+
+/**
+ * STEER a patterned value into its pattern instead of only refusing its close.
+ * `token_text` is the token the model itself ranks first (the sampler's
+ * unmasked argmax).  When it is refused because it tries to END a non-empty
+ * free-text value whose `field_patterns` rule does not match yet — the
+ * whitespace of the trained "\n</parameter>" tail, or "</parameter>" whole —
+ * the walk is put on the pattern's forced continuation
+ * (fp_forced_continuation: " from: " for Argus's finding rule): until those
+ * bytes are spelled, a token off them is not allowed, so the mask leaves only
+ * that continuation.  Returns true when it did so; false (walk untouched) for
+ * anything else — an allowed token, any other refusal, no pattern, an empty
+ * value, a value already mid-"</parameter>", a steer still pending, or a
+ * pattern that forces no bytes there.
+ */
+bool tg_steer(tg_state *st, const char *token_text);
+
+/**
+ * The prompt left a think block open: watch it so the walk knows whether the
+ * reply reasoned.  tg_state_new_required(g, true) does this itself; the AUTO and
+ * named-function walks need this call (before the first tg_advance).  It changes
+ * nothing else about the walk.  Without it a walk is never "reasoned".
+ */
+void tg_watch_reasoning(tg_state *st);
+
+/** Has the walk seen reasoning (non-whitespace think text outside the close)? */
+bool tg_reply_reasoned(const tg_state *st);
+
+/** How many calls of this reply have reached a NAME (0 before the first). */
+int tg_calls_named(const tg_state *st);
 
 /** Largest text tg_closing_text can produce, NUL included. */
 #define TG_CLOSING_MAX 96
@@ -232,6 +306,18 @@ void tg_state_copy(tg_state *dst, const tg_state *src);
 void tg_state_free(tg_state *st);
 
 /**
+ * Close reasoning only on the "</think>" TOKEN: a tg_advance whose whole text is
+ * "</think>".  The same text spelled out of ordinary tokens stays reasoning
+ * (think_close_rule.h).  Set it when the model's close is one token; leave it off
+ * otherwise.  Call before the first tg_advance.
+ *
+ * Thread-safe: no (mutates st)
+ * Reentrant: yes
+ * Signal-safe: no
+ */
+void tg_set_think_close_token(tg_state *st);
+
+/**
  * Signal that the reasoning phase has ended.  In FORCED mode this releases the
  * reasoning grace and REQUIRES the opener from here on (prose/JSON masked out).
  * A no-op in AUTO mode, and idempotent.
@@ -265,6 +351,11 @@ void tg_reasoning_end(tg_state *st);
  * to TG_LANDING_BUDGET chars later.  The window ends EARLY the moment the model
  * emits its own "</think>".  A no-op in AUTO mode, and idempotent (a second call
  * simply re-grants the window).
+ *
+ * A "required" walk (tg_state_new_required) gets NO window: the opener is
+ * compelled from the next token, as after the model's own close.  The serve's
+ * close lands on a line end (reasoning_budget.h), and the window let a model
+ * write its thought on as prose and run to max_tokens with no call.
  */
 void tg_reasoning_end_injected(tg_state *st);
 

@@ -239,8 +239,17 @@ void pn_admit_request(int n_prompt, bool kv_q4, uint64_t kv_per_token,
     bool host_fits = out->host_need_bytes <= host_budget;
     bool die_fits = !have_die || die_need <= die_free;
 
-    if (host_fits && die_fits)
+    if (host_fits && die_fits) {
+        /* Memory holds it, but the configured window still binds: a CPU-resident
+         * model is capped at its --ctx-cap like a GPU one (H2d: a 5,000-token
+         * prompt at cap 4096 was answered on the Mac). */
+        if (max_window > 0 && n_prompt > max_window) {
+            out->verdict = PN_ADMIT_CAP;
+            out->fit_tokens = max_window;
+            out->reason = "prompt exceeds the max sequence window";
+        }
         return;                                 /* ADMIT */
+    }
 
     /* --- Doesn't fit at N. Can a smaller window fit host + die? --- */
     int host_win = host_fits ? n_prompt

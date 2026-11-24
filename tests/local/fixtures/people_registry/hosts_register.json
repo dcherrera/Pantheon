@@ -1,0 +1,12 @@
+{"endpoint":"POST /local/hosts","class":"device",
+ "request":{"key":"c-0123456789ab","kind":"session","origin_device":"d0123456789abcdef","host_port":53211,
+            "title":"Fix the relay","model":"qwen3.6-35b-a3b-q8","instance":2,"state":"thinking",
+            "host_secret":"<64 hex>","host_pub":"<64 hex>"},
+ "status":200,
+ "response":{"key":"c-0123456789ab","owner":{"id":"p1a2b3c4d","handle":"david","name":"David"},
+             "host_addr":"192.0.2.20:53211","seq":0,"shares":[],"beat_s":30,"disconnect_s":90},
+ "errors":[{"when":"origin_device is not this key's device_id","status":409,"type":"device_mismatch"},
+           {"when":"this device key has no device_id yet (POST /local/me/device first)","status":409,"type":"device_unclaimed"},
+           {"when":"another person registered this key","status":409,"type":"key_taken"},
+           {"when":"state is disconnected (set by the box only), or a field breaks the rules","status":400,"type":"invalid_request_error"},
+           {"when":"512 rows on the box, or 128 for this person","status":507,"type":"registry_full"}]}

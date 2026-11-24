@@ -37,8 +37,7 @@
  *        count how often the model is being cut off mid-call.
  *
  * @status Complete for the serve layer's needs.
- * @issues See header (@issues) — consecutive tool results are separate turns.
- *         Frame-capture recovery is a SAFETY NET over a serve-side cause (the
+ * @issues Frame-capture recovery is a SAFETY NET over a serve-side cause (the
  *         reasoning-budget "</think>" injection), not a fix for it, and it can
  *         only reach values that ARE a complete call.  A captured value that is
  *         free-form scratch text (a shell pipeline in a `read` path, an analysis
@@ -96,7 +95,8 @@ bool tc_dialect_grammar_models(tc_dialect dialect)
 }
 
 /* Literal fragments of the tools system block, copied verbatim from the model's
- * chat_template so the prompt the model sees is byte-identical to the oracle. */
+ * chat_template so the prompt the model sees is byte-identical to the oracle.
+ * Source: Qwen chat_template (Qwen team, Alibaba Cloud), Apache-2.0; see NOTICE. */
 static const char TOOLS_HEAD[] =
     "# Tools\n\nYou have access to the following functions:\n\n<tools>";
 static const char TOOLS_FORMAT[] =
@@ -252,7 +252,7 @@ char *tc_render_tools_system(const jr_value *tools, const char *system_content)
     int n = jr_array_len(tools);
     for (int i = 0; i < n; i++) {
         jw_raw(&jw, "\n");
-        jr_to_json(jr_array_get(tools, i), &jw);   /* tool | tojson */
+        jr_to_json_tojson(jr_array_get(tools, i), &jw);   /* tool | tojson */
     }
     jw_raw(&jw, TOOLS_FORMAT);
     if (system_content && *system_content) {
@@ -273,7 +273,8 @@ char *tc_render_tools_system(const jr_value *tools, const char *system_content)
  * <function name="NAME"><param name="KEY">VALUE</param>…</function>. Rendering
  * the Qwen preamble instead makes MiniCPM improvise a garbled hybrid (it echoes
  * the tool's JSON schema as nested <parameter>/<property> tags), so the
- * orchestrator model MUST be prompted in its own dialect. */
+ * orchestrator model MUST be prompted in its own dialect.
+ * Source: openbmb/MiniCPM5 chat_template (OpenBMB), Apache-2.0; see NOTICE. */
 static const char MC_TOOLS_HEAD[] =
     "# Tools\n\nYou are provided with function signatures within "
     "<tools></tools> XML tags:\n<tools>";
@@ -385,23 +386,14 @@ char *tc_render_tools_system_ornith(const jr_value *tools,
  * Assistant tool-call history rendering (JSON args -> XML)
  * ============================================================ */
 
-/* Append a history parameter value the way the template re-renders it:
- * objects/arrays as compact JSON, everything else as its bare text. */
+/* Append a history parameter value the way the Qwen template re-renders it:
+ * `args_value | string if args_value is string else args_value | tojson`.  A
+ * string goes in bare; anything else as Python json.dumps writes it (", " and
+ * ": " separators, null as "null"). */
 static void append_history_value(json_writer *jw, const jr_value *v)
 {
-    switch (jr_kind(v)) {
-        case JR_STRING: jw_raw(jw, jr_as_string(v)); break;
-        case JR_BOOL:   jw_raw(jw, jr_as_bool(v, false) ? "true" : "false"); break;
-        case JR_NUMBER: {
-            double d = jr_as_number(v, 0);
-            if (d == (double)(long long)d) jw_printf(jw, "%lld", (long long)d);
-            else                           jw_printf(jw, "%.17g", d);
-            break;
-        }
-        case JR_NULL:   break;
-        case JR_ARRAY:
-        case JR_OBJECT: jr_to_json(v, jw); break;
-    }
+    if (jr_kind(v) == JR_STRING) jw_raw(jw, jr_as_string(v));
+    else                         jr_to_json_tojson(v, jw);
 }
 
 /* Render one call's <function=…>…</function> body (name + parameters). */
@@ -411,9 +403,16 @@ static void render_one_call(json_writer *jw, const jr_value *fn)
     jw_raw(jw, "<function=");
     jw_raw(jw, name ? name : "");
     jw_raw(jw, ">\n");
-    /* arguments arrive as a stringified JSON object; parse and expand. */
-    const char *args_str = jr_as_string(jr_object_get(fn, "arguments"));
-    jr_value *args = args_str ? jr_parse(args_str) : NULL;
+    /* arguments arrive as a JSON object (HF style, used as-is) or a stringified
+     * JSON object (OpenAI wire format, parsed here and freed below). */
+    const jr_value *av = jr_object_get(fn, "arguments");
+    jr_value *parsed = NULL;
+    const jr_value *args = av;
+    if (jr_kind(av) != JR_OBJECT) {
+        const char *args_str = jr_as_string(av);
+        parsed = args_str ? jr_parse(args_str) : NULL;
+        args = parsed;
+    }
     if (jr_kind(args) == JR_OBJECT) {
         int n = jr_object_member_count(args);
         for (int i = 0; i < n; i++) {
@@ -425,22 +424,27 @@ static void render_one_call(json_writer *jw, const jr_value *fn)
             jw_raw(jw, "\n</parameter>\n");
         }
     }
-    jr_free(args);
+    jr_free(parsed);
     jw_raw(jw, "</function>\n");
 }
 
 /* Render one call as Ornith's markdown-fenced JSON block: ```json {"function":
- * NAME,"arguments":{…}} ```. `arguments` on the history call is already a
- * stringified JSON object (the same shape tc_parse_tool_calls produced), so it
- * is emitted verbatim inside the block. */
+ * NAME,"arguments":{…}} ```. A stringified `arguments` (the same shape
+ * tc_parse_tool_calls produced) is emitted verbatim inside the block; a JSON
+ * object `arguments` is written as compact JSON, the same shape. */
 static void render_one_call_ornith(json_writer *jw, const jr_value *fn)
 {
     const char *name = jr_as_string(jr_object_get(fn, "name"));
-    const char *args_str = jr_as_string(jr_object_get(fn, "arguments"));
+    const jr_value *av = jr_object_get(fn, "arguments");
     jw_raw(jw, "```json\n{\"function\": ");
     jw_string(jw, name ? name : "");
     jw_raw(jw, ", \"arguments\": ");
-    jw_raw(jw, (args_str && *args_str) ? args_str : "{}");
+    if (jr_kind(av) == JR_OBJECT) {
+        jr_to_json(av, jw);
+    } else {
+        const char *args_str = jr_as_string(av);
+        jw_raw(jw, (args_str && *args_str) ? args_str : "{}");
+    }
     jw_raw(jw, "}\n```");
 }
 
@@ -469,6 +473,28 @@ char *tc_render_assistant_tool_calls(const jr_value *tool_calls,
     char *result = jw.oom ? NULL : strdup(jw.data);
     jw_free(&jw);
     return result;
+}
+
+char *tc_join_assistant_history(const char *content, const jr_value *tool_calls,
+                                tc_dialect dialect)
+{
+    char *trimmed = dup_trim(content ? content : "",
+                             content ? content + strlen(content) : "");
+    if (!trimmed) return NULL;
+    char *calls = tc_render_assistant_tool_calls(tool_calls, trimmed[0] == '\0',
+                                                 dialect);
+    char *joined = NULL;
+    if (calls) {
+        size_t content_len = strlen(trimmed), calls_len = strlen(calls);
+        joined = malloc(content_len + calls_len + 1);
+        if (joined) {
+            memcpy(joined, trimmed, content_len);
+            memcpy(joined + content_len, calls, calls_len + 1);
+        }
+    }
+    free(calls);
+    free(trimmed);
+    return joined;
 }
 
 /* ============================================================

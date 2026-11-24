@@ -144,7 +144,10 @@ void pn_qwen35_tt_ckpt_plan(pn_qwen35_tt *g, const pn_state *state, int base, in
     g->ckpt.capture_ms = 0.0;
     g->ckpt.verify_words = 0u;
     g->ckpt.verify_differ = 0;
-    if (!state || !pn_qwen35_tt_ckpt_enabled() || !g->gdn_on_card || base % 32 != 0)
+    /* `ckpt_off`: the load could not reserve the twins (qwen35moe_fit_tt.c). No retry here:
+     * a retry would take DRAM a pinned buffer needs, and it failed at load already. */
+    if (!state || !pn_qwen35_tt_ckpt_enabled() || g->ckpt_off || !g->gdn_on_card ||
+        base % 32 != 0)
         return;
     at = pn_qwen35_ckpt_band_at(base, batch_end, ceiling);
     if (at == 0)
@@ -205,6 +208,7 @@ void pn_qwen35_tt_ckpt_commit(pn_qwen35_tt *g, const pn_state *state, const uint
     g->ckpt.valid = true;
     fprintf(stderr, "qwen35_tt: prefill checkpoint at %d — %d layers copied in %.1f ms\n", at,
             n_ssm, g->ckpt.capture_ms);
+    pn_tt_device_report_dram_stage(g->device, "after prefill checkpoint");
     if (pn_tt_gdn_checkpoint_verify_wanted())
         fprintf(stderr, "pn_tt: gdn checkpoint — VERIFY after capture: %lld of %llu sampled "
                         "words DIFFER\n", g->ckpt.verify_differ, g->ckpt.verify_words);
@@ -216,6 +220,26 @@ void pn_qwen35_tt_ckpt_release(pn_qwen35_tt *g)
         return;
     free(g->ckpt.tokens);
     memset(&g->ckpt, 0, sizeof(g->ckpt));
+}
+
+tm_tensor *pn_qwen35_tt_prefill_abort(pn_qwen35_tt *g, pn_state *state, const char *reason,
+                                      int positions_done)
+{
+    fprintf(stderr, "qwen35_tt: BATCHED PREFILL ABORTED after %d positions — %s. The card's "
+                    "carried state and K/V are PARTLY WRITTEN, so the session is INVALIDATED: "
+                    "this request fails, and the next one starts a fresh sequence.\n",
+            positions_done, reason ? reason : "(no reason)");
+    if (g) {
+        g->ckpt.pending_at = 0;
+        ckpt_drop(g, "a prefill aborted over it");
+        g->ckpt.owner = NULL;
+        g->card_owner = NULL;
+        g->prefill_last_batched = -1;
+        g->prefill_aborted = true;
+    }
+    if (state)
+        state->pos = 0;
+    return NULL;
 }
 
 /** The resident model behind `model`, or NULL. */
@@ -273,6 +297,13 @@ void pn_qwen35moe_tt_checkpoint_ceiling(pn_model *model, const pn_state *state, 
         return;
     g->ckpt.ceiling = ceiling;
     g->ckpt.ceiling_owner = state;
+}
+
+int pn_qwen35moe_tt_checkpoint_available(const pn_model *model)
+{
+    const pn_qwen35_tt *g = ckpt_model(model);
+
+    return g && g->resident && g->gdn_on_card && !g->ckpt_off && pn_qwen35_tt_ckpt_enabled();
 }
 
 int pn_qwen35moe_tt_card_holds(const pn_model *model, const pn_state *state)

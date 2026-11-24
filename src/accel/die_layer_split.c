@@ -12,6 +12,8 @@
 #include "die_layer_split.h"
 
 #include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 /* The boundary before die `idx` of an n_die-way split of n_layer layers.
  * Computed in `long` because n_layer * idx overflows int for absurd inputs
@@ -29,12 +31,55 @@ static int split_args_ok(int n_layer, int n_die)
            n_die <= PN_DIE_LAYER_SPLIT_MAX_DIES && n_die <= n_layer;
 }
 
+/* PN_DIE_SPLIT_LAYERS=b1,b2,...: the N-1 boundaries of an N-die split, for
+ * placements where the flat split does not fit (the head die also carries the
+ * LM head and the MTP head). Used only when it names exactly n_die-1 strictly
+ * increasing boundaries inside (0, n_layer); anything else is ignored with a
+ * warning, never half-applied. Fills b[0..n_die] (b[0] = 0, b[n_die] =
+ * n_layer) and returns 1 when it applies. */
+static int env_boundaries(int n_layer, int n_die, int *b)
+{
+    const char *env = getenv("PN_DIE_SPLIT_LAYERS");
+    if (!env || !*env || n_die < 2)
+        return 0;
+    const char *p = env;
+    int n = 0;
+    b[0] = 0;
+    while (*p && n < n_die - 1) {
+        char *end;
+        long v = strtol(p, &end, 10);
+        if (end == p || v <= b[n] || v >= n_layer)
+            break;
+        b[++n] = (int)v;
+        p = (*end == ',') ? end + 1 : end;
+        if (*end != ',' && *end)
+            break;
+    }
+    if (n != n_die - 1 || *p) {
+        fprintf(stderr, "die_layer_split: PN_DIE_SPLIT_LAYERS='%s' ignored — "
+                "needs %d increasing boundaries in (0,%d)\n", env, n_die - 1,
+                n_layer);
+        return 0;
+    }
+    b[n_die] = n_layer;
+    return 1;
+}
+
 int pn_plan_die_layer_split(int n_layer, int n_die, int override_boundary,
                             pn_die_layer_split *out)
 {
     if (!out || !split_args_ok(n_layer, n_die))
         return -1;
 
+    int eb[PN_DIE_LAYER_SPLIT_MAX_DIES + 1];
+    if (env_boundaries(n_layer, n_die, eb)) {
+        for (int i = 0; i < n_die; i++) {
+            out->layer_lo[i] = eb[i];
+            out->layer_hi[i] = eb[i + 1];
+        }
+        out->n_die = n_die;
+        return 0;
+    }
     for (int i = 0; i < n_die; i++) {
         out->layer_lo[i] = split_boundary(n_layer, n_die, i);
         out->layer_hi[i] = (i == n_die - 1) ? n_layer
@@ -59,6 +104,15 @@ int pn_die_layer_range(int n_layer, int n_die, int idx, int *lo_out,
 {
     if (!split_args_ok(n_layer, n_die) || idx < 0 || idx >= n_die)
         return -1;
+
+    int eb[PN_DIE_LAYER_SPLIT_MAX_DIES + 1];
+    if (env_boundaries(n_layer, n_die, eb)) {
+        if (lo_out)
+            *lo_out = eb[idx];
+        if (hi_out)
+            *hi_out = eb[idx + 1];
+        return 0;
+    }
 
     if (lo_out)
         *lo_out = split_boundary(n_layer, n_die, idx);

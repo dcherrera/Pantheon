@@ -15,7 +15,9 @@
 
 #ifdef USE_TT
 
+#include "pn_tt_attention_grid.h"
 #include "pn_tt_device_internal.h"
+#include "pn_tt_attention_splitk.h"
 #include "pn_tt_gdngate.h"
 #include "pn_tt_reader.h"
 #include "pn_tt_core_boot_guard.h"
@@ -23,9 +25,15 @@
 #include "pn_tt_eltwise_group.h"
 #include "pn_tt_gdnc.h"
 #include "pn_tt_gate.h"
+#include "pn_tt_kv_append_split.h"
 #include "pn_tt_render.h"
+#include "pn_tt_moe.h"
+#include "pn_tt_norm_role.h"
 #include "pn_tt_replica_map.h"
+#include "pn_tt_strip_placement.h"
+#include "pn_tt_weight_view.h"
 
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -107,7 +115,8 @@ double pn_tt_now_seconds(void)
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
-uint32_t pn_tt_env_u32(const char *name, uint32_t fallback)
+/** Parse `name` from the environment: the value, or `fallback` when unset or not a number. */
+static uint32_t pn_tt_env_u32_parse(const char *name, uint32_t fallback)
 {
     const char *value = getenv(name);
     char *end = NULL;
@@ -119,6 +128,32 @@ uint32_t pn_tt_env_u32(const char *name, uint32_t fallback)
     if (!end || *end != '\0')
         return fallback;
     return (uint32_t)parsed;
+}
+
+/**
+ * CACHED BY NAME POINTER (qwen36 plan S2): descriptor builders call this per descriptor, and
+ * getenv() is a scan of the whole environment — 13 ms of host CPU a Qwen3.6 token in the
+ * replay profile. No PN_TT_* variable changes after start (nothing in Pantheon sets one), so
+ * the first answer for a (name, fallback) pair is kept. Called from the forward's thread.
+ */
+#define PN_TT_ENV_CACHE 128u
+uint32_t pn_tt_env_u32(const char *name, uint32_t fallback)
+{
+    static struct {
+        const char *name;
+        uint32_t fallback, value;
+    } cache[PN_TT_ENV_CACHE];
+    static uint32_t used;
+
+    for (uint32_t i = 0; i < used; i++)
+        if (cache[i].name == name && cache[i].fallback == fallback)
+            return cache[i].value;
+    if (used == PN_TT_ENV_CACHE)
+        return pn_tt_env_u32_parse(name, fallback);
+    cache[used].name = name;
+    cache[used].fallback = fallback;
+    cache[used].value = pn_tt_env_u32_parse(name, fallback);
+    return cache[used++].value;
 }
 
 /** The program directory for a weight tile size, or NULL if we hold no program for it. */
@@ -297,6 +332,64 @@ static int pn_tt_bring_up_core(pn_tt_device *device, const char *root)
     return 0;
 }
 
+/* The devices this process has open, so the hardware report can read each card's DRAM
+ * allocators. A device is listed only between a successful open and the start of its close,
+ * and its allocator is read under the lock, so a read never sees a device being freed. */
+#define PN_TT_OPEN_MAX 8
+static pthread_mutex_t g_open_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct {
+    const pn_tt_device *device;
+    int index;
+} g_open[PN_TT_OPEN_MAX];
+
+static void pn_tt_open_note(const pn_tt_device *device, int device_index)
+{
+    pthread_mutex_lock(&g_open_lock);
+    for (int i = 0; i < PN_TT_OPEN_MAX; i++) {
+        if (!g_open[i].device) {
+            g_open[i].device = device;
+            g_open[i].index = device_index;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_open_lock);
+}
+
+static void pn_tt_open_forget(const pn_tt_device *device)
+{
+    pthread_mutex_lock(&g_open_lock);
+    for (int i = 0; i < PN_TT_OPEN_MAX; i++)
+        if (g_open[i].device == device)
+            g_open[i].device = NULL;
+    pthread_mutex_unlock(&g_open_lock);
+}
+
+int pn_tt_device_dram_usage_on(int device_index, uint64_t *used_out, uint64_t *total_out)
+{
+    uint64_t used = 0u, total = 0u;
+    int found = 0;
+
+    pthread_mutex_lock(&g_open_lock);
+    for (int i = 0; i < PN_TT_OPEN_MAX; i++) {
+        uint64_t u = 0u, t = 0u;
+
+        if (!g_open[i].device || g_open[i].index != device_index)
+            continue;
+        pn_tt_device_dram_usage(g_open[i].device, &u, &t);
+        used += u;
+        total = t > total ? t : total;
+        found = 1;
+    }
+    pthread_mutex_unlock(&g_open_lock);
+    if (!found)
+        return -1;
+    if (used_out)
+        *used_out = used;
+    if (total_out)
+        *total_out = total;
+    return 0;
+}
+
 int pn_tt_device_open(int device_index, pn_tt_device **out_device)
 {
     /* NULL means the embedded blob, and NULL is the normal case. Passed through rather than
@@ -375,6 +468,7 @@ int pn_tt_device_open(int device_index, pn_tt_device **out_device)
         goto fail;
 
     *out_device = device;
+    pn_tt_open_note(device, device_index);
     return 0;
 
 fail:
@@ -428,6 +522,7 @@ void pn_tt_device_close(pn_tt_device *device)
 {
     if (!device)
         return;
+    pn_tt_open_forget(device);
     /* The reader thread holds its own window bank: joined before anything is torn down. */
     pn_tt_reader_close(device);
     /* The residency is retired by ASKING; the one-shot path has nothing to retire, because
@@ -455,8 +550,17 @@ void pn_tt_device_close(pn_tt_device *device)
     }
     pn_tt_matmul_grid_close(device);
     pn_tt_matmul_group_retire(device);
+    pn_tt_moe_release(device);
+    pn_tt_norm_role_teardown(device);
+    free(device->norm_role);
+    device->norm_role = NULL;
     pn_tt_residency_release(&device->reduce);
-    pn_tt_residency_release(&device->reduce_member);
+    {
+        uint32_t m;
+
+        for (m = 0; m + 1u < PN_TT_REDUCE_MAX_MEMBERS; m++)
+            pn_tt_residency_release(&device->reduce_member[m]);
+    }
     {
         uint32_t f;
 
@@ -481,12 +585,14 @@ void pn_tt_device_close(pn_tt_device *device)
         device->sample_members = 0u;
     }
     pn_tt_residency_release(&device->rope);
+    pn_tt_kv_append_members_release(device);
     pn_tt_residency_release(&device->memory);
     pn_tt_residency_release(&device->puller);
     pn_tt_residency_release(&device->attention);
     for (uint32_t member = 1u; member < device->attention_members; member++)
         pn_tt_residency_release(&device->attention_member[member - 1u]);
     device->attention_members = 0u;
+    pn_tt_attention_splitk_release(device);
     /* THE PER-PHASE FIGURE PRINTS AT RELEASE, NOT ON A TOKEN MULTIPLE, and that is a fix
      * rather than a duplicate of the report line.
      *
@@ -542,6 +648,12 @@ void pn_tt_device_close(pn_tt_device *device)
     pn_tt_render_release(device);
     pn_tt_gate_release(device);
     free(device->kv_region);
+    /* C's borrowed grid members, if a prefill stopped while they lived: retired and parked
+     * like every other residency here, never left running for the next process. */
+    if (device->attention_grid_count != 0u)
+        (void)pn_tt_attention_grid_park_all(device, NULL, NULL);
+    free(device->attention_grid);
+    device->attention_grid = NULL;
     device->kv_region = NULL;
     free(device->gdn_region);
     device->gdn_region = NULL;
@@ -595,6 +707,19 @@ static uint32_t pn_tt_gcd(uint32_t a, uint32_t b)
  * prefetch depth has to divide, because a depth that does not divide a later descriptor's
  * Kt collapses to 1 on the card and walks the CB write pointer off the block grid.
  */
+/**
+ * The MoE block's own weights, which no dense family reads: a routed-expert stack (Bfp6_b,
+ * per-expert placement) and an fp32 router (`ffn_gate_inp`, spec §11 D4: 4096 B tiles, its
+ * own program in qwen36 plan Phase 5.3). Neither decides the dense triad's tile size.
+ */
+static bool pn_tt_entry_is_moe_block(const ft_tt_artifact_entry *entry)
+{
+    if (ft_tt_fttw_expert_count(entry) > 1u)
+        return true;
+    return entry->format == FT_TT_FORMAT_FP32 && strstr(entry->name, "ffn_gate_inp") != NULL &&
+           strstr(entry->name, "ffn_gate_inp_shexp") == NULL;
+}
+
 static void pn_tt_scan_extents(pn_tt_device *device)
 {
     uint32_t index;
@@ -606,7 +731,9 @@ static void pn_tt_scan_extents(pn_tt_device *device)
         const ft_tt_artifact_entry *entry = &device->artifact.directory[index];
         uint32_t entry_tile_bytes;
 
-        if (entry->layout != FT_TT_LAYOUT_MATMUL_NMAJOR)
+        /* Routed-expert stacks and the fp32 router are the MoE block's, never the dense
+         * triad's: their tile sizes (832 B, 4096 B) do not decide the dense program. */
+        if (entry->layout != FT_TT_LAYOUT_MATMUL_NMAJOR || pn_tt_entry_is_moe_block(entry))
             continue;
         if (entry->tile_rows > device->max_tile_rows)
             device->max_tile_rows = entry->tile_rows;
@@ -796,12 +923,96 @@ static int pn_tt_stage_activation_zeros(pn_tt_device *device)
     return 0;
 }
 
-int pn_tt_device_load_artifact(pn_tt_device *device, const char *path)
+/**
+ * A routed-expert stack's DRAM, reserved and NOT written: the Qwen3.6 MoE census arm
+ * (`PN_TT_Q36_CENSUS=1`) needs every expert byte held so the fit is the real one, and no
+ * expert placement exists before the MoE block does.
+ * Spread evenly over the banks, as a per-member expert placement will spread them.
+ */
+static int pn_tt_reserve_expert_stack(pn_tt_device *device, const ft_tt_artifact_entry *entry)
 {
-    uint32_t index;
-    double started;
+    const uint32_t banks = device->dram_bank_count;
+    const uint64_t share = (entry->byte_count / banks + 63u) / 64u * 64u;
 
-    if (!device || !path)
+    for (uint32_t bank = 0; bank < banks; bank++) {
+        ft_tt_buffer buffer;
+
+        if (ft_tt_buffer_alloc(&device->allocator, FT_TT_MEM_SPACE_DRAM, bank, share, &buffer) != FT_TT_OK) {
+            fprintf(stderr, "pn_tt: DRAM full reserving %s (%.1f MiB a bank)\n", entry->name,
+                    (double)share / (1024.0 * 1024.0));
+            return -1;
+        }
+    }
+    device->resident_bytes += share * banks;
+    return 0;
+}
+
+/** Resident-table slots this artifact needs: one per tensor, plus the extra parts of every
+ *  tensor the split rule uploads as parts. */
+static uint32_t pn_tt_resident_slots_needed(const pn_tt_device *device)
+{
+    uint32_t slots = device->artifact.header.tensor_count;
+
+    if (!device->weight_split_set)
+        return slots;
+    for (uint32_t index = 0; index < device->artifact.header.tensor_count; index++) {
+        const ft_tt_artifact_entry *entry = &device->artifact.directory[index];
+
+        if (entry->layout == FT_TT_LAYOUT_MATMUL_NMAJOR &&
+            pn_tt_weight_split_applies(&device->weight_split, entry->name, entry->tile_cols))
+            slots += pn_tt_weight_split_part_count(&device->weight_split) - 1u;
+    }
+    return slots;
+}
+
+/**
+ * Place one N-major tensor: whole, or as the column parts the split rule names.
+ *
+ * Where each upload goes is the GROUP's decision, because the number of banks a weight is
+ * spread over is the number of cores that will read it (pn_tt_matmul_group.h). Parts take
+ * consecutive cursor positions from the tensor's own, and the cursor then moves on by ONE as
+ * it would for the whole tensor, so every later tensor keeps the bank run it had before.
+ */
+static int pn_tt_place_resident_entry(pn_tt_device *device, const ft_tt_artifact_entry *entry,
+                                      uint32_t tile_bytes)
+{
+    pn_tt_weight_upload_part parts[PN_TT_WEIGHT_SPLIT_MAX_PARTS];
+    const uint32_t start = device->weight_bank_cursor;
+    const uint32_t count = pn_tt_weight_upload_parts(
+        device->weight_split_set ? &device->weight_split : NULL, entry->name, entry->tile_cols,
+        entry->byte_count, parts);
+
+    if (count == 0u) {
+        fprintf(stderr, "pn_tt: %s (%u column tiles, %llu B) cannot be cut into its parts\n",
+                entry->name, entry->tile_cols, (unsigned long long)entry->byte_count);
+        return -1;
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        pn_tt_resident *slot = &device->resident[device->resident_count];
+        const bool whole = parts[i].part < 0;
+
+        snprintf(slot->name, sizeof(slot->name), "%s", entry->name);
+        slot->part = parts[i].part;
+        slot->weight.tile_rows = entry->tile_rows;
+        slot->weight.tile_cols = parts[i].tile_cols;
+        slot->weight.tile_bytes = tile_bytes;
+        slot->weight.in_features = entry->tile_rows * PN_TT_TILE_DIM;
+        slot->weight.out_features = parts[i].tile_cols * PN_TT_TILE_DIM;
+        if (pn_tt_matmul_group_place_weight_columns(device, entry, whole ? NULL : parts[i].runs,
+                                                    whole ? 0u : parts[i].run_count,
+                                                    &device->weight_bank_cursor,
+                                                    &slot->weight) != 0)
+            return -1;
+        device->resident_count++;
+        device->resident_bytes += parts[i].bytes;
+    }
+    device->weight_bank_cursor = (start + 1u) % device->dram_bank_count;
+    return 0;
+}
+
+int pn_tt_device_open_artifact(pn_tt_device *device, const char *path)
+{
+    if (!device || !path || device->artifact_open)
         return -1;
     if (ft_tt_fttw_open(path, &device->artifact) != FT_TT_OK) {
         fprintf(stderr, "pn_tt: cannot open artifact %s\n", path);
@@ -827,15 +1038,55 @@ int pn_tt_device_load_artifact(pn_tt_device *device, const char *path)
             return -1;
         }
     }
+    return 0;
+}
 
-    device->resident = calloc(device->artifact.header.tensor_count, sizeof(*device->resident));
+int pn_tt_device_artifact_matmul_bytes(const pn_tt_device *device, const char *suffix,
+                                       uint64_t *total, uint64_t *suffix_total)
+{
+    const size_t suffix_length = suffix ? strlen(suffix) : 0u;
+
+    if (!device || !device->artifact_open || !total || !suffix_total)
+        return -1;
+    *total = *suffix_total = 0u;
+    for (uint32_t index = 0; index < device->artifact.header.tensor_count; index++) {
+        const ft_tt_artifact_entry *entry = &device->artifact.directory[index];
+        const size_t length = strlen(entry->name);
+
+        if (entry->layout != FT_TT_LAYOUT_MATMUL_NMAJOR)
+            continue;
+        *total += entry->byte_count;
+        if (suffix_length && length >= suffix_length &&
+            strcmp(entry->name + length - suffix_length, suffix) == 0)
+            *suffix_total += entry->byte_count;
+    }
+    return 0;
+}
+
+int pn_tt_device_load_artifact(pn_tt_device *device, const char *path)
+{
+    return pn_tt_device_open_artifact(device, path) == 0 ? pn_tt_device_place_artifact(device)
+                                                         : -1;
+}
+
+int pn_tt_device_place_artifact(pn_tt_device *device)
+{
+    const char *census = getenv("PN_TT_Q36_CENSUS");
+    uint32_t expert_stacks = 0;
+    uint32_t fp32_routers = 0;
+    uint32_t deferred_moe = 0;
+    uint32_t index;
+    double started;
+
+    if (!device || !device->artifact_open || device->resident)
+        return -1;
+    device->resident = calloc(pn_tt_resident_slots_needed(device), sizeof(*device->resident));
     if (!device->resident)
         return -1;
 
     started = pn_tt_now_seconds();
     for (index = 0; index < device->artifact.header.tensor_count; index++) {
         const ft_tt_artifact_entry *entry = &device->artifact.directory[index];
-        pn_tt_resident *slot = &device->resident[device->resident_count];
         uint32_t tile_bytes;
 
         /* Only matmul weights. A tensor in SOURCE layout is either a 1-D norm the engine
@@ -843,30 +1094,47 @@ int pn_tt_device_load_artifact(pn_tt_device *device, const char *path)
          * this format (pn_tt_device.h). Uploading either would be dead weight in DRAM. */
         if (entry->layout != FT_TT_LAYOUT_MATMUL_NMAJOR)
             continue;
+        /* A routed-expert stack or an fp32 router is not a matmul weight of the dense
+         * families: it needs the MoE block's placement and programs. Reserved on the census
+         * arm; refused otherwise. */
+        if (pn_tt_entry_is_moe_block(entry)) {
+            /* The MoE block places these itself (pn_tt_moe.c), after the dense load. */
+            if (device->moe_defer_weights) {
+                deferred_moe++;
+                continue;
+            }
+            if (!census || atoi(census) != 1) {
+                fprintf(stderr, "pn_tt: %s is a MoE-block weight (expert stack or fp32 router) and no "
+                                "MoE block is built (PN_TT_Q36_CENSUS=1 reserves its DRAM for the "
+                                "census)\n", entry->name);
+                return -1;
+            }
+            if (pn_tt_reserve_expert_stack(device, entry) != 0)
+                return -1;
+            if (ft_tt_fttw_expert_count(entry) > 1u)
+                expert_stacks++;
+            else
+                fp32_routers++;
+            continue;
+        }
         tile_bytes = ft_tt_fttw_tile_bytes(entry->format);
         if (tile_bytes == 0 || pn_tt_program_for(device, tile_bytes) == NULL) {
             fprintf(stderr, "pn_tt: no matmul program for %s (tile %u bytes)\n", entry->name,
                     tile_bytes);
             return -1;
         }
-        snprintf(slot->name, sizeof(slot->name), "%s", entry->name);
-        slot->weight.tile_rows = entry->tile_rows;
-        slot->weight.tile_cols = entry->tile_cols;
-        slot->weight.tile_bytes = tile_bytes;
-        slot->weight.in_features = entry->tile_rows * PN_TT_TILE_DIM;
-        slot->weight.out_features = entry->tile_cols * PN_TT_TILE_DIM;
-        /* Where it goes is the GROUP's decision, because the number of banks a weight is
-         * spread over is the number of cores that will read it (pn_tt_matmul_group.h). At
-         * one member this is the same one-bank placement it always was. */
-        if (pn_tt_matmul_group_place_weight(device, entry, &device->weight_bank_cursor,
-                                            &slot->weight) != 0)
+        if (pn_tt_place_resident_entry(device, entry, tile_bytes) != 0)
             return -1;
-        device->resident_count++;
-        device->resident_bytes += entry->byte_count;
     }
     fprintf(stderr, "pn_tt: %u matmul weights resident, %.1f MiB, %.1f s\n",
             device->resident_count, (double)device->resident_bytes / (1024.0 * 1024.0),
             pn_tt_now_seconds() - started);
+    if (deferred_moe)
+        fprintf(stderr, "pn_tt: %u MoE-block weights (expert stacks, fp32 routers) left to the "
+                        "MoE block's own placement\n", deferred_moe);
+    if (expert_stacks || fp32_routers)
+        fprintf(stderr, "pn_tt: CENSUS — %u routed-expert stacks and %u fp32 routers RESERVED in "
+                        "DRAM, not uploaded (counted as weights above)\n", expert_stacks, fp32_routers);
     pn_tt_matmul_group_report(device);
     if (device->resident_count == 0)
         return -1;
@@ -892,12 +1160,44 @@ int pn_tt_device_find_weight(const pn_tt_device *device, const char *name,
     if (!device || !name || !out_weight)
         return -1;
     for (index = 0; index < device->resident_count; index++) {
-        if (strcmp(device->resident[index].name, name) == 0) {
+        if (device->resident[index].part < 0 && strcmp(device->resident[index].name, name) == 0) {
             *out_weight = device->resident[index].weight;
             return 0;
         }
     }
     return -1;
+}
+
+int pn_tt_device_find_weight_part(const pn_tt_device *device, const char *name, uint32_t part,
+                                  pn_tt_weight *out_weight)
+{
+    if (!device || !name || !out_weight)
+        return -1;
+    for (uint32_t index = 0; index < device->resident_count; index++) {
+        const pn_tt_resident *slot = &device->resident[index];
+
+        if (slot->part == (int32_t)part && strcmp(slot->name, name) == 0) {
+            *out_weight = slot->weight;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+int pn_tt_device_split_weights_at_load(pn_tt_device *device, const char *suffix,
+                                       uint32_t fields, uint32_t field_tiles,
+                                       uint32_t part_tiles)
+{
+    if (!device || device->resident || device->weight_split_set)
+        return -1;
+    if (pn_tt_weight_split_rule_init(&device->weight_split, suffix, fields, field_tiles,
+                                     part_tiles) != 0) {
+        fprintf(stderr, "pn_tt: cannot split *%s into %u-tile parts of %u fields x %u tiles\n",
+                suffix ? suffix : "(null)", part_tiles, fields, field_tiles);
+        return -1;
+    }
+    device->weight_split_set = true;
+    return 0;
 }
 
 int pn_tt_device_stage_weight_columns(pn_tt_device *device, const char *source_name,
@@ -937,13 +1237,23 @@ int pn_tt_device_stage_weight_columns(pn_tt_device *device, const char *source_n
                 out_weight->tile_bytes);
         return -1;
     }
-    /* A SECOND COPY IN DRAM, and it is deliberate — the source stays resident because the
-     * artifact's own placement is what every other tensor's bank rotation was computed
-     * against, and freeing one tensor out of the middle of that would be a hole the
-     * allocator cannot reuse anyway. For Ornith's `attn_q` at 71.3 MiB a layer this is
-     * 570 MiB over 8 attention layers against 32 GB of board memory. */
+    /* A SECOND COPY IN DRAM when the source is resident too: the bump allocator cannot free
+     * one tensor out of the middle of the rotation. A tensor that is only ever read as its
+     * parts is split AT LOAD instead (pn_tt_device_split_weights_at_load) — the joint
+     * `attn_q` was 0.996 GiB of such copies on Qwen3.8-27B. */
     return pn_tt_matmul_group_place_weight_columns(device, entry, runs, run_count,
                                                    &device->weight_bank_cursor, out_weight);
+}
+
+int pn_tt_device_view_weight_columns(const pn_tt_device *device, const pn_tt_weight *source,
+                                     const pn_tt_column_run *runs, uint32_t run_count,
+                                     pn_tt_weight *out_weight)
+{
+    if (!device || device->group.cooperative_requested || device->group.cooperative)
+        return -1;
+    return pn_tt_weight_column_view(source, runs, run_count,
+                                    device->group.member_count ? device->group.member_count : 1u,
+                                    out_weight);
 }
 
 /* ================================================================
@@ -970,6 +1280,149 @@ static void pn_tt_extra_swap(pn_tt_device *device)
 
     device->artifact = device->extra_artifact;
     device->extra_artifact = t;
+}
+
+int pn_tt_device_reserve_extra_expert_stacks(pn_tt_device *device)
+{
+    uint32_t reserved = 0;
+
+    if (!device || !device->extra_open)
+        return -1;
+    for (uint32_t i = 0; i < device->extra_artifact.header.tensor_count; i++) {
+        const ft_tt_artifact_entry *entry = &device->extra_artifact.directory[i];
+
+        if (entry->layout != FT_TT_LAYOUT_MATMUL_NMAJOR || !pn_tt_entry_is_moe_block(entry))
+            continue;
+        if (pn_tt_reserve_expert_stack(device, entry) != 0)
+            return -1;
+        reserved++;
+    }
+    fprintf(stderr, "pn_tt: CENSUS — %u MoE-block weights (expert stacks, fp32 router) of the extra "
+                    "artifact RESERVED\n", reserved);
+    return (int)reserved;
+}
+
+int pn_tt_dram_alloc_any(pn_tt_device *device, size_t bytes, ft_tt_buffer *out)
+{
+    uint32_t first, tried[FT_TT_MAX_DRAM_BANKS] = { 0 };
+
+    if (!device || !out || device->dram_bank_count == 0u)
+        return -1;
+    first = device->strip_bank_cursor++ % device->dram_bank_count;
+    if (ft_tt_buffer_alloc(&device->allocator, FT_TT_MEM_SPACE_DRAM, first, bytes, out) == FT_TT_OK)
+        return 0;
+    tried[first] = 1u;
+    for (uint32_t attempt = 1u; attempt < device->dram_bank_count; attempt++) {
+        uint32_t best = device->dram_bank_count;
+        size_t best_free = 0u;
+
+        for (uint32_t b = 0; b < device->dram_bank_count; b++) {
+            const size_t free_bytes =
+                ft_tt_allocator_free_bytes(&device->allocator, FT_TT_MEM_SPACE_DRAM, b);
+
+            if (!tried[b] && free_bytes >= bytes && free_bytes > best_free) {
+                best = b;
+                best_free = free_bytes;
+            }
+        }
+        if (best == device->dram_bank_count)
+            break;
+        tried[best] = 1u;
+        if (ft_tt_buffer_alloc(&device->allocator, FT_TT_MEM_SPACE_DRAM, best, bytes, out) ==
+            FT_TT_OK) {
+            fprintf(stderr, "pn_tt: DRAM bank %u is full for %zu bytes — placed in bank %u\n",
+                    first, bytes, best);
+            return 0;
+        }
+    }
+    return -1;
+}
+
+uint32_t pn_tt_device_dram_free_banks(const pn_tt_device *device, uint64_t *free_bytes,
+                                      uint32_t max_banks)
+{
+    if (!device || !free_bytes || device->dram_bank_count == 0u ||
+        device->dram_bank_count > max_banks)
+        return 0u;
+    for (uint32_t b = 0; b < device->dram_bank_count; b++)
+        free_bytes[b] = ft_tt_allocator_free_bytes(&device->allocator, FT_TT_MEM_SPACE_DRAM, b);
+    return device->dram_bank_count;
+}
+
+uint32_t pn_tt_device_strip_cursor(const pn_tt_device *device)
+{
+    return device ? device->strip_bank_cursor : 0u;
+}
+
+int pn_tt_dram_alloc_emptiest(pn_tt_device *device, size_t bytes, ft_tt_buffer *out)
+{
+    uint64_t free_bytes[FT_TT_MAX_DRAM_BANKS];
+    uint32_t bank;
+
+    if (!device || !out || device->dram_bank_count == 0u ||
+        device->dram_bank_count > FT_TT_MAX_DRAM_BANKS)
+        return -1;
+    for (uint32_t b = 0; b < device->dram_bank_count; b++)
+        free_bytes[b] = ft_tt_allocator_free_bytes(&device->allocator, FT_TT_MEM_SPACE_DRAM, b);
+    bank = pn_tt_strip_placement_emptiest_bank(free_bytes, device->dram_bank_count, bytes);
+    if (bank >= device->dram_bank_count)
+        return -1;
+    return ft_tt_buffer_alloc(&device->allocator, FT_TT_MEM_SPACE_DRAM, bank, bytes, out) ==
+                   FT_TT_OK
+               ? 0
+               : -1;
+}
+
+uint64_t pn_tt_device_extra_tensor_bytes(const pn_tt_device *device, const char *name)
+{
+    const ft_tt_artifact_entry *entry;
+
+    if (!device || !name || !device->extra_open)
+        return 0u;
+    entry = ft_tt_fttw_find(&device->extra_artifact, name);
+    return entry ? entry->byte_count : 0u;
+}
+
+int pn_tt_device_artifact_tensor_tiles(const pn_tt_device *device, const char *name,
+                                       uint32_t *tile_rows, uint32_t *tile_cols,
+                                       uint32_t *tile_bytes)
+{
+    const ft_tt_artifact_entry *entry;
+
+    if (!device || !name || !tile_rows || !tile_cols || !tile_bytes || !device->artifact_open)
+        return -1;
+    entry = ft_tt_fttw_find(&device->artifact, name);
+    if (!entry || entry->layout != FT_TT_LAYOUT_MATMUL_NMAJOR)
+        return -1;
+    *tile_rows = entry->tile_rows;
+    *tile_cols = entry->tile_cols;
+    *tile_bytes = ft_tt_fttw_tile_bytes(entry->format);
+    return 0;
+}
+
+int pn_tt_moe_place_extra_stack(pn_tt_device *device, const char *name, pn_tt_moe_stack *out)
+{
+    int rc;
+
+    if (!device || !device->extra_open)
+        return -1;
+    pn_tt_extra_swap(device);
+    rc = pn_tt_moe_place_stack(device, name, out);
+    pn_tt_extra_swap(device);
+    return rc;
+}
+
+int pn_tt_moe_place_extra_router(pn_tt_device *device, const char *name, const float *shexp_gate,
+                                 pn_tt_moe_router *out)
+{
+    int rc;
+
+    if (!device || !device->extra_open)
+        return -1;
+    pn_tt_extra_swap(device);
+    rc = pn_tt_moe_place_router(device, name, shexp_gate, out);
+    pn_tt_extra_swap(device);
+    return rc;
 }
 
 int pn_tt_device_place_extra_weight(pn_tt_device *device, const char *name,
@@ -1066,12 +1519,44 @@ void pn_tt_device_dram_usage(const pn_tt_device *device, uint64_t *used_out,
 void pn_tt_device_report_dram(const pn_tt_device *device, const char *tag)
 {
     const double gib = 1024.0 * 1024.0 * 1024.0;
-    uint64_t used = 0u, total = 0u;
+    uint64_t used = 0u, total = 0u, fullest_used = 0u, fullest_free = 0u;
+    uint32_t fullest = 0u;
 
     pn_tt_device_dram_usage(device, &used, &total);
+    /* The banks fill independently (a bump arena each), so the card is full when its FULLEST
+     * bank is, not when the sum is: the qwen36 fit question is read off this column. */
+    for (uint32_t bank = 0; device && bank < device->dram_bank_count; bank++) {
+        uint64_t bank_used =
+            ft_tt_allocator_used_bytes(&device->allocator, FT_TT_MEM_SPACE_DRAM, bank);
+
+        if (bank_used >= fullest_used) {
+            fullest_used = bank_used;
+            fullest_free = ft_tt_allocator_free_bytes(&device->allocator, FT_TT_MEM_SPACE_DRAM,
+                                                      bank);
+            fullest = bank;
+        }
+    }
     fprintf(stderr, "pn_tt: DRAM %s — %.3f GiB used of %.3f GiB over %u bank(s), %.3f GiB "
-                    "free\n", tag ? tag : "usage", (double)used / gib, (double)total / gib,
-            device ? device->dram_bank_count : 0u, (double)(total - used) / gib);
+                    "free; weights %.3f GiB, non-weight %.3f GiB; fullest bank %u %.3f GiB "
+                    "used %.3f GiB free\n", tag ? tag : "usage", (double)used / gib,
+            (double)total / gib, device ? device->dram_bank_count : 0u,
+            (double)(total - used) / gib,
+            (double)(device ? device->resident_bytes : 0u) / gib,
+            (double)(used - (device ? device->resident_bytes : 0u)) / gib, fullest,
+            (double)fullest_used / gib, (double)fullest_free / gib);
+}
+
+bool pn_tt_device_dram_report_wanted(void)
+{
+    const char *env = getenv("PN_TT_DRAM_REPORT");
+
+    return env && atoi(env) != 0;
+}
+
+void pn_tt_device_report_dram_stage(const pn_tt_device *device, const char *tag)
+{
+    if (pn_tt_device_dram_report_wanted())
+        pn_tt_device_report_dram(device, tag);
 }
 
 int pn_tt_device_rope_is_split_half(const pn_tt_device *device)
@@ -1357,7 +1842,127 @@ int pn_tt_matvec_enqueue(pn_tt_device *device, const pn_tt_weight *weight,
     device->pending[device->pending_count].weight = weight;
     device->pending[device->pending_count].input = *input;
     device->pending[device->pending_count].output = *output;
+    device->pending[device->pending_count].swiglu_up = NULL;
+    device->pending[device->pending_count].resadd = false;
     device->pending_count++;
+    device->matvec_count++;
+    return 0;
+}
+
+int pn_tt_matvec_enqueue_swiglu(pn_tt_device *device, const pn_tt_weight *gate,
+                                const pn_tt_weight *up, const pn_tt_activation *input,
+                                const pn_tt_activation *output)
+{
+    double started;
+    int rc;
+
+    if (!device || !gate || !up || !input || !output)
+        return -1;
+    if (!pn_tt_fuse_swiglu_mode() || !pn_tt_matvec_strips_fit(gate, input, output) ||
+        !pn_tt_matvec_strips_fit(up, input, output))
+        return 1;
+    if (device->pending_count == 0u)
+        pn_tt_resident_idle_refresh(device);
+    if (!device->resident_running)
+        return 1;
+    if (device->pending_count >= pn_tt_matvec_chain_limit() && pn_tt_matvec_flush(device) != 0)
+        return -1;
+    started = pn_tt_now_seconds();
+    rc = pn_tt_matmul_group_enqueue_swiglu(device, gate, up, input, output);
+    started = pn_tt_now_seconds() - started;
+    device->matvec_seconds += started;
+    device->dispatch_seconds += started;
+    device->dispatch_issue_seconds += started;
+    device->dispatch_issues++;
+    /* REFUSED BEFORE ANYTHING WAS WRITTEN: the caller runs gate, up and silu_mul unfused. */
+    if (rc == FT_TT_EINVAL)
+        return 1;
+    if (rc != FT_TT_OK)
+        return -1;
+    device->pending[device->pending_count].weight = gate;
+    device->pending[device->pending_count].input = *input;
+    device->pending[device->pending_count].output = *output;
+    device->pending[device->pending_count].swiglu_up = up;
+    device->pending[device->pending_count].resadd = false;
+    device->pending_count++;
+    device->matvec_count += 2u; /* the gate and up projections it replaces */
+    return 0;
+}
+
+/** Replay one FUSED projection on a re-armed residency, issued and awaited (the arm re-planted
+ *  the members' replica table). A fused shape the re-armed group refuses is an error: the
+ *  unfused replay would need the gate/up strips, which this level does not know. */
+static int pn_tt_matvec_replay_swiglu(pn_tt_device *device, const pn_tt_weight *gate,
+                                      const pn_tt_weight *up, const pn_tt_activation *input,
+                                      const pn_tt_activation *output)
+{
+    if (pn_tt_matmul_group_flush(device) != FT_TT_OK ||
+        pn_tt_matmul_group_enqueue_swiglu(device, gate, up, input, output) != FT_TT_OK ||
+        pn_tt_matmul_group_flush(device) != FT_TT_OK) {
+        fprintf(stderr, "pn_tt: a fused SwiGLU projection could not be replayed after the "
+                        "re-arm\n");
+        return -1;
+    }
+    device->matvec_count += 2u;
+    return 0;
+}
+
+int pn_tt_matvec_resadd(pn_tt_device *device, const pn_tt_weight *weight,
+                        const pn_tt_activation *input, const pn_tt_activation *residual,
+                        const pn_tt_activation *output)
+{
+    double started;
+    int rc;
+
+    if (!device || !weight || !input || !residual || !output)
+        return -1;
+    if (!pn_tt_fuse_resadd_mode() || !pn_tt_matvec_strips_fit(weight, input, output))
+        return 1;
+    /* THE WAITING FORM FLUSHES FIRST, as pn_tt_matvec_resident(): chained work may write the
+     * input or the residual this projection reads. */
+    if (pn_tt_matvec_flush(device) != 0)
+        return -1;
+    pn_tt_resident_idle_refresh(device);
+    if (!device->resident_running)
+        return 1;
+    started = pn_tt_now_seconds();
+    rc = pn_tt_matmul_group_enqueue_resadd(device, weight, input, residual, output);
+    started = pn_tt_now_seconds() - started;
+    device->matvec_seconds += started;
+    device->dispatch_seconds += started;
+    device->dispatch_issue_seconds += started;
+    device->dispatch_issues++;
+    /* REFUSED BEFORE ANYTHING WAS WRITTEN: the caller runs the projection and the add. */
+    if (rc == FT_TT_EINVAL)
+        return 1;
+    if (rc != FT_TT_OK)
+        return -1;
+    device->pending[device->pending_count].weight = weight;
+    device->pending[device->pending_count].input = *input;
+    device->pending[device->pending_count].output = *output;
+    device->pending[device->pending_count].swiglu_up = NULL;
+    device->pending[device->pending_count].resadd = true;
+    device->pending[device->pending_count].residual = *residual;
+    device->pending_count++;
+    device->matvec_count++;
+    return pn_tt_matvec_flush(device) == 0 ? 0 : -1;
+}
+
+/** Replay one RESADD projection on a re-armed residency, issued and awaited. A shape the
+ *  re-armed group refuses is an error: the unfused replay would need `project`, which this
+ *  level does not know. */
+static int pn_tt_matvec_replay_resadd(pn_tt_device *device, const pn_tt_weight *weight,
+                                      const pn_tt_activation *input,
+                                      const pn_tt_activation *residual,
+                                      const pn_tt_activation *output)
+{
+    if (pn_tt_matmul_group_flush(device) != FT_TT_OK ||
+        pn_tt_matmul_group_enqueue_resadd(device, weight, input, residual, output) != FT_TT_OK ||
+        pn_tt_matmul_group_flush(device) != FT_TT_OK) {
+        fprintf(stderr, "pn_tt: a fused residual-add projection could not be replayed after "
+                        "the re-arm\n");
+        return -1;
+    }
     device->matvec_count++;
     return 0;
 }
@@ -1406,8 +2011,25 @@ int pn_tt_matvec_flush(pn_tt_device *device)
         pn_tt_matmul_group_retire(device);
         device->resident_restarts++;
         pn_tt_arm_residency(device);
-        device->matvec_count -= pending;
+        for (index = 0; index < pending; index++)
+            device->matvec_count -= device->pending[index].swiglu_up ? 2u : 1u;
         for (index = 0; index < pending; index++) {
+            if (device->pending[index].swiglu_up) {
+                if (pn_tt_matvec_replay_swiglu(device, device->pending[index].weight,
+                                               device->pending[index].swiglu_up,
+                                               &device->pending[index].input,
+                                               &device->pending[index].output) != 0)
+                    return -1;
+                continue;
+            }
+            if (device->pending[index].resadd) {
+                if (pn_tt_matvec_replay_resadd(device, device->pending[index].weight,
+                                               &device->pending[index].input,
+                                               &device->pending[index].residual,
+                                               &device->pending[index].output) != 0)
+                    return -1;
+                continue;
+            }
             if (pn_tt_matvec_resident(device, device->pending[index].weight,
                                       &device->pending[index].input,
                                       &device->pending[index].output) != 0)
@@ -1419,9 +2041,11 @@ int pn_tt_matvec_flush(pn_tt_device *device)
     /* OUTSIDE the timed phase, and only now: the dump reads each projection's OUTPUT strip
      * off the card, which is not written until the member that owns those columns is done. */
     if (device->matvec_dump) {
+        /* A fused entry's output is silu(gate) * up, not the gate's projection: not dumped. */
         for (index = 0; index < pending; index++)
-            pn_tt_dump_result_row(device, device->pending[index].weight,
-                                  &device->pending[index].output);
+            if (!device->pending[index].swiglu_up && !device->pending[index].resadd)
+                pn_tt_dump_result_row(device, device->pending[index].weight,
+                                      &device->pending[index].output);
     }
     return 0;
 }
@@ -1546,9 +2170,10 @@ const pn_tt_descriptor_census *pn_tt_device_census(const pn_tt_device *device)
  *  cost was being estimated by subtraction. The eltwise SPLIT MEMBERS are here and are not in
  *  the per-family report: that report keys on a name, and a member shares member 0's. */
 #define PN_TT_RESIDENCY_TABLE_MAX                                                             \
-    (9u + (PN_TT_TOPK_MAX_MEMBERS - 1u) + PN_TT_RENDER_DIRECTIONS * PN_TT_RENDER_SPLIT_MAX_MEMBERS +                          \
+    (9u + (PN_TT_REDUCE_MAX_MEMBERS - 2u) + (PN_TT_TOPK_MAX_MEMBERS - 1u) + PN_TT_RENDER_DIRECTIONS * PN_TT_RENDER_SPLIT_MAX_MEMBERS +                          \
      PN_TT_HEAD_NORM_MAX_WIDTHS * PN_TT_HEAD_NORM_MAX_MEMBERS +                              \
-     PN_TT_ELTWISE_SPLIT_MAX_MEMBERS + PN_TT_ATTN_MAX_MEMBERS)
+     PN_TT_ELTWISE_SPLIT_MAX_MEMBERS + PN_TT_ATTN_MAX_MEMBERS + PN_TT_ATTN_SPLITK_MAX_EXTRA +  \
+     PN_TT_KV_APPEND_MAX_MEMBERS)
 
 static unsigned residency_table(const pn_tt_device *device,
                                 const pn_tt_residency *table[PN_TT_RESIDENCY_TABLE_MAX],
@@ -1558,8 +2183,9 @@ static unsigned residency_table(const pn_tt_device *device,
     uint32_t slot;
 
     table[count++] = &device->reduce;
-    if (device->reduce_member.running || device->reduce_member.core_booted)
-        table[count++] = &device->reduce_member;
+    for (slot = 0; slot + 1u < PN_TT_REDUCE_MAX_MEMBERS; slot++)
+        if (device->reduce_member[slot].running || device->reduce_member[slot].core_booted)
+            table[count++] = &device->reduce_member[slot];
     table[count++] = &device->eltwise;
     table[count++] = &device->sample;
     {
@@ -1591,6 +2217,10 @@ static unsigned residency_table(const pn_tt_device *device,
             table[count++] = &device->eltwise_member[slot - 1u];
         for (slot = 1u; slot < device->attention_members; slot++)
             table[count++] = &device->attention_member[slot - 1u];
+        for (slot = 0; slot < device->attention_splitk_extras; slot++)
+            table[count++] = &device->attention_splitk_extra[slot];
+        for (slot = 1u; slot < device->memory_members; slot++)
+            table[count++] = &device->memory_member[slot - 1u];
         for (slot = 0; slot < device->head_norm_count; slot++)
             for (uint32_t m = 1u; m < device->head_norm[slot].members; m++)
                 table[count++] = &device->head_norm[slot].member[m - 1u];
@@ -1951,6 +2581,84 @@ void pn_tt_device_telemetry_log(pn_tt_device *device, const char *label)
  * main residencies) is the card-idle time the host's issue/await chain puts in a token —
  * the time an on-card dispatcher can remove. `stage` 0 = start snapshot, 1 = report.
  */
+/**
+ * TTFT lane (`PN_TT_IDLE_CLOCK=2`, measure only): the cores the idle clock's table leaves out —
+ * every split member (gdn, eltwise, attention, head-norm, render) and the two families with no
+ * main in it (gdnc, gdngate). A member runs CONCURRENTLY with its family's main, so a family
+ * costs the slowest of them: each extra core's busy is booked against its family's main busy
+ * (`main_busy`, the same window) and only the excess is added. @return ms a token the base
+ * clock did not see (0 at stage 0)
+ */
+static double idle_clock_members(pn_tt_device *device, int stage, double window, double tokens,
+                                 const double *main_busy_by_family)
+{
+    enum { kFamGdn, kFamEltwise, kFamAttention, kFamHeadNorm, kFamRender, kFamGdnc,
+           kFamGdngate, kFamCount, kMaxExtra = 128 };
+    static const char *fam_name[kFamCount] = { "gdn", "eltwise", "attention", "head-norm",
+                                               "render", "gdnc", "gdngate" };
+    static uint32_t start_idle[kMaxExtra];
+    const pn_tt_residency *extra[kMaxExtra];
+    int fam_of[kMaxExtra];
+    double fam_max[kFamCount] = { 0 }, unseen = 0.0;
+    unsigned n = 0, i, f;
+    uint32_t slot, m;
+
+#define IDLE_EXTRA(r, fam) do { if (n < kMaxExtra && (r)->running) { extra[n] = (r); fam_of[n++] = (fam); } } while (0)
+    for (m = 1u; m < device->gdn_members; m++) IDLE_EXTRA(&device->gdn_member[m - 1u], kFamGdn);
+    for (m = 1u; m < device->eltwise_members; m++)
+        IDLE_EXTRA(&device->eltwise_member[m - 1u], kFamEltwise);
+    for (m = 1u; m < device->attention_members; m++)
+        IDLE_EXTRA(&device->attention_member[m - 1u], kFamAttention);
+    for (m = 0; m < device->attention_splitk_extras; m++)
+        IDLE_EXTRA(&device->attention_splitk_extra[m], kFamAttention);
+    for (slot = 0; slot < device->head_norm_count; slot++)
+        for (m = 1u; m < device->head_norm[slot].members; m++)
+            IDLE_EXTRA(&device->head_norm[slot].member[m - 1u], kFamHeadNorm);
+    for (slot = 0; slot < (uint32_t)PN_TT_RENDER_DIRECTIONS; slot++)
+        for (m = 1u; m < device->render[slot].members; m++)
+            IDLE_EXTRA(&device->render[slot].member[m - 1u], kFamRender);
+    IDLE_EXTRA(&device->gdnc, kFamGdnc);
+    for (m = 1u; m < device->gdnc_members; m++) IDLE_EXTRA(&device->gdnc_member[m - 1u], kFamGdnc);
+    for (m = 0u; m < device->gdngate_members; m++) IDLE_EXTRA(&device->gdngate[m], kFamGdngate);
+#undef IDLE_EXTRA
+    for (i = 0; i < n; i++) {
+        const ft_tt_queue *queue = &extra[i]->queue;
+        uint32_t idle = 0u;
+
+        if (device->runtime.noc.read(device->runtime.noc.user, queue->x, queue->y,
+                                     queue->control_address + 60u * 4u, &idle,
+                                     sizeof(idle)) != FT_TT_OK)
+            continue;
+        /* A core whose clock word never moved keeps no clock (2026-10-22: attention members
+         * and gdnc read as busy for the whole window) — skipped, not booked. */
+        if (stage == 0) {
+            start_idle[i] = idle;
+        } else if (idle != 0u && idle != start_idle[i]) {
+            const double idle_s = (double)(uint32_t)(idle - start_idle[i]) * 16.0 / 1.35e9;
+            const double busy = (window - idle_s) / tokens;
+
+            if (busy > fam_max[fam_of[i]])
+                fam_max[fam_of[i]] = busy;
+        }
+    }
+    if (stage == 0)
+        return 0.0;
+    fprintf(stderr, "pn_tt: IDLE CLOCK members (busiest extra core / its family's main, ms a "
+                    "token):");
+    for (f = 0; f < kFamCount; f++) {
+        const double over = fam_max[f] - main_busy_by_family[f];
+
+        if (fam_max[f] <= 0.0)
+            continue;
+        fprintf(stderr, " %s %.2f/%.2f", fam_name[f], fam_max[f] * 1e3,
+                main_busy_by_family[f] * 1e3);
+        if (over > 0.0)
+            unseen += over;
+    }
+    fprintf(stderr, " | unseen by the base clock %.2f ms\n", unseen * 1e3);
+    return unseen;
+}
+
 void pn_tt_device_idle_clock(pn_tt_device *device, int stage, double tokens)
 {
     enum { kMax = PN_TT_RESIDENCY_TABLE_MAX + PN_TT_MATMUL_MAX_CORES };
@@ -1959,6 +2667,9 @@ void pn_tt_device_idle_clock(pn_tt_device *device, int stage, double tokens)
     const pn_tt_residency *table[PN_TT_RESIDENCY_TABLE_MAX];
     unsigned count, index;
     double wall, matmul_max = 0.0, others = 0.0, last_main = 0.0;
+    /* PN_TT_IDLE_CLOCK=2: the main busy of the families idle_clock_members() extends, in its
+     * order (gdn, eltwise, attention, head-norm, render, gdnc, gdngate). */
+    double main_busy_by_family[7] = { 0 };
 
     if (!device || pn_tt_env_u32("PN_TT_IDLE_CLOCK", 0u) == 0u)
         return;
@@ -2013,6 +2724,17 @@ void pn_tt_device_idle_clock(pn_tt_device *device, int stage, double tokens)
                     others += busy;
                     last_main = busy;
                 }
+                {
+                    static const char *fam[5] = { "gdn", "eltwise", "attention", "head-norm",
+                                                  "render" };
+                    unsigned f;
+
+                    for (f = 0; f < 5u; f++)
+                        if ((f == 0u ? strcmp(name, fam[f]) == 0
+                                     : strncmp(name, fam[f], strlen(fam[f])) == 0) &&
+                            busy > main_busy_by_family[f])
+                            main_busy_by_family[f] = busy;
+                }
                 fprintf(stderr, " %s %.2fms", name, busy * 1e3);
             } else if (busy > matmul_max) {
                 matmul_max = busy;
@@ -2027,6 +2749,14 @@ void pn_tt_device_idle_clock(pn_tt_device *device, int stage, double tokens)
                         "of %.2f ms wall: HOST-ATTRIBUTABLE card idle %.2f ms/token\n",
                 (matmul_max + others) * 1e3, matmul_max * 1e3, others * 1e3, per * 1e3,
                 (per - matmul_max - others) * 1e3);
+    }
+    if (pn_tt_env_u32("PN_TT_IDLE_CLOCK", 0u) >= 2u) {
+        const double unseen =
+            idle_clock_members(device, stage, wall - start_wall, tokens, main_busy_by_family);
+
+        if (stage != 0)
+            fprintf(stderr, "pn_tt: IDLE CLOCK with members — card idle %.2f ms/token\n",
+                    ((wall - start_wall) / tokens - matmul_max - others - unseen) * 1e3);
     }
 }
 
@@ -2055,7 +2785,7 @@ static void pn_tt_wait_line(pn_tt_device *device, const ft_tt_queue *queue, cons
     fprintf(stderr, "  [ms/token since launch]\n");
 }
 
-/* M5: the gdn reader's own clocks, control words 57-60 (resident_gdn_reader.c). */
+/* M5: the gdn reader's own clocks, control words 12 and 57-60 (resident_gdn_reader.c). */
 static void pn_tt_gdn_reader_clocks(pn_tt_device *device, const ft_tt_queue *queue,
                                     const char *label, double tokens)
 {
@@ -2064,10 +2794,13 @@ static void pn_tt_gdn_reader_clocks(pn_tt_device *device, const ft_tt_queue *que
 
     if (!queue || queue->control_address == 0u ||
         device->runtime.noc.read(device->runtime.noc.user, queue->x, queue->y,
-                                 queue->control_address + 56u * 4u, w, sizeof(w)) != FT_TT_OK)
+                                 queue->control_address + 56u * 4u, w, sizeof(w)) != FT_TT_OK ||
+        device->runtime.noc.read(device->runtime.noc.user, queue->x, queue->y,
+                                 queue->control_address + 12u * 4u, w, sizeof(w[0])) != FT_TT_OK)
         return;
-    /* words 56..63: conv barrier, delta barrier, build, conv, delta (reader); CONV waits of
-     * the writer, unpack, and unpack on the reader's buffers. */
+    /* word 12 conv barrier (over 56, the S1 done-sequence); 57..63: delta barrier, build,
+     * conv, delta (reader); CONV waits of the writer, unpack, and unpack on the reader's
+     * buffers. */
     fprintf(stderr, "pn_tt: gdn reader clocks %-8s: DELTA barrier %.2f build %.2f all %.2f | "
                     "CONV barrier %.2f all %.2f | CONV waits: writer %.2f unpack %.2f (on "
                     "reader %.2f) ms/token\n",

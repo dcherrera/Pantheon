@@ -1,0 +1,13 @@
+{"endpoint":"POST /local/relay/<key>","class":"device",
+ "request":{"ticket":"<b64url payload>.<64 hex>"},
+ "status":200,
+ "response_head":"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nX-Pantheon-Relay: r-0011223344556677\r\nConnection: close\r\n\r\n",
+ "after_head":"the connection pipes bytes to and from the host's leg; send nothing before reading the head",
+ "errors":[{"when":"no ticket in the body","status":400,"type":"invalid_request_error"},
+           {"when":"the ticket fails the box's check (MAC under the row's secret, key, exp + 30 s, person or device_id not the caller's)","status":403,"type":"bad_ticket"},
+           {"when":"no row with that key","status":404,"type":"not_found"},
+           {"when":"the row reads disconnected","status":409,"type":"disconnected"},
+           {"when":"this device key has no device_id yet (POST /local/me/device first)","status":409,"type":"device_unclaimed"},
+           {"when":"this ticket's nonce already opened a relay (attach again)","status":409,"type":"ticket_used"},
+           {"when":"the box or the caller's person is at the relay cap (Retry-After: 1)","status":503,"type":"relay_full"},
+           {"when":"the host did not join within 10 s","status":504,"type":"relay_timeout"}]}

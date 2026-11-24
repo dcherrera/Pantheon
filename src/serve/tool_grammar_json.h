@@ -40,6 +40,16 @@
  * rules.  Every other schema keyword (minLength, pattern, const, numeric
  * bounds, nested shape) is still dropped.
  *
+ * FIELD PATTERNS.  The request field `field_patterns` (tgj_apply_field_patterns;
+ * the XML twin is tg_apply_field_patterns) puts a whole-value regex
+ * (field_pattern.h) on one string value.  The value judged is the DECODED JSON
+ * string — `\"` is `"`, `\n` a newline, `\uXXXX` its UTF-8 bytes (a surrogate
+ * pair as one code point, a lone surrogate as its 3-byte form) — exactly what
+ * the client gets, since ornith's parser forwards the value verbatim.  Every
+ * char that leaves no way to a matching value is masked (with a pattern, an
+ * invalid escape or a non-hex \u digit is off-grammar too), and the closing
+ * quote is legal only on a match.  It never forces the key present.
+ *
  * The public contract MIRRORS tool_grammar.h exactly (tgj_* == tg_*), so the
  * serve sampler hook (pn_tool_grammar_hook / sg_tg_* glue in serve_generation.c)
  * is reused unchanged — only the grammar object it drives differs by dialect.
@@ -143,6 +153,51 @@ tgj_state *tgj_state_new_forced(const tgj_grammar *g, const char *forced_name);
  */
 tgj_state *tgj_state_new_required(const tgj_grammar *g, bool think_open);
 
+/**
+ * Apply the request field `required_if_reasoned` — the JSON twin of
+ * tg_require_if_reasoned (tool_grammar.h): each listed name, on every tool whose
+ * properties have it, is required on the reply's FIRST call when the reply
+ * REASONED, and optional otherwise.  Unknown names, non-string members and a
+ * non-array value are ignored; NULL or an empty array leaves the grammar
+ * unchanged.  Call once, after tgj_build and before any state walks.
+ * Returns false only on OOM (some names may then be left optional).
+ */
+bool tgj_require_if_reasoned(tgj_grammar *g, const jr_value *names);
+
+/**
+ * Apply the request field `field_patterns` (tool name -> object of property
+ * name -> pattern string) — the JSON twin of tg_apply_field_patterns
+ * (tool_grammar.h).  Only plain string values (schema `type` absent or
+ * "string", no `enum`) take a pattern; unknown tools/properties and non-string
+ * patterns are ignored; NULL or an empty object leaves the grammar unchanged.
+ * Call once, after tgj_build and before any state walks.  Returns false when a
+ * pattern does not compile or on OOM.
+ */
+bool tgj_apply_field_patterns(tgj_grammar *g, const jr_value *field);
+
+/**
+ * The JSON twin of tg_steer (tool_grammar.h): when `token_text` (the model's
+ * own top token) is refused at the unescaped closing quote of a non-empty
+ * string value whose field pattern does not match yet, put the walk on the
+ * pattern's forced continuation (fp_forced_continuation, cut before the first
+ * byte a JSON string would have to escape).  Returns true when it did so;
+ * false (walk untouched) otherwise.
+ */
+bool tgj_steer(tgj_state *st, const char *token_text);
+
+/**
+ * The prompt left a think block open: watch it so the walk knows whether the
+ * reply reasoned (tgj_state_new_required(g, true) does this itself).  Changes
+ * nothing else about the walk.  Call before the first tgj_advance.
+ */
+void tgj_watch_reasoning(tgj_state *st);
+
+/** Has the walk seen reasoning (non-whitespace think text outside the close)? */
+bool tgj_reply_reasoned(const tgj_state *st);
+
+/** How many calls of this reply have reached a NAME (0 before the first). */
+int tgj_calls_named(const tgj_state *st);
+
 /** Heap copy of a walk state (NULL on OOM / NULL input).  Free with
  *  tgj_state_free.  Used to look ahead over speculative drafts without
  *  touching the live walk. */
@@ -153,6 +208,18 @@ void tgj_state_copy(tgj_state *dst, const tgj_state *src);
 
 /** Free a walk state (NULL-safe). */
 void tgj_state_free(tgj_state *st);
+
+/**
+ * Close reasoning only on the "</think>" TOKEN: a tgj_advance whose whole text is
+ * "</think>".  The same text spelled out of ordinary tokens stays reasoning
+ * (think_close_rule.h).  Set it when the model's close is one token; leave it off
+ * otherwise.  Call before the first tgj_advance.
+ *
+ * Thread-safe: no (mutates st)
+ * Reentrant: yes
+ * Signal-safe: no
+ */
+void tgj_set_think_close_token(tgj_state *st);
 
 /**
  * Signal that the reasoning phase has ended.  In FORCED mode this releases the

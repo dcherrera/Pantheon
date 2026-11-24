@@ -193,7 +193,8 @@ uint64_t pn_load_spike_bytes(void);
  *     is reporting, that die's free VRAM — the path that OOM-rebooted the box.
  *
  * `die_id` is the model's die (-1 = no die / CPU path, host-only check).
- * `max_window` caps the CAP fit_tokens to a runnable window. Fills *out.
+ * `max_window` caps the CAP fit_tokens to a runnable window, and on both paths a
+ * prompt longer than it is CAPPED even when memory holds it. Fills *out.
  * Never allocates, never blocks.
  *
  * Thread-safe: yes (reads a snapshot copy)

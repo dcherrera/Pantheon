@@ -4,7 +4,7 @@
  * @file   qweight.c
  * @brief  Quantized weight matvec / matmul / dot kernels, threading and GPU dispatch.
  *
- * Written from a behaviour specification (plans/cleanroom_r2_qweight_spec.md); no ggml or
+ * Written from a behaviour specification (cleanroom_r2_qweight_spec.md, recorded in docs/cleanroom/README.md); no ggml or
  * llama.cpp source was consulted.
  *
  * Release results depend on clang fast-math codegen for the exact expression shapes below
@@ -50,6 +50,8 @@
 #endif
 
 #include "../accel/simd.h"
+#include "../formats/gguf_tiled.h"
+#include "qweight_tiled.h"
 
 #ifdef USE_THREADS
 #include "threadpool/threadpool.h"
@@ -80,6 +82,8 @@ static fw_pool *g_pool = NULL;
 static int g_gpu_decode = 0;
 static pn_qweight_dispatch_observer_fn g_observer_fn = NULL;
 static void *g_observer_user = NULL;
+static pn_qweight_activation_observer_fn g_activation_fn = NULL;
+static void *g_activation_user = NULL;
 
 #ifdef USE_METAL
 static fm_buffer *g_gpu_in = NULL;
@@ -408,6 +412,18 @@ void pn_qweight_note_dispatch(const pn_qweight *w, pn_qweight_op op) {
         g_observer_fn(w, op, g_observer_user);
 }
 
+void pn_qweight_set_activation_observer(pn_qweight_activation_observer_fn fn, void *user) {
+    g_activation_fn = fn;
+    g_activation_user = user;
+}
+
+/* Called once per entry-point dispatch (never from the internal per-row fallbacks), so each
+ * activation row reaches the observer exactly once. One predictable branch when unset. */
+static inline void note_activations(const pn_qweight *w, const float *acts, int B) {
+    if (g_activation_fn)
+        g_activation_fn(w, acts, B, g_activation_user);
+}
+
 void pn_qmv_set_pool(struct fw_pool *pool) {
 #ifdef USE_THREADS
     g_pool = pool;
@@ -559,10 +575,23 @@ static void run_rows(int rows, void (*fn)(int, int, void *), void *task) {
     fn(0, rows, task);
 }
 
-void pn_qmv(const pn_qweight *w, const float *vec, float *out) {
-    if (!w || !vec || !out)
-        return;
+/* The pool the tiled path splits over, or NULL. */
+static struct fw_pool *tiled_pool(void) {
+#ifdef USE_THREADS
+    return (struct fw_pool *)g_pool;
+#else
+    return NULL;
+#endif
+}
+
+/* pn_qmv after its argument check and activation report: the per-row fallbacks of pn_qmm and
+ * pn_qmv_group call this, so their rows are reported once, by their own entry point. */
+static void qmv_dispatch(const pn_qweight *w, const float *vec, float *out) {
     pn_qweight_note_dispatch(w, PN_QWEIGHT_OP_MATVEC);
+    if (pn_tiled_is_type(w->type)) {
+        pn_qmm_tiled(w, vec, 1, out, tiled_pool());
+        return;
+    }
 
     qmv_task task = { w, vec, out, 0 };
     if (w->type == PN_QUANT_TERNARY) {
@@ -575,6 +604,13 @@ void pn_qmv(const pn_qweight *w, const float *vec, float *out) {
         return;
 #endif
     run_rows(w->rows, qmv_range, &task);
+}
+
+void pn_qmv(const pn_qweight *w, const float *vec, float *out) {
+    if (!w || !vec || !out)
+        return;
+    note_activations(w, vec, 1);
+    qmv_dispatch(w, vec, out);
 }
 
 /* ------------------------------------------------------------------------------------------
@@ -612,7 +648,7 @@ static int qmv_group_coalesced(const pn_qweight *const *w, const float *const *v
                                float *const *out, int n) {
     int coalesce = g_pool != NULL;
     for (int i = 0; i < n && coalesce; i++) {
-        if (!w[i] || w[i]->type == PN_QUANT_TERNARY)
+        if (!w[i] || w[i]->type == PN_QUANT_TERNARY || pn_tiled_is_type(w[i]->type))
             coalesce = 0;
 #ifdef USE_METAL
         /* Dereferences a NULL entry [AS-IS]. */
@@ -641,14 +677,19 @@ void pn_qmv_group(const pn_qweight *const *w, const float *const *vec,
         return;
     if (n > QWEIGHT_GROUP_MAX)
         n = QWEIGHT_GROUP_MAX;
-    for (int i = 0; i < n; i++)
+    for (int i = 0; i < n; i++) {
         pn_qweight_note_dispatch(w[i], PN_QWEIGHT_OP_MATVEC);
+        if (w[i] && vec[i] && out[i])
+            note_activations(w[i], vec[i], 1);
+    }
 #ifdef USE_THREADS
     if (qmv_group_coalesced(w, vec, out, n))
         return;
 #endif
-    for (int i = 0; i < n; i++)
-        pn_qmv(w[i], vec[i], out[i]);
+    for (int i = 0; i < n; i++) {
+        if (w[i] && vec[i] && out[i])
+            qmv_dispatch(w[i], vec[i], out[i]);
+    }
 }
 
 /* ------------------------------------------------------------------------------------------
@@ -789,13 +830,18 @@ static void qmm_range(int start, int end, void *arg) {
 /* Per-batch pn_qmv loop: ternary weights and batches above the shared-dequant cap. */
 static void qmm_per_batch(const pn_qweight *w, const float *acts, int B, float *out) {
     for (int b = 0; b < B; b++)
-        pn_qmv(w, acts + (size_t)b * w->cols, out + (size_t)b * w->rows);
+        qmv_dispatch(w, acts + (size_t)b * w->cols, out + (size_t)b * w->rows);
 }
 
 void pn_qmm(const pn_qweight *w, const float *acts, int B, float *out) {
     if (!w || !acts || !out || B <= 0)
         return;
+    note_activations(w, acts, B);
     pn_qweight_note_dispatch(w, PN_QWEIGHT_OP_MATMUL);
+    if (pn_tiled_is_type(w->type)) {
+        pn_qmm_tiled(w, acts, B, out, tiled_pool());
+        return;
+    }
 #ifdef USE_METAL
     if (gpu_qmm(w, acts, B, out))
         return;
@@ -835,7 +881,12 @@ static void prefill_range(int bs, int be, void *arg) {
 void pn_qmm_prefill(const pn_qweight *w, const float *acts, int B, float *out) {
     if (!w || !acts || !out || B <= 0)
         return;
+    note_activations(w, acts, B);
     pn_qweight_note_dispatch(w, PN_QWEIGHT_OP_MATMUL);
+    if (pn_tiled_is_type(w->type)) {
+        pn_qmm_tiled(w, acts, B, out, tiled_pool());
+        return;
+    }
     if (w->type == PN_QUANT_TERNARY) {
         qmm_per_batch(w, acts, B, out);
         return;

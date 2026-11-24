@@ -59,14 +59,15 @@ uint64_t pn_session_watch_backstop_ms(void);
 
 /**
  * Create + start the watch manager over `reg` (borrowed; must outlive the
- * manager). Spawns the single poll/grace background thread. Returns the manager
+ * manager). Spawns the single poll/grace background thread and installs itself
+ * as the registry's unload hook (closes a model's watches when it unloads). Returns the manager
  * or NULL on failure (self-pipe / thread). One per serve process.
  */
 pn_session_watch_mgr *pn_session_watch_start(mr_registry *reg);
 
 /**
- * Stop the manager: signal the poll thread, join it, close every held watch fd
- * and the self-pipe, free the manager. NULL-safe. Call at shutdown only.
+ * Stop the manager: remove the unload hook, signal the poll thread, join it,
+ * close every held watch fd and the self-pipe, free the manager. NULL-safe. Call at shutdown only.
  */
 void pn_session_watch_stop(pn_session_watch_mgr *mgr);
 
@@ -76,8 +77,11 @@ void pn_session_watch_stop(pn_session_watch_mgr *mgr);
  * peer close, replacement by a reconnect for the same key, or shutdown). `entry`
  * is the resolved registry entry whose prefix_cache holds the session; the
  * caller must have taken an mr_acquire reference — the manager takes its OWN
- * reference for the fd's lifetime and releases it when the fd is dropped, so the
- * caller releases its reference as usual after this returns. `name` (model id,
+ * watch pin (mr_watch_pin) on that entry for the fd's lifetime and drops it when
+ * the fd is dropped, so the caller releases its reference as usual after this
+ * returns. The pin never delays an unload: on unload the manager (installed as
+ * the registry's unload hook) sends the watch `event: model_unloaded` and
+ * closes it. `name` (model id,
  * for logging) and `sid` (the prefix-cache session key) are copied.
  *
  * A watch arriving for a (name,sid) that already has a live watch CANCELS the
@@ -85,8 +89,14 @@ void pn_session_watch_stop(pn_session_watch_mgr *mgr);
  * the manager sends the HTTP 200 SSE-style keepalive header on `fd` itself
  * (so the client sees the watch is established) and holds it.
  *
- * @return 0 on success (fd is owned by the manager), -1 on failure (fd is NOT
- *         adopted — the caller still owns and must close it). Failure reasons:
+ * Pantheon Local (§4.8): the caller's thread principal (hs_set_thread_principal)
+ * may not watch a session bound to another person, and the watch records it: its
+ * release skips a session bound to another person by then. No principal (plain
+ * `pantheon serve`): nothing is checked.
+ *
+ * @return 0 on success (fd is owned by the manager), MS_NOT_YOURS when the session
+ *         belongs to another person, -1 on any other failure (fd is NOT adopted on
+ *         either — the caller still owns and must close it). Failure reasons:
  *         NULL args, no prefix cache on the entry, table full, OOM.
  */
 int pn_session_watch_add(pn_session_watch_mgr *mgr, int fd, mr_entry *entry,

@@ -91,4 +91,11 @@ bool jr_as_bool(const jr_value *value, bool fallback);
  */
 void jr_to_json(const jr_value *value, json_writer *jw);
 
+/**
+ * Same as jr_to_json but with the separators of Jinja's `tojson` in HF chat
+ * templates (Python json.dumps defaults: ", " between items, ": " after keys).
+ * Use it where a prompt must match the template's bytes (the tools preamble).
+ */
+void jr_to_json_tojson(const jr_value *value, json_writer *jw);
+
 #endif /* PN_SERVE_JSON_READER_H */

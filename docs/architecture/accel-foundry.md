@@ -307,7 +307,8 @@ udev rule `foundry/tt/tools/60-foundry-blackhole.rules`. No tt-metal runtime, no
 TT-NN, no Python, and no C++ anywhere — host or device. That boundary is the
 point of the backend, not an incidental property. Foundry's TT layer was rewritten
 from public documentation and measured behaviour; no tt-metal, TT-NN, tt-umd or
-tt-llk source is compiled, linked or vendored. The vLLM/tt-metal stack cannot
+tt-llk library is linked or vendored (the few Apache-2.0-derived files that remain
+are listed in Foundry's NOTICE). The vLLM/tt-metal stack cannot
 run on the reference host at all: 2 cores / 8 GB and **no AVX**, so TT's prebuilt
 wheels SIGILL.
 

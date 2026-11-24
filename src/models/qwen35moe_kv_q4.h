@@ -4,7 +4,7 @@
  * @file   qwen35moe_kv_q4.h
  * @brief  Q4 KV-cache row helpers with an fp16 sink and recent-window shadow.
  *
- * Written from a behaviour specification (plans/cleanroom_r2_qwen35_spec.md); no ggml or llama.cpp source was consulted.
+ * Written from a behaviour specification (cleanroom_r2_qwen35_spec.md, recorded in docs/cleanroom/README.md); no ggml or llama.cpp source was consulted.
  *
  * @status None
  * @issues Env getters cache per translation unit and are not thread-safe. The window

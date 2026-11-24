@@ -140,6 +140,10 @@ pn_chat_style pn_chat_detect_style(const char *jinja_template) {
     return PN_CHAT_NONE;
 }
 
+bool pn_chat_template_trims_content(const char *jinja_template) {
+    return jinja_template && strstr(jinja_template, "|trim") != NULL;
+}
+
 pn_chat_style pn_chat_style_from_arch(int arch) {
     switch (arch) {
         case 7:  /* PN_ARCH_QWEN3 */

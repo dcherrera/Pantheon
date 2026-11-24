@@ -27,9 +27,8 @@ The signature roster is .cla/signatures.md.
 
 Third-party code
 ----------------
-Pantheon has no external dependencies. It links Foundry
-(https://git.teamide.dev/David/Foundry.git), which is under the same AGPL-3.0
-terms and the same copyright holder.
+Pantheon links Foundry (https://git.teamide.dev/David/Foundry.git), which is
+under the same AGPL-3.0 terms and the same copyright holder.
 
 src/accel/tt/pn_tt_device.c uses the ARC telemetry tag numbers and names
 defined by the TelemetryTag enumeration of tt-umd
@@ -37,6 +36,37 @@ defined by the TelemetryTag enumeration of tt-umd
 licensed under the Apache License, Version 2.0. Only those numbers and names
 are used; no tt-umd source code is included. A copy of the Apache License 2.0
 is in LICENSES/Apache-2.0.txt.
+
+lib/monocypher/ is Monocypher 4.0.3 (https://monocypher.org/), used by
+Pantheon Local to verify catalog signatures (Ed25519, minisign format).
+Copyright (c) 2017-2023 Loup Vaillant, (c) 2017-2019 Michael Savage,
+(c) 2017-2023 Fabio Scotoni. Dual-licensed CC0-1.0 OR BSD-2-Clause; Pantheon
+uses it under BSD-2-Clause. The full license text, with the copyright notices
+that binary distributions must reproduce, is in lib/monocypher/LICENSE.
+Provenance (version, tarball sha256) is in lib/monocypher/README.md.
+
+src/serve/tool_calling.c contains short tool-prompt fragments copied verbatim
+from model chat templates, so the prompt matches the model's own rendering:
+the Qwen tools block (Qwen3-Coder / Qwen3.5 family chat_template, Qwen team,
+Alibaba Cloud) and the MiniCPM5 tools block (openbmb/MiniCPM5 chat_template,
+OpenBMB). Both model repositories are licensed under the Apache License,
+Version 2.0 (LICENSES/Apache-2.0.txt).
+
+tests/bonsai_phase3b/mb_q2_0_matvec.c (a private diagnostic, not part of the
+public release) transcribes the Q2_0/Q8_0 dot-product and fp16 conversion
+math of ggml (https://github.com/ggml-org/ggml, via the PrismML llama.cpp
+fork), Copyright (c) 2023-2026 The ggml authors, MIT License.
+
+tools/dflash_accept.py (not part of the public release) is a modified NumPy
+port of the DFlash drafter forward pass and greedy loop in dflash/model.py of
+z-lab/dflash (https://github.com/z-lab/dflash), Copyright (c) 2026 Z Lab,
+MIT License.
+
+evals/gpqa/gpqa_dataset.py uses the QUERY_TEMPLATE_MULTICHOICE prompt from
+OpenAI simple-evals (https://github.com/openai/simple-evals),
+Copyright (c) 2024 OpenAI, MIT License.
+
+The MIT License text is in LICENSES/MIT.txt.
 
 Model weights executed by Pantheon carry their own licenses, entirely separate
 from this one and entirely between you and whoever published them.

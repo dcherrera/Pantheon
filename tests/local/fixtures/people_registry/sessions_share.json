@@ -1,0 +1,9 @@
+{"endpoint":"POST /local/sessions/<key>/share","class":"device",
+ "request":{"handle":"bob","role":"view"},
+ "status":200,
+ "response":{"key":"c-0123456789ab","shares":[{"person":"p55aa66bb","handle":"bob","role":"view"}]},
+ "errors":[{"when":"no row with that key, or no such person (person or handle)","status":404,"type":"not_found"},
+           {"when":"the caller's person does not own the row","status":403,"type":"forbidden"},
+           {"when":"a desktop row","status":400,"type":"not_shareable"},
+           {"when":"sharing with yourself, role not view | control | none, or neither person nor handle","status":400,"type":"invalid_request_error"},
+           {"when":"the row has 16 shares","status":507,"type":"shares_full"}]}

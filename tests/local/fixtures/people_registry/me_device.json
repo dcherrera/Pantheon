@@ -1,0 +1,5 @@
+{"endpoint":"POST /local/me/device","class":"device",
+ "request":{"device_id":"d0123456789abcdef","device_name":"mac-studio"},
+ "status":200,
+ "response":{"key_id":"k1a2b3c4d","device_id":"d0123456789abcdef","device_name":"mac-studio"},
+ "errors":[{"when":"the key already claimed a different device_id","status":409,"type":"device_id_mismatch"}]}

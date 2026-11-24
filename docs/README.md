@@ -1,6 +1,6 @@
 # Pantheon Documentation
 
-Pantheon is a pure-C11 inference engine and OpenAI-compatible model server, built on Foundry (a git submodule). Beyond Foundry it needs libc, libm, pthreads and libdl; BLAS and the Metal backend's Apple frameworks are optional.
+Pantheon is a pure-C11 inference engine and OpenAI-compatible model server, built on Foundry (a git submodule in the public repository). Beyond Foundry it needs libc, libm, pthreads and libdl; BLAS and the Metal backend's Apple frameworks are optional.
 
 ## ⭐ Multi-Model Smart Routing — the flagship feature
 

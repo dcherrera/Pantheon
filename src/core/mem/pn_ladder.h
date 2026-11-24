@@ -78,6 +78,30 @@ typedef struct {
  * the operator config at every level). The portable / bare-Mac escape hatch. */
 bool pn_ladder_disabled(void);
 
+/* False when PN_LADDER_KV_Q4=0: rung 4a never switches a KV cache to Q4 (the
+ * other rungs still act). */
+bool pn_ladder_kv_q4_allowed(void);
+
+/* What rung 4a does to a new fp32 KV cache at `level`. A cache in the serve's
+ * default format is switched to Q4 (the rung's cheapest VRAM win); a cache the
+ * load explicitly asked to be fp32 is never switched: the rung refuses it
+ * instead, so the user's choice is kept or the load fails with a reason. */
+typedef enum {
+    PN_LADDER_KV_KEEP = 0,   /* allocate as asked */
+    PN_LADDER_KV_TO_Q4,      /* default-format cache: allocate Q4 instead */
+    PN_LADDER_KV_REFUSE,     /* explicit fp32 under pressure: do not allocate */
+} pn_ladder_kv_action;
+
+/* Pure. `explicit_fp32`: the load asked for fp32 (pn_load_opts.kv_format). */
+pn_ladder_kv_action pn_ladder_kv_action_for(pn_mem_level level, bool explicit_fp32);
+
+/* Per-thread reason of the last refused KV cache (""/NULL when none since the last
+ * clear). Set by the KV init that refused, read by the loader on the same thread
+ * to tell the user why the load failed. Thread-safe: thread-local. */
+void        pn_ladder_kv_refusal_set(const char *why);
+void        pn_ladder_kv_refusal_clear(void);
+const char *pn_ladder_kv_refusal(void);
+
 /* Compute the rung plan for a pressure `level` given the operator config:
  *   cfg_max_slots      — configured concurrency ceiling (>=1; clamped up if <1)
  *   cfg_prefill_window — configured max prefill window in tokens (0 = unknown /

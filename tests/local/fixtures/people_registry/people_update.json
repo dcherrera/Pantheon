@@ -1,0 +1,10 @@
+{"endpoint":"POST /local/people/<id>","class":"admin (a person may change their own name with a device key)",
+ "request":{"name":"Bob","handle":"bob","may_load":true,"admin":true},
+ "status":200,
+ "response":{"person":{"id":"p55aa66bb","handle":"bob","name":"Bob","admin":true,"may_load":true,"created":1793000100}},
+ "errors":[{"when":"a non-admin changes anyone else, or more than their own name","status":403,"type":"forbidden"},
+           {"when":"demoting an admin not below the caller in the admin tree","status":403,"type":"admin_above"},
+           {"when":"demoting the last admin","status":409,"type":"last_admin"},
+           {"when":"handle breaks the rules","status":400,"type":"bad_handle"},
+           {"when":"the handle is taken","status":409,"type":"handle_taken"},
+           {"when":"no person with that id","status":404,"type":"not_found"}]}

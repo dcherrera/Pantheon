@@ -250,6 +250,30 @@ static void test_reasoning_close_split_across_tokens(void)
     rfg_state_free(st);
 }
 
+/* Qwen3.8 eval run 3 (2026-11-14): reasoning about a test, the model wrote the C
+ * string "\n</think>\n" out of ORDINARY tokens — `</` 510, `think` 26003, `>\`
+ * 8189 — while its real close is one token (248069).  The text match ended
+ * reasoning there and compelled the call from the next token: the model, mid-string,
+ * could only take the whitespace the opener allows and wrote "   \r" to max_tokens. */
+static const char *const SPELLED_CLOSE[] = {
+    "\"<think>\\n\" + trim(reasoning) + \"\\n", "</", "think", ">\\", "n\");",
+};
+#define N_SPELLED_CLOSE ((int)(sizeof(SPELLED_CLOSE) / sizeof(SPELLED_CLOSE[0])))
+
+static void test_spelled_reasoning_close_is_reasoning(void)
+{
+    rfg_state *st = rfg_state_new(RFG_FORMAT_JSON_OBJECT, true);
+    rfg_set_think_close_token(st);
+    for (int i = 0; i < N_SPELLED_CLOSE; i++)
+        ASSERT_TRUE(feed_token(st, SPELLED_CLOSE[i]));
+    ASSERT_FALSE(rfg_reasoning_ended(st));
+    ASSERT_FALSE(rfg_mask_active(st));
+    ASSERT_TRUE(feed_token(st, "</think>"));
+    ASSERT_TRUE(rfg_reasoning_ended(st));
+    ASSERT_FALSE(feed_token(st, "n\");"));
+    rfg_state_free(st);
+}
+
 static void test_explicit_reasoning_end(void)
 {
     /* The reasoning-budget force-close path calls this directly. */
@@ -318,6 +342,7 @@ int main(void)
     RUN_TEST(complete_stops_the_walk);
     RUN_TEST(mask_active_while_open);
     RUN_TEST(reasoning_grace_is_unconstrained);
+    RUN_TEST(spelled_reasoning_close_is_reasoning);
     RUN_TEST(reasoning_close_split_across_tokens);
     RUN_TEST(explicit_reasoning_end);
     RUN_TEST(text_format_builds_no_state);

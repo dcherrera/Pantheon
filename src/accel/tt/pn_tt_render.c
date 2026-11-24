@@ -19,6 +19,7 @@
 
 #include "pn_tt_device_internal.h"
 #include "pn_tt_eltwise_split.h"
+#include "pn_tt_group_pull.h"
 #include "pn_tt_replica_map.h"
 
 /**
@@ -255,9 +256,7 @@ static bool render_arm_direction(pn_tt_device *device, uint32_t index, uint32_t 
                 direction->in_tile_bytes, direction->out_tile_bytes);
         return false;
     }
-    if (ft_tt_buffer_alloc(&device->allocator, FT_TT_MEM_SPACE_DRAM,
-                           device->strip_bank_cursor++ % device->dram_bank_count,
-                           (size_t)tiles * direction->in_tile_bytes, &zeros) != FT_TT_OK) {
+    if (pn_tt_dram_alloc_any(device, (size_t)tiles * direction->in_tile_bytes, &zeros) != 0) {
         fprintf(stderr, "pn_tt: DRAM full allocating the %s zero operand\n", direction->name);
         return false;
     }
@@ -439,10 +438,12 @@ static int render_submit_split(pn_tt_device *device, uint32_t index,
                                const ft_tt_op_eltwise_request *whole, uint32_t members)
 {
     uint32_t words[PN_TT_RENDER_SPLIT_MAX_MEMBERS][FT_TT_OP_VECTOR_WORDS];
+    pn_tt_residency *set[PN_TT_RENDER_SPLIT_MAX_MEMBERS];
     bool bad[PN_TT_RENDER_SPLIT_MAX_MEMBERS];
     pn_tt_render_residency *slot = &device->render[index];
     double enqueue_started;
     uint32_t member;
+    bool pulled;
     int failed = 0;
 
     memset(bad, 0, sizeof(bad));
@@ -474,29 +475,19 @@ static int render_submit_split(pn_tt_device *device, uint32_t index,
         }
         pn_tt_vec_probe_apply(words[member]);
     }
-    enqueue_started = pn_tt_now_seconds();
     for (member = 0u; member < members; member++)
-        if (pn_tt_residency_enqueue(render_member(device, index, member),
-                                    FT_TT_QUEUE_OP_ELTWISE, words[member], 1u) != 0)
-            failed = bad[member] = 1;
+        set[member] = render_member(device, index, member);
+    /* S1: member 0 posts only once every member has (pn_tt_group_pull.h); one await. */
+    pulled = pn_tt_group_pull_decide(&slot->pull, pn_tt_group_pull_decode(device), set, members,
+                                     members, g_render_directions[index].name);
+    enqueue_started = pn_tt_now_seconds();
+    (void)pn_tt_group_pull_enqueue(&slot->pull, pulled, set, members, FT_TT_QUEUE_OP_ELTWISE,
+                                   words[0], bad);
     /* THE RESIDENCY CLOCKS RUN ON THIS PATH TOO (class 28). Enqueue on member 0, each serial
      * await on its member, so the rows SUM to the split's wall. */
-    render_member(device, index, 0u)->seconds += pn_tt_now_seconds() - enqueue_started;
-    /* EVERY member is awaited even after one has failed. An enqueue that got as far as the
-     * ring has a descriptor the card will run whatever this host does next, and leaving it
-     * un-awaited desynchronises that member's cursor for the rest of the run. */
-    for (member = 0u; member < members; member++) {
-        const double member_started = pn_tt_now_seconds();
-        double member_elapsed;
-
-        if (pn_tt_residency_await(render_member(device, index, member),
-                                  PN_TT_OP_TIMEOUT_MS) != 0)
-            failed = bad[member] = 1;
-        member_elapsed = pn_tt_now_seconds() - member_started;
-
-        slot->member_seconds[member] += member_elapsed;
-        render_member(device, index, member)->seconds += member_elapsed;
-    }
+    set[0]->seconds += pn_tt_now_seconds() - enqueue_started;
+    failed = pn_tt_group_pull_await(&slot->pull, pulled, set, members, bad,
+                                    slot->member_seconds) != 0;
     /* PER-MEMBER RE-ARM AND REPLAY. Replaying one member's slice is the SAME COMPUTATION and
      * not merely a safe one: `a + 0` is a pure function of operands it does not modify and
      * the slices are disjoint, so a member that succeeded is neither re-run nor read. */
@@ -722,17 +713,19 @@ void pn_tt_render_defer(pn_tt_device *device, bool narrow, bool on)
 
 int pn_tt_render_settle(pn_tt_device *device, bool narrow)
 {
+    pn_tt_residency *set[PN_TT_RENDER_SPLIT_MAX_MEMBERS];
     pn_tt_render_residency *slot;
-    int rc;
+    uint32_t members;
 
     if (!device)
         return -1;
     slot = &device->render[narrow ? PN_TT_RENDER_NARROW : PN_TT_RENDER_WIDEN];
-    rc = pn_tt_residency_settle(&slot->residency, PN_TT_OP_TIMEOUT_MS);
-    for (uint32_t member = 1u; member < slot->members; member++)
-        if (pn_tt_residency_settle(&slot->member[member - 1u], PN_TT_OP_TIMEOUT_MS) != 0)
-            rc = -1;
-    return rc;
+    members = slot->members < 1u ? 1u : slot->members;
+    for (uint32_t member = 0u; member < members; member++)
+        set[member] = render_member(device, narrow ? PN_TT_RENDER_NARROW : PN_TT_RENDER_WIDEN,
+                                    member);
+    /* A member a pulled split covered is settled by member 0's completion (S1). */
+    return pn_tt_group_pull_settle(&slot->pull, set, members, PN_TT_OP_TIMEOUT_MS);
 }
 
 #endif /* USE_TT */

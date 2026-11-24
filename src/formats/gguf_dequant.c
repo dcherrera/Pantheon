@@ -4,7 +4,8 @@
  * @file   gguf_dequant.c
  * @brief  Dequantization of GGUF tensor blocks to float32, half conversions, size helpers.
  *
- * Rewritten from a behaviour specification and public GGUF format documentation;
+ * Rewritten from a behaviour specification
+ * (cleanroom_bpe_dequant_spec.md, recorded in docs/cleanroom/README.md) and public GGUF format documentation;
  * the implementer did not see the previous code.
  *
  * Bit-exactness under -ffast-math: every scale x quant product here is exactly
@@ -22,6 +23,8 @@
  * @todo   None
  */
 #include "gguf_dequant.h"
+#include "gguf_tiled.h"
+#include "../core/mem/pn_host_admission.h"
 
 #include <stdint.h>
 #include <stddef.h>
@@ -338,6 +341,13 @@ int pn_gguf_block_size(pn_gguf_quant type) {
         return 256;
     case GGUF_QUANT_Q2_0_G128:
         return 128;
+    case PN_QUANT_TILED_FP32:
+    case PN_QUANT_TILED_BFP8:
+    case PN_QUANT_TILED_BFP4:
+    case PN_QUANT_TILED_BFP6:
+    case PN_QUANT_TILED_ROWS_FP32:
+    case PN_QUANT_TILED_ROWS_BFP8:
+        return PN_TILED_DIM; /* a block = 32 elements of one tile (gguf_tiled.h) */
     default:
         return 0;
     }
@@ -355,6 +365,13 @@ size_t pn_gguf_bytes_per_block(pn_gguf_quant type) {
     case GGUF_QUANT_Q4_K:      return sizeof(pn_block_q4_k);
     case GGUF_QUANT_Q5_K:      return sizeof(pn_block_q5_k);
     case GGUF_QUANT_Q6_K:      return sizeof(pn_block_q6_k);
+    case PN_QUANT_TILED_FP32:
+    case PN_QUANT_TILED_BFP8:
+    case PN_QUANT_TILED_BFP4:
+    case PN_QUANT_TILED_BFP6:
+    case PN_QUANT_TILED_ROWS_FP32:
+    case PN_QUANT_TILED_ROWS_BFP8:
+        return pn_tiled_tile_bytes(type) / PN_TILED_DIM; /* 128 / 34 / 18 / 26: exact */
     default:                   return 0;   /* includes the deliberately unsizeable types */
     }
 }
@@ -387,6 +404,12 @@ const char *pn_gguf_quant_name(pn_gguf_quant type, char *buf, size_t buf_len) {
     case GGUF_QUANT_Q6_K:      name = "Q6_K"; break;
     case GGUF_QUANT_Q8_K:      name = "Q8_K"; break;
     case GGUF_QUANT_Q2_0_G128: name = "Q2_0_G128"; break;
+    case PN_QUANT_TILED_FP32:  name = "TILED_FP32"; break;
+    case PN_QUANT_TILED_ROWS_FP32: name = "TILED_ROWS_FP32"; break;
+    case PN_QUANT_TILED_BFP8:  name = "TILED_BFP8_B"; break;
+    case PN_QUANT_TILED_BFP4:  name = "TILED_BFP4_B"; break;
+    case PN_QUANT_TILED_BFP6:  name = "TILED_BFP6_B"; break;
+    case PN_QUANT_TILED_ROWS_BFP8: name = "TILED_ROWS_BFP8_B"; break;
     default:                   break;
     }
     if (name != NULL)
@@ -413,6 +436,10 @@ float *pn_gguf_dequantize_tensor(pn_gguf_file *file, const char *name, size_t *n
         numel *= (size_t)info->dims[i];
 
     const char *raw = (const char *)file->data + info->offset;
+    /* An anonymous copy of a weight is host RAM the mmap does not cover:
+     * admitted first, charged to the model being loaded (pn_load_on). */
+    if (pn_host_admit_weight_copy((uint64_t)numel * sizeof(float), name) != 0)
+        return NULL;
     float *out = malloc(numel * sizeof(float));
     if (out == NULL) return NULL;
 
@@ -431,6 +458,8 @@ int pn_gguf_dequantize_row(pn_gguf_file *file, const char *name,
     if (file == NULL || name == NULL || dst == NULL) return -1;
     pn_gguf_tensor_info *info = pn_gguf_find_tensor(file, name);
     if (info == NULL) return -1;
+    if (pn_tiled_is_type(info->type))
+        return pn_tiled_decode_row(info->type, (const char *)file->data + info->offset, row, row_numel, dst);
 
     int bs = pn_gguf_block_size(info->type);
     if (bs <= 0) return -1;

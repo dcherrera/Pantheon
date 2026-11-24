@@ -28,9 +28,7 @@
  *         closed is refused rather than emitted with an argument missing.  An
  *         empty value the model CLOSED is emitted as "" rather than dropped, so
  *         The client sees empty-and-present instead of absent.
- * @issues Consecutive tool results are rendered as separate user turns rather
- *         than grouped into one (the model handles either; token-identical
- *         grouping is a fidelity nicety, not a correctness need).
+ * @issues None
  * @todo None
  */
 
@@ -295,6 +293,23 @@ char *tc_render_tools_system_ornith(const jr_value *tools,
  */
 char *tc_render_assistant_tool_calls(const jr_value *tool_calls,
                                      bool content_empty, tc_dialect dialect);
+
+/**
+ * One assistant history turn's content as the template renders it: content
+ * `|trim`med, then its tool calls, with the "\n\n" separator only when the
+ * trimmed content is non-empty.  The ONE join of content and calls: the request
+ * parse (combine_assistant_tool_calls) and the serve's own re-render projection
+ * (sg_project_client_rerender) both go through it, so they cannot drift.
+ *
+ * @param content    the message's text content, or NULL.
+ * @param tool_calls OpenAI assistant.tool_calls array (JR_ARRAY).
+ * @param dialect    as tc_render_assistant_tool_calls.
+ * @return  Owned string, or NULL on OOM / no calls.
+ *
+ * Thread-safe: yes
+ */
+char *tc_join_assistant_history(const char *content, const jr_value *tool_calls,
+                                tc_dialect dialect);
 
 /**
  * Parse model output into structured calls. Accepts BOTH forms the model emits:

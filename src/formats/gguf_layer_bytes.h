@@ -27,6 +27,11 @@ uint64_t pn_gguf_tensor_file_bytes(pn_gguf_file *gf, const char *name);
  * an older estimate rather than admit blind. */
 uint64_t pn_gguf_layer_range_bytes(pn_gguf_file *gf, int lo, int hi);
 
+/* Same as pn_gguf_layer_range_bytes but Q8_0 tensors count at the CUDA
+ * repacked size (36 B per 32 weights, fc_repack_row_bytes); every other
+ * type at file bytes. */
+uint64_t pn_gguf_layer_range_upload_bytes(pn_gguf_file *gf, int lo, int hi);
+
 /* Highest `blk.<i>.` index in the table, + 1. Read off the tensors rather than
  * `<arch>.block_count` so it needs no architecture prefix and cannot disagree
  * with the tensors a layer range will actually sum. 0 if there are none. */
@@ -36,5 +41,10 @@ int pn_gguf_layer_count(pn_gguf_file *gf);
  * must size a DEQUANTIZED copy need this rather than the file bytes — a tied
  * model's LM head is token_embd materialized to F32, four bytes an element. */
 uint64_t pn_gguf_tensor_numel(pn_gguf_file *gf, const char *name);
+
+/* Bytes the host CPU forward reads per token, which must stay resident for it
+ * not to page: every tensor, with the routed experts (`*_exps.*`) counted at
+ * expert_used_count / expert_count. 0 if any tensor cannot be sized. */
+uint64_t pn_gguf_cpu_forward_bytes(pn_gguf_file *gf);
 
 #endif /* PN_GGUF_LAYER_BYTES_H */

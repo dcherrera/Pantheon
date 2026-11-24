@@ -79,6 +79,7 @@ logical id per served name. The response does **not** include `live` or `free_sl
       "max_concurrent": 4,
       "context_window": 32000,
       "tool_choice_required_with_thinking": true,
+      "think_history": ["as_sent"],
       "graphs": {"live": 30, "total": 40, "failed": 0,
                  "ineligible": 10, "pending": 0},
       "attention": {"ondie": 10, "host": 0, "total": 10}
@@ -96,6 +97,7 @@ logical id per served name. The response does **not** include `live` or `free_sl
 | `max_concurrent` | int | CONCURRENCY: how many requests this model ACTUALLY decodes at once — the **served** value (`bs_get_load` capacity), not the configured cap. See below. |
 | `context_window` | int | **Per-session context window in tokens** — see below. Omitted when unknown. |
 | `tool_choice_required_with_thinking` | bool | `true` when `tool_choice: "required"` may be sent with thinking on: the think block is unconstrained and the turn ends in a parsed tool call (the think-gated grammar models ORNITH_JSON and QWEN_XML; `false` for MiniCPM's attribute dialect, which no grammar models, and for every model when `PANTHEON_TOOL_GRAMMAR=0`). |
+| `think_history` | array | The request `think_history` values this model honours. Always present. `as_sent` on every backend; `drop_last` where a turn-start state is kept (CUDA batched turn checkpoints; the single-user qwen35 path's turn snapshot; the TT card's band checkpoint). |
 | `graphs` | object | **CUDA-graph residency** — see below. Omitted when the model has no graph slots. |
 | `attention` | object | **Attention-path residency** — see below. Omitted until the forward has reached an attention layer. |
 
@@ -242,6 +244,7 @@ Includes reasoning (`<think>…</think>` split) and tool-call support.
 |--------|----------|--------|
 | `Content-Type: application/json` | no | Not checked; the body is parsed as JSON regardless. |
 | `X-Session-Id: <sid>` | no | Prefix-cache session key. A body key (`session_id`, `prompt_cache_key`, `promptCacheKey`) takes precedence. opencode sends this header on every request. |
+| `X-Pantheon-Replica: <N>` | no | Replica (copy) of the model to bind a new session to. The body's `replica` takes precedence. See [Replicas](#replicas). |
 
 ### Request body
 
@@ -287,11 +290,35 @@ Includes reasoning (`<think>…</think>` split) and tool-call support.
 | `n` | int | `1` | Number of completions. Each is a full separate decode (only the first uses the session's prefix cache). Capped at 8; a larger `n` returns 8 and sets `n_status: "capped_to_8"`. |
 | `response_format` | object | `{"type":"text"}` | `json_object` constrains the answer to valid JSON. `json_schema` gets the same JSON constraint but the schema's shape is **not** enforced. See `response_format_status` below. |
 | `enable_thinking` | bool | unset | Think-style templates: `true` opens a think block, `false` prefills a closed one. Absent → the `PANTHEON_NO_THINK` env decides. |
-| `reasoning_budget` | int | per-model | Force `</think>` after N reasoning tokens. Overrides the model's `--reasoning-budget`; `0` or negative disables it. `max_reasoning_tokens` is an alias (`reasoning_budget` wins). |
+| `think_history` | string | unset | What the session's KV holds of earlier think blocks. `as_sent`: the KV must equal this request as rendered — the batched ladder skips every warm rung and resumes at the system-prefix snapshot (or cold); the single-user cache and the TT card checkpoint never resume past the request's first think block. `drop_last` (advertised where built): the client dropped the last turn's think block; the request resumes at that turn's start (batched: the turn checkpoint, when its KV is exactly the request's prefix; single-user: the turn snapshot saved at the start of the last request that carried `think_history`; TT: the card's band checkpoint, which a `think_history` request keeps at or below its turn start, ≤ 31 tokens back), else as `as_sent` (usage `resume` says which). Unknown values are ignored (logged once). Advertised per model in `GET /v1/models`. |
+| `reasoning_budget` | int | per-model | Force `</think>` after N reasoning tokens. Overrides the model's `--reasoning-budget`; `0` or negative disables it. `max_reasoning_tokens` is an alias (`reasoning_budget` wins). The cap run keeps the model's `--reasoning-reserve` of `max_tokens` for the answer and closes on a line end near the cap (see `--reasoning-budget`). |
 | `tools` | array | unset | OpenAI-format tool definitions. Rendered into a system turn in the model's tool dialect (below). Ignored when `tool_choice` is `"none"`. |
 | `tool_choice` | string or object | `"auto"` | `"none"` disables tools. `"required"` forces a call: the grammar is armed by default (`PANTHEON_TOOL_GRAMMAR=0` opts out). With thinking on the think block is unconstrained and the call is compelled from `</think>` (models advertising `tool_choice_required_with_thinking`). `{"type":"function","function":{"name":"X"}}` is enforced only when `PANTHEON_TOOL_GRAMMAR=1`; otherwise it behaves like `"auto"`. |
 | `session_id` | string | unset | Prefix-cache session key (overrides `X-Session-Id`). Enables delta prefill on later turns of the same session. |
 | `prompt_cache_key` / `promptCacheKey` | string | unset | Aliases for `session_id` (OpenAI's name; opencode's camelCase body field). Order: `session_id`, `prompt_cache_key`, `promptCacheKey`, then the `X-Session-Id` header. |
+| `replica` | int >= 1 | unset | Replica to bind a new session to (overrides `X-Pantheon-Replica`). Absent → the least busy replica. See [Replicas](#replicas). |
+
+### Replicas
+
+One model name may be loaded several times (copies on different dies, possibly
+with different load options). Each copy has a number, `replica` in
+`GET /admin/models` (Pantheon Local: the same number as its loaded list).
+
+- A new session (its first request, prewarm included) binds to the copy the
+  request names, and only to it. A copy that is not loaded is
+  `404 replica_not_found`; a copy with no free session slot is
+  `429 model_at_session_capacity` whose message names the model and the copy.
+  Neither is ever re-routed to another copy, and the refused session stays
+  unbound, so a retry may name another copy.
+- A session already bound keeps its copy (its KV lives there); a later request
+  naming another copy is served by the bound one, and the response header says so.
+- No `replica` = the least busy copy, as before.
+- `sessions_used` in `GET /admin/models` (and Pantheon Local's
+  `GET /local/models/loaded`) counts the sessions bound to each copy.
+- Every response after routing (JSON, SSE and errors) carries
+  `X-Pantheon-Replica: <serving copy>`.
+- `/session/restore` and `/session/watch` bind sessions too and take the same
+  pin (`replica` body field / `?replica=N` query, or the header).
 
 ### Tool calling
 
@@ -352,7 +379,9 @@ carries tools, tools win and `response_format_status` is `"ignored_tools_present
     "total_tokens": 19,
     "prompt_tokens_details": {"cached_tokens": 0},
     "kv_used": 12,
-    "kv_cap": 32000
+    "kv_cap": 32000,
+    "resume": "cold",
+    "prefill_tokens": 12
   }
 }
 ```
@@ -373,6 +402,14 @@ carries tools, tools win and `response_format_status` is `"ignored_tools_present
   `GET /v1/models` advertises as `context_window`, re-read every turn. If the
   memory ladder moves the window mid-session, the next completion carries the
   new value. Treat the model list as the initial plan and this as authoritative.
+- `resume` — the rung this turn resumed on: `exact` (committed history is a
+  prefix), `projection` (the think-elided / reasoning-bearing projection),
+  `partial` (an aborted prefill's prefix, or the plain-KV longest-common-prefix
+  rewind), `turn_ckpt` (the turn-start checkpoint; on TT the band checkpoint),
+  `div_ckpt` (the divergence checkpoint), `sys_prefix` (the system-prefix
+  snapshot) or `cold`. Always present, also in the streaming usage chunk.
+- `prefill_tokens` — prompt tokens this turn prefilled (`prompt_tokens` minus
+  the resume point).
 - `session_conflict: true` (inside `usage`) — two conversations are sharing one
   session id, so neither can resume from cache.
 - `response_format_status` (top-level, when the request sent `response_format`)
@@ -425,8 +462,9 @@ and the stream ends; other generation failures close the choice with
 
 | Status | `type` | Condition |
 |--------|--------|-----------|
-| 400 | `invalid_request_error` | Empty body, malformed JSON, body not an object, `messages` missing or empty |
+| 400 | `invalid_request_error` | Empty body, malformed JSON, body not an object, `messages` missing or empty, `replica` / `X-Pantheon-Replica` not an integer >= 1 |
 | 404 | `model_not_found` | Several models loaded and `model` matches none |
+| 404 | `replica_not_found` | The requested replica of the model is not loaded (the message lists the loaded ones) |
 | 422 | `context_over_budget` | Prompt exceeds the effective per-session window. Not transient: shorten the conversation and retry. Non-streaming: `kv_used`/`kv_cap` are in the message text; streaming: they are fields of the error object. |
 | 429 | `server_busy` | Single-user path: a generation is already running on this model. Batched path: all slots busy and the queue full, or 30 s queue wait timed out. `Retry-After` when the scheduler supplies one. |
 | 429 | `model_at_session_capacity` | A new `session_id` while every session slot (`max_sessions`) holds a live session. `Retry-After: 30`; the message estimates the re-prefill time. |
@@ -470,6 +508,7 @@ uploads via `reg->upload_lock` (one GPU upload in flight at a time).
 | `max_sessions` | int | no | **Residency** — how many named sessions may hold KV at once. Over the cap a new session id gets `429 model_at_session_capacity`. `0`/absent = engine default. Mirrors `--max-sessions`. |
 | `max_concurrent` | int | no | **Concurrency** — how many requests may decode simultaneously (batch-scheduler slots). Surplus queues, then `429`/`503`. Distinct from `max_sessions`. `0`/absent = the resolved `max_sessions`. Mirrors `--max-concurrent`. |
 | `reasoning_budget` | int | no | Force `</think>` after N tokens of unclosed reasoning. `0`/absent = unbounded. Mirrors `--reasoning-budget`. |
+| `reasoning_reserve` | int | no | Tokens of `max_tokens` kept for the answer after a forced close. `0`/absent = 3072. Mirrors `--reasoning-reserve`. |
 
 Every per-model option available on the `serve` command line is settable here, so a model
 added at runtime ends up configured identically to one launched with the process.
@@ -580,10 +619,12 @@ effect of loading a model.
     {
       "id": "my-model",
       "object": "model",
+      "replica": 1,
       "path": "/models/my-model.gguf",
       "dies": [2, 3],
       "vram_bytes": 12345678,
       "max_sessions": 4,
+      "sessions_used": 1,
       "max_concurrent": 4,
       "max_concurrent_configured": 4,
       "context_window": 32000,
@@ -603,6 +644,13 @@ effect of loading a model.
   ]
 }
 ```
+
+`sessions_used` is how many sessions are bound to this replica now (see
+[Replicas](#replicas)): a session binds on its first request, prewarm, restore or
+watch, and counts while idle until it is released (`POST /session/release`, its
+watch closing or expiring) or the replica unloads. A watch opened on a tab's
+base id before its turns carries the `<base>-<mode>` ids too: one count. A session whose KV was dropped without a release
+(the idle reaper, a batched warm slot reused) still counts.
 
 The operator row carries **both** concurrency numbers: `max_concurrent` is what
 the model serves right now (`bs_get_load` capacity, the same value `/v1/models`
@@ -775,7 +823,8 @@ Source: `openai_chat.c:oai_handle_session_estimate`.
 
 ### GET /session/watch
 
-`GET /session/watch?session_id=S[&name=M]` (or `X-Session-Id`).
+`GET /session/watch?session_id=S[&name=M][&replica=N]` (or `X-Session-Id`,
+`X-Pantheon-Replica`).
 
 Liveness hold. On success the server answers `200` with
 `Content-Type: text/event-stream`, a `: watch established` comment, and keeps the

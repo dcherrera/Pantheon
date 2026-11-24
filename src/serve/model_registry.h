@@ -36,9 +36,11 @@
 #include <stdint.h>
 
 #include "../../include/pantheon.h"
+#include "../accel/die_manager.h"
 #include "../core/engine.h"
 #include "../core/prefix_cache.h"
 #include "batch_sched.h"
+#include "sampling_defaults.h"
 
 #define MR_MAX_MODELS 16
 #define MR_MAX_NAME   64
@@ -70,11 +72,17 @@ typedef struct {
                                      * path has concurrent slots). */
     int              dies[PN_MODEL_MAX_DIES];
     int              n_dies;                    /* 0 = CPU-resident */
+    pn_dm_binding_ref die_binding;              /* this placement's die reservation */
     int              reasoning_budget;          /* per-model AUTO-path reasoning cap
                                                  * (tokens); 0 = disabled. Set at load
                                                  * from `--reasoning-budget` (or the
                                                  * admin body); a request may override
                                                  * it per-turn. See sg_gen_params. */
+    int              reasoning_reserve;         /* tokens of max_tokens kept for the
+                                                 * answer after a forced close; 0 =
+                                                 * PN_REASONING_RESERVE_DEFAULT
+                                                 * (reasoning_budget.h). Set right
+                                                 * after load (mr_set_reasoning_reserve). */
     uint64_t         vram_bytes;                /* placement estimate */
     uint64_t         weights_version;           /* model-identity tag for the
                                                  * session warm-tier (Phase 7):
@@ -108,7 +116,32 @@ typedef struct {
                                                  * conversations may HOLD KV,
                                                  * concurrency is how many may
                                                  * decode simultaneously. */
-    int              refs;                      /* in-flight acquires */
+    pn_model_sampling sampling;              /* per-model sampling defaults
+                                                 * (A4): a request field that is
+                                                 * absent takes these, then the
+                                                 * serve fallback. All-absent
+                                                 * unless set at load. */
+    int              refs;                      /* in-flight acquires: live
+                                                 * turns + short admin/route
+                                                 * holds. The ONLY count an
+                                                 * unload waits out. */
+    int              watch_refs;                /* open /session/watch pins
+                                                 * (mr_watch_pin). Never delay
+                                                 * an unload: it closes them
+                                                 * via the unload hook. */
+    int              cancel_turns;              /* set by mr_unload once its
+                                                 * finish-wait expires; live
+                                                 * turns poll it through
+                                                 * mr_turn_cancel_requested
+                                                 * and abort. Atomic access. */
+    uint64_t         serial;                    /* unique per placement (a load);
+                                                 * session affinity names a
+                                                 * replica by it, so a binding
+                                                 * never outlives its replica */
+    int              replica;                   /* 1, 2, ...: this copy's number
+                                                 * among entries of its name; what
+                                                 * a client pins ("replica": N) and
+                                                 * X-Pantheon-Replica reports */
     bool             unloading;                 /* draining — no new acquires */
     bool             used;                      /* slot occupancy */
 } mr_entry;
@@ -122,12 +155,23 @@ typedef struct {
  * mr_load acquires it before pn_load_on and releases it after, so at most one
  * GPU weight upload is in flight at any time. The hold is bounded (~55 s on
  * the K80) and well-telegraphed (the caller gets a blocking load, not a 503). */
+/* Called by mr_unload once an entry's live turns have drained and it is about
+ * to be freed, WITHOUT the registry lock held: the watch manager closes every
+ * /session/watch on that entry (terminal `model_unloaded` event) and unpins it.
+ * See mr_set_unload_hook. */
+typedef void (*mr_unload_hook_fn)(void *ctx, mr_entry *entry);
+
 typedef struct {
     mr_entry        entries[MR_MAX_MODELS];
     int             n;              /* live (used && !unloading) entries */
     pthread_mutex_t lock;
     pthread_cond_t  drained;        /* signaled on every mr_release */
     pthread_mutex_t upload_lock;    /* A3: one GPU upload at a time */
+    mr_unload_hook_fn unload_hook;  /* watch manager's close-on-unload */
+    void           *unload_hook_ctx;
+    int             unload_hook_busy; /* hook calls in progress (guards a
+                                       * concurrent mr_set_unload_hook) */
+    uint64_t        next_serial;    /* last mr_entry.serial handed out */
 } mr_registry;
 
 /* Copy-out row for /v1/models, `pantheon models`, and the admin surface. */
@@ -138,6 +182,7 @@ typedef struct {
     int      n_dies;
     uint64_t vram_bytes;
     int      max_sessions;              /* resolved per-model session cap */
+    pn_model_sampling sampling;         /* per-model sampling defaults (A4) */
     int      max_concurrent;            /* CONFIGURED per-model batch-slot cap —
                                          * what --max-concurrent asked for. NOT
                                          * what the model actually serves; see
@@ -188,7 +233,22 @@ typedef struct {
                                          * MiniCPM5's attribute tool dialect.
                                          * /v1/models resolves the dialect from
                                          * this + the name (tc_dialect_for_model). */
-    int      refs;
+    int      refs;                      /* live (in-flight) references */
+    int      watch_refs;                /* open /session/watch pins */
+    int      replica;                   /* copy number among its name (mr_entry) */
+    int      sessions_used;             /* session families holding a seat
+                                         * on this replica now (ms_sessions_used:
+                                         * scheduler slots or cache entries,
+                                         * idle ones included, released or
+                                         * reaped ones not) */
+    int      slots_held;                /* decode slots held (a family may hold
+                                         * more than one; == sessions_used
+                                         * without a scheduler) */
+    bool     seat_free;                 /* could a NEW session be seated now */
+    bool     think_history_drop_last;   /* think_history "drop_last" is served:
+                                         * batched turn checkpoints carved
+                                         * (bs_think_history_drop_last), or the
+                                         * single-user turn snapshot */
 } mr_info;
 
 /* Initialize / destroy. mr_free unloads every resident model (draining each);
@@ -223,6 +283,18 @@ int mr_load(mr_registry *reg, const char *path, const char *name,
             char *err, size_t errlen);
 
 /**
+ * mr_load with an explicit copy number: `replica` >= 1 numbers this copy (a name
+ * already holding that number is a refusal); 0 takes the lowest number the name
+ * does not use yet. mr_load is mr_load_replica(..., 0, ...).
+ *
+ * Thread-safe: yes. Reentrant: no. Signal-safe: no
+ */
+int mr_load_replica(mr_registry *reg, const char *path, const char *name,
+                    const pn_load_opts *opts, const int *dies, int n_dies,
+                    int reasoning_budget, int max_sessions, int max_concurrent,
+                    int replica, char *err, size_t errlen);
+
+/**
  * Look up an entry by name and take a reference. NULL/empty name resolves to
  * the default model (the first loaded). Returns NULL if unknown, unloading,
  * or the registry is empty. Every successful mr_acquire MUST be paired with
@@ -230,8 +302,110 @@ int mr_load(mr_registry *reg, const char *path, const char *name,
  */
 mr_entry *mr_acquire(mr_registry *reg, const char *name);
 
+/**
+ * mr_acquire for a session: when `name` has several replicas (the same model
+ * loaded on several die-sets), a session already bound to one goes back to it
+ * (its KV lives there); a new session, or a request without one, goes to the
+ * least busy replica (live turns + sessions bound to it; ties to the first
+ * loaded) and the session is bound there. A bound session that holds no seat
+ * on its replica (ms_session_holds_seat: nothing of it lives there — e.g. a
+ * watch bound it while only that copy was loaded, or the serve restarted) is
+ * placed like a new one on a generation turn (mr_route.place_unseated).
+ * NULL/empty name = the default model's name. sid may be NULL. Pair with
+ * mr_release.
+ *
+ * Thread-safe: yes. Reentrant: no. Signal-safe: no
+ */
+mr_entry *mr_acquire_session(mr_registry *reg, const char *name, const char *sid);
+
+typedef enum {
+    MR_ROUTE_OK = 0,
+    MR_ROUTE_NO_MODEL,       /* nothing ready under the name */
+    MR_ROUTE_NO_REPLICA,     /* the name is loaded, the requested copy is not */
+} mr_route_status;
+
+/* One routing decision of mr_acquire_session_on. */
+typedef struct {
+    int             replica;                   /* in: copy to bind a NEW session
+                                                * to; 0 = least busy */
+    bool            place_unseated;            /* in: a generation turn — a bound
+                                                * session holding no seat on its
+                                                * copy is placed like a new one */
+    mr_route_status status;                    /* out */
+    bool            bound_now;                 /* out: this call bound sid */
+    bool            kept_binding;              /* out: sid was bound to another
+                                                * copy than `replica`; it stays */
+    bool            moved;                     /* out: sid was bound to a copy where
+                                                * it held no seat; re-placed */
+    int             n_replicas;                /* out: copies of the name */
+    int             replicas[MR_MAX_MODELS];   /* out: their numbers, load order */
+    char            name[MR_MAX_NAME];         /* out: the name routed on (the default
+                                                * model's when none was given) */
+} mr_route;
+
+/**
+ * mr_acquire_session with a requested copy. A session already bound keeps its
+ * copy (kept_binding says the request named another). A new session, or a
+ * request without one, goes to copy route->replica when it is > 0 (never to
+ * another: a missing copy is MR_ROUTE_NO_REPLICA and NULL), else to the least
+ * busy one exactly as mr_acquire_session. route may be NULL (= replica 0).
+ * Pair a non-NULL return with mr_release.
+ *
+ * Thread-safe: yes. Reentrant: no. Signal-safe: no
+ */
+mr_entry *mr_acquire_session_on(mr_registry *reg, const char *name, const char *sid,
+                                mr_route *route);
+
+/**
+ * Fail a session over: `from` refused it (no seat, or no slot in time) and it
+ * holds no seat there, so take the least busy OTHER ready copy of from's name
+ * that has a free seat, move the session's bindings to it and take a
+ * reference. NULL when no other copy has a seat (the caller answers the
+ * refusal). sid may be NULL. The caller still holds and releases `from`.
+ * Pair a non-NULL return with mr_release.
+ *
+ * Thread-safe: yes. Reentrant: no. Signal-safe: no
+ */
+mr_entry *mr_failover_session(mr_registry *reg, const mr_entry *from, const char *sid,
+                              mr_route *route);
+
+/**
+ * Take a reference on every ready copy of `name` (at most `max`), in load
+ * order. Returns the count; release each with mr_release.
+ *
+ * Thread-safe: yes. Reentrant: no. Signal-safe: no
+ */
+int mr_acquire_replicas(mr_registry *reg, const char *name, mr_entry **out, int max);
+
 /** Drop a reference taken by mr_acquire (signals any draining unload). */
 void mr_release(mr_registry *reg, mr_entry *entry);
+
+/**
+ * Pin `entry` for an open /session/watch. Unlike mr_acquire this does NOT count
+ * as in-flight work: an unload never waits on a watch pin — it closes the watch
+ * through the unload hook instead. The caller must already hold an mr_acquire
+ * reference on `entry` (so it is resident). @return 0, or -1 when the entry is
+ * gone or unloading.
+ */
+int mr_watch_pin(mr_registry *reg, mr_entry *entry);
+
+/** Drop a pin taken by mr_watch_pin (signals any finishing unload). */
+void mr_watch_unpin(mr_registry *reg, mr_entry *entry);
+
+/**
+ * Install the unload hook (NULL clears it). One hook per registry: the serve's
+ * watch manager. Clearing waits for any hook call in progress to return, so the
+ * hook's ctx may be freed right after mr_set_unload_hook(reg, NULL, NULL).
+ */
+void mr_set_unload_hook(mr_registry *reg, mr_unload_hook_fn fn, void *ctx);
+
+/**
+ * True once an unload has asked this entry's live turns to stop (its
+ * finish-wait expired). A turn's should_abort polls this so the unload can
+ * free the card instead of refusing. Lock-free; safe from any thread holding
+ * an mr_acquire reference.
+ */
+bool mr_turn_cancel_requested(const mr_entry *entry);
 
 /** PM 5: the serve's idle tick — pn_model_keepalive() on every single-user entry whose
  *  gen_lock is free (trylock; a generation in flight is skipped). @return NOPs sent. */
@@ -242,25 +416,51 @@ int mr_keepalive(mr_registry *reg);
 int mr_trylock_generation(mr_entry *entry);
 
 /**
- * Unload `name`: refuse new acquires, wait for in-flight references to drain,
- * release its die binding, and free the model + state.
+ * Unload `name`: refuse new acquires, let live turns finish or cancel them,
+ * close every /session/watch on it, release its die binding, and free the
+ * model + state.
  *
- * The drain is BOUNDED (PN_UNLOAD_DRAIN_MS, default 15000 ms). Success means
- * the model is gone AND its dies are back: die binding released, scheduler
- * slots and their per-slot KV rings destroyed, prefix cache and model freed. A
- * drain that does not complete in budget is a REFUSAL, not a slow success — the
- * entry is rolled back to fully resident and acquirable and nothing is freed.
- * An unload never leaves a model deregistered with its dies still held.
+ *   1. Finish-wait: wait up to PN_UNLOAD_DRAIN_MS (default 5000 ms) for live
+ *      references (mr_acquire) to drain. Watch pins are NOT waited on.
+ *   2. Cancel: if turns are still live, set the entry's cancel flag (turns
+ *      abort at their next should_abort poll) and wait up to
+ *      PN_UNLOAD_CANCEL_MS (default 10000 ms) more.
+ *   3. Close watches: the unload hook sends each open watch on the entry a
+ *      terminal `model_unloaded` event and closes it (in-grace rows too).
+ *   4. Free: die binding, scheduler slots + KV, prefix cache, model.
+ *
+ * A turn that ignores the cancel past step 2 is a REFUSAL: the entry is rolled
+ * back to fully resident and acquirable, its watches stay open, nothing is
+ * freed. An unload never leaves a model deregistered with its dies held.
  *
  * @return 0 on success; -1 with a reason in err[errlen] — unknown name,
- *         already unloading, or "model is busy: N reference(s) still in
- *         flight" (retry once the holders finish).
+ *         already unloading, or "model is busy: N live turn(s) ..." (a turn
+ *         did not stop).
  *
  * Thread-safe: yes (registry lock)
  * Reentrant: no
  * Signal-safe: no
  */
 int mr_unload(mr_registry *reg, const char *name, char *err, size_t errlen);
+
+/**
+ * mr_unload of one replica: the entry named `name` whose die-set starts at
+ * `first_die` (first_die < 0 = the first entry of that name, as mr_unload).
+ * Releases exactly that replica's die binding.
+ *
+ * Thread-safe: yes (registry lock). Reentrant: no. Signal-safe: no
+ */
+int mr_unload_replica(mr_registry *reg, const char *name, int first_die, char *err,
+                      size_t errlen);
+
+/**
+ * The entry named `name` whose die-set starts at `first_die` (< 0: any), or
+ * NULL. Caller holds reg->lock. require_ready skips loading/unloading slots.
+ *
+ * Thread-safe: no (caller holds reg->lock). Reentrant: yes. Signal-safe: no
+ */
+mr_entry *mr_find_replica_locked(mr_registry *reg, const char *name, int first_die,
+                                 bool require_ready);
 
 /**
  * The model-identity tag of a held entry (session warm-tier, Phase 7): a stable
@@ -270,6 +470,31 @@ int mr_unload(mr_registry *reg, const char *name, char *err, size_t errlen);
  * reference to (mr_acquire). Returns 0 for a NULL entry.
  */
 uint64_t mr_weights_version(const mr_entry *entry);
+
+/**
+ * Set the sampling defaults of the resident model `name` (every instance of
+ * that name). Call right after mr_load.
+ *
+ * @return 0, or -1 if no entry has that name
+ *
+ * Thread-safe: yes (registry lock)
+ * Reentrant: no
+ * Signal-safe: no
+ */
+int mr_set_sampling_defaults(mr_registry *reg, const char *name,
+                             const pn_model_sampling *defaults);
+
+/**
+ * Set the reasoning reserve (sg_gen_params.reasoning_reserve) of the resident
+ * model `name` (every instance of that name). Call right after mr_load.
+ *
+ * @return 0, or -1 if no entry has that name
+ *
+ * Thread-safe: yes (registry lock)
+ * Reentrant: no
+ * Signal-safe: no
+ */
+int mr_set_reasoning_reserve(mr_registry *reg, const char *name, int reserve);
 
 /** Number of resident (acquirable) models. */
 int mr_count(mr_registry *reg);

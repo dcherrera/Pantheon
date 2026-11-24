@@ -6,8 +6,9 @@
 #
 # Foundry location, in precedence order:
 #   1. FOUNDRY=/path/to/foundry   explicit override
-#   2. ./foundry                  the git submodule (git clone --recursive, or
-#                                 git submodule update --init), or a symlink
+#   2. ./foundry                  the git submodule in the public repository (git
+#                                 clone --recursive, or git submodule update
+#                                 --init), or a symlink in a development checkout
 #   3. ../foundry                 sibling checkout
 
 CC ?= clang
@@ -172,6 +173,7 @@ ifdef USE_TT
 	$(FOUNDRY)/tt/ft_tt_multicast.c \
 	$(FOUNDRY)/tt/ft_tt_group_shared_operand.c \
 	$(FOUNDRY)/tt/ft_tt_dram_stripe.c \
+	$(FOUNDRY)/tt/ft_tt_dram_nearest.c \
 	$(FOUNDRY)/tt/ft_tt_op_matmul_cooperative.c \
 	$(FOUNDRY)/tt/ft_tt_group_broadcast_partition.c \
 	$(FOUNDRY)/tt/ft_tt_op_matmul_resident_multicast.c \
@@ -198,11 +200,11 @@ ifdef USE_TT
 	$(FOUNDRY)/tt/ft_tt_op_rope.c \
 	$(FOUNDRY)/tt/ft_tt_op_sample.c \
 	$(FOUNDRY)/tt/ft_tt_op_vector.c \
+	$(FOUNDRY)/tt/ft_tt_op_norm_role.c \
 	$(FOUNDRY)/tt/ft_tt_op_attention.c \
 	$(FOUNDRY)/tt/ft_tt_op_gdn.c \
 	$(FOUNDRY)/tt/ft_tt_op_gdnc.c \
 	$(FOUNDRY)/tt/ft_tt_op_replicas.c \
-	$(FOUNDRY)/tt/convert/ft_bfp.c \
 	$(FOUNDRY)/tt/convert/ft_float_convert.c \
 	$(FOUNDRY)/tt/convert/ft_tt_precision_ledger.c \
 	$(FOUNDRY)/tt/convert/ft_gguf_map.c \
@@ -225,6 +227,7 @@ FOUNDRY_SRC = \
 	$(FOUNDRY)/tokenizer/tokenizer.c \
 	$(FOUNDRY)/quantization/quantization.c \
 	$(FOUNDRY)/pth/pth.c \
+	$(FOUNDRY)/tt/convert/ft_bfp.c \
 	$(THREADPOOL_SRC) \
 	$(METAL_SRC) \
 	$(CUDA_SRC) \
@@ -234,22 +237,51 @@ FOUNDRY_SRC = \
 # Pantheon sources
 # ============================================================
 
+# Host-RAM admission, for tests that link a routed source without PN_SRC.
+HOST_ADMIT_SRC = src/core/mem/pn_host_admission.c src/core/mem/pn_host_signals.c
+
+# FTTW tile decoding (the card-format oracle, gguf_tiled.h): every target that links
+# gguf_dequant.c links these too. foundry's ft_bfp.c is the one block-float codec.
+TILED_SRC = src/formats/gguf_tiled.c $(FOUNDRY)/tt/convert/ft_bfp.c
+
 PN_SRC = \
 	src/core/engine.c \
+	src/core/load_guard.c \
+	src/core/load_progress.c \
 	src/core/mem/pn_host_signals.c \
 	src/core/mem/pn_memwatch.c \
 	src/core/mem/pn_admission.c \
+	src/core/mem/pn_host_admission.c \
+	src/core/mem/pn_session_host_fit.c \
 	src/core/mem/pn_kv_geometry.c \
 	src/core/mem/pn_ladder.c \
 	src/core/mem/pn_lazy_zero.c \
+	src/core/mem/pn_host_heap.c \
 	src/core/bench.c \
 	src/core/sample_profiler.c \
+	src/core/act_stats.c \
+	src/core/act_stats_file.c \
+	src/core/act_stats_xtx.c \
 	src/core/qweight.c \
+	src/core/qweight_tiled.c \
 	src/core/sampling_modifiers.c \
+	src/core/host_stage_timer.c \
+	src/core/host_row_dump.c \
+	src/core/sampler_margin_draw.c \
 	src/core/grammar_mask_shortlist.c \
+	src/core/grammar_row_dump.c \
+	src/core/sampler_topn_tail.c \
+	src/core/sampler_topn_surgery.c \
 	src/core/chat.c \
 	src/core/bpe_pretokenize.c \
 	src/core/ngram_draft.c \
+	src/core/spec_sampling_rule.c \
+	src/core/spec_sampling_chooser.c \
+	src/core/spec_depth.c \
+	src/core/dump_reqlog.c \
+	src/core/spec_mtp.c \
+	src/core/spec_mtp_step.c \
+	src/core/spec_mtp_couple.c \
 	src/core/prefix_cache.c \
 	src/core/session_snapshot.c \
 	src/memory/arena.c \
@@ -259,16 +291,45 @@ PN_SRC = \
 	src/accel/backend_identity.c \
 	src/accel/tt/pn_tt_device.c \
 	src/accel/tt/pn_tt_matmul_group.c \
+	src/accel/tt/pn_tt_core_list.c \
+	src/accel/tt/pn_tt_matmul_pull.c \
+	src/accel/tt/pn_tt_unmirrored_probe.c \
+	src/accel/tt/pn_tt_weight_banks.c \
 	src/accel/tt/pn_tt_residency.c \
+	src/accel/tt/pn_tt_group_pull.c \
+	src/accel/tt/pn_tt_moe.c \
 	src/accel/tt/pn_tt_issue.c \
 	src/accel/tt/pn_tt_core_boot_guard.c \
 	src/accel/tt/pn_tt_oncard.c \
 	src/accel/tt/pn_tt_eltwise_group.c \
 	src/accel/tt/pn_tt_eltwise_split.c \
+	src/accel/tt/pn_tt_norm_schedule.c \
+	src/accel/tt/pn_tt_norm_role.c \
+	src/accel/tt/pn_tt_norm_role_plan.c \
+	src/accel/tt/pn_tt_role_table.c \
 	src/accel/tt/pn_tt_reader.c \
 	src/accel/tt/pn_tt_attention.c \
+	src/accel/tt/pn_tt_attention_lanes.c \
+	src/accel/tt/pn_tt_attention_splitk.c \
+	src/accel/tt/pn_tt_attention_grid.c \
+	src/accel/tt/pn_tt_attn_deep.c \
+	src/accel/tt/pn_tt_lend_ledger.c \
+	src/accel/tt/pn_tt_prefill_lend.c \
+	src/accel/tt/pn_tt_attn_splitk.c \
+	src/accel/tt/pn_tt_attn_fast.c \
+	src/accel/tt/pn_tt_grid_probe.c \
+	src/accel/tt/pn_tt_grid_msplit.c \
+	src/accel/tt/pn_tt_grid_marks.c \
+	src/accel/tt/pn_tt_kv_banks.c \
+	src/accel/tt/pn_tt_kv_append_split.c \
+	src/accel/tt/pn_tt_kv_format.c \
+	src/accel/tt/pn_tt_kv_rotate.c \
 	src/accel/tt/pn_tt_gdn.c \
 	src/accel/tt/pn_tt_gdn_checkpoint.c \
+	src/accel/tt/pn_tt_gdn_verify_slots.c \
+	src/accel/tt/pn_tt_gdn_conv_share.c \
+	src/accel/tt/pn_tt_gdn_conv_split.c \
+	src/accel/tt/pn_tt_matmul_rows.c \
 	src/accel/tt/pn_tt_gdnc.c \
 	src/accel/tt/pn_tt_gdngate.c \
 	src/accel/tt/pn_tt_stage_pipeline.c \
@@ -277,14 +338,32 @@ PN_SRC = \
 	src/accel/tt/pn_tt_gate.c \
 	src/accel/tt/pn_tt_fp32_strip.c \
 	src/accel/tt/pn_tt_column_runs.c \
+	src/accel/tt/pn_tt_weight_view.c \
+	src/accel/tt/pn_tt_weight_split.c \
+	src/accel/tt/pn_tt_strip_placement.c \
+	src/accel/tt/pn_tt_mixw_fit.c \
+	src/accel/tt/pn_tt_prefill_reserve.c \
 	src/accel/tt/pn_tt_descriptor_census.c \
 	src/accel/tt/pn_tt_name_list.c \
 	src/accel/tt/pn_tt_gdn_layout.c \
 	src/accel/tt/pn_tt_gdn_core_scaling.c \
 	src/accel/tt/pn_tt_replica_map.c \
+	src/accel/tt/pn_tt_late_mirrors.c \
+	src/accel/tt/pn_tt_swiglu_fuse.c \
+	src/accel/tt/pn_tt_resadd_fuse.c \
 	src/accel/tt/pn_tt_dispatch.c \
+	src/accel/tt/pn_tt_dispatch_hoist.c \
+	src/accel/tt/pn_tt_precondition.c \
+	src/accel/tt/pn_tt_precondition_verify.c \
+	src/accel/tt/pn_tt_precondition_dump.c \
+	src/accel/tt/pn_tt_host_gap.c \
+	src/accel/tt/pn_tt_topk_tail.c \
+	src/accel/tt/pn_tt_topk_rows.c \
 	src/formats/gguf.c \
 	src/formats/gguf_dequant.c \
+	src/formats/gguf_tiled.c \
+	src/formats/gguf_fttw_overlay.c \
+	src/formats/gguf_fttw_repack.c \
 	src/formats/gguf_layer_bytes.c \
 	src/models/llama.c \
 	src/models/llama_state_snapshot.c \
@@ -297,22 +376,33 @@ PN_SRC = \
 	src/models/rwkvx.c \
 	src/models/gpu_attn_path_tracker.c \
 	src/models/gpu_graph_capture_tracker.c \
+	src/models/qwen35moe_mtp_ring.c \
 	src/models/qwen35moe.c \
+	src/models/qwen35moe_die_projection.c \
 	src/models/qwen35moe_attn.c \
 	src/models/qwen35moe_ssm.c \
+	src/models/qwen35moe_gate_tables.c \
 	src/models/qwen35moe_moe.c \
+	src/models/qwen35moe_routing_dump.c \
 	src/models/qwen35moe_forward.c \
 	src/models/qwen35moe_forward_cuda.c \
 	src/models/qwen35moe_forward_tt.c \
 	src/models/qwen35moe_resident_tt.c \
+	src/models/qwen35moe_moe_tt.c \
 	src/models/qwen35moe_gdn_tt.c \
 	src/models/qwen35moe_gdn_strip_tt.c \
 	src/models/qwen35moe_attn_tt.c \
 	src/models/qwen35moe_prefill_tt.c \
 	src/models/qwen35moe_prefill_checkpoint_tt.c \
+	src/models/qwen35moe_fit_tt.c \
+	src/models/qwen35moe_tt_fit_plan.c \
+	src/models/qwen35moe_tt_mixw_census.c \
+	src/models/qwen35moe_mtp_prompt_defer_tt.c \
+	src/models/qwen35moe_outproj_mirrors_tt.c \
 	src/models/qwen35moe_checkpoint_band.c \
 	src/models/qwen35moe_prefill_prefetch_tt.c \
 	src/models/qwen35moe_prefill_overlap_tt.c \
+	src/models/qwen35moe_prefill_ov_plan.c \
 	src/models/qwen35moe_prefill_tt_wall.c \
 	src/models/qwen35moe_gdn_parity_tt.c \
 	src/models/qwen35moe_gdn_normcheck_tt.c \
@@ -336,6 +426,8 @@ SERVE_SRC = \
 	src/serve/tool_grammar_json.c \
 	src/serve/grammar_spec_chooser.c \
 	src/serve/tool_param_empty_value_rule.c \
+	src/serve/field_pattern.c \
+	src/serve/field_patterns_request.c \
 	src/serve/response_format_grammar.c \
 	src/serve/serve_emitter.c \
 	src/serve/json_canonical_stream.c \
@@ -343,14 +435,28 @@ SERVE_SRC = \
 	src/serve/repetition_loop_detector.c \
 	src/serve/serve_prompt_tokens.c \
 	src/serve/serve_spec_lookup.c \
+	src/serve/serve_spec_census.c \
+	src/serve/serve_spec_mtp_cuda.c \
+	src/serve/serve_request_dump.c \
+	src/serve/serve_dump_reqlog.c \
 	src/serve/serve_generation.c \
+	src/serve/context_over_budget.c \
 	src/serve/model_registry.c \
+	src/serve/model_replica_route.c \
+	src/serve/replica_affinity.c \
+	src/serve/replica_pin.c \
 	src/serve/model_session.c \
 	src/serve/batch_sched.c \
+	src/serve/batch_sched_slots.c \
+	src/serve/batch_sched_turn_checkpoint.c \
+	src/serve/batch_sched_admission.c src/serve/batch_sched_watchdog.c \
+	src/serve/batch_sched_spec.c \
 	src/serve/base64.c \
-	src/serve/model_admin.c \
+	src/serve/model_admin.c src/serve/load_env_scope.c \
 	src/serve/openai_chat.c \
+	src/serve/sampling_defaults.c \
 	src/serve/request_profile.c \
+	src/serve/request_timing_line.c \
 	src/serve/signal_handlers.c \
 	src/serve/serve_shutdown.c \
 	src/serve/serve_backend_guard.c \
@@ -363,6 +469,36 @@ SERVE_SRC = \
 	src/serve/http_client.c \
 	src/serve/router.c \
 	src/serve/router_command.c
+
+# Foundry's Ingot codec (foundry ingot/): Pantheon Local decodes catalog .ingot downloads
+# (src/local/ingot_fetch.c). An archive compiled with the codec's own flags — never
+# -ffast-math — and listed last in SERVE_SRC so every link of the serve resolves against it.
+# safetensors.c is in it for the module tests; links that compile FOUNDRY_SRC take theirs.
+# Switching build configs needs `rm -rf build`, as for libpantheon.a.
+INGOT_OBJDIR = build/ingot
+INGOT_LIB    = $(INGOT_OBJDIR)/libpn_ingot.a
+# Every codec source foundry's ingot/ has (a new foundry file links without a Makefile change).
+INGOT_SRC = $(wildcard $(FOUNDRY)/ingot/core/*.c $(FOUNDRY)/ingot/codec/*.c \
+	$(FOUNDRY)/ingot/container/*.c) $(FOUNDRY)/tt/convert/ft_sha256.c \
+	$(FOUNDRY)/safetensors/safetensors.c
+INGOT_OBJS = $(addprefix $(INGOT_OBJDIR)/,$(notdir $(INGOT_SRC:.c=.o)))
+INGOT_HDR  = $(wildcard $(FOUNDRY)/ingot/*/*.h) $(FOUNDRY)/tt/convert/ft_sha256.h \
+	$(FOUNDRY)/safetensors/safetensors.h
+INGOT_CFLAGS = -std=c11 -O2 $(ARCH_FLAGS) -Wall -Wextra -pedantic -pthread -I$(FOUNDRY) \
+	-D_DARWIN_C_SOURCE -D_DEFAULT_SOURCE
+
+# Pantheon Local (appliance mode, `pantheon local`). Its own folder; linked into
+# the CLI with the serve (docs/local/README.md).
+LOCAL_SRC = $(wildcard src/local/*.c)
+# Monocypher 4.0.3 (lib/monocypher/README.md): Ed25519 + BLAKE2b for the catalog
+# signature. Vendored, CC0-1.0 OR BSD-2-Clause.
+MONOCYPHER_SRC = lib/monocypher/monocypher.c lib/monocypher/monocypher-ed25519.c
+SERVE_SRC += $(LOCAL_SRC) $(MONOCYPHER_SRC) $(INGOT_LIB)
+# make LOCAL_TEST_CATALOG_KEY=1: also trust tests/local/fixtures/test_catalog.pub.
+# TEST ONLY — for the on-hardware e2e scripts; never for a shipped build.
+ifdef LOCAL_TEST_CATALOG_KEY
+  CFLAGS += -DPN_LOCAL_TEST_CATALOG_KEY
+endif
 
 # ============================================================
 # Header dependencies — DISCOVERED, never hand-listed
@@ -493,6 +629,8 @@ LIB_OBJS   = $(patsubst %,$(LIB_OBJDIR)/%.o,$(LIB_C_ONLY))
 ifdef USE_METAL
 LIB_OBJS  += $(patsubst %,$(LIB_OBJDIR)/%.o,$(METAL_SRC))
 endif
+# The Ingot objects (minus safetensors, which FOUNDRY_SRC already brings).
+LIB_OBJS  += $(filter-out %/safetensors.o,$(INGOT_OBJS))
 LIB_DEPS   = $(LIB_OBJS:.o=.d)
 
 # Real depfiles: these are the only separately-compiled objects in the build,
@@ -516,17 +654,56 @@ libpantheon.a: $(LIB_OBJS)
 	@echo "built $@ (public header: include/pantheon.h)"
 	@echo "link with: -lpantheon $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA) -lm"
 
+# The Ingot archive (INGOT_SRC above), with the codec's own flags.
+define INGOT_OBJ_RULE
+$(INGOT_OBJDIR)/$(notdir $(1:.c=.o)): $(1) $(INGOT_HDR)
+	@mkdir -p $(INGOT_OBJDIR)
+	$$(CC) $$(INGOT_CFLAGS) -c $(1) -o $$@
+endef
+$(foreach s,$(INGOT_SRC),$(eval $(call INGOT_OBJ_RULE,$(s))))
+
+$(INGOT_LIB): $(INGOT_OBJS)
+	@rm -f $@
+	ar rcs $@ $(INGOT_OBJS)
+
+# Pantheon Local tests, defined before test: so its prerequisite list sees them
+# (a rule's prerequisites expand when the rule is read).
+LOCAL_TESTS_FULL = tests/test_local_empty_start tests/test_local_hw_report tests/test_local_keys \
+	tests/test_local_flow tests/test_local_reload_placement tests/test_local_replicas \
+	tests/test_local_load_progress tests/test_load_guard tests/test_local_unit_types \
+	tests/test_load_budget_release tests/test_local_replica_pin tests/test_replica_pin_serve \
+	tests/test_local_pairing_devices tests/test_local_people_routes tests/test_local_hook_adopt \
+	tests/test_local_host_routes tests/test_local_session_routes tests/test_local_relay_routes
+LOCAL_TESTS = tests/test_sampling_defaults tests/test_local_unit_place tests/test_local_mdns_packet tests/test_local_pick_port \
+	tests/test_local_minisign tests/test_local_catalog tests/test_local_download \
+	tests/test_local_loaded_set tests/test_local_load_options tests/test_replica_route \
+	tests/test_local_store_cleanup tests/test_local_people_store tests/test_local_key_migration \
+	tests/test_local_route_classes tests/test_local_session_registry tests/test_local_hosts_hub \
+	tests/test_local_attach_ticket tests/test_local_hub_relays $(LOCAL_TESTS_FULL)
+# Ingot Phase 1b: .ingot catalog downloads.
+LOCAL_TESTS += tests/test_local_ingot
+# People registry P5: loads, keys and seats by person.
+LOCAL_TESTS_FULL += tests/test_local_loads_by_person tests/test_local_serve_principal \
+	tests/test_local_seats
+
 # Build + run tests
-test: tests/test_backend_guard tests/test_build tests/test_gguf tests/test_gguf_layer_bytes tests/test_admission_reserve tests/test_die_scratch_ctx tests/test_die_layer_split tests/test_arena tests/test_qmv tests/test_simd tests/test_simd_props tests/test_chat tests/test_tool_calling tests/test_tool_call_defects tests/test_tool_call_truncation tests/test_empty_argument tests/test_frame_capture tests/test_json_value_grammar tests/test_tool_grammar tests/test_tool_grammar_json tests/test_grammar_spec_chooser tests/test_grammar_mask_shortlist tests/test_grammar_topn_sampler tests/test_response_format_grammar tests/test_sampling_modifiers tests/test_chat_request tests/test_serve_emitter tests/test_tool_call_stream tests/test_repetition_loop_detector tests/test_serve_spec_lookup tests/test_registry tests/test_base64 tests/test_prefix_cache_sys tests/test_llama_state_snapshot tests/test_prefix_projection tests/test_session_watch tests/test_session_affinity tests/test_bs_load tests/test_bpe_pretokenize tests/test_pretok_props tests/test_dequant_props tests/test_rwkvx tests/test_qwen35moe tests/test_qwen35_prefill_causality tests/test_qwen35moe_metal_coverage tests/test_qwen35moe_metal_coverage_fake tests/test_die_manager tests/test_model_registry tests/test_model_unload_reclaim tests/test_embed_row tests/test_tt_column_runs tests/test_qwen35_ckpt_band tests/test_tt_name_list tests/test_tt_eltwise_split tests/test_tt_descriptor_census tests/test_tt_stage_pipeline tests/test_graph_capture_retry tests/test_attn_ring_retry tests/test_serve_shutdown
+test: tests/test_backend_guard tests/test_build tests/test_gguf tests/test_gguf_layer_bytes tests/test_admission_reserve tests/test_context_budget tests/test_reasoning_budget tests/test_host_admission tests/test_host_admit_serve tests/test_die_scratch_ctx tests/test_qwen35_die_projection tests/test_die_layer_split tests/test_arena tests/test_qmv tests/test_tiled_fast_decode tests/test_simd tests/test_simd_props tests/test_chat tests/test_tool_calling tests/test_tool_call_defects tests/test_tool_call_truncation tests/test_empty_argument tests/test_frame_capture tests/test_json_value_grammar tests/test_tool_grammar tests/test_tool_grammar_json tests/test_tool_grammar_reasoned tests/test_tool_grammar_json_reasoned tests/test_field_pattern tests/test_tool_grammar_field_patterns tests/test_tool_grammar_json_field_patterns tests/test_tool_grammar_no_repeat_keys tests/test_field_pattern_steer tests/test_tool_grammar_forced_close_call tests/test_grammar_spec_chooser tests/test_grammar_mask_shortlist tests/test_grammar_topn_sampler tests/test_grammar_repeat_penalty tests/test_topn_surgery tests/test_grammar_exact_bound tests/test_grammar_dense_shortlist tests/test_grammar_select_shortlist tests/test_sampler_margin_draw tests/test_response_format_grammar tests/test_sampling_modifiers tests/test_chat_request tests/test_serve_emitter tests/test_tool_call_stream tests/test_repetition_loop_detector tests/test_serve_spec_lookup tests/test_registry tests/test_base64 tests/test_prefix_cache_sys tests/test_host_heap_churn tests/test_sampler_thread_scratch tests/test_llama_state_snapshot tests/test_prefix_projection tests/test_think_history_as_sent tests/test_think_history_drop_last tests/test_template_parity_qwen tests/test_session_watch tests/test_session_affinity tests/test_bs_load tests/test_bs_finalize_yield tests/test_request_timing_line tests/test_bs_prefill_share tests/test_bs_pd_budget tests/test_decode_watchdog tests/test_think_flip_backlog tests/test_bpe_pretokenize tests/test_pretok_props tests/test_dequant_props tests/test_rwkvx tests/test_qwen35moe tests/test_qwen35_prefill_causality tests/test_qwen35moe_metal_coverage tests/test_qwen35moe_metal_coverage_fake tests/test_die_manager tests/test_model_registry tests/test_model_unload_reclaim tests/test_unload_closes_watch tests/test_embed_row tests/test_tt_column_runs tests/test_qwen35_ckpt_band tests/test_tt_name_list tests/test_tt_core_list tests/test_tt_eltwise_split tests/test_tt_norm_schedule tests/test_tt_norm_role tests/test_tt_role_table tests/test_tt_descriptor_census tests/test_tt_q38_mixw_fit tests/test_tt_q38_fit_banks tests/test_tt_q38_fit_levers tests/test_tt_weight_view tests/test_tt_gate_tables tests/test_tt_reader_runs tests/test_tt_grid_msplit tests/test_tt_grid_marks tests/test_qwen35_ov_plan tests/test_tt_attn_splitk tests/test_tt_dispatch_shape_key tests/test_tt_attn_fast tests/test_tt_attn_deep tests/test_tt_lend_ledger tests/test_tt_dispatch_hoist tests/test_tt_precondition tests/test_tt_gdn_conv_split tests/test_tt_matmul_rows tests/test_tt_stage_pipeline tests/test_graph_capture_retry tests/test_attn_ring_retry tests/test_mtp_ring_clear tests/test_serve_shutdown tests/test_spec_depth tests/test_spec_mtp_couple tests/test_spec_grammar_draw tests/test_qwen35_tp_forget tests/test_qwen35_tp_restore_sync tests/test_dump_reqlog tests/test_act_stats tests/test_act_stats_model tests/test_act_stats_xtx tools/oracle/act_stats_merge tests/test_load_env_scope $(LOCAL_TESTS)
 	./tests/test_backend_guard
 	./tests/test_build
 	./tests/test_gguf
 	./tests/test_gguf_layer_bytes
 	./tests/test_admission_reserve
+	./tests/test_context_budget
+	./tests/test_reasoning_budget
+	./tests/test_host_admission
+	./tests/test_host_admit_serve
 	./tests/test_die_scratch_ctx
+	./tests/test_qwen35_die_projection
 	./tests/test_die_layer_split
 	./tests/test_arena
 	./tests/test_qmv
+	./tests/test_tiled_fast_decode
+	PN_TILED_RED=1 ./tests/test_tiled_fast_decode
 	./tests/test_simd
 	./tests/test_simd_props
 	./tests/test_chat
@@ -538,9 +715,32 @@ test: tests/test_backend_guard tests/test_build tests/test_gguf tests/test_gguf_
 	./tests/test_json_value_grammar
 	./tests/test_tool_grammar
 	./tests/test_tool_grammar_json
+	./tests/test_tool_grammar_reasoned
+	./tests/test_tool_grammar_json_reasoned
+	./tests/test_field_pattern
+	./tests/test_tool_grammar_field_patterns
+	./tests/test_tool_grammar_json_field_patterns
+	./tests/test_tool_grammar_no_repeat_keys
+	./tests/test_field_pattern_steer
+	./tests/test_tool_grammar_forced_close_call
 	./tests/test_grammar_spec_chooser
 	./tests/test_grammar_mask_shortlist
 	./tests/test_grammar_topn_sampler
+	./tests/test_grammar_repeat_penalty
+	./tests/test_topn_surgery
+	./tests/test_topn_surgery --selftest
+	./tests/test_grammar_exact_bound
+	./tests/test_grammar_exact_bound --red
+	./tests/test_grammar_exact_bound --selftest
+	./tests/test_grammar_dense_shortlist
+	./tests/test_grammar_dense_shortlist --red
+	./tests/test_grammar_dense_shortlist --selftest
+	./tests/test_grammar_dense_shortlist --red-hint
+	./tests/test_grammar_select_shortlist
+	./tests/test_grammar_select_shortlist --selftest
+	./tests/test_sampler_margin_draw
+	./tests/test_sampler_margin_draw --selftest
+	./tests/test_sampler_margin_draw --red-wrong
 	./tests/test_grammar_topn_sampler --selftest
 	./tests/test_response_format_grammar
 	./tests/test_sampling_modifiers
@@ -548,14 +748,40 @@ test: tests/test_backend_guard tests/test_build tests/test_gguf tests/test_gguf_
 	./tests/test_serve_emitter
 	./tests/test_tool_call_stream
 	./tests/test_repetition_loop_detector
+	./tests/test_spec_depth
+	./tests/test_spec_mtp_couple
+	./tests/test_spec_mtp_couple --selftest
+	./tests/test_spec_grammar_draw
+	./tests/test_spec_grammar_draw --selftest
+	./tests/test_qwen35_tp_forget
+	./tests/test_qwen35_tp_restore_sync
+	./tests/test_dump_reqlog
+	mkdir -p build && ./tests/test_act_stats
+	mkdir -p build && ./tests/test_act_stats_model
+	mkdir -p build && ./tests/test_act_stats_xtx
+	./tools/oracle/act_stats_merge build/act_stats/merged.imatrix build/act_stats/h1.imatrix \
+		build/act_stats/h2.imatrix && cmp build/act_stats/merged.imatrix build/act_stats/full.imatrix
+	./tests/test_load_env_scope
 	./tests/test_registry
 	./tests/test_base64
 	./tests/test_prefix_cache_sys
+	./tests/test_host_heap_churn
+	./tests/test_sampler_thread_scratch
 	./tests/test_llama_state_snapshot
 	./tests/test_prefix_projection
+	./tests/test_think_history_as_sent
+	./tests/test_think_history_drop_last
+	./tests/test_template_parity_qwen
 	./tests/test_session_watch
 	./tests/test_session_affinity
 	./tests/test_bs_load
+	./tests/test_bs_finalize_yield
+	./tests/test_request_timing_line
+	./tests/test_bs_prefill_share
+	./tests/test_bs_pd_budget
+	./tests/test_decode_watchdog
+	./tests/test_think_flip_backlog
+	./tests/test_think_flip_backlog --red
 	./tests/test_bpe_pretokenize
 	./tests/test_pretok_props
 	./tests/test_dequant_props
@@ -567,16 +793,43 @@ test: tests/test_backend_guard tests/test_build tests/test_gguf tests/test_gguf_
 	./tests/test_die_manager
 	./tests/test_model_registry
 	./tests/test_model_unload_reclaim
+	./tests/test_unload_closes_watch
 	./tests/test_embed_row
 	./tests/test_tt_column_runs
 	./tests/test_qwen35_ckpt_band
 	./tests/test_tt_eltwise_split
+	./tests/test_tt_norm_schedule
+	./tests/test_tt_norm_role
+	./tests/test_tt_role_table
 	./tests/test_tt_descriptor_census
+	./tests/test_tt_q38_mixw_fit
+	./tests/test_tt_q38_fit_banks
+	./tests/test_tt_q38_fit_levers
+	./tests/test_tt_weight_view
+	./tests/test_tt_gate_tables
+	./tests/test_tt_reader_runs
+	./tests/test_tt_grid_msplit
+	./tests/test_tt_grid_marks
+	./tests/test_qwen35_ov_plan
+	./tests/test_tt_core_list
+	./tests/test_tt_attn_splitk
+	./tests/test_tt_dispatch_shape_key
+	./tests/test_tt_attn_fast
+
+	./tests/test_tt_attn_deep
+	./tests/test_tt_lend_ledger
+	./tests/test_tt_dispatch_hoist
+	./tests/test_tt_precondition
+	./tests/test_tt_gdn_conv_split
+	./tests/test_tt_matmul_rows
 	./tests/test_graph_capture_retry
 	./tests/test_graph_capture_retry --latch
 	./tests/test_attn_ring_retry
 	./tests/test_attn_ring_retry --latch
+	./tests/test_mtp_ring_clear
+	./tests/test_mtp_ring_clear --no-clear
 	./tests/test_serve_shutdown
+	@for t in $(LOCAL_TESTS); do echo "./$$t"; ./$$t || exit 1; done
 
 tests/test_build: tests/test_build.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
 	$(CC) $(CFLAGS) -o $@ tests/test_build.c $(PN_SRC) $(FOUNDRY_SRC) \
@@ -594,8 +847,23 @@ tests/test_admission_reserve: tests/test_admission_reserve.c $(PN_SRC) $(FOUNDRY
 	$(CC) $(CFLAGS) -o $@ tests/test_admission_reserve.c $(PN_SRC) $(FOUNDRY_SRC) \
 		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
 
+tests/test_context_budget: tests/test_context_budget.c src/serve/context_over_budget.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_context_budget.c src/serve/context_over_budget.c $(PN_SRC) $(FOUNDRY_SRC) \
+		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
+
+# The per-turn reasoning plan (answer reserve + line-end close); header-only.
+tests/test_reasoning_budget: tests/test_reasoning_budget.c src/serve/reasoning_budget.h
+	$(CC) $(CFLAGS) -o $@ tests/test_reasoning_budget.c
+
+tests/test_host_admission: tests/test_host_admission.c src/core/mem/pn_host_admission.c src/core/mem/pn_host_signals.c src/core/mem/pn_host_admission.h
+	$(CC) $(CFLAGS) -o $@ tests/test_host_admission.c src/core/mem/pn_host_admission.c \
+		src/core/mem/pn_host_signals.c -lpthread
+
 tests/test_die_layer_split: tests/test_die_layer_split.c src/accel/die_layer_split.c src/accel/die_layer_split.h
 	$(CC) $(CFLAGS) -o $@ tests/test_die_layer_split.c src/accel/die_layer_split.c -lm
+
+tests/test_qwen35_die_projection: tests/test_qwen35_die_projection.c src/models/qwen35moe_die_projection.c $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_qwen35_die_projection.c src/models/qwen35moe_die_projection.c -lm
 
 tests/test_die_scratch_ctx: tests/test_die_scratch_ctx.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
 	$(CC) $(CFLAGS) -o $@ tests/test_die_scratch_ctx.c $(PN_SRC) $(FOUNDRY_SRC) \
@@ -617,7 +885,7 @@ tests/test_simd: tests/test_simd.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
 tests/test_simd_props: tests/test_simd_props.c src/accel/simd.c src/accel/simd.h \
 		src/formats/gguf_dequant.c src/formats/gguf.c src/formats/gguf_dequant.h src/formats/gguf.h
 	$(CC) $(CFLAGS) -o $@ tests/test_simd_props.c src/accel/simd.c \
-		src/formats/gguf_dequant.c src/formats/gguf.c -lm
+		src/formats/gguf_dequant.c src/formats/gguf.c $(TILED_SRC) $(HOST_ADMIT_SRC) -lm
 
 tests/test_chat: tests/test_chat.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
 	$(CC) $(CFLAGS) -o $@ tests/test_chat.c $(PN_SRC) $(FOUNDRY_SRC) \
@@ -649,8 +917,8 @@ tests/test_tool_call_defects: tests/test_tool_call_defects.c src/serve/tool_call
 # ended, and a call the grammar never closed must not be handed back as a call.
 # The only test that links BOTH halves — the defect lives in the gap between
 # them. Still pure C: no engine/model/CUDA.
-tests/test_tool_call_truncation: tests/test_tool_call_truncation.c src/serve/tool_calling.c src/serve/json_value_grammar.c src/serve/tool_grammar.c src/serve/tool_param_empty_value_rule.c src/serve/json_reader.c src/serve/json_writer.c $(ALL_HDR)
-	$(CC) $(CFLAGS) -o $@ tests/test_tool_call_truncation.c src/serve/tool_calling.c src/serve/json_value_grammar.c src/serve/tool_grammar.c src/serve/tool_param_empty_value_rule.c src/serve/json_reader.c src/serve/json_writer.c \
+tests/test_tool_call_truncation: tests/test_tool_call_truncation.c src/serve/tool_calling.c src/serve/json_value_grammar.c src/serve/tool_grammar.c src/serve/tool_param_empty_value_rule.c src/serve/field_pattern.c src/serve/json_reader.c src/serve/json_writer.c $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_tool_call_truncation.c src/serve/tool_calling.c src/serve/json_value_grammar.c src/serve/tool_grammar.c src/serve/tool_param_empty_value_rule.c src/serve/field_pattern.c src/serve/json_reader.c src/serve/json_writer.c \
 		-lm $(LDFLAGS)
 
 # EMPTY IS NOT ABSENT: a parameter the model CLOSED around an empty value is
@@ -672,34 +940,71 @@ tests/test_json_value_grammar: tests/test_json_value_grammar.c src/serve/json_va
 # Grammar-constrained tool decoding FSM (Phase 5). Pure C string/DOM parsing
 # over the tools schema; links only the grammar module + the JSON reader — no
 # engine/model/CUDA deps, fully local.
-tests/test_tool_grammar: tests/test_tool_grammar.c src/serve/tool_grammar.c src/serve/tool_calling.c src/serve/json_value_grammar.c src/serve/tool_param_empty_value_rule.c src/serve/json_reader.c src/serve/json_writer.c $(ALL_HDR)
-	$(CC) $(CFLAGS) -o $@ tests/test_tool_grammar.c src/serve/tool_grammar.c src/serve/tool_calling.c src/serve/json_value_grammar.c src/serve/tool_param_empty_value_rule.c src/serve/json_reader.c src/serve/json_writer.c \
+tests/test_tool_grammar: tests/test_tool_grammar.c src/serve/tool_grammar.c src/serve/tool_calling.c src/serve/json_value_grammar.c src/serve/tool_param_empty_value_rule.c src/serve/field_pattern.c src/serve/json_reader.c src/serve/json_writer.c $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_tool_grammar.c src/serve/tool_grammar.c src/serve/tool_calling.c src/serve/json_value_grammar.c src/serve/tool_param_empty_value_rule.c src/serve/field_pattern.c src/serve/json_reader.c src/serve/json_writer.c \
 		-lm $(LDFLAGS)
 
-tests/test_tool_grammar_json: tests/test_tool_grammar_json.c src/serve/tool_grammar_json.c src/serve/tool_param_empty_value_rule.c src/serve/json_reader.c src/serve/json_writer.c $(ALL_HDR)
-	$(CC) $(CFLAGS) -o $@ tests/test_tool_grammar_json.c src/serve/tool_grammar_json.c src/serve/tool_param_empty_value_rule.c src/serve/json_reader.c src/serve/json_writer.c \
+tests/test_tool_grammar_reasoned: tests/test_tool_grammar_reasoned.c src/serve/tool_grammar.c src/serve/json_value_grammar.c src/serve/tool_param_empty_value_rule.c src/serve/field_pattern.c src/serve/json_reader.c src/serve/json_writer.c $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_tool_grammar_reasoned.c src/serve/tool_grammar.c src/serve/json_value_grammar.c src/serve/tool_param_empty_value_rule.c src/serve/field_pattern.c src/serve/json_reader.c src/serve/json_writer.c \
+		-lm $(LDFLAGS)
+
+tests/test_tool_grammar_json_reasoned: tests/test_tool_grammar_json_reasoned.c src/serve/tool_grammar_json.c src/serve/tool_param_empty_value_rule.c src/serve/field_pattern.c src/serve/json_reader.c src/serve/json_writer.c $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_tool_grammar_json_reasoned.c src/serve/tool_grammar_json.c src/serve/tool_param_empty_value_rule.c src/serve/field_pattern.c src/serve/json_reader.c src/serve/json_writer.c \
+		-lm $(LDFLAGS)
+
+# `field_patterns`: the regex (field_pattern.c) and its use in both tool-call
+# grammars.  Pure C, no engine deps.
+tests/test_field_pattern: tests/test_field_pattern.c src/serve/field_pattern.c $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_field_pattern.c src/serve/field_pattern.c -lm $(LDFLAGS)
+
+tests/test_tool_grammar_field_patterns: tests/test_tool_grammar_field_patterns.c src/serve/tool_grammar.c src/serve/json_value_grammar.c src/serve/tool_param_empty_value_rule.c src/serve/field_pattern.c src/serve/json_reader.c src/serve/json_writer.c $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_tool_grammar_field_patterns.c src/serve/tool_grammar.c src/serve/json_value_grammar.c src/serve/tool_param_empty_value_rule.c src/serve/field_pattern.c src/serve/json_reader.c src/serve/json_writer.c \
+		-lm $(LDFLAGS)
+
+tests/test_tool_grammar_json_field_patterns: tests/test_tool_grammar_json_field_patterns.c src/serve/tool_grammar_json.c src/serve/tool_param_empty_value_rule.c src/serve/field_pattern.c src/serve/json_reader.c src/serve/json_writer.c $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_tool_grammar_json_field_patterns.c src/serve/tool_grammar_json.c src/serve/tool_param_empty_value_rule.c src/serve/field_pattern.c src/serve/json_reader.c src/serve/json_writer.c \
+		-lm $(LDFLAGS)
+
+# Each parameter key at most once per call, both dialects, and the head+tail raw
+# excerpt on the dropped-call log line.  Pure C, no engine deps.
+tests/test_tool_grammar_no_repeat_keys: tests/test_tool_grammar_no_repeat_keys.c src/serve/tool_grammar.c src/serve/tool_grammar_json.c src/serve/json_value_grammar.c src/serve/tool_param_empty_value_rule.c src/serve/field_pattern.c src/serve/json_reader.c src/serve/json_writer.c $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_tool_grammar_no_repeat_keys.c src/serve/tool_grammar.c src/serve/tool_grammar_json.c src/serve/json_value_grammar.c src/serve/tool_param_empty_value_rule.c src/serve/field_pattern.c src/serve/json_reader.c src/serve/json_writer.c \
+		-lm $(LDFLAGS)
+
+# Mask cost per step with and without a field pattern (not part of `make test`).
+tests/bench_field_pattern_mask: tests/bench_field_pattern_mask.c src/serve/tool_grammar.c src/serve/tool_grammar_json.c src/serve/json_value_grammar.c src/serve/tool_param_empty_value_rule.c src/serve/field_pattern.c src/serve/json_reader.c src/serve/json_writer.c $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/bench_field_pattern_mask.c src/serve/tool_grammar.c src/serve/tool_grammar_json.c src/serve/json_value_grammar.c src/serve/tool_param_empty_value_rule.c src/serve/field_pattern.c src/serve/json_reader.c src/serve/json_writer.c \
+		-lm $(LDFLAGS)
+
+tests/test_tool_grammar_json: tests/test_tool_grammar_json.c src/serve/tool_grammar_json.c src/serve/tool_param_empty_value_rule.c src/serve/field_pattern.c src/serve/json_reader.c src/serve/json_writer.c $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_tool_grammar_json.c src/serve/tool_grammar_json.c src/serve/tool_param_empty_value_rule.c src/serve/field_pattern.c src/serve/json_reader.c src/serve/json_writer.c \
 		-lm $(LDFLAGS)
 
 # Speculative decoding under the tool-call grammar: drafts verified through the
 # grammar-aware chooser must reproduce plain constrained decoding token for
 # token (self-falsifying simulation).  Links the real JSON grammar and the
 # parser; no engine/model/device.
-tests/test_grammar_spec_chooser: tests/test_grammar_spec_chooser.c src/serve/grammar_spec_chooser.c src/core/grammar_mask_shortlist.c src/serve/tool_grammar_json.c src/serve/tool_calling.c src/serve/json_value_grammar.c src/serve/tool_param_empty_value_rule.c src/serve/json_reader.c src/serve/json_writer.c $(ALL_HDR)
-	$(CC) $(CFLAGS) -o $@ tests/test_grammar_spec_chooser.c src/serve/grammar_spec_chooser.c src/core/grammar_mask_shortlist.c src/serve/tool_grammar_json.c src/serve/tool_calling.c src/serve/json_value_grammar.c src/serve/tool_param_empty_value_rule.c src/serve/json_reader.c src/serve/json_writer.c \
+tests/test_grammar_spec_chooser: tests/test_grammar_spec_chooser.c src/serve/grammar_spec_chooser.c src/core/grammar_mask_shortlist.c src/core/sampler_topn_tail.c src/serve/tool_grammar_json.c src/serve/tool_calling.c src/serve/json_value_grammar.c src/serve/tool_param_empty_value_rule.c src/serve/field_pattern.c src/serve/json_reader.c src/serve/json_writer.c $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_grammar_spec_chooser.c src/serve/grammar_spec_chooser.c src/core/grammar_mask_shortlist.c src/core/sampler_topn_tail.c src/serve/tool_grammar_json.c src/serve/tool_calling.c src/serve/json_value_grammar.c src/serve/tool_param_empty_value_rule.c src/serve/field_pattern.c src/serve/json_reader.c src/serve/json_writer.c \
 		-lm $(LDFLAGS)
 
 # The grammar mask decided from a shortlist of the highest logits must leave the
 # same greedy pick / top-K set as the full-vocabulary mask.  libc-only.
-tests/test_grammar_mask_shortlist: tests/test_grammar_mask_shortlist.c src/core/grammar_mask_shortlist.c src/core/sampling_modifiers.c $(ALL_HDR)
-	$(CC) $(CFLAGS) -o $@ tests/test_grammar_mask_shortlist.c src/core/grammar_mask_shortlist.c src/core/sampling_modifiers.c \
+tests/test_grammar_mask_shortlist: tests/test_grammar_mask_shortlist.c src/core/grammar_mask_shortlist.c src/core/sampler_topn_tail.c src/core/sampling_modifiers.c $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_grammar_mask_shortlist.c src/core/grammar_mask_shortlist.c src/core/sampler_topn_tail.c src/core/sampling_modifiers.c \
+		-lm $(LDFLAGS)
+
+# The shortlist select's SSE prefilter returns the scalar select's ids and bound to the bit.
+tests/test_grammar_select_shortlist: tests/test_grammar_select_shortlist.c src/core/grammar_mask_shortlist.c src/core/sampler_topn_tail.c $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_grammar_select_shortlist.c src/core/grammar_mask_shortlist.c src/core/sampler_topn_tail.c \
 		-lm $(LDFLAGS)
 
 # Full-logits ARMING WINDOW (PN_GRAMMAR_ARM_WINDOW): is the row a masked step
 # reads armed one token EARLY enough?  Models the decode loop's ordering over
 # the three real grammar walks; self-falsifying — exits 2 VACUOUS if the
 # deliberately-stale policy fails to break.  No engine/model/CUDA deps.
-tests/test_grammar_arm_window: tests/test_grammar_arm_window.c src/serve/tool_grammar.c src/serve/json_value_grammar.c src/serve/tool_grammar_json.c src/serve/response_format_grammar.c src/serve/tool_param_empty_value_rule.c src/serve/json_reader.c src/serve/json_writer.c $(ALL_HDR)
-	$(CC) $(CFLAGS) -o $@ tests/test_grammar_arm_window.c src/serve/tool_grammar.c src/serve/json_value_grammar.c src/serve/tool_grammar_json.c src/serve/response_format_grammar.c src/serve/tool_param_empty_value_rule.c src/serve/json_reader.c src/serve/json_writer.c \
+tests/test_grammar_arm_window: tests/test_grammar_arm_window.c src/serve/tool_grammar.c src/serve/json_value_grammar.c src/serve/tool_grammar_json.c src/serve/response_format_grammar.c src/serve/tool_param_empty_value_rule.c src/serve/field_pattern.c src/serve/json_reader.c src/serve/json_writer.c $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_grammar_arm_window.c src/serve/tool_grammar.c src/serve/json_value_grammar.c src/serve/tool_grammar_json.c src/serve/response_format_grammar.c src/serve/tool_param_empty_value_rule.c src/serve/field_pattern.c src/serve/json_reader.c src/serve/json_writer.c \
 		-lm $(LDFLAGS)
 
 # response_format (json_object) constrained-decoding FSM.  Pure C char walk with
@@ -725,8 +1030,8 @@ tests/test_sampling_modifiers: tests/test_sampling_modifiers.c src/core/sampling
 # src/accel/backend_identity.c joins the link line because oai_handle_models now
 # names the compiled backend on /v1/models. The module is a handful of string
 # literals with no dependencies of its own, so it costs this harness nothing.
-tests/test_chat_request: tests/test_chat_request.c src/serve/tool_calling.c src/serve/json_value_grammar.c src/serve/json_reader.c src/serve/json_writer.c src/serve/serve_shutdown.c src/serve/openai_chat.c src/serve/tool_call_stream.c src/serve/json_canonical_stream.c src/serve/serve_emitter.c src/accel/backend_identity.c $(ALL_HDR)
-	$(CC) $(CFLAGS) -o $@ tests/test_chat_request.c src/serve/tool_calling.c src/serve/json_value_grammar.c src/serve/json_reader.c src/serve/json_writer.c src/serve/request_profile.c src/serve/serve_shutdown.c src/serve/tool_call_stream.c src/serve/json_canonical_stream.c src/serve/serve_emitter.c src/accel/backend_identity.c \
+tests/test_chat_request: tests/test_chat_request.c src/serve/tool_calling.c src/serve/json_value_grammar.c src/serve/json_reader.c src/serve/json_writer.c src/serve/serve_shutdown.c src/serve/serve_request_dump.c src/serve/openai_chat.c src/serve/tool_call_stream.c src/serve/json_canonical_stream.c src/serve/serve_emitter.c src/serve/sampling_defaults.c src/serve/field_pattern.c src/serve/field_patterns_request.c src/accel/backend_identity.c $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_chat_request.c src/serve/sampling_defaults.c src/serve/tool_calling.c src/serve/json_value_grammar.c src/serve/json_reader.c src/serve/json_writer.c src/serve/request_profile.c src/serve/serve_shutdown.c src/serve/serve_request_dump.c src/serve/tool_call_stream.c src/serve/json_canonical_stream.c src/serve/serve_emitter.c src/serve/field_pattern.c src/serve/field_patterns_request.c src/accel/backend_identity.c \
 		-lm $(LDFLAGS)
 
 # Stream tool-call detection (serve_generation.c emitter, Phase 2). The emitter
@@ -808,6 +1113,18 @@ tests/test_attn_ring_retry: tests/test_attn_ring_retry.c \
 	$(CC) $(CFLAGS) -o $@ tests/test_attn_ring_retry.c \
 		src/models/gpu_attn_path_tracker.c -lm $(LDFLAGS)
 
+# The MTP head's KV ring is zeroed at allocation, so a draft that attends rows nothing
+# wrote (a long resumed session after a backlog reset) reads K = V = 0, not recycled
+# VRAM that decodes as NaN. Host buffers in the device layout, no GPU. The red arm
+# `--no-clear` replays the uncleared ring and must fail its expectations.
+# -fno-fast-math: the reference attention must propagate NaN/inf the way the device does,
+# or isfinite() folds to 1 and the gate is vacuous.
+tests/test_mtp_ring_clear: tests/test_mtp_ring_clear.c src/models/qwen35moe_mtp_ring.c \
+		src/formats/gguf_dequant.c src/formats/gguf.c $(ALL_HDR)
+	$(CC) $(CFLAGS) -fno-fast-math -o $@ tests/test_mtp_ring_clear.c \
+		src/models/qwen35moe_mtp_ring.c src/formats/gguf_dequant.c src/formats/gguf.c \
+		$(TILED_SRC) $(HOST_ADMIT_SRC) -lm $(LDFLAGS)
+
 # Llama-family session snapshot (the primitive session export/restore rides on
 # for every arch whose per-session state is a plain causal KV cache — the family
 # the Tenstorrent backend serves). Pure host memory, no engine, no accelerator:
@@ -818,26 +1135,43 @@ tests/test_llama_state_snapshot: tests/test_llama_state_snapshot.c src/models/ll
 	$(CC) $(CFLAGS) -o $@ tests/test_llama_state_snapshot.c \
 		src/models/llama_state_snapshot.c src/models/qwen35moe_state_snapshot.c \
 		src/core/session_snapshot.c \
-		-lm $(LDFLAGS)
+		$(HOST_ADMIT_SRC) -lm $(LDFLAGS)
 
-tests/test_prefix_cache_sys: tests/test_prefix_cache_sys.c tests/tt_prefix_cache_link_stubs.c src/core/prefix_cache.c src/core/session_snapshot.c src/models/qwen35moe_state_snapshot.c src/models/llama_state_snapshot.c src/serve/batch_sched.c src/serve/request_profile.c $(ALL_HDR)
+tests/test_prefix_cache_sys: tests/test_prefix_cache_sys.c tests/tt_prefix_cache_link_stubs.c src/core/prefix_cache.c src/core/session_snapshot.c src/models/qwen35moe_state_snapshot.c src/models/llama_state_snapshot.c src/serve/batch_sched.c src/serve/batch_sched_turn_checkpoint.c src/serve/batch_sched_admission.c src/serve/batch_sched_watchdog.c src/serve/request_profile.c $(ALL_HDR)
 	$(CC) $(CFLAGS) -o $@ tests/test_prefix_cache_sys.c tests/tt_prefix_cache_link_stubs.c \
 		src/core/prefix_cache.c src/core/session_snapshot.c \
 		src/models/qwen35moe_state_snapshot.c src/models/llama_state_snapshot.c \
-		src/serve/batch_sched.c src/serve/request_profile.c \
-		-lm $(LDFLAGS)
+		src/serve/batch_sched.c src/serve/batch_sched_turn_checkpoint.c src/serve/batch_sched_admission.c src/serve/batch_sched_watchdog.c src/serve/request_profile.c \
+		$(HOST_ADMIT_SRC) -lm $(LDFLAGS)
+
+# think_history as_sent / drop_last on the batched ladder and the single-user cache: same
+# hand-built-state harness as test_prefix_cache_sys (tests/think_history_ladder_harness.h).
+THINK_HISTORY_LADDER_SRC = tests/tt_prefix_cache_link_stubs.c src/core/prefix_cache.c \
+	src/core/session_snapshot.c src/models/qwen35moe_state_snapshot.c \
+	src/models/llama_state_snapshot.c src/serve/batch_sched.c \
+	src/serve/batch_sched_turn_checkpoint.c src/serve/batch_sched_admission.c \
+	src/serve/batch_sched_watchdog.c src/serve/request_profile.c \
+	src/models/qwen35moe_checkpoint_band.c
+tests/test_think_history_as_sent: tests/test_think_history_as_sent.c \
+		tests/think_history_ladder_harness.h $(THINK_HISTORY_LADDER_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_think_history_as_sent.c $(THINK_HISTORY_LADDER_SRC) \
+		$(HOST_ADMIT_SRC) -lm $(LDFLAGS)
+tests/test_think_history_drop_last: tests/test_think_history_drop_last.c \
+		tests/think_history_ladder_harness.h $(THINK_HISTORY_LADDER_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_think_history_drop_last.c $(THINK_HISTORY_LADDER_SRC) \
+		$(HOST_ADMIT_SRC) -lm $(LDFLAGS)
 
 # Liveness-based session release (§C.4). Links the watch manager + prefix cache
 # + snapshot machinery + http_server (hs_client_alive); mr_acquire/mr_release +
 # pn_state_* are test stubs. Host-side, deterministic (manual manager + sweep
 # hooks), no engine/model/CUDA.
-tests/test_session_watch: tests/test_session_watch.c tests/tt_prefix_cache_link_stubs.c src/serve/session_watch.c src/core/prefix_cache.c src/core/session_snapshot.c src/models/qwen35moe_state_snapshot.c src/models/llama_state_snapshot.c src/serve/http_server.c src/serve/model_session.c $(ALL_HDR)
-	$(CC) $(CFLAGS) -o $@ tests/test_session_watch.c tests/tt_prefix_cache_link_stubs.c \
+tests/test_session_watch: tests/test_session_watch.c tests/tt_prefix_cache_link_stubs.c src/serve/session_watch.c src/core/prefix_cache.c src/core/session_snapshot.c src/models/qwen35moe_state_snapshot.c src/models/llama_state_snapshot.c src/serve/http_server.c src/serve/model_session.c src/serve/replica_affinity.c $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_session_watch.c tests/tt_prefix_cache_link_stubs.c src/serve/replica_affinity.c \
 		src/serve/session_watch.c src/core/prefix_cache.c src/core/session_snapshot.c \
 		src/models/qwen35moe_state_snapshot.c src/models/llama_state_snapshot.c \
 		src/serve/http_server.c \
-		src/serve/model_session.c src/serve/batch_sched.c src/serve/request_profile.c \
-		-lm $(LDFLAGS)
+		src/serve/model_session.c src/serve/batch_sched.c src/serve/batch_sched_turn_checkpoint.c src/serve/batch_sched_admission.c src/serve/batch_sched_watchdog.c src/serve/request_profile.c \
+		$(HOST_ADMIT_SRC) -lm $(LDFLAGS)
 
 # Session-affinity unit test (PC0.2). Links the affinity map + registry + the two
 # JSON modules — no engine/model/CUDA. Host-side, deterministic.
@@ -915,6 +1249,92 @@ tests/test_tt_boot_guard_leftover: tests/test_tt_boot_guard_leftover.c $(PN_SRC)
 	$(CC) $(CFLAGS) -o $@ tests/test_tt_boot_guard_leftover.c $(PN_SRC) $(FOUNDRY_SRC) \
 		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
 
+# The qwen35 TT accessors against a NON-qwen35 model: none may read its weights as a
+# pn_qwen35moe_model (the 1,891-token Argus CHAT crash). Needs USE_TT=1, NOT a card.
+tests/test_tt_family_guard: tests/test_tt_family_guard.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_tt_family_guard.c $(PN_SRC) $(FOUNDRY_SRC) \
+		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
+
+# The prefill KV append split: its per-head descriptors decode (memory kernel protocol) to the
+# banked pair's placement, and spread over the cores. Needs USE_TT=1, NOT a card.
+tests/test_tt_kv_append_split: tests/test_tt_kv_append_split.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_tt_kv_append_split.c $(PN_SRC) $(FOUNDRY_SRC) \
+		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
+
+# Qwen3.8-27B on one p150 at 32k: the attn_q halves, mirror-first tall placement and no tall
+# attn_qg, against the tt-full-load census. Needs USE_TT=1, NOT a card.
+# Also checks the shipped catalog's Qwen3.8 p150 profiles load as the shapes it fits.
+TT_Q38_FIT_LOCAL_SRC = src/local/catalog_manifest.c src/local/load_options.c \
+	src/local/unit_place.c src/local/catalog_match.c src/local/local_file_io.c \
+	src/serve/json_reader.c src/serve/json_writer.c src/serve/sampling_defaults.c \
+	src/serve/load_env_scope.c
+tests/test_tt_q38_fit: tests/test_tt_q38_fit.c $(PN_SRC) $(FOUNDRY_SRC) $(TT_Q38_FIT_LOCAL_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_tt_q38_fit.c $(PN_SRC) $(FOUNDRY_SRC) $(TT_Q38_FIT_LOCAL_SRC) \
+		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
+
+# K4H (pn_tt_kv_rotate.h): H exact in every weight tile format, the matmul view emulated
+# against a per-head rotation, q.k invariance, the state-file round trip, knob + catalog.
+# Needs USE_TT=1, NOT a card.
+tests/test_tt_kv_rotate: tests/test_tt_kv_rotate.c $(PN_SRC) $(FOUNDRY_SRC) $(TT_Q38_FIT_LOCAL_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_tt_kv_rotate.c $(PN_SRC) $(FOUNDRY_SRC) $(TT_Q38_FIT_LOCAL_SRC) \
+		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
+
+# The verify's GDN snapshot-slot map (legacy and compact) against a model of the foundry GDN
+# kernels' read/write order, and the Qwen3.8 MTP contexts it buys. Pure: no card, no USE_TT.
+tests/test_tt_gdn_verify_slots: tests/test_tt_gdn_verify_slots.c src/accel/tt/pn_tt_gdn_verify_slots.c src/accel/tt/pn_tt_gdn_verify_slots.h
+	$(CC) $(CFLAGS) -o $@ tests/test_tt_gdn_verify_slots.c src/accel/tt/pn_tt_gdn_verify_slots.c
+
+# L2: the M2 pull only at a chain's end, late reserve-respecting mirrors, and the decode
+# out-projection inputs' range records (with the RED arm as a child). USE_TT=1, no card.
+tests/test_tt_q38_l2: tests/test_tt_q38_l2.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_tt_q38_l2.c $(PN_SRC) $(FOUNDRY_SRC) \
+		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
+
+# S1: group completion by pull for the split vector families — the table, the a3/a4/a5 words
+# and ONE await per split, against a fake card (with the RED arm as a child). USE_TT=1, no card.
+tests/test_tt_group_pull: tests/test_tt_group_pull.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_tt_group_pull.c $(PN_SRC) $(FOUNDRY_SRC) \
+		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
+
+# S2 on-card completion through the real dispatch recorder + replay builder against a fake
+# card: knob 0 byte-identical to the base code's program (tests/tt_oncard_golden.sh), knob 1
+# sidecar entries, the precondition_early red aimed short. USE_TT=1, no card.
+tests/test_tt_oncard_dispatch: tests/test_tt_oncard_dispatch.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_tt_oncard_dispatch.c $(PN_SRC) $(FOUNDRY_SRC) \
+		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
+
+# S3b: fused SwiGLU in the gate/up members — knob off moves nothing, the members' replica table,
+# the fused descriptor words and every refusal (knob-on half as a child). USE_TT=1, no card.
+tests/test_tt_swiglu_fuse: tests/test_tt_swiglu_fuse.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_tt_swiglu_fuse.c $(PN_SRC) $(FOUNDRY_SRC) \
+		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
+
+# Qwen3.8-27B on one p150: the contexts the load accepts once every post-load prefill buffer
+# is counted, where the prefix checkpoint fits, and the abort invalidation. USE_TT=1, no card.
+tests/test_tt_q38_reserve: tests/test_tt_q38_reserve.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_tt_q38_reserve.c $(PN_SRC) $(FOUNDRY_SRC) \
+		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
+
+# The GDN PHASE CONV split (4 / 8 / 16 members, narrow and wide column encodings) against the
+# whole descriptor on a host model of the kernels' column walk, all 48 Qwen3.8 layers, with
+# the slice reds. Pure: the production slicer, foundry's encoder and the kernels' decode.
+tests/test_tt_gdn_conv_split: tests/test_tt_gdn_conv_split.c src/accel/tt/pn_tt_gdn_conv_split.c \
+	src/accel/tt/pn_tt_gdn_conv_split.h $(FOUNDRY)/tt/ft_tt_op_gdn.c $(FOUNDRY)/tt/ft_tt_op_gdn.h \
+	$(FOUNDRY)/tt/kernels/resident_gdn_protocol.h
+	$(CC) $(CFLAGS) -I$(FOUNDRY)/tt -o $@ tests/test_tt_gdn_conv_split.c \
+	  src/accel/tt/pn_tt_gdn_conv_split.c $(FOUNDRY)/tt/ft_tt_op_gdn.c -lm
+
+# The decode matmul's A-reuse ring per model and the Qwen3.8 classes it covers. Pure.
+tests/test_tt_matmul_rows: tests/test_tt_matmul_rows.c src/accel/tt/pn_tt_matmul_rows.c \
+	src/accel/tt/pn_tt_matmul_rows.h
+	$(CC) $(CFLAGS) -o $@ tests/test_tt_matmul_rows.c src/accel/tt/pn_tt_matmul_rows.c
+
+# Option D: one conv weight for both GDN families — the production placement on a host
+# allocator (decode weights aliased, 30 MiB a bank freed) and the row-0 identity. USE_TT=1, no card.
+tests/test_tt_q38_conv_share: tests/test_tt_q38_conv_share.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_tt_q38_conv_share.c $(PN_SRC) $(FOUNDRY_SRC) \
+		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
+
 tests/test_tt_prefill_parity: tests/test_tt_prefill_parity.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
 	$(CC) $(CFLAGS) -o $@ tests/test_tt_prefill_parity.c $(PN_SRC) $(FOUNDRY_SRC) \
 		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
@@ -959,6 +1379,12 @@ tests/test_sparse_sampler_identity: tests/test_sparse_sampler_identity.c $(PN_SR
 	$(CC) $(CFLAGS) -o $@ tests/test_sparse_sampler_identity.c $(PN_SRC) $(FOUNDRY_SRC) \
 		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
 
+# The sampler's survivor hint (pn_sampler_row_hint) must draw the token the row scan draws.
+# `--selftest`: a hint missing the best survivor must go red.
+tests/test_sampler_row_hint: tests/test_sampler_row_hint.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_sampler_row_hint.c $(PN_SRC) $(FOUNDRY_SRC) \
+		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
+
 # The grammar mask on a backend's top-N row (shortlist / dense chunks / whole-row
 # refill) must draw the token the full mask draws on the dense row.
 # `--selftest`: a subject that skips the mask must be caught.
@@ -966,10 +1392,93 @@ tests/test_grammar_topn_sampler: tests/test_grammar_topn_sampler.c $(PN_SRC) $(F
 	$(CC) $(CFLAGS) -o $@ tests/test_grammar_topn_sampler.c $(PN_SRC) $(FOUNDRY_SRC) \
 		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
 
+# Repetition penalty stands down while the tool grammar's mask is live.
+TEST_GRP_SRC = src/serve/tool_grammar.c src/serve/tool_grammar_json.c src/serve/json_value_grammar.c src/serve/tool_param_empty_value_rule.c src/serve/field_pattern.c src/serve/json_reader.c src/serve/json_writer.c
+tests/test_grammar_repeat_penalty: tests/test_grammar_repeat_penalty.c $(TEST_GRP_SRC) $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_grammar_repeat_penalty.c $(TEST_GRP_SRC) $(PN_SRC) $(FOUNDRY_SRC) \
+		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
+
+# field_patterns steer: a refused close on a patterned value becomes the pattern's
+# forced continuation (tg_steer / tgj_steer via pn_tool_grammar_hook.steer).
+tests/test_field_pattern_steer: tests/test_field_pattern_steer.c $(TEST_GRP_SRC) $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_field_pattern_steer.c $(TEST_GRP_SRC) $(PN_SRC) $(FOUNDRY_SRC) \
+		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
+
+# tool_choice "required": only the call opener after the thinking close (forced or
+# the model's own); no landing window, bounded whitespace before the opener.
+tests/test_tool_grammar_forced_close_call: tests/test_tool_grammar_forced_close_call.c $(TEST_GRP_SRC) $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_tool_grammar_forced_close_call.c $(TEST_GRP_SRC) $(PN_SRC) $(FOUNDRY_SRC) \
+		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
+
 # Gate for the top-N exactness check the sampler uses before sampling a top-N row
 # (`--selftest`: a check blind to the penalties must be caught).
 tests/test_topn_row_exact: tests/test_topn_row_exact.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
 	$(CC) $(CFLAGS) -o $@ tests/test_topn_row_exact.c $(PN_SRC) $(FOUNDRY_SRC) \
+		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
+
+# Gate for the top-N verdict under client logit surgery (logit bias, presence/frequency):
+# greedy and sampled draws it calls exact are the dense row's (`--selftest`: a verdict blind to
+# the bias must be caught).
+tests/test_topn_surgery: tests/test_topn_surgery.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_topn_surgery.c $(PN_SRC) $(FOUNDRY_SRC) \
+		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
+
+# Gate for the grammar shortlist's outside bound: a masked top-64 row it decides draws the plain
+# path's token (dense row, full mask) for every seed, at verify row 0 and past it (`--red`: a
+# bound blind to the outside must mismatch; `--selftest`: the comparison can fail).
+tests/test_grammar_exact_bound: tests/test_grammar_exact_bound.c tests/grammar_exact/grammar_row_compare.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_grammar_exact_bound.c tests/grammar_exact/grammar_row_compare.c $(PN_SRC) $(FOUNDRY_SRC) \
+		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
+
+# Gate for the grammar shortlist on a dense row (the batched CUDA wiring): the draw with dense_row set
+# (no-op refill) is the full-scan draw for every seed (--red: a bound blind to the outside, --selftest: a subject without the grammar, must mismatch).
+tests/test_grammar_dense_shortlist: tests/test_grammar_dense_shortlist.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_grammar_dense_shortlist.c $(PN_SRC) $(FOUNDRY_SRC) \
+		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
+
+# Census of real grammar-masked rows dumped on the Mac (PN_GRAMMAR_ROW_DUMP): what the outside
+# bound decides, and its draws against the plain path's (tools/grammar_exact/run_mac_rows.sh).
+tools/grammar_exact/grammar_row_census: tools/grammar_exact/grammar_row_census.c tests/grammar_exact/grammar_row_compare.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tools/grammar_exact/grammar_row_census.c tests/grammar_exact/grammar_row_compare.c $(PN_SRC) $(FOUNDRY_SRC) \
+		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
+
+# Gate for the top-N tail planner: a sampled draw with top-k off or past the N, taken from a
+# top-64 row (plain and as a deferring verify row), is distributed as the dense draw
+# (`--selftest`: the reds tail_nobound / tail_nocarry must fail).
+tests/test_topn_tail_sampler: tests/test_topn_tail_sampler.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_topn_tail_sampler.c $(PN_SRC) $(FOUNDRY_SRC) \
+		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
+
+# True speculative sampling: the rule's emitted distribution is p (analytic TVD + chi-square
+# over many draws, against p and against the plain sampler's draws) on random rows at the
+# shipped settings; `--selftest`: the reds accept-always / residual = p must fail.
+tests/test_spec_sampling_rule: tests/test_spec_sampling_rule.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_spec_sampling_rule.c $(PN_SRC) $(FOUNDRY_SRC) \
+		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
+
+# forget_state under QWEN35_TP drops both rank halves' host bindings (CUDA build; no GPU
+# touched). Red: CFLAGS+=-DQW_FORGET_RED must fail.
+tests/test_qwen35_tp_forget: tests/test_qwen35_tp_forget.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_qwen35_tp_forget.c $(PN_SRC) $(FOUNDRY_SRC) \
+		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
+
+# A TP host restore then a resume at pos0 > 0 syncs both rank halves' KV rings (CUDA build,
+# one die; skips without one). Red: CFLAGS+=-DQW_TP_SYNC_RED must fail.
+tests/test_qwen35_tp_restore_sync: tests/test_qwen35_tp_restore_sync.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_qwen35_tp_restore_sync.c $(PN_SRC) $(FOUNDRY_SRC) \
+		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
+
+# Coupled MTP drafts (spec_mtp_couple.h): emitted stream byte-identical to plain draws
+# (seeded and unseeded), q = p accepts every draft, coupled > argmax acceptance;
+# `--selftest`: the red couple_consume must fail.
+tests/test_spec_mtp_couple: tests/test_spec_mtp_couple.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_spec_mtp_couple.c $(PN_SRC) $(FOUNDRY_SRC) \
+		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
+
+# MTP grammar draw (spec_mtp.h): verify rows drawn over a scratch walk = plain grammar
+# decoding's stream (tokens, RNG, walk), greedy and seeded; `--selftest`: both reds must fail.
+tests/test_spec_grammar_draw: tests/test_spec_grammar_draw.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_spec_grammar_draw.c $(PN_SRC) $(FOUNDRY_SRC) \
 		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
 
 # Context-DEPTH decode bench: per-user steady-state DECODE tok/s as the seeded
@@ -989,6 +1498,34 @@ tests/test_slot_free_bind_qwen35: tests/test_slot_free_bind_qwen35.c $(PN_SRC) $
 	$(CC) $(CFLAGS) -o $@ tests/test_slot_free_bind_qwen35.c $(PN_SRC) $(FOUNDRY_SRC) \
 		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
 
+# One-slot fused launches on the decode-slots path: all built, and bit-identical
+# to the unfused slots sequence (tests/run_slots_fused_k80.sh runs both arms).
+# Needs the model + a CUDA GPU; build with USE_CUDA=1 on a CUDA host.
+tests/test_qwen35_slots_fused: tests/test_qwen35_slots_fused.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_qwen35_slots_fused.c $(PN_SRC) $(FOUNDRY_SRC) \
+		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
+
+# Turn-start checkpoint exactness gate (rung 1c): restore == never decoded,
+# bytewise logits. CUDA host + model; falsifier TCKPT_SKIP_RESTORE=1 must fail.
+tests/test_turn_checkpoint_qwen35: tests/test_turn_checkpoint_qwen35.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_turn_checkpoint_qwen35.c $(PN_SRC) $(FOUNDRY_SRC) \
+		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
+
+# Aborted-prefill exactness gate: an aborted pipelined prefill, kept and
+# resumed == one uninterrupted prefill, bytewise logits. CUDA host + model;
+# falsifier PABORT_POS_LAG=1 must fail.
+tests/test_prefill_abort_resume_qwen35: tests/test_prefill_abort_resume_qwen35.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_prefill_abort_resume_qwen35.c $(PN_SRC) $(FOUNDRY_SRC) \
+		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
+
+# Prefill/decode overlap engine gate: K decoders + a cursor prefill (overlap
+# cycles, quiesce, finish) == the sequential run, per-step logits and the
+# prefill's. CUDA host + model, 4 dies TP2; reds PN_PDO_RED_SHARED_SCRATCH and
+# PN_PDO_RED_NO_HOP_FENCE must fail.
+tests/test_pd_overlap_engine_qwen35: tests/test_pd_overlap_engine_qwen35.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_pd_overlap_engine_qwen35.c $(PN_SRC) $(FOUNDRY_SRC) \
+		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
+
 # Phase 9.1 speculative-decoding GATE bench: cost of a D-row batched verify vs
 # D sequential single-token forwards, plus the batched-slots row-cost curve.
 # Pure measurement, changes no engine behaviour. Build with USE_CUDA=1 on a
@@ -996,6 +1533,65 @@ tests/test_slot_free_bind_qwen35: tests/test_slot_free_bind_qwen35.c $(PN_SRC) $
 tests/bench_spec_verify_gate: tests/bench_spec_verify_gate.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
 	$(CC) $(CFLAGS) -o $@ tests/bench_spec_verify_gate.c $(PN_SRC) $(FOUNDRY_SRC) \
 		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
+
+# Prefill (TTFT) bench: seq chunk loop vs the wide die pipeline, wall time +
+# last-logits hash. Build with USE_CUDA=1 on a CUDA host.
+tests/bench_prefill_qwen35: tests/bench_prefill_qwen35.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/bench_prefill_qwen35.c $(PN_SRC) $(FOUNDRY_SRC) \
+		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
+
+tests/test_batch_verify_exact: tests/test_batch_verify_exact.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_batch_verify_exact.c $(PN_SRC) $(FOUNDRY_SRC) \
+		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
+
+# One-cycle CUDA MTP step (spec_mtp_step.h) vs plain decode, token-exact; red: PN_MTP_RED=1.
+tests/test_cuda_spec_step: tests/test_cuda_spec_step.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_cuda_spec_step.c $(PN_SRC) $(FOUNDRY_SRC) \
+		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
+
+# Dense-FFN qwen35 (Ornith/Bonsai): batched prefill + decode-slots vs single-token, greedy.
+tests/test_cuda_dense_slots: tests/test_cuda_dense_slots.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_cuda_dense_slots.c $(PN_SRC) $(FOUNDRY_SRC) \
+		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
+
+# Phase 2F end-to-end: MTP speculative decode (adaptive depth) vs plain decode, token-exact.
+tests/bench_mtp_e2e: tests/bench_mtp_e2e.c src/serve/serve_spec_lookup.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/bench_mtp_e2e.c src/serve/serve_spec_lookup.c $(PN_SRC) $(FOUNDRY_SRC) \
+		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
+
+tests/test_spec_depth: tests/test_spec_depth.c src/core/spec_depth.c src/core/spec_depth.h
+	$(CC) $(CFLAGS) -o $@ tests/test_spec_depth.c src/core/spec_depth.c -lm
+
+# The environment one model load sets and puts back (model_admin.c). Pure: no model.
+tests/test_load_env_scope: tests/test_load_env_scope.c src/serve/load_env_scope.c src/serve/load_env_scope.h
+	$(CC) $(CFLAGS) -o $@ tests/test_load_env_scope.c src/serve/load_env_scope.c
+
+tests/test_dump_reqlog: tests/test_dump_reqlog.c src/core/dump_reqlog.c src/core/dump_reqlog.h \
+		src/serve/serve_dump_reqlog.c src/serve/serve_dump_reqlog.h src/local/sha256.c
+	$(CC) $(CFLAGS) -o $@ tests/test_dump_reqlog.c src/core/dump_reqlog.c \
+		src/serve/serve_dump_reqlog.c src/local/sha256.c -lpthread
+
+# PN_ACT_STATS (mixw imatrix): every qweight entry point vs a naive per-channel reference,
+# outputs byte-identical with the stats on; then a tiny synthetic qwen35 model end to end
+# (logits identical knob on/off, coverage, post-norm semantics, split halves merge = whole;
+# the test recipe then merges the halves with tools/oracle/act_stats_merge: = the unsplit file).
+tests/test_act_stats: tests/test_act_stats.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_act_stats.c $(PN_SRC) $(FOUNDRY_SRC) \
+		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
+
+# The batched X^T X accumulator (dsyrk/ssyrk vs the scalar path, f32) and the sequential .xtx
+# write streamed through a FIFO (src/core/act_stats_xtx.h).
+tests/test_act_stats_xtx: tests/test_act_stats_xtx.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_act_stats_xtx.c $(PN_SRC) $(FOUNDRY_SRC) \
+		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
+
+tests/test_act_stats_model: tests/test_act_stats_model.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_act_stats_model.c $(PN_SRC) $(FOUNDRY_SRC) \
+		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
+
+# Sums PN_ACT_STATS files (split halves, separate runs): src/core/act_stats_file.h.
+tools/oracle/act_stats_merge: tools/oracle/act_stats_merge.c src/core/act_stats_file.c src/core/act_stats_file.h
+	$(CC) $(CFLAGS) -o $@ tools/oracle/act_stats_merge.c src/core/act_stats_file.c
 
 # Phase 9.2 ACCEPTANCE bench: what fraction of prompt-lookup drafts the verify
 # actually accepts, on real code-edit prompts, counted separately for the
@@ -1023,6 +1619,14 @@ tests/test_serve_sched_prefix_cache: tests/test_serve_sched_prefix_cache.c $(PN_
 	$(CC) $(CFLAGS) -o $@ tests/test_serve_sched_prefix_cache.c $(PN_SRC) $(SERVE_SRC) $(FOUNDRY_SRC) \
 		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
 
+# Session-switch gate: two conversations taking STRICT turns on one batched
+# scheduler (A1 B1 A2 B2 A3 B3) must each resume warm (cached >= the previous
+# turn's prompt) and stay token-identical to a cold reference. Build with
+# USE_CUDA=1 on a CUDA host; run under QWEN35_BATCH_SLOTS=1 QWEN35_KV_Q4=1.
+tests/test_serve_sched_session_switch: tests/test_serve_sched_session_switch.c $(PN_SRC) $(SERVE_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_serve_sched_session_switch.c $(PN_SRC) $(SERVE_SRC) $(FOUNDRY_SRC) \
+		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
+
 # True per-user capacity bench — realistic growing-context workload with prefix
 # caching ON (steady-state delta-prefill), K concurrent users through the
 # batched serve path. Reports per-user + aggregate tok/s + cost/1M. Build with
@@ -1047,6 +1651,11 @@ tests/eval_ppl: tests/eval_ppl.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
 	$(CC) $(CFLAGS) -o $@ tests/eval_ppl.c $(PN_SRC) $(FOUNDRY_SRC) \
 		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
 
+# Per-layer residual probe of one forward (tests/qwen3_parity). Needs a model.
+tests/qwen3_parity/probe_layers: tests/qwen3_parity/probe_layers.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/qwen3_parity/probe_layers.c $(PN_SRC) $(FOUNDRY_SRC) \
+		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
+
 tests/test_prefix_projection: tests/test_prefix_projection.c $(PN_SRC) $(FOUNDRY_SRC) \
 		src/serve/serve_prompt_tokens.c src/serve/tool_calling.c \
 		src/serve/json_value_grammar.c \
@@ -1056,6 +1665,21 @@ tests/test_prefix_projection: tests/test_prefix_projection.c $(PN_SRC) $(FOUNDRY
 		src/serve/json_value_grammar.c \
 		src/serve/json_reader.c src/serve/json_writer.c \
 		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
+
+# Pantheon's prompt rendering vs the Qwen3.6 / Qwen3.8 chat templates (goldens
+# from tests/host/render_qwen_template_goldens.py; no Python at test time). Reaches
+# the static request parse by #including openai_chat.c, like test_chat_request.
+TEMPLATE_PARITY_SERVE_SRC = src/serve/serve_prompt_tokens.c src/serve/sampling_defaults.c \
+	src/serve/tool_calling.c src/serve/json_value_grammar.c src/serve/json_reader.c \
+	src/serve/json_writer.c src/serve/request_profile.c src/serve/serve_shutdown.c \
+	src/serve/serve_request_dump.c src/serve/tool_call_stream.c \
+	src/serve/json_canonical_stream.c src/serve/serve_emitter.c \
+	src/serve/field_pattern.c src/serve/field_patterns_request.c
+tests/test_template_parity_qwen: tests/test_template_parity_qwen.c \
+		tests/template_parity_qwen_pins.h tests/openai_chat_link_stubs.h \
+		src/serve/openai_chat.c $(TEMPLATE_PARITY_SERVE_SRC) $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_template_parity_qwen.c $(TEMPLATE_PARITY_SERVE_SRC) \
+		$(PN_SRC) $(FOUNDRY_SRC) -lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
 
 tests/test_bpe_pretokenize: tests/test_bpe_pretokenize.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
 	$(CC) $(CFLAGS) -o $@ tests/test_bpe_pretokenize.c $(PN_SRC) $(FOUNDRY_SRC) \
@@ -1069,7 +1693,8 @@ tests/test_pretok_props: tests/test_pretok_props.c $(PN_SRC) $(FOUNDRY_SRC) $(AL
 
 tests/test_dequant_props: tests/test_dequant_props.c src/formats/gguf_dequant.c src/formats/gguf.c \
 		src/formats/gguf_dequant.h src/formats/gguf.h
-	$(CC) $(CFLAGS) -o $@ tests/test_dequant_props.c src/formats/gguf_dequant.c src/formats/gguf.c -lm
+	$(CC) $(CFLAGS) -o $@ tests/test_dequant_props.c src/formats/gguf_dequant.c src/formats/gguf.c \
+		$(TILED_SRC) $(HOST_ADMIT_SRC) -lm
 
 tests/test_rwkvx: tests/test_rwkvx.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
 	$(CC) $(CFLAGS) -o $@ tests/test_rwkvx.c $(PN_SRC) $(FOUNDRY_SRC) \
@@ -1142,6 +1767,29 @@ MEM_SRC = src/core/mem/pn_host_signals.c src/core/mem/pn_memwatch.c \
 tests/test_memwatch: tests/test_memwatch.c $(MEM_SRC) $(ALL_HDR)
 	$(CC) $(CFLAGS) -o $@ tests/test_memwatch.c $(MEM_SRC) $(CUDA_SRC) -lm $(LDFLAGS) $(LDFLAGS_CUDA)
 
+# B5: host anon RAM stays flat across many concurrent requests (glibc only;
+# SKIPs elsewhere). Runs the unmanaged heap (must grow) and pn_host_heap
+# (must stay flat) in child processes.
+tests/test_host_heap_churn: tests/test_host_heap_churn.c src/core/mem/pn_host_heap.c src/models/qwen35moe_state_snapshot.c $(HOST_ADMIT_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_host_heap_churn.c src/core/mem/pn_host_heap.c \
+		src/models/qwen35moe_state_snapshot.c $(HOST_ADMIT_SRC) -lm $(LDFLAGS)
+
+# Offline sampler bench on dense rows dumped by a serve (PN_HOST_ROW_DUMP).
+tests/bench_sampler_rows: tests/bench_sampler_rows.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/bench_sampler_rows.c $(PN_SRC) $(FOUNDRY_SRC) \
+		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
+
+# The margin draw returns the dense draw's token for the same uniform (sampler_margin_draw.h).
+tests/test_sampler_margin_draw: tests/test_sampler_margin_draw.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_sampler_margin_draw.c $(PN_SRC) $(FOUNDRY_SRC) \
+		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
+
+# B6: a thread that samples frees its _Thread_local sampler buffers at exit
+# (the serve samples token #1 on a per-request thread).
+tests/test_sampler_thread_scratch: tests/test_sampler_thread_scratch.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_sampler_thread_scratch.c $(PN_SRC) $(FOUNDRY_SRC) \
+		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
+
 # Die-manager unit test (Phase 7 placement primitive). Self-contained: logical
 # dies only — links just the die-manager module, no model/GPU, so it builds
 # and runs on the Mac. The pn_dm_init_cuda probe is validated on the K80 test machine.
@@ -1153,8 +1801,8 @@ tests/test_die_manager: tests/test_die_manager.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_
 # run everywhere; the model-backed part (two names resident, generation,
 # unload-drain) uses models/qwen3-0.6b-Q8_0.gguf and skips if it is absent
 # (override with PN_TEST_MODEL).
-tests/test_model_registry: tests/test_model_registry.c src/serve/model_registry.c src/serve/batch_sched.c src/serve/request_profile.c src/serve/serve_backend_guard.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
-	$(CC) $(CFLAGS) -o $@ tests/test_model_registry.c src/serve/model_registry.c src/serve/batch_sched.c src/serve/request_profile.c src/serve/serve_backend_guard.c \
+tests/test_model_registry: tests/test_model_registry.c src/serve/model_registry.c src/serve/model_session.c src/serve/model_replica_route.c src/serve/replica_affinity.c src/serve/batch_sched.c src/serve/batch_sched_turn_checkpoint.c src/serve/batch_sched_admission.c src/serve/batch_sched_watchdog.c src/serve/batch_sched_slots.c src/serve/batch_sched_spec.c src/serve/serve_spec_mtp_cuda.c src/serve/request_profile.c src/serve/serve_backend_guard.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_model_registry.c src/serve/model_registry.c src/serve/model_session.c src/serve/model_replica_route.c src/serve/replica_affinity.c src/serve/batch_sched.c src/serve/batch_sched_turn_checkpoint.c src/serve/batch_sched_admission.c src/serve/batch_sched_watchdog.c src/serve/batch_sched_slots.c src/serve/batch_sched_spec.c src/serve/serve_spec_mtp_cuda.c src/serve/request_profile.c src/serve/serve_backend_guard.c \
 		$(PN_SRC) $(FOUNDRY_SRC) \
 		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
 
@@ -1163,8 +1811,17 @@ tests/test_model_registry: tests/test_model_registry.c src/serve/model_registry.
 # process, on a die sized to fit exactly one — and that an unload which cannot
 # drain REFUSES instead of reporting success and stranding the dies. Same link
 # set as test_model_registry; logical dies only, so it runs on the Mac.
-tests/test_model_unload_reclaim: tests/test_model_unload_reclaim.c src/serve/model_registry.c src/serve/batch_sched.c src/serve/request_profile.c src/serve/serve_backend_guard.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
-	$(CC) $(CFLAGS) -o $@ tests/test_model_unload_reclaim.c src/serve/model_registry.c src/serve/batch_sched.c src/serve/request_profile.c src/serve/serve_backend_guard.c \
+tests/test_model_unload_reclaim: tests/test_model_unload_reclaim.c src/serve/model_registry.c src/serve/model_session.c src/serve/model_replica_route.c src/serve/replica_affinity.c src/serve/batch_sched.c src/serve/batch_sched_turn_checkpoint.c src/serve/batch_sched_admission.c src/serve/batch_sched_watchdog.c src/serve/batch_sched_slots.c src/serve/batch_sched_spec.c src/serve/serve_spec_mtp_cuda.c src/serve/request_profile.c src/serve/serve_backend_guard.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_model_unload_reclaim.c src/serve/model_registry.c src/serve/model_session.c src/serve/model_replica_route.c src/serve/replica_affinity.c src/serve/batch_sched.c src/serve/batch_sched_turn_checkpoint.c src/serve/batch_sched_admission.c src/serve/batch_sched_watchdog.c src/serve/batch_sched_slots.c src/serve/batch_sched_spec.c src/serve/serve_spec_mtp_cuda.c src/serve/request_profile.c src/serve/serve_backend_guard.c \
+		$(PN_SRC) $(FOUNDRY_SRC) \
+		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
+
+# Unload vs open /session/watch (Argus Unload refused while a chat tab was
+# open). Real registry + real watch manager + poll thread over a socketpair: an
+# idle or in-grace watch never blocks an unload and gets `model_unloaded`; a
+# live turn is waited for, then cancelled; a turn that will not stop refuses.
+tests/test_unload_closes_watch: tests/test_unload_closes_watch.c src/serve/model_registry.c src/serve/model_replica_route.c src/serve/replica_affinity.c src/serve/session_watch.c src/serve/model_session.c src/serve/http_server.c src/serve/batch_sched.c src/serve/batch_sched_turn_checkpoint.c src/serve/batch_sched_admission.c src/serve/batch_sched_watchdog.c src/serve/batch_sched_slots.c src/serve/batch_sched_spec.c src/serve/serve_spec_mtp_cuda.c src/serve/request_profile.c src/serve/serve_backend_guard.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_unload_closes_watch.c src/serve/model_registry.c src/serve/model_replica_route.c src/serve/replica_affinity.c src/serve/session_watch.c src/serve/model_session.c src/serve/http_server.c src/serve/batch_sched.c src/serve/batch_sched_turn_checkpoint.c src/serve/batch_sched_admission.c src/serve/batch_sched_watchdog.c src/serve/batch_sched_slots.c src/serve/batch_sched_spec.c src/serve/serve_spec_mtp_cuda.c src/serve/request_profile.c src/serve/serve_backend_guard.c \
 		$(PN_SRC) $(FOUNDRY_SRC) \
 		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
 
@@ -1174,6 +1831,10 @@ tests/test_model_unload_reclaim: tests/test_model_unload_reclaim.c src/serve/mod
 # (like test_serve_sched_qwen35) so the JSON assertions run the REAL
 # oai_handle_models / ma_handle_models over a socketpair rather than a
 # reimplementation of them. No GPU, no model file, no network.
+tests/test_host_admit_serve: tests/test_host_admit_serve.c $(PN_SRC) $(SERVE_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_host_admit_serve.c $(PN_SRC) $(SERVE_SRC) $(FOUNDRY_SRC) \
+		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
+
 tests/test_backend_guard: tests/test_backend_guard.c $(PN_SRC) $(SERVE_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
 	$(CC) $(CFLAGS) -o $@ tests/test_backend_guard.c $(PN_SRC) $(SERVE_SRC) $(FOUNDRY_SRC) \
 		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
@@ -1181,14 +1842,79 @@ tests/test_backend_guard: tests/test_backend_guard.c $(PN_SRC) $(SERVE_SRC) $(FO
 # Dispatch-layer bs_get_load() accessor test (Phase G0). Exercises the pure
 # slot/queue snapshot (sched==NULL single-user + hand-built cap=4 states);
 # links batch_sched.c + the engine (batch_sched.c's other fns need it), no GPU.
-tests/test_bs_load: tests/test_bs_load.c src/serve/batch_sched.c src/serve/request_profile.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
-	$(CC) $(CFLAGS) -o $@ tests/test_bs_load.c src/serve/batch_sched.c src/serve/request_profile.c \
+tests/test_bs_load: tests/test_bs_load.c src/serve/batch_sched.c src/serve/batch_sched_turn_checkpoint.c src/serve/batch_sched_admission.c src/serve/batch_sched_watchdog.c src/serve/batch_sched_slots.c src/serve/batch_sched_spec.c src/serve/serve_spec_mtp_cuda.c src/serve/request_profile.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_bs_load.c src/serve/batch_sched.c src/serve/batch_sched_turn_checkpoint.c src/serve/batch_sched_admission.c src/serve/batch_sched_watchdog.c src/serve/batch_sched_slots.c src/serve/batch_sched_spec.c src/serve/serve_spec_mtp_cuda.c src/serve/request_profile.c \
+		$(PN_SRC) $(FOUNDRY_SRC) \
+		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
+
+# A finished slot queued in bs_slot_finalize makes a long prefill yield at its next
+# chunk boundary (its reply waits on finalize). Hand-built scheduler, no GPU.
+tests/test_bs_finalize_yield: tests/test_bs_finalize_yield.c src/serve/batch_sched.c src/serve/batch_sched_turn_checkpoint.c src/serve/batch_sched_admission.c src/serve/batch_sched_watchdog.c src/serve/batch_sched_slots.c src/serve/batch_sched_spec.c src/serve/serve_spec_mtp_cuda.c src/serve/request_profile.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_bs_finalize_yield.c src/serve/batch_sched.c src/serve/batch_sched_turn_checkpoint.c src/serve/batch_sched_admission.c src/serve/batch_sched_watchdog.c src/serve/batch_sched_slots.c src/serve/batch_sched_spec.c src/serve/serve_spec_mtp_cuda.c src/serve/request_profile.c \
+		$(PN_SRC) $(FOUNDRY_SRC) \
+		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
+
+# The per-request [req] timing line: fields, decode rate, arrival mark, release stats.
+tests/test_request_timing_line: tests/test_request_timing_line.c src/serve/request_timing_line.c src/serve/batch_sched.c src/serve/batch_sched_turn_checkpoint.c src/serve/batch_sched_admission.c src/serve/batch_sched_watchdog.c src/serve/batch_sched_slots.c src/serve/batch_sched_spec.c src/serve/serve_spec_mtp_cuda.c src/serve/request_profile.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_request_timing_line.c src/serve/request_timing_line.c src/serve/batch_sched.c src/serve/batch_sched_turn_checkpoint.c src/serve/batch_sched_admission.c src/serve/batch_sched_watchdog.c src/serve/batch_sched_slots.c src/serve/batch_sched_spec.c src/serve/serve_spec_mtp_cuda.c src/serve/request_profile.c \
+		$(PN_SRC) $(FOUNDRY_SRC) \
+		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
+
+# B3/B4: a decode slot's owner always gets control back (watched token wait,
+# legacy wait limit, SSE write failure + send timeout). Hand-built scheduler.
+tests/test_bs_prefill_share: tests/test_bs_prefill_share.c src/serve/batch_sched_prefill_share.h
+	$(CC) $(CFLAGS) -o $@ tests/test_bs_prefill_share.c -lm
+
+tests/test_bs_pd_budget: tests/test_bs_pd_budget.c src/serve/batch_sched_pd_budget.h
+	$(CC) $(CFLAGS) -o $@ tests/test_bs_pd_budget.c -lm
+
+tests/test_decode_watchdog: tests/test_decode_watchdog.c src/serve/batch_sched.c src/serve/batch_sched_turn_checkpoint.c src/serve/batch_sched_admission.c src/serve/batch_sched_watchdog.c src/serve/batch_sched_slots.c src/serve/batch_sched_spec.c src/serve/serve_spec_mtp_cuda.c src/serve/request_profile.c src/serve/http_server.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_decode_watchdog.c src/serve/batch_sched.c src/serve/batch_sched_turn_checkpoint.c src/serve/batch_sched_admission.c src/serve/batch_sched_watchdog.c src/serve/batch_sched_slots.c src/serve/batch_sched_spec.c src/serve/serve_spec_mtp_cuda.c src/serve/request_profile.c src/serve/http_server.c \
+		$(PN_SRC) $(FOUNDRY_SRC) \
+		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
+
+tests/test_think_flip_backlog: tests/test_think_flip_backlog.c src/serve/serve_emitter.c $(TEST_GRP_SRC) src/serve/batch_sched.c src/serve/batch_sched_turn_checkpoint.c src/serve/batch_sched_admission.c src/serve/batch_sched_watchdog.c src/serve/batch_sched_slots.c src/serve/batch_sched_spec.c src/serve/serve_spec_mtp_cuda.c src/serve/request_profile.c src/serve/http_server.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_think_flip_backlog.c src/serve/serve_emitter.c $(TEST_GRP_SRC) src/serve/batch_sched.c src/serve/batch_sched_turn_checkpoint.c src/serve/batch_sched_admission.c src/serve/batch_sched_watchdog.c src/serve/batch_sched_slots.c src/serve/batch_sched_spec.c src/serve/serve_spec_mtp_cuda.c src/serve/request_profile.c src/serve/http_server.c \
 		$(PN_SRC) $(FOUNDRY_SRC) \
 		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
 
 # A4: unit tests for pn_gguf_dequantize_row (per-row byte-offset math +
 # per-row == slice-of-full-tensor) and pn_qwen35moe_model_embed_row.
 # Part A always runs (synthetic data); Part B needs PN_TEST_MODEL (a real GGUF).
+# The card-format oracle's weight path (gguf_fttw_overlay + gguf_tiled + qweight_tiled, and the
+# PN_MIXW_BFP4 repack in gguf_fttw_repack), with
+# fixtures built by foundry's own converter. Green run, then the red run (one tile per column
+# decoded with its exponent off by one) which must FAIL.
+FTTW_ORACLE_TEST_SRC = tests/test_fttw_oracle.c src/formats/gguf.c src/formats/gguf_dequant.c \
+	src/formats/gguf_tiled.c src/formats/gguf_fttw_overlay.c src/formats/gguf_fttw_repack.c \
+	src/core/qweight.c src/core/qweight_tiled.c \
+	src/accel/simd.c $(HOST_ADMIT_SRC) $(THREADPOOL_SRC) \
+	$(FOUNDRY)/tt/convert/ft_bfp.c $(FOUNDRY)/tt/convert/ft_float_convert.c $(FOUNDRY)/tt/convert/ft_gguf_map.c \
+	$(FOUNDRY)/tt/convert/ft_gguf_dequant.c $(FOUNDRY)/tt/convert/ft_gguf_write.c \
+	$(FOUNDRY)/tt/convert/ft_tt_precision_ledger.c $(FOUNDRY)/tt/convert/ft_tt_weight_convert.c \
+	$(FOUNDRY)/tt/ft_tt_tilize.c
+# The oracle's tile-column decode (NEON fast path) vs foundry's codec + the scalar transpose, and the
+# fused one-row matvec vs pn_dot_f32 over that reference.
+tests/test_tiled_fast_decode: tests/test_tiled_fast_decode.c src/formats/gguf_tiled.c src/formats/gguf_tiled.h \
+	src/accel/simd.c src/formats/gguf_dequant.c src/formats/gguf.c $(HOST_ADMIT_SRC) $(FOUNDRY)/tt/convert/ft_bfp.c
+	$(CC) $(CFLAGS) -o $@ tests/test_tiled_fast_decode.c src/formats/gguf_tiled.c src/accel/simd.c \
+		src/formats/gguf_dequant.c src/formats/gguf.c $(HOST_ADMIT_SRC) $(FOUNDRY)/tt/convert/ft_bfp.c -lm
+
+tests/test_fttw_oracle: $(FTTW_ORACLE_TEST_SRC)
+	$(CC) $(CFLAGS) -o $@ $(FTTW_ORACLE_TEST_SRC) -lm $(LDFLAGS) $(LDFLAGS_BLAS)
+
+# The oracle's dumper, whole-program like the tests.
+tools/oracle/qwen36_oracle_dump: tools/oracle/qwen36_oracle_dump.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tools/oracle/qwen36_oracle_dump.c $(PN_SRC) $(FOUNDRY_SRC) \
+		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
+
+tools/oracle/qwen36_oracle_compare: tools/oracle/qwen36_oracle_compare.c
+	$(CC) $(CFLAGS) -o $@ tools/oracle/qwen36_oracle_compare.c -lm
+
+test-fttw-oracle: tests/test_fttw_oracle
+	mkdir -p build && ./tests/test_fttw_oracle
+	! PN_TILED_RED=1 ./tests/test_fttw_oracle --red
+
 tests/test_embed_row: tests/test_embed_row.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
 	$(CC) $(CFLAGS) -o $@ tests/test_embed_row.c $(PN_SRC) $(FOUNDRY_SRC) \
 		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
@@ -1204,6 +1930,99 @@ tests/test_tt_column_runs: tests/test_tt_column_runs.c src/accel/tt/pn_tt_column
 # The elementwise core split's tile arithmetic. Links ONLY the module under test — no device,
 # no artifact, no USE_TT — because the one thing a split can get wrong that nothing reports is
 # an ADDRESS, and that is settled here rather than on a card.
+# The grid M split's row partition (pn_tt_grid_msplit.h): the module alone, no card.
+tests/test_tt_grid_msplit: tests/test_tt_grid_msplit.c src/accel/tt/pn_tt_grid_msplit.c \
+                           src/accel/tt/pn_tt_grid_msplit.h
+	$(CC) $(CFLAGS) -o $@ tests/test_tt_grid_msplit.c src/accel/tt/pn_tt_grid_msplit.c
+
+# G.2 grid step marks (pn_tt_grid_marks.h): the module alone, no card.
+tests/test_tt_grid_marks: tests/test_tt_grid_marks.c src/accel/tt/pn_tt_grid_marks.c \
+                          src/accel/tt/pn_tt_grid_marks.h
+	$(CC) $(CFLAGS) -o $@ tests/test_tt_grid_marks.c src/accel/tt/pn_tt_grid_marks.c
+
+# The prefill overlap's step placement (qwen35moe_prefill_ov_plan.h): the module alone.
+tests/test_qwen35_ov_plan: tests/test_qwen35_ov_plan.c src/models/qwen35moe_prefill_ov_plan.c \
+                           src/models/qwen35moe_prefill_ov_plan.h
+	$(CC) $(CFLAGS) -o $@ tests/test_qwen35_ov_plan.c src/models/qwen35moe_prefill_ov_plan.c
+
+# Split-K decode attention's plan (pn_tt_attn_splitk.h): the module alone, no card, no USE_TT.
+tests/test_tt_attn_splitk: tests/test_tt_attn_splitk.c src/accel/tt/pn_tt_attn_splitk.c \
+                           src/accel/tt/pn_tt_attn_splitk.h
+	$(CC) $(CFLAGS) -o $@ tests/test_tt_attn_splitk.c src/accel/tt/pn_tt_attn_splitk.c -lm
+
+# The same with every chunk overlapping its predecessor by a tile: must FAIL. Rebuilt every
+# time (macOS make 3.81 one-second mtimes).
+test-tt-attn-splitk-red:
+	rm -f tests/test_tt_attn_splitk_red
+	$(CC) $(CFLAGS) -DPN_TT_ATTN_SPLITK_RED -o tests/test_tt_attn_splitk_red \
+	  tests/test_tt_attn_splitk.c src/accel/tt/pn_tt_attn_splitk.c -lm
+	! ./tests/test_tt_attn_splitk_red
+
+# Dispatch replay across split-K's plan changes (pn_tt_attn_splitk_plan_key): no card, no USE_TT.
+tests/test_tt_dispatch_shape_key: tests/test_tt_dispatch_shape_key.c src/accel/tt/pn_tt_attn_splitk.c \
+                                  src/accel/tt/pn_tt_attn_splitk.h
+	$(CC) $(CFLAGS) -o $@ tests/test_tt_dispatch_shape_key.c src/accel/tt/pn_tt_attn_splitk.c
+
+# The same with a key that ignores chunk lengths (misses 9,217): must FAIL. Rebuilt every time
+# (macOS make 3.81 one-second mtimes).
+test-tt-dispatch-shape-key-red:
+	rm -f tests/test_tt_dispatch_shape_key_red
+	$(CC) $(CFLAGS) -DPN_TT_ATTN_SPLITK_KEY_RED -o tests/test_tt_dispatch_shape_key_red \
+	  tests/test_tt_dispatch_shape_key.c src/accel/tt/pn_tt_attn_splitk.c
+	! ./tests/test_tt_dispatch_shape_key_red
+
+# Attention fast-math program selection (pn_tt_attn_fast.h): the module alone, no card, no USE_TT.
+tests/test_tt_attn_fast: tests/test_tt_attn_fast.c src/accel/tt/pn_tt_attn_fast.c \
+                         src/accel/tt/pn_tt_attn_fast.h
+	$(CC) $(CFLAGS) -o $@ tests/test_tt_attn_fast.c src/accel/tt/pn_tt_attn_fast.c
+
+# The same with `exp` mapped to the LoFi program: must FAIL. Rebuilt every time (macOS make
+# 3.81 one-second mtimes).
+test-tt-attn-fast-red:
+	rm -f tests/test_tt_attn_fast_red
+	$(CC) $(CFLAGS) -DPN_TT_ATTN_FAST_RED -o tests/test_tt_attn_fast_red \
+	  tests/test_tt_attn_fast.c src/accel/tt/pn_tt_attn_fast.c
+	! ./tests/test_tt_attn_fast_red
+
+# The "96-110,0-15" core-list parser (PN_TT_MATMUL_CORE_LIST): the module alone, no card.
+# Build with -DPN_TT_CORE_LIST_RED to see it fail.
+tests/test_tt_core_list: tests/test_tt_core_list.c src/accel/tt/pn_tt_core_list.c \
+                         src/accel/tt/pn_tt_core_list.h
+	$(CC) $(CFLAGS) -o $@ tests/test_tt_core_list.c src/accel/tt/pn_tt_core_list.c
+
+# L1a's prefill lend ledger (pn_tt_lend_ledger.h): the module alone, no card.
+tests/test_tt_lend_ledger: tests/test_tt_lend_ledger.c src/accel/tt/pn_tt_lend_ledger.c \
+                           src/accel/tt/pn_tt_lend_ledger.h
+	$(CC) $(CFLAGS) -o $@ tests/test_tt_lend_ledger.c src/accel/tt/pn_tt_lend_ledger.c
+
+# The same with stuck cores handed back for a boot, then with deep attention off by default
+# (L1a never on unasked): each must FAIL.
+test-tt-lend-ledger-red:
+	rm -f tests/test_tt_lend_ledger_red
+	$(CC) $(CFLAGS) -DPN_TT_LEND_LEDGER_RED -o tests/test_tt_lend_ledger_red \
+	  tests/test_tt_lend_ledger.c src/accel/tt/pn_tt_lend_ledger.c
+	! ./tests/test_tt_lend_ledger_red
+	rm -f tests/test_tt_lend_ledger_red
+	$(CC) $(CFLAGS) -DPN_TT_LEND_DEFAULT_RED -o tests/test_tt_lend_ledger_red \
+	  tests/test_tt_lend_ledger.c src/accel/tt/pn_tt_lend_ledger.c
+	! ./tests/test_tt_lend_ledger_red
+
+# Deep-queued prefill attention's schedule (pn_tt_attn_deep.h): the module alone, no card.
+tests/test_tt_attn_deep: tests/test_tt_attn_deep.c src/accel/tt/pn_tt_attn_deep.c \
+                         src/accel/tt/pn_tt_attn_deep.h
+	$(CC) $(CFLAGS) -o $@ tests/test_tt_attn_deep.c src/accel/tt/pn_tt_attn_deep.c
+
+# The same with the last unit never queued, and with no settle before a full ring: both must FAIL.
+test-tt-attn-deep-red:
+	rm -f tests/test_tt_attn_deep_red
+	$(CC) $(CFLAGS) -DPN_TT_ATTN_DEEP_RED -o tests/test_tt_attn_deep_red \
+	  tests/test_tt_attn_deep.c src/accel/tt/pn_tt_attn_deep.c
+	! ./tests/test_tt_attn_deep_red
+	rm -f tests/test_tt_attn_deep_red_overrun
+	$(CC) $(CFLAGS) -DPN_TT_ATTN_DEEP_RED_NO_SETTLE -o tests/test_tt_attn_deep_red_overrun \
+	  tests/test_tt_attn_deep.c src/accel/tt/pn_tt_attn_deep.c
+	! ./tests/test_tt_attn_deep_red_overrun
+
 tests/test_tt_name_list: tests/test_tt_name_list.c \
 	src/accel/tt/pn_tt_name_list.c src/accel/tt/pn_tt_name_list.h
 	$(CC) $(CFLAGS) -o $@ tests/test_tt_name_list.c \
@@ -1220,11 +2039,86 @@ tests/test_tt_eltwise_split: tests/test_tt_eltwise_split.c \
 	$(CC) $(CFLAGS) -o $@ tests/test_tt_eltwise_split.c \
 	  src/accel/tt/pn_tt_eltwise_split.c -lm
 
+# P3: the norm schedules and the residency extents they need, off hardware.
+tests/test_tt_norm_schedule: tests/test_tt_norm_schedule.c \
+	src/accel/tt/pn_tt_norm_schedule.c src/accel/tt/pn_tt_norm_schedule.h
+	$(CC) $(CFLAGS) -o $@ tests/test_tt_norm_schedule.c src/accel/tt/pn_tt_norm_schedule.c
+
+# P0: the persistent norm role's step map and forward cursor, off hardware.
+tests/test_tt_norm_role: tests/test_tt_norm_role.c \
+	src/accel/tt/pn_tt_norm_role_plan.c src/accel/tt/pn_tt_norm_role_plan.h
+	$(CC) $(CFLAGS) -o $@ tests/test_tt_norm_role.c src/accel/tt/pn_tt_norm_role_plan.c
+
+# P0: the role table's claims and mode-switch order, off hardware.
+tests/test_tt_role_table: tests/test_tt_role_table.c \
+	src/accel/tt/pn_tt_role_table.c src/accel/tt/pn_tt_role_table.h
+	$(CC) $(CFLAGS) -o $@ tests/test_tt_role_table.c src/accel/tt/pn_tt_role_table.c
+
 tests/test_tt_descriptor_census: tests/test_tt_descriptor_census.c \
 	src/accel/tt/pn_tt_descriptor_census.c src/accel/tt/pn_tt_descriptor_census.h \
 	src/accel/tt/pn_tt_name_list.c src/accel/tt/pn_tt_name_list.h
 	$(CC) $(CFLAGS) -o $@ tests/test_tt_descriptor_census.c \
 	  src/accel/tt/pn_tt_descriptor_census.c src/accel/tt/pn_tt_name_list.c -lm
+
+# A per-tensor Bfp8/Bfp4 format map priced per DRAM bank for Qwen3.8 (mixw plan 1.3): the
+# modules alone, no card, no USE_TT. The catalog parser checks the 262,144 tier profile.
+TT_TIER_CATALOG_SRC = src/local/catalog_manifest.c src/local/load_options.c \
+	src/local/unit_place.c src/local/catalog_match.c src/serve/json_reader.c \
+	src/serve/sampling_defaults.c src/serve/json_writer.c
+tests/test_tt_q38_mixw_fit: tests/test_tt_q38_mixw_fit.c src/accel/tt/pn_tt_mixw_fit.c \
+	src/accel/tt/pn_tt_mixw_fit.h src/models/qwen35moe_tt_mixw_census.c \
+	src/models/qwen35moe_tt_mixw_census.h src/models/qwen35moe_tt_fit_plan.c \
+	src/models/qwen35moe_tt_fit_plan.h $(TT_TIER_CATALOG_SRC) \
+	tests/local/fixtures/catalog_q38_tier.json catalog/catalog.json
+	$(CC) $(CFLAGS) -o $@ tests/test_tt_q38_mixw_fit.c src/accel/tt/pn_tt_mixw_fit.c \
+	  src/models/qwen35moe_tt_mixw_census.c src/models/qwen35moe_tt_fit_plan.c \
+	  $(TT_TIER_CATALOG_SRC) -lm
+
+# The fit policy's bank rule (128 MiB a bank, verify slots and the checkpoint in): the trigger
+# alone, no card, no USE_TT.
+tests/test_tt_q38_fit_banks: tests/test_tt_q38_fit_banks.c src/models/qwen35moe_tt_fit_plan.c \
+	src/models/qwen35moe_tt_fit_plan.h
+	$(CC) $(CFLAGS) -o $@ tests/test_tt_q38_fit_banks.c src/models/qwen35moe_tt_fit_plan.c
+
+# A column view of a resident weight reads its source's bytes in place (the MTP draft head).
+tests/test_tt_weight_view: tests/test_tt_weight_view.c src/accel/tt/pn_tt_weight_view.c \
+	src/accel/tt/pn_tt_weight_view.h src/accel/tt/pn_tt_column_runs.c
+	$(CC) $(CFLAGS) -DUSE_TT -o $@ tests/test_tt_weight_view.c src/accel/tt/pn_tt_weight_view.c \
+	src/accel/tt/pn_tt_column_runs.c -lm
+
+# The fit policy's levers (GDNC copies, tall bands, unmirrored gated strips) for the bank rule.
+tests/test_tt_q38_fit_levers: tests/test_tt_q38_fit_levers.c src/models/qwen35moe_tt_fit_plan.c \
+	src/models/qwen35moe_tt_fit_plan.h $(TT_TIER_CATALOG_SRC) catalog/catalog.json
+	$(CC) $(CFLAGS) -o $@ tests/test_tt_q38_fit_levers.c src/models/qwen35moe_tt_fit_plan.c \
+	  $(TT_TIER_CATALOG_SRC) -lm
+
+# The exact card gates' tables vs the host gates they replace, and the refusal that keeps a
+# load on the host gates: no card, no USE_TT.
+tests/test_tt_gate_tables: tests/test_tt_gate_tables.c $(FOUNDRY)/tt/kernels/ftgc_table.h $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_tt_gate_tables.c $(PN_SRC) $(FOUNDRY_SRC) \
+		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
+
+# The alpha/beta readback's tile runs (rider (a)): no card, no USE_TT.
+tests/test_tt_reader_runs: tests/test_tt_reader_runs.c src/accel/tt/pn_tt_reader_runs.h
+	$(CC) $(CFLAGS) -o $@ tests/test_tt_reader_runs.c
+
+tests/test_tt_dispatch_hoist: tests/test_tt_dispatch_hoist.c \
+	src/accel/tt/pn_tt_dispatch_hoist.c src/accel/tt/pn_tt_dispatch_hoist.h \
+	src/accel/tt/pn_tt_precondition.c src/accel/tt/pn_tt_precondition_verify.c \
+	src/accel/tt/pn_tt_precondition.h
+	$(CC) $(CFLAGS) -o $@ tests/test_tt_dispatch_hoist.c src/accel/tt/pn_tt_dispatch_hoist.c \
+	  src/accel/tt/pn_tt_precondition.c src/accel/tt/pn_tt_precondition_verify.c
+
+# S2 on-card completion: the AWAIT -> wait-sidecar rewrite of the puller's programs and the
+# plan check that guards it, on hand-built cases and a synthesized Qwen3.8 decode token
+# (replay + stream), with mutated plans and the `precondition_early` red refused. Pure.
+tests/test_tt_precondition: tests/test_tt_precondition.c src/accel/tt/pn_tt_dispatch_hoist.c \
+	src/accel/tt/pn_tt_dispatch_hoist.h src/accel/tt/pn_tt_precondition.c \
+	src/accel/tt/pn_tt_precondition_verify.c src/accel/tt/pn_tt_precondition_dump.c \
+	src/accel/tt/pn_tt_precondition.h
+	$(CC) $(CFLAGS) -o $@ tests/test_tt_precondition.c src/accel/tt/pn_tt_dispatch_hoist.c \
+	  src/accel/tt/pn_tt_precondition.c src/accel/tt/pn_tt_precondition_verify.c \
+	  src/accel/tt/pn_tt_precondition_dump.c
 
 # Self-contained differential parity test for the optimized token sampler:
 # diffs a verbatim copy of the original sampler against the optimized one over
@@ -1280,7 +2174,130 @@ pantheon-convert: cli/convert.c $(FOUNDRY)/pth/pth.c $(FOUNDRY)/safetensors/safe
 # .gitignore, so a new test cannot be missed.
 clean:
 	rm -f pantheon pantheon-convert libpantheon.a $(foreach b,cpu cuda tt metal cuda-tt cuda-metal tt-metal cuda-tt-metal,pantheon-$(b))
-	find tests -maxdepth 1 -type f \( -name 'test_*' -o -name 'bench_*' -o -name 'gen_golden_*' \) ! -name '*.c' ! -name '*.h' -delete
+	find tests -maxdepth 1 -type f \( -name 'test_*' -o -name 'bench_*' -o -name 'gen_golden_*' \) ! -name '*.c' ! -name '*.h' ! -name '*.py' -delete
 	rm -rf *.dSYM tests/*.dSYM
 	rm -f *.o src/core/*.o src/formats/*.o src/models/*.o src/memory/*.o src/accel/*.o
 	rm -rf $(LIB_OBJDIR)
+	rm -rf $(INGOT_OBJDIR)
+
+# ============================================================
+# Pantheon Local tests (tests/test_local_*.c, tests/test_sampling_defaults.c).
+# LOCAL_TESTS_FULL link the whole serve (they fork a `pantheon local` child);
+# the rest link only the module under test.
+# ============================================================
+# LOCAL_TESTS / LOCAL_TESTS_FULL are defined above the test: rule.
+
+$(LOCAL_TESTS_FULL): tests/%: tests/%.c tests/local_test_support.h $(PN_SRC) $(SERVE_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ $< $(PN_SRC) $(SERVE_SRC) $(FOUNDRY_SRC) \
+		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
+
+tests/test_sampling_defaults: tests/test_sampling_defaults.c src/serve/sampling_defaults.c src/serve/json_reader.c src/serve/json_writer.c $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_sampling_defaults.c src/serve/sampling_defaults.c \
+		src/serve/json_reader.c src/serve/json_writer.c -lm $(LDFLAGS)
+
+tests/test_local_unit_place: tests/test_local_unit_place.c src/local/unit_place.c $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_local_unit_place.c src/local/unit_place.c -lm $(LDFLAGS)
+
+tests/test_local_pick_port: tests/test_local_pick_port.c tests/local_test_support.h
+	$(CC) $(CFLAGS) -o $@ tests/test_local_pick_port.c $(LDFLAGS)
+
+tests/test_local_mdns_packet: tests/test_local_mdns_packet.c src/local/mdns_packet.c $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_local_mdns_packet.c src/local/mdns_packet.c -lm $(LDFLAGS)
+
+tests/test_local_minisign: tests/test_local_minisign.c src/local/minisign_verify.c src/local/sha256.c src/serve/base64.c $(MONOCYPHER_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_local_minisign.c src/local/minisign_verify.c \
+		src/local/sha256.c src/serve/base64.c $(MONOCYPHER_SRC) -lm $(LDFLAGS)
+
+LOCAL_CATALOG_TEST_SRC = src/local/catalog.c src/local/catalog_manifest.c src/local/catalog_match.c src/local/load_options.c \
+	src/local/unit_place.c src/local/minisign_verify.c src/local/curl_runner.c \
+	src/local/local_file_io.c src/serve/sampling_defaults.c src/serve/base64.c \
+	src/serve/json_reader.c src/serve/json_writer.c $(MONOCYPHER_SRC)
+tests/test_local_catalog: tests/test_local_catalog.c $(LOCAL_CATALOG_TEST_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_local_catalog.c $(LOCAL_CATALOG_TEST_SRC) -lm $(LDFLAGS)
+
+LOCAL_DOWNLOAD_TEST_SRC = src/local/downloader.c src/local/install_worker.c src/local/model_store.c \
+	src/local/curl_runner.c src/local/sha256.c src/local/catalog_manifest.c src/local/unit_place.c \
+	src/local/ingot_fetch.c src/serve/sampling_defaults.c src/serve/json_reader.c \
+	src/serve/json_writer.c $(INGOT_LIB)
+tests/test_local_download: tests/test_local_download.c tests/local_fixture_httpd.h $(LOCAL_DOWNLOAD_TEST_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_local_download.c $(LOCAL_DOWNLOAD_TEST_SRC) -lm $(LDFLAGS)
+
+# Ingot Phase 1b: .ingot catalog downloads decoded while they arrive (bounded memory,
+# resume after a cut, corrupt / delta base refusals).
+tests/test_local_ingot: tests/test_local_ingot.c tests/local_fixture_httpd.h $(LOCAL_DOWNLOAD_TEST_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_local_ingot.c $(LOCAL_DOWNLOAD_TEST_SRC) -lm $(LDFLAGS)
+
+# H2m: store listing + uninstall by catalog id.
+tests/test_local_store_cleanup: tests/test_local_store_cleanup.c src/local/model_store_cleanup.c $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_local_store_cleanup.c src/local/model_store_cleanup.c -lm $(LDFLAGS)
+
+# Static file server standing in for Hugging Face in the on-hardware scripts.
+build/fixture_httpd: tests/local/fixture_httpd.c tests/local_fixture_httpd.h
+	@mkdir -p build
+	$(CC) -O2 -Wall -Wextra -std=c11 $(if $(filter Darwin,$(shell uname -s)),,-D_GNU_SOURCE) -o $@ tests/local/fixture_httpd.c
+
+# L3: load options (grid, fit, refusals, the catalog's memory model vs measured peaks).
+LOCAL_OPTIONS_TEST_SRC = src/local/load_options.c src/local/unit_place.c src/local/catalog_manifest.c \
+	src/local/catalog_match.c src/local/local_file_io.c src/serve/sampling_defaults.c \
+	src/serve/json_reader.c src/serve/json_writer.c src/core/mem/pn_ladder.c
+tests/test_local_load_options: tests/test_local_load_options.c $(LOCAL_OPTIONS_TEST_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_local_load_options.c $(LOCAL_OPTIONS_TEST_SRC) -lm $(LDFLAGS)
+
+# L4: one served name on several replicas (session routing; hand-built registry).
+tests/test_replica_route: tests/test_replica_route.c src/serve/model_replica_route.c src/serve/replica_affinity.c src/serve/replica_pin.c src/serve/http_server.c src/serve/json_reader.c src/serve/json_writer.c $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_replica_route.c src/serve/model_replica_route.c \
+		src/serve/replica_affinity.c src/serve/replica_pin.c src/serve/http_server.c \
+		src/serve/json_reader.c src/serve/json_writer.c -lm $(LDFLAGS)
+
+tests/test_local_loaded_set: tests/test_local_loaded_set.c src/local/loaded_set.c src/local/local_file_io.c src/serve/json_reader.c src/serve/json_writer.c $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_local_loaded_set.c src/local/loaded_set.c \
+		src/local/local_file_io.c src/serve/json_reader.c src/serve/json_writer.c -lm $(LDFLAGS)
+
+# People registry P1.1: people.json and the admin tree.
+LOCAL_PEOPLE_TEST_SRC = src/local/people_store.c src/local/local_file_io.c src/local/local_random.c \
+	src/local/sha256.c src/serve/json_reader.c src/serve/json_writer.c
+tests/test_local_people_store: tests/test_local_people_store.c $(LOCAL_PEOPLE_TEST_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_local_people_store.c $(LOCAL_PEOPLE_TEST_SRC) -lm $(LDFLAGS)
+
+# People registry P1.2: keys.json v2 and the v1 migration.
+LOCAL_KEYS_TEST_SRC = $(LOCAL_PEOPLE_TEST_SRC) src/local/key_store.c src/local/key_migration.c
+tests/test_local_key_migration: tests/test_local_key_migration.c $(LOCAL_KEYS_TEST_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_local_key_migration.c $(LOCAL_KEYS_TEST_SRC) -lm $(LDFLAGS)
+
+# People registry P1.3: route classes x callers through the real auth hook.
+LOCAL_AUTH_TEST_SRC = $(LOCAL_KEYS_TEST_SRC) src/local/local_auth.c src/local/local_caller.c \
+	src/local/rate_limit.c src/serve/http_server.c
+tests/test_local_route_classes: tests/test_local_route_classes.c $(LOCAL_AUTH_TEST_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_local_route_classes.c $(LOCAL_AUTH_TEST_SRC) -lm $(LDFLAGS)
+
+# People registry P2.2: sessions.json and the registry rules (no sockets).
+LOCAL_REGISTRY_TEST_SRC = src/local/session_registry.c src/local/local_file_io.c \
+	src/serve/json_reader.c src/serve/json_writer.c $(MONOCYPHER_SRC)
+tests/test_local_session_registry: tests/test_local_session_registry.c $(LOCAL_REGISTRY_TEST_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_local_session_registry.c $(LOCAL_REGISTRY_TEST_SRC) -lm $(LDFLAGS)
+
+# People registry P2.3: the hub's held waits over socketpairs.
+LOCAL_HUB_TEST_SRC = $(LOCAL_REGISTRY_TEST_SRC) src/local/hosts_hub.c src/local/hub_relays.c \
+	src/local/used_nonces.c src/local/local_random.c src/local/sha256.c src/serve/http_server.c
+tests/test_local_hosts_hub: tests/test_local_hosts_hub.c $(LOCAL_HUB_TEST_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_local_hosts_hub.c $(LOCAL_HUB_TEST_SRC) -lm $(LDFLAGS)
+
+# People registry P4.1: relay pairs in the hub over socketpairs.
+tests/test_local_hub_relays: tests/test_local_hub_relays.c $(LOCAL_HUB_TEST_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_local_hub_relays.c $(LOCAL_HUB_TEST_SRC) -lm $(LDFLAGS)
+
+# People registry P3.1: HMAC-SHA256 and attach tickets.
+LOCAL_TICKET_TEST_SRC = src/local/attach_ticket.c src/local/sha256.c src/local/local_random.c \
+	src/serve/json_reader.c src/serve/json_writer.c $(MONOCYPHER_SRC)
+tests/test_local_attach_ticket: tests/test_local_attach_ticket.c $(LOCAL_TICKET_TEST_SRC) \
+	tests/local_fixture_replay.h $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_local_attach_ticket.c $(LOCAL_TICKET_TEST_SRC) -lm $(LDFLAGS)
+
+# People registry P1.4+: the contract fixtures are replayed against a forked box.
+tests/test_local_pairing_devices tests/test_local_people_routes tests/test_local_host_routes \
+	tests/test_local_session_routes tests/test_local_relay_routes: tests/local_fixture_replay.h tests/local_people_test_support.h \
+	tests/local_host_wait_support.h
+
+# The Mac end-to-end flow trusts the TEST ONLY catalog key (this binary only).
+tests/test_local_flow: CFLAGS += -DPN_LOCAL_TEST_CATALOG_KEY
+tests/test_local_unit_types: CFLAGS += -DPN_LOCAL_TEST_CATALOG_KEY

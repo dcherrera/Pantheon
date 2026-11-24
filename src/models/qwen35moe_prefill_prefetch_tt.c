@@ -33,6 +33,7 @@
 #include <string.h>
 
 #include "../accel/tt/pn_tt_gdnc.h"
+#include "../accel/tt/pn_tt_gdn.h"
 #include "../accel/tt/pn_tt_reader.h"
 #include "../accel/tt/pn_tt_dispatch.h"
 #include "../accel/tt/pn_tt_matmul_group.h"
@@ -191,12 +192,13 @@ static bool ab_post_bands(pn_qwen35_tt *g, ab_reader_slot *slot, int first, int 
 
         if (take <= 0 || band >= AB_READER_MAX_BANDS)
             return false;
-        slot->ticket[0][band] = pn_tt_reader_post_rows_gated(
+        /* (a): the last tile's unused right faces are not read (48 of 64 columns). */
+        slot->ticket[0][band] = pn_tt_reader_post_rows_live(
             g->device, a->bank, ab_band_address(a, src), a->tile_count, (uint32_t)take,
-            alpha + (size_t)done * alpha_width, alpha_width, gate);
-        slot->ticket[1][band] = pn_tt_reader_post_rows_gated(
+            alpha + (size_t)done * alpha_width, alpha_width, pn_tt_gdn_v_heads(g->device), gate);
+        slot->ticket[1][band] = pn_tt_reader_post_rows_live(
             g->device, b->bank, ab_band_address(b, src), b->tile_count, (uint32_t)take,
-            beta + (size_t)done * beta_width, beta_width, gate);
+            beta + (size_t)done * beta_width, beta_width, pn_tt_gdn_v_heads(g->device), gate);
         slot->posted = band + 1;
     }
     return true;

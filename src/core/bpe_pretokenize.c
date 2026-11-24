@@ -4,7 +4,8 @@
  * @file   bpe_pretokenize.c
  * @brief  Pre-token splitter (qwen35/GPT-2 and llama-bpe modes) feeding ft_encode.
  *
- * Rewritten from a behaviour specification and measured behaviour;
+ * Rewritten from a behaviour specification
+ * (cleanroom_bpe_dequant_spec.md, recorded in docs/cleanroom/README.md) and measured behaviour;
  * the implementer did not see the previous code. The split is a hand-written
  * scanner over a fixed character-class table, tried rule by rule at each position:
  * contraction, letter run, digits, symbol run, whitespace, single code point.

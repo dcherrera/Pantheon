@@ -4,7 +4,7 @@
  * @file   simd.h
  * @brief  CPU vector kernels: dot products, element-wise ops, RMS norm, Q4_0/Q8_0 block dots.
  *
- * Written from a behaviour specification (plans/cleanroom_r2_simd_spec.md); no ggml or
+ * Written from a behaviour specification (cleanroom_r2_simd_spec.md, recorded in docs/cleanroom/README.md); no ggml or
  * llama.cpp source was consulted.
  *
  * One code path is chosen at compile time: NEON (arm64), AVX2+FMA (x86 built with both),

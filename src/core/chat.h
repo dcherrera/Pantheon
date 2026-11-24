@@ -3,6 +3,7 @@
 #ifndef PN_CHAT_H
 #define PN_CHAT_H
 
+#include <stdbool.h>
 #include <stdint.h>
 #include "tokenizer/tokenizer.h"
 
@@ -31,6 +32,11 @@ typedef struct {
 
 /* Detect chat style from Jinja2 template string (GGUF metadata) */
 pn_chat_style pn_chat_detect_style(const char *jinja_template);
+
+/* Does the template |trim message content (Qwen3.5+ family, Ornith)?  The
+ * prompt builder then trims every message's content as the template does;
+ * templates without |trim (Qwen2.5, Qwen3) keep their content as sent. */
+bool pn_chat_template_trims_content(const char *jinja_template);
 
 /* Fallback: detect from architecture enum value */
 pn_chat_style pn_chat_style_from_arch(int arch);

@@ -81,6 +81,7 @@
 
 #ifdef USE_TT
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #include "pn_tt_device.h"
@@ -167,6 +168,60 @@ uint32_t pn_tt_activation_replica_count(const pn_tt_device *device);
 int pn_tt_publish_replica_map(pn_tt_device *device, const pn_tt_activation *const *strips,
                               uint32_t strip_count, const pn_tt_activation *split_output);
 
+/**
+ * OUT-PROJECTIONS ON THE GRID (2026-10-27). `ranged`: every TALL mirrored strip (more than 4
+ * bands) is keyed by ONE range record (any write inside it fans out at the same offset)
+ * instead of the span / super-band keys; and the `gated` strips (`ssm_gated`, attention
+ * `gated`, written band by band) get a range record in EVERY writer's table, so they can be
+ * mirrored and their out-projections take the prefill grid. Republish after changing it.
+ * `ranged` false = the keys above, word for word.
+ */
+void pn_tt_replica_map_set_ranged(bool ranged, const pn_tt_activation *const *gated,
+                                  uint32_t gated_count);
+
+/**
+ * L2: the DECODE out-projection inputs
+ * (`ssm_gated`, attention `gated`), mirrored late (pn_tt_late_mirrors.h), each keyed by ONE
+ * range record in every writer's table — the eltwise members write slices and verify rows
+ * write bands, and a range covers both. Pointers to the model's strip SLOTS: a strip taller
+ * than 4 bands there (the tall set swapped in for a batched pass) is skipped, and one with a
+ * single replica adds nothing. Republish after changing it. NULL / 0 clears it.
+ */
+void pn_tt_replica_map_set_decode_ranged(const pn_tt_activation *const *strips, uint32_t count);
+
+/** Strips the fused-SwiGLU members' table can name (decode + tall `ffn_swiglu`, spare). */
+#define PN_TT_REPLICA_MAP_FUSED_MAX 4u
+
+/**
+ * S3b: register the strips a FUSED SwiGLU descriptor writes, BY SLOT (pointer): a tall swap
+ * exchanges the contents of the decode and tall strip structs, so the pair of slot pointers
+ * names both strips whatever the swap state, and late mirrors are seen as they land. Clears
+ * the published flag; pn_tt_replica_map_publish_fused() sets it.
+ *
+ * Thread-safe: no    Reentrant: no    Signal-safe: no
+ */
+void pn_tt_replica_map_set_fused_swiglu(const pn_tt_activation *const *strips, uint32_t count);
+
+/**
+ * S3b: publish (and read back) the matmul members' replica table — one RANGE record per
+ * registered mirrored strip, keyed at its band-0 primary over every band — to every running
+ * member of the matmul group. A no-op with the knob off or nothing registered. Called by
+ * pn_tt_publish_replica_map() and after every matmul-group arm (a re-arm re-plants it).
+ *
+ * @return 0, or -1 (a write or read-back failed; the fused path is then refused)
+ *
+ * Thread-safe: no    Reentrant: no    Signal-safe: no
+ */
+int pn_tt_replica_map_publish_fused(pn_tt_device *device);
+
+/**
+ * S3b: may a fused descriptor write `output`? True for an unmirrored strip (no fan-out
+ * needed), or a mirrored one that a published members' table names.
+ *
+ * Thread-safe: no    Reentrant: no    Signal-safe: no
+ */
+bool pn_tt_replica_map_fused_covers(const pn_tt_device *device, const pn_tt_activation *output);
+
 /** PHASE G: the prefill span (bands a pass's ops cover) the keys of a TALL strip (> 4 bands)
  *  are published for; republish after changing it. 0/1 = decode only. */
 void pn_tt_replica_map_set_span(uint32_t span);
@@ -197,6 +252,17 @@ void pn_tt_replica_map_set_superband(uint32_t bands);
  */
 int pn_tt_publish_empty_replica_map(pn_tt_device *device, const pn_tt_residency *residency,
                                     const char *label);
+
+/**
+ * The persistent norm role's members (pn_tt_norm_role.h): the reduce residency's table, built
+ * from the strips the last pn_tt_publish_replica_map() was given. Called at the role's arm and
+ * by every publish after it. No members running: nothing written.
+ *
+ * @return 0, or -1 with the reason on stderr
+ *
+ * Thread-safe: no    Reentrant: no    Signal-safe: no
+ */
+int pn_tt_replica_map_publish_role(pn_tt_device *device);
 
 #endif /* USE_TT */
 #endif /* PN_TT_REPLICA_MAP_H */

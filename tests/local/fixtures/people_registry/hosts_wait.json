@@ -1,0 +1,15 @@
+{"endpoint":"GET /local/hosts/<key>/wait?since=<seq>","class":"device",
+ "request":null,
+ "status":200,
+ "response":{"seq":14,"events":[
+   {"seq":12,"type":"relay","id":"r-0011223344556677","expires_in":10},
+   {"seq":13,"type":"shares","shares":[{"person":"p55aa66bb","handle":"bob","role":"control"}]},
+   {"seq":14,"type":"close","reason":"removed"}]},
+ "response_timeout":{"seq":14,"events":[]},
+ "response_replaced":{"seq":14,"events":[],"replaced":true},
+ "response_reregister":{"seq":15,"events":[{"seq":15,"type":"reregister"}]},
+ "response_close":{"seq":15,"events":[{"seq":15,"type":"close","reason":"removed"}]},
+ "response_shares":{"seq":13,"events":[{"seq":13,"type":"shares","shares":[{"person":"p55aa66bb","handle":"bob","role":"control"}]}]},
+ "errors":[{"when":"no row with that key (register it again)","status":404,"type":"not_registered"},
+           {"when":"the caller's person does not own the row","status":403,"type":"forbidden"},
+           {"when":"the hub holds its maximum of waits","status":503,"type":"hub_full"}]}

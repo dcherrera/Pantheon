@@ -18,12 +18,16 @@
  *         (K80 serving-ops Phase 7) pn_qwen35moe_snap_serialize/_deserialize —
  *         a contiguous portable blob for the session warm-tier; the snap→bytes
  *         →snap round-trip is byte-identical (unit-tested, same suite).
+ *         A RECURRENT snapshot (pn_qwen35moe_state_snapshot_recurrent) holds
+ *         no KV rows: the single-user turn-start snapshot (think_history
+ *         drop_last), restored over KV rows the mirror still holds.
  * @issues None
  * @todo None
  */
 
 #include "qwen35moe_internal.h"
 #include "qwen35moe_kv_q4.h"
+#include "../core/mem/pn_host_admission.h"
 
 #include <assert.h>
 #include <stdint.h>
@@ -59,11 +63,48 @@ typedef struct {
 /* Whole-state snapshot at one position (opaque to callers). */
 typedef struct {
     int pos;
+    int kv_rows;              /* KV rows held: pos, or 0 (recurrent snapshot) */
     int n_ssm;
     int n_attn;
     snap_ssm_layer *ssm;
     snap_kv_layer *kv;
+    uint64_t host_admitted;   /* host bytes admitted (released on free) */
 } qwen35moe_state_snap;
+
+#define SNAP_ADMIT_HINT "shorten the session or free host memory"
+
+/* Host bytes a capture of `s` copies: every SSM image, rows [0, pos) of every
+ * attention layer's K and V, and the q4 fp16 shadows. */
+static uint64_t snap_capture_bytes(const pn_qwen35moe_state *s, int pos)
+{
+    uint64_t total = 0;
+    for (int i = 0; i < s->n_ssm; i++) {
+        const pn_qwen35moe_ssm_state *st = &s->ssm[i];
+        total += ((uint64_t)st->conv_minus_1 * st->conv_dim +
+                  (uint64_t)st->state_size * st->state_size * st->n_v_heads) *
+                 sizeof(float);
+    }
+    for (int i = 0; i < s->n_attn; i++) {
+        const pn_qwen35moe_kv *kv = &s->kv[i];
+        uint64_t row_b = kv->q4 ? (uint64_t)pn_kvq4_row_bytes(kv->head_dim)
+                                : (uint64_t)kv->head_dim * sizeof(float);
+        total += 2ull * kv->n_head_kv * (uint64_t)pos * row_b;
+        if (kv->q4)
+            total += 2ull * kv->n_head_kv * (PN_KVQ4_SINKMAX + PN_KVQ4_WMAX) *
+                     (uint64_t)kv->head_dim * sizeof(uint16_t);
+    }
+    return total;
+}
+
+/* Admit `bytes` for `sn`; the charge rides on the snapshot until it is freed. */
+static int snap_admit(qwen35moe_state_snap *sn, uint64_t bytes)
+{
+    if (pn_host_admit_hint(bytes, "hybrid session snapshot", SNAP_ADMIT_HINT,
+                           NULL, 0) != 0)
+        return -1;
+    sn->host_admitted = bytes;
+    return 0;
+}
 
 /* Copy `pos` rows per head between packed ([pos] stride) and live ([max_seq]
  * stride) layouts. dir_capture != 0: live -> packed; else packed -> live. */
@@ -166,12 +207,13 @@ void pn_qwen35moe_state_snapshot_free(void *snap_v)
         }
         free(sn->kv);
     }
+    pn_host_release(sn->host_admitted);
     free(sn);
 }
 
-void *pn_qwen35moe_state_snapshot(const void *state_v, int pos)
+/* Capture `s` at `pos` holding KV rows [0, kv_rows) (kv_rows is pos or 0). */
+static void *snap_capture(const pn_qwen35moe_state *s, int pos, int kv_rows)
 {
-    const pn_qwen35moe_state *s = (const pn_qwen35moe_state *)state_v;
     if (!s || pos <= 0)
         return NULL;
     for (int i = 0; i < s->n_attn; i++)
@@ -182,11 +224,14 @@ void *pn_qwen35moe_state_snapshot(const void *state_v, int pos)
     if (!sn)
         return NULL;
     sn->pos = pos;
+    sn->kv_rows = kv_rows;
     sn->n_ssm = s->n_ssm;
     sn->n_attn = s->n_attn;
     sn->ssm = s->n_ssm ? calloc((size_t)s->n_ssm, sizeof(*sn->ssm)) : NULL;
     sn->kv = s->n_attn ? calloc((size_t)s->n_attn, sizeof(*sn->kv)) : NULL;
     if ((s->n_ssm && !sn->ssm) || (s->n_attn && !sn->kv))
+        goto fail;
+    if (snap_admit(sn, snap_capture_bytes(s, kv_rows)) != 0)
         goto fail;
 
     for (int i = 0; i < s->n_ssm; i++) {
@@ -202,13 +247,23 @@ void *pn_qwen35moe_state_snapshot(const void *state_v, int pos)
         memcpy(sl->ssm, st->ssm_state, sl->ssm_n * sizeof(float));
     }
     for (int i = 0; i < s->n_attn; i++)
-        if (snap_kv_capture(&s->kv[i], &sn->kv[i], pos) < 0)
+        if (snap_kv_capture(&s->kv[i], &sn->kv[i], kv_rows) < 0)
             goto fail;
     return sn;
 
 fail:
     pn_qwen35moe_state_snapshot_free(sn);
     return NULL;
+}
+
+void *pn_qwen35moe_state_snapshot(const void *state_v, int pos)
+{
+    return snap_capture((const pn_qwen35moe_state *)state_v, pos, pos);
+}
+
+void *pn_qwen35moe_state_snapshot_recurrent(const void *state_v, int pos)
+{
+    return snap_capture((const pn_qwen35moe_state *)state_v, pos, 0);
 }
 
 /* Do the snapshot's dimensions match the target state exactly? A mismatch
@@ -264,7 +319,7 @@ int pn_qwen35moe_state_restore(void *state_v, const void *snap_v)
                sn->ssm[i].ssm_n * sizeof(float));
     }
     for (int i = 0; i < s->n_attn; i++)
-        snap_kv_restore(&sn->kv[i], &s->kv[i], sn->pos);
+        snap_kv_restore(&sn->kv[i], &s->kv[i], sn->kv_rows);
     return 0;
 }
 
@@ -434,7 +489,8 @@ int pn_qwen35moe_snap_serialize(const void *snap_v, uint64_t weights_version,
                                 unsigned char **bytes_out, size_t *len_out)
 {
     const qwen35moe_state_snap *sn = (const qwen35moe_state_snap *)snap_v;
-    if (!sn || !bytes_out || !len_out)
+    /* A recurrent snapshot holds no KV rows: not a self-contained session. */
+    if (!sn || !bytes_out || !len_out || sn->kv_rows != sn->pos)
         return -1;
     *bytes_out = NULL;
     *len_out = 0;
@@ -445,6 +501,9 @@ int pn_qwen35moe_snap_serialize(const void *snap_v, uint64_t weights_version,
     if (sz.err)
         return -1;
 
+    if (pn_host_admit_check(sz.off, "hybrid session snapshot blob",
+                            SNAP_ADMIT_HINT, NULL, 0) != 0)
+        return -1;
     unsigned char *buf = malloc(sz.off ? sz.off : 1);
     if (!buf)
         return -1;
@@ -562,11 +621,15 @@ void *pn_qwen35moe_snap_deserialize(const unsigned char *bytes, size_t len,
     if (!sn)
         return NULL;
     sn->pos = pos;
+    sn->kv_rows = pos;
     sn->n_ssm = n_ssm;
     sn->n_attn = n_attn;
     sn->ssm = n_ssm ? calloc((size_t)n_ssm, sizeof(*sn->ssm)) : NULL;
     sn->kv = n_attn ? calloc((size_t)n_attn, sizeof(*sn->kv)) : NULL;
     if ((n_ssm && !sn->ssm) || (n_attn && !sn->kv))
+        goto fail;
+    /* The decoded snapshot is the blob's payload, so its length bounds it. */
+    if (snap_admit(sn, len) != 0)
         goto fail;
 
     for (int i = 0; i < n_ssm; i++)

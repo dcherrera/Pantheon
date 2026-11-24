@@ -149,6 +149,16 @@ static int decode_batched(pn_model *model, int K, int n_gen, int n_vocab,
     float *logits[USERS_MAX];
     uint32_t prompt[USERS_PROMPT];
     int rc = -1;
+    /* QWEN35_USERS_ROWS=scatter: bind user u to persistent row 2K-1-2u of 2K
+     * rows (reversed, with a gap between every pair) and step through the row
+     * map — the layout the serve's fixed session blocks produce. Must be
+     * bit-identical to the identity layout. */
+    const char *rows_env = getenv("QWEN35_USERS_ROWS");
+    int scatter = rows_env && strcmp(rows_env, "scatter") == 0;
+    int rows[USERS_MAX];
+    int n_rows = scatter ? 2 * K : K;
+    for (int u = 0; u < K; u++)
+        rows[u] = scatter ? 2 * K - 1 - 2 * u : u;
 
     for (int u = 0; u < K; u++) {
         int len = user_prompt(u, prompt);
@@ -160,7 +170,7 @@ static int decode_batched(pn_model *model, int K, int n_gen, int n_vocab,
             goto cleanup;
         /* Bind IMMEDIATELY after this user's prefill: the live GPU SSM
          * state is this user's, and the next user's prefill replaces it. */
-        if (pn_qwen35moe_decode_slot_bind(model, sts[u], u, K) != 0) {
+        if (pn_qwen35moe_decode_slot_bind(model, sts[u], rows[u], n_rows) != 0) {
             fprintf(stderr, "bind failed (user %d)\n", u);
             goto cleanup;
         }
@@ -175,7 +185,8 @@ static int decode_batched(pn_model *model, int K, int n_gen, int n_vocab,
     int want_digest = digest_out && getenv("QWEN35_USERS_DIGEST") != NULL;
     double t0 = now_s();
     for (int i = 1; i < n_gen; i++) {
-        if (pn_qwen35moe_decode_slots(model, toks, sts, K, logits) != 0) {
+        if (pn_qwen35moe_decode_slots_rows(model, toks, sts, rows, K,
+                                           logits) != 0) {
             fprintf(stderr, "decode_slots failed @step %d\n", i);
             goto cleanup;
         }
@@ -227,7 +238,9 @@ int main(int argc, char **argv)
     int run_gate = !(gate_env && gate_env[0] == '0');
 
     if (run_gate) {
-        fprintf(stderr, "users gate: K=%d n_gen=%d\n", K, n_gen);
+        fprintf(stderr, "users gate: K=%d n_gen=%d rows=%s\n", K, n_gen,
+                getenv("QWEN35_USERS_ROWS") ? getenv("QWEN35_USERS_ROWS")
+                                            : "identity");
 
         /* ---- Phase 1: each user decodes ALONE (the reference). ---- */
         double dt_alone_sum = 0.0;

@@ -1,0 +1,4 @@
+raw|The capital of France is
+raw|def fibonacci(n):
+raw|Once upon a time, in a small village by the sea,
+chat|Name three colours of the rainbow.

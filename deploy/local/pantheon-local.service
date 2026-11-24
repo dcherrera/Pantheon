@@ -1,0 +1,29 @@
+# Pantheon Local — the home inference appliance (`pantheon local`).
+# Install: see deploy/local/README.md. Starts on boot, restarts on failure,
+# reloads the remembered models itself. The pairing code is in the journal:
+#   journalctl -u pantheon-local | grep "pairing code"
+# or, on the box: sudo -u pantheon pantheon local pair-code
+[Unit]
+Description=Pantheon Local inference appliance
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pantheon
+Group=pantheon
+# Flags (port, catalog URL, store) live in this file: PANTHEON_LOCAL_ARGS="..."
+EnvironmentFile=-/etc/default/pantheon-local
+ExecStart=/usr/local/bin/pantheon local $PANTHEON_LOCAL_ARGS
+Restart=on-failure
+RestartSec=5
+# The serve drains in-flight turns before it frees the accelerators.
+TimeoutStopSec=60
+KillSignal=SIGTERM
+# 8 GB hosts: throttle and reclaim this cgroup under pressure instead of an
+# OOM reboot (same backstop as the fleet serve). Soft limit, never a kill.
+MemoryHigh=6G
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target

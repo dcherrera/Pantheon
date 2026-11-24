@@ -6,6 +6,7 @@
 #include "../memory/arena.h"
 #include "../accel/simd.h"
 #include "../formats/gguf_dequant.h"
+#include "../core/mem/pn_host_admission.h"
 #ifdef USE_THREADS
 #include "threadpool/threadpool.h"
 #endif
@@ -151,7 +152,9 @@ pn_phi3_qweights* pn_phi3_load_gguf_quantized(pn_gguf_file *gguf, pn_config *con
         }
     } else {
         /* Tied embeddings: use tok_embd as F32 output head */
-        qw->output_f32 = malloc(embd_numel * sizeof(float));
+        qw->output_f32 = pn_host_admit_weight_copy(embd_numel * sizeof(float),
+                                                   "tied output (lm_head)") == 0
+                             ? malloc(embd_numel * sizeof(float)) : NULL;
         if (!qw->output_f32) {
             pn_phi3_qweights_free(qw);
             return NULL;

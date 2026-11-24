@@ -1,0 +1,7 @@
+{"endpoint":"POST /local/relay/<id>/host","class":"device",
+ "request":{},
+ "status":200,
+ "response_head":"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nX-Pantheon-Relay: r-0011223344556677\r\nConnection: close\r\n\r\n",
+ "after_head":"the connection pipes bytes to and from the client's leg; send nothing before reading the head",
+ "errors":[{"when":"no pending relay with that id (unknown, already joined, or past its 10 s)","status":404,"type":"not_found"},
+           {"when":"the caller's person does not own the row","status":403,"type":"forbidden"}]}

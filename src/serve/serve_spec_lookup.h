@@ -51,6 +51,16 @@ typedef struct {
 int sg_spec_lookup_init(sg_spec_lookup *lookup, const uint32_t *prompt, int n_prompt,
                         int max_new);
 
+/**
+ * The CUDA MTP cycle's lookup (serve_spec_mtp_cuda.h): `QWEN35_MTP_LOOKUP` (0 = off, the
+ * default; 1 lookup whenever it matches, in place of the head's drafts; 2 only when its first
+ * draft is the head's first draft), `QWEN35_MTP_LOOKUP_K` (drafts a lookup cycle, default and
+ * at most 4: the verify's 5 rows), `QWEN35_MTP_LOOKUP_MIN` (shortest suffix match, default 5).
+ * @return 0, or -1 on OOM (left off)
+ */
+int sg_spec_lookup_init_cuda(sg_spec_lookup *lookup, const uint32_t *prompt, int n_prompt,
+                             int max_new);
+
 /** Append one emitted token to the history. */
 void sg_spec_lookup_push(sg_spec_lookup *lookup, uint32_t token);
 

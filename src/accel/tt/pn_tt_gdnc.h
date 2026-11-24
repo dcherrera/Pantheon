@@ -85,6 +85,7 @@
 #include <stdint.h>
 
 #include "pn_tt_device.h"
+#include "pn_tt_prefill_reserve.h"
 
 /**
  * Arm the chunkwise residency and allocate the three buffers above.
@@ -103,11 +104,70 @@
  */
 int pn_tt_device_arm_gdnc(pn_tt_device *device);
 
+/**
+ * The conv-constant copy count the model's fit picked (lever E, qwen35moe_tt_fit_plan.h), read
+ * when the family arms; 0 = the default 8. `PN_TT_GDNC_CONST_REPLICAS` still wins. Call before
+ * pn_tt_device_arm_gdnc.
+ *
+ * Thread-safe: no    Reentrant: no    Signal-safe: yes
+ */
+void pn_tt_gdnc_request_replicas(pn_tt_device *device, uint32_t replicas);
+
 /** Did the chunkwise family actually arm for this run? */
 bool pn_tt_gdnc_is_armed(const pn_tt_device *device);
 
 /** The host's 1/sqrt(S) word, as the COMPACT block's header carries it. */
 uint32_t pn_tt_gdnc_compact_scale_bits(const pn_tt_device *device);
+
+/** One exact-gate table's slot cap in bytes (src/models/qwen35moe_gate_tables.h
+ *  PN_QWEN35_GATE_TABLE_SLOT_WORDS x 4). */
+#define PN_TT_GDNC_TABLE_SLOT_BYTES 40960u
+/** The most banks a layer's decay tables stripe over (ftgc_table.h kFtgtMaxStripes). */
+#define PN_TT_GDNC_TABLE_STRIPES 8u
+
+/**
+ * THE EXACT CARD GATES: upload the host's lookup tables (src/models/qwen35moe_gate_tables.h) —
+ * `decay` is layers x heads tables at `head_stride_words` apart, `layer_words[l]` the widest of
+ * layer l's (its heads are packed at that, 64 B aligned) — STRIPED: layer l's head h in bank
+ * `stripe_bank[l * PN_TT_GDNC_TABLE_STRIPES + h % stripes]` (distinct banks a layer, the
+ * placement pn_qwen35_tt_fit_table_stripes chose), with one beta copy in every bank that holds
+ * a stripe; then allocate the per-layer table blocks in DELTA constant slot 0's bank.
+ * @return 0, or -1 (the host gates stay).
+ */
+int pn_tt_gdnc_table_arm(pn_tt_device *device, uint32_t layers, uint32_t heads,
+                         const uint32_t *decay, size_t head_stride_words,
+                         const uint32_t *layer_words, const uint32_t *beta, uint32_t beta_words,
+                         uint32_t stripes, const uint32_t *stripe_bank);
+
+/** Did the exact card gates arm? */
+bool pn_tt_gdnc_table_ready(const pn_tt_device *device);
+
+/** Layer `layer`'s table block (ftgc_table.h) for the alpha/beta strips, from their band-0
+ *  addresses whatever band they are seeked to. @return 0, or -1. */
+int pn_tt_gdnc_table_block(const pn_tt_device *device, uint32_t layer,
+                           const pn_tt_activation *alpha, const pn_tt_activation *beta,
+                           uint32_t out[48]);
+
+/** Put layer `layer`'s block on the card if it changed. Before the layer's band loop: nothing
+ *  queued may be reading it. */
+int pn_tt_gdnc_table_bind(pn_tt_device *device, uint32_t layer, const pn_tt_activation *alpha,
+                          const pn_tt_activation *beta);
+
+/** The most decode table blocks a layer keeps (one per distinct strip address pair). */
+#define PN_TT_GDNC_TABLE_DECODE_BLOCKS 8u
+
+/** DECODE: layer `layer`'s table block naming `alpha`/`beta` AS THEY STAND (the decode rows
+ *  are rows of their current band), for pn_tt_gdn_table_gate. Written once per address pair
+ *  and never rewritten, so a queued decode DELTA never sees its block change.
+ *  @return 0 with `bank`/`address`, or -1 (no tables, a misaligned strip, the cache full: the
+ *  caller keeps the host gates). */
+int pn_tt_gdnc_table_decode_block(pn_tt_device *device, uint32_t layer,
+                                  const pn_tt_activation *alpha, const pn_tt_activation *beta,
+                                  uint32_t *bank, uint32_t *address);
+
+/** One DELTA descriptor whose gates the reader looks up from band `band` of the bound strips. */
+int pn_tt_gdnc_delta_oncard_table(pn_tt_device *device, uint32_t layer, uint32_t first_row,
+                                  uint32_t chunk_rows, uint32_t band);
 
 /** PM 7 ITEM 5: one DELTA descriptor whose COMPACT gate block the card already computed (the
  *  GDN GATE family) at `gate_address`, in the DELTA constant bank. Nothing is staged. */
@@ -200,6 +260,44 @@ void pn_tt_gdnc_set_overlap(pn_tt_device *device, int (*fn)(void *context), void
  * may set this slot again for the window after. NULL clears it.
  */
 void pn_tt_gdnc_set_overlap_aux(pn_tt_device *device, int (*fn)(void *context), void *context);
+
+/**
+ * Prefill lane — PER-MEMBER STATE BANKS (`PN_TT_GDNC_STATE_BANKS`, default on, `=0` off). The 8 DELTA members all
+ * read and write one layer's recurrent state (2 MiB) from ONE bank twice a band. With this on,
+ * `enter` copies member m's heads into a buffer in bank (layer + 1 + m) % banks, every DELTA of
+ * that layer reads and writes there, `sync` copies them back into `gdn_region[layer].state`
+ * (the decode family's buffer: the tail forward, the checkpoint and decode read it), `exit`
+ * syncs and drops the slices. Same bytes, other addresses: bit-exact. All three are card-side
+ * copies and refuse inside a puller stream. No-ops (0) when off or unsplit.
+ */
+bool pn_tt_gdnc_state_split_enabled(void);
+/** `bands` = the layer's band count; below `PN_TT_GDNC_STATE_BANKS_MIN_BANDS` (default 4) the
+ *  copies cost more than they save (a 25-token prompt: +3 ms TTFT) and enter is a no-op. */
+int pn_tt_gdnc_state_split_enter(pn_tt_device *device, uint32_t layer, uint32_t bands);
+int pn_tt_gdnc_state_split_sync(pn_tt_device *device, uint32_t layer);
+int pn_tt_gdnc_state_split_exit(pn_tt_device *device, uint32_t layer);
+
+/**
+ * The DRAM a batched prefill takes from this family after the load: the state-split slices
+ * (when the split is enabled and usable) and PIPE 2's alternate streams. `prefill_need` adds
+ * them to `need` per bank; `reserve_prefill` allocates them now, so the prefill finds them in
+ * place (pn_tt_prefill_reserve.h). Nothing when the family is not armed.
+ * @return reserve: 0, or -1 when a buffer did not allocate
+ */
+void pn_tt_gdnc_prefill_need(const pn_tt_device *device, pn_tt_bank_need *need);
+int pn_tt_gdnc_reserve_prefill(pn_tt_device *device);
+
+/**
+ * Prefill lane PIPE 2 helpers. `set_parity` swaps the second stream_in / stream_out / y triple in
+ * (1) or back (0); every operand accessor and every descriptor issued after it uses that
+ * parity. `defer` makes the members' awaits record-only (pn_tt_residency defer_await) until
+ * `settle` awaits them all. `serialize_next` marks the next DELTA descriptor(s) with the
+ * reader's wait-for-the-previous-completion flag while on.
+ */
+int pn_tt_gdnc_set_parity(pn_tt_device *device, uint32_t parity);
+void pn_tt_gdnc_defer(pn_tt_device *device, bool on);
+int pn_tt_gdnc_settle(pn_tt_device *device);
+void pn_tt_gdnc_serialize_next(pn_tt_device *device, bool on);
 
 /** Retire the residency and free what arming allocated. Safe on a device that never armed. */
 void pn_tt_gdnc_release(pn_tt_device *device);

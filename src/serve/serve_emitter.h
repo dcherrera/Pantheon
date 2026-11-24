@@ -62,6 +62,7 @@ typedef struct {
 
 typedef struct {
     int          in_think;
+    bool         think_close_token;  /* only the "</think>" TOKEN ends <think> */
     int          in_tool;      /* capturing a tool-call block into `tool` */
     bool         has_tools;    /* request carried tools → arm bare <function= */
     tc_dialect   dialect;      /* resident model's dialect: ORNITH_JSON diverts a
@@ -103,6 +104,11 @@ typedef struct {
  * the XML openers).  `stops`/`n_stop` are the request's stop strings (borrowed). */
 void em_init(emitter *em, sg_delta_fn cb, void *ud,
              char **stops, int n_stop, bool has_tools, tc_dialect dialect);
+
+/* End <think> only on a fed piece that is exactly "</think>" (the close token);
+ * the same text spelled out of ordinary tokens stays reasoning
+ * (think_close_rule.h).  Call after em_init, before the first em_feed. */
+void em_set_think_close_token(emitter *em);
 
 /* Attach a tool-channel tap (NULL detaches).  Call after em_init. */
 void em_set_tool_tap(emitter *em, em_tool_tap_fn tap, void *ud);

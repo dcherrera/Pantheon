@@ -78,6 +78,12 @@ uint64_t pn_die_reserve_bytes(void)
     return override ? override : PN_DIE_RESERVE_BYTES;
 }
 
+uint64_t pn_die_load_margin_bytes(void)
+{
+    uint64_t override = env_bytes("PN_DIE_LOAD_MARGIN_BYTES");
+    return override ? override : PN_DIE_LOAD_MARGIN_BYTES;
+}
+
 /* Read a positive percentage from an env var, falling back to `dflt`. A zero,
  * negative or unparseable value falls back — a zero threshold would re-arm the
  * any-non-zero-PSI-is-pressure behavior these thresholds exist to remove. */

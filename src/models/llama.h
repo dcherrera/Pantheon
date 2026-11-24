@@ -280,6 +280,18 @@ tm_tensor* pn_llama_prefill(pn_model *model, const uint32_t *tokens,
                             const float *const *embd_rows, int n_tokens,
                             pn_state *state);
 
+/**
+ * Finish one position's q/k/v projections for layer `l`, before RoPE: add the
+ * optional attention biases (Qwen2) and apply the per-head Q/K RMSNorm (Qwen3).
+ * A no-op for plain Llama. Every forward (CPU, CUDA, Tenstorrent) calls THIS, so
+ * a backend that reads q/k/v back to the host cannot skip a step the CPU oracle
+ * takes. `q` is [n_head*head_dim], `k`/`v` are [n_kv_head*head_dim], in place.
+ *
+ * Thread-safe: yes (touches only its arguments)  Reentrant: yes  Signal-safe: no
+ */
+void pn_llama_qkv_finish(const pn_llama_qlayer *l, const pn_config *cfg,
+                         float *q, float *k, float *v);
+
 /* Batched single-token decode across B independent sequences (quantized,
  * non-MoE Llama/Qwen path).
  *

@@ -11,14 +11,15 @@
  *     result is published (or the slot returned) under the lock.
  *   - entry->gen_lock is the per-model generation serializer; the registry
  *     never takes it (the serve chat path does, via trylock).
- *   - reg->drained is signaled by mr_release; mr_unload waits on it until the
- *     entry's refs hit zero, then frees outside the lock. The wait is BOUNDED
- *     (see MR_UNLOAD_DRAIN_MS_DEFAULT) and rolls the entry back on timeout —
- *     an unload that cannot free must refuse, never report success and strand
- *     the dies.
+ *   - reg->drained is signaled by mr_release / mr_watch_unpin; mr_unload waits
+ *     on it until the entry's live refs hit zero (cancelling turns that
+ *     overstay), closes its watches through the unload hook, then frees
+ *     outside the lock. Every wait is BOUNDED (see MR_UNLOAD_DRAIN_MS_DEFAULT)
+ *     and rolls the entry back on timeout — an unload that cannot free must
+ *     refuse, never report success and strand the dies.
  *
  * @status CPU-validated (tests/test_model_registry.c,
- *         tests/test_model_unload_reclaim.c); die placement numbers become
+ *         tests/test_model_unload_reclaim.c, tests/test_load_budget_release.c); die placement numbers become
  *         real on the K80 test machine (die-manager CUDA probe).
  * @issues None
  * @todo None
@@ -36,9 +37,15 @@
 #include "../accel/backend_identity.h"
 #include "../accel/die_layer_split.h"
 #include "../accel/die_manager.h"
+#include "../core/load_guard.h"
 #include "../core/mem/pn_admission.h"
+#include "../core/mem/pn_host_admission.h"
+#include "../core/mem/pn_ladder.h"
 #include "../formats/gguf_layer_bytes.h"
 #include "batch_sched.h"
+#include "batch_sched_slots.h"
+#include "model_session.h"
+#include "replica_affinity.h"
 #include "serve_backend_guard.h"
 
 /* Pre-load admission gate context, used ONLY when the model was launched
@@ -118,23 +125,27 @@ static uint64_t mr_die_weight_share(const char *path, int idx, int n_placed,
     return share;
 }
 
-/* How long mr_unload waits for in-flight references to drain before refusing.
+/* How long mr_unload lets live turns finish before cancelling them.
  *
- * The wait has to be BOUNDED because not every reference drains on its own.
- * A generation turn releases in milliseconds, but pn_session_watch_add takes a
- * reference for the whole lifetime of an open /session/watch connection — a
- * pinned model would park the unload forever. That is not hypothetical: it is
- * what the shutdown path already works around by stopping the watch manager
- * BEFORE mr_free (serve_command.c, serve_run_shutdown), and it is exactly what
- * /admin/models/unload hit in the field — the entry was marked `unloading`
- * (gone from /v1/models and from mr_acquire) while the drain never returned, so
- * pn_dm_release and the model free below it never ran and the dies stayed
- * budgeted AND resident until the whole serve was restarted.
+ * Only LIVE references (generation turns, short route/admin holds) are waited
+ * on. An open /session/watch used to hold an mr_acquire reference for the whole
+ * life of its connection, so an unload with a chat tab open always timed out
+ * and refused ("2 reference(s) in flight after 15000 ms"). Watches now hold a
+ * separate pin (mr_watch_pin) that an unload never waits on: it closes them
+ * through the unload hook once the turns are gone.
  *
- * 15 s is above a normal turn's release latency and below an operator's
- * patience. Override with PN_UNLOAD_DRAIN_MS (0 = refuse immediately if
- * anything is in flight — what the regression test uses). */
-#define MR_UNLOAD_DRAIN_MS_DEFAULT 15000
+ * Override with PN_UNLOAD_DRAIN_MS (0 = cancel at once). */
+#define MR_UNLOAD_DRAIN_MS_DEFAULT 5000
+
+/* How long a cancelled turn gets to unwind before the unload refuses. A turn
+ * polls should_abort between prefill chunks and every 8 decode tokens, so this
+ * is generous. Override with PN_UNLOAD_CANCEL_MS. */
+#define MR_UNLOAD_CANCEL_MS_DEFAULT 10000
+
+/* How long the unload waits for watch pins to drop after the hook closed them.
+ * Only a grace sweep caught mid-release can still hold one; it lets go in
+ * microseconds. */
+#define MR_UNLOAD_WATCH_UNPIN_MS 5000
 
 /* Sentinel for the shutdown path: wait for the drain without a deadline.
  * mr_free is only reached after serve_run_shutdown has quiesced generations and
@@ -150,18 +161,18 @@ static void set_err(char *err, size_t errlen, const char *msg)
     }
 }
 
-/* Configured unload drain budget in milliseconds (PN_UNLOAD_DRAIN_MS, else the
- * default). A garbage value falls back; an explicit 0 is honoured. */
-static int mr_unload_drain_ms(void)
+/* A millisecond budget from env var `name`, else `fallback`. A garbage value
+ * falls back; an explicit 0 is honoured. */
+static int mr_env_ms(const char *name, int fallback)
 {
-    const char *env = getenv("PN_UNLOAD_DRAIN_MS");
+    const char *env = getenv(name);
     if (env && *env) {
         char *end = NULL;
         long v = strtol(env, &end, 10);
         if (end != env && v >= 0 && v <= 3600000L)
             return (int)v;
     }
-    return MR_UNLOAD_DRAIN_MS_DEFAULT;
+    return fallback;
 }
 
 /* Basename of a path (pointer into the same string). */
@@ -193,8 +204,8 @@ int mr_init(mr_registry *reg)
 
 /* Locked lookup: the slot holding `name`, or NULL. Ready-only when
  * require_ready (skips reserved-but-still-loading slots). */
-static mr_entry *find_locked(mr_registry *reg, const char *name,
-                             bool require_ready)
+mr_entry *mr_find_replica_locked(mr_registry *reg, const char *name, int first_die,
+                                 bool require_ready)
 {
     for (int i = 0; i < MR_MAX_MODELS; i++) {
         mr_entry *e = &reg->entries[i];
@@ -202,16 +213,78 @@ static mr_entry *find_locked(mr_registry *reg, const char *name,
             continue;
         if (require_ready && (!e->model || e->unloading))
             continue;
+        if (first_die >= 0 && (e->n_dies < 1 || e->dies[0] != first_die))
+            continue;
         if (strncmp(e->name, name, MR_MAX_NAME) == 0)
             return e;
     }
     return NULL;
 }
 
+/* The load was refused by host-RAM admission: hand back the exact refusal.
+ * "admission" in the text is what maps it to HTTP 507 (model_admin.c). */
+static void set_host_refusal_err(char *err, size_t errlen)
+{
+    if (err && errlen)
+        snprintf(err, errlen, "host RAM admission refused: %s",
+                 pn_host_admit_last_refusal());
+}
+
+/* Undo a load that did not publish: free what it built, give back its die
+ * reservation, and return the slot. The ONE exit for every failure after the
+ * slot was reserved, so no failure path can keep a reservation.
+ *
+ * The reservation is released by its ref, never by name: replicas of one model
+ * share a name, and a by-name release freed the first replica's binding while
+ * the failed load's stayed budgeted (K80 bank 2026-11-03: "die 8 has 792 MiB
+ * free, needs 10261 MiB" with die 8 empty). */
+static void mr_load_abandon(mr_registry *reg, mr_entry *e, pn_dm_binding_ref *binding,
+                            pn_batch_sched *sched, pn_state *state, pn_model *model)
+{
+    bs_destroy(sched);
+    if (state)
+        pn_state_free(state);
+    if (model)
+        pn_model_free(model);
+    if (binding->slot >= 0 && pn_dm_release_ref(binding) != 0)
+        fprintf(stderr, "registry: WARNING failed load of '%s' found no die binding "
+                "to release\n", e->name);
+    pthread_mutex_lock(&reg->lock);
+    memset(e, 0, sizeof(*e));
+    pthread_mutex_unlock(&reg->lock);
+}
+
+/* The copy number for a new entry of `name`: `want` when free (0 = refused),
+ * else, for want == 0, the lowest number no reserved entry of the name uses.
+ * Caller holds reg->lock. */
+static int replica_number_locked(mr_registry *reg, const char *name, int want)
+{
+    for (int n = want > 0 ? want : 1;; n++) {
+        bool taken = false;
+        for (int i = 0; i < MR_MAX_MODELS && !taken; i++) {
+            const mr_entry *c = &reg->entries[i];
+            taken = c->used && c->replica == n && strncmp(c->name, name, MR_MAX_NAME) == 0;
+        }
+        if (!taken)
+            return n;
+        if (want > 0)
+            return 0;
+    }
+}
+
 int mr_load(mr_registry *reg, const char *path, const char *name,
             const pn_load_opts *opts, const int *dies, int n_dies,
             int reasoning_budget, int max_sessions, int max_concurrent,
             char *err, size_t errlen)
+{
+    return mr_load_replica(reg, path, name, opts, dies, n_dies, reasoning_budget, max_sessions,
+                           max_concurrent, 0, err, errlen);
+}
+
+int mr_load_replica(mr_registry *reg, const char *path, const char *name,
+                    const pn_load_opts *opts, const int *dies, int n_dies,
+                    int reasoning_budget, int max_sessions, int max_concurrent,
+                    int replica, char *err, size_t errlen)
 {
     if (!reg || !path) {
         set_err(err, errlen, "registry/path required");
@@ -251,14 +324,19 @@ int mr_load(mr_registry *reg, const char *path, const char *name,
         set_err(err, errlen, "bad die list");
         return -1;
     }
+    const bool cpu_only = opts && opts->cpu_only;
+    if (cpu_only && n_dies > 0) {
+        set_err(err, errlen, "a cpu placement takes no dies");
+        return -1;
+    }
 
     /* A die request this process cannot honour is a REFUSAL, not a quiet CPU
      * placement. The check lives here as well as in pn_serve_main's pre-flight
      * because POST /admin/models/load reaches this function directly with its
      * own `dies` array, and a serve that refused the wrong manifest at startup
      * must not accept the same mistake an hour later over HTTP. Same predicate,
-     * one definition (serve_backend_guard.h). n_dies == 0 is always allowed —
-     * that is how a CPU serve is asked for. */
+     * one definition (serve_backend_guard.h). n_dies == 0 is always allowed
+     * here; where it runs is the load guard's call (load_guard.h). */
     {
         pn_backend_guard_verdict v =
             pn_backend_guard_check(n_dies, pn_backend_supports_die_placement(),
@@ -309,18 +387,28 @@ int mr_load(mr_registry *reg, const char *path, const char *name,
         set_err(err, errlen, "model table full");
         return -1;
     }
+    int number = replica_number_locked(reg, name, replica);
+    if (number == 0) {
+        pthread_mutex_unlock(&reg->lock);
+        if (err && errlen)
+            snprintf(err, errlen, "replica %d of '%s' is already loaded", replica, name);
+        return -1;
+    }
     memset(e, 0, sizeof(*e));
     e->used = true;                       /* reserved: name taken, not ready */
     strncpy(e->name, name, MR_MAX_NAME - 1);
+    e->serial = ++reg->next_serial;       /* this placement, never reused */
+    e->replica = number;
     pthread_mutex_unlock(&reg->lock);
 
     /* --- placement + cross-model VRAM budgeting (no registry lock) ------- */
     int placed[PN_MODEL_MAX_DIES];
     int n_placed = 0;
+    pn_dm_binding_ref binding = PN_DM_BINDING_NONE;   /* owned here until publish */
     if (n_dies > 0) {
         memcpy(placed, dies, (size_t)n_dies * sizeof(int));
         n_placed = n_dies;
-    } else if (pn_dm_count() > 0) {
+    } else if (!cpu_only && pn_dm_count() > 0) {
         /* Auto-place: one die when the weights fit a die's budget, else a
          * same-card pair (the qwen35moe 2-die split). Ask what ONE die would
          * really hold, not what the file weighs — a tied model's F32 LM head
@@ -334,9 +422,16 @@ int mr_load(mr_registry *reg, const char *path, const char *name,
             want = 2;
         if (pn_dm_place(one_die, want, placed) == 0)
             n_placed = want;
-        /* No fit → fall through CPU-resident rather than refusing: the CPU
-         * forward still serves (the K80 host does this for GGUF models the
-         * GPU path doesn't cover). */
+    }
+    /* No die has room: refused, never placed on the host CPU instead (the
+     * load guard, load_guard.h). A CPU load is asked for with cpu_only. */
+    if (n_placed == 0 && !cpu_only && pn_dm_count() > 0 && pn_load_guard_accel_build()) {
+        mr_load_abandon(reg, e, &binding, NULL, NULL, NULL);
+        if (err && errlen)
+            snprintf(err, errlen, "no die has room for %s (~%llu MiB of weights); "
+                     "no CPU fallback: try a smaller quant, free a die, or --cpu",
+                     path_basename(path), (unsigned long long)(weights_bytes >> 20));
+        return -1;
     }
 
     uint64_t vram_bytes = 0;
@@ -346,6 +441,8 @@ int mr_load(mr_registry *reg, const char *path, const char *name,
          * the default; mirror pn_qwen35moe_kv_q4_on()'s logic (ON unless =0). */
         const char *kv_q4_env = getenv("QWEN35_KV_Q4");
         bool kv_q4 = !(kv_q4_env && kv_q4_env[0] == '0');
+        if (opts && opts->kv_format != PN_KV_FORMAT_DEFAULT)
+            kv_q4 = opts->kv_format == PN_KV_FORMAT_Q4;   /* the load's own choice */
         /* The KV ring is sized to --ctx-cap when one is set, so gate against
          * that and fall back to the guess only when it is absent. */
         int admit_ctx = (opts && opts->ctx_cap > 0) ? opts->ctx_cap
@@ -354,9 +451,7 @@ int mr_load(mr_registry *reg, const char *path, const char *name,
         for (int i = 0; i < n_placed; i++) {
             pn_dm_die d;
             if (pn_dm_get(placed[i], &d) != 0) {
-                pthread_mutex_lock(&reg->lock);
-                memset(e, 0, sizeof(*e));
-                pthread_mutex_unlock(&reg->lock);
+                mr_load_abandon(reg, e, &binding, NULL, NULL, NULL);
                 set_err(err, errlen, "unknown die in placement");
                 return -1;
             }
@@ -389,9 +484,7 @@ int mr_load(mr_registry *reg, const char *path, const char *name,
              * hold it back a second time. */
             if (!pn_admit_model_load_die_budgeted(per_die, kv_bytes, admit_ctx,
                                                   die_free, &need)) {
-                pthread_mutex_lock(&reg->lock);
-                memset(e, 0, sizeof(*e));
-                pthread_mutex_unlock(&reg->lock);
+                mr_load_abandon(reg, e, &binding, NULL, NULL, NULL);
                 /* Say WHICH die and BY HOW MUCH. A bare "(admission)" sent an
                  * operator hunting the wrong gate for a whole session: the
                  * numbers are the difference between "buy VRAM" and "the
@@ -409,10 +502,8 @@ int mr_load(mr_registry *reg, const char *path, const char *name,
             need_total += need;
         }
         vram_bytes = need_total;
-        if (pn_dm_bind(placed, n_placed, name, vram_bytes) != 0) {
-            pthread_mutex_lock(&reg->lock);
-            memset(e, 0, sizeof(*e));
-            pthread_mutex_unlock(&reg->lock);
+        if (pn_dm_bind_ref(placed, n_placed, name, vram_bytes, &binding) != 0) {
+            mr_load_abandon(reg, e, &binding, NULL, NULL, NULL);
             set_err(err, errlen, "die binding refused (placement raced or "
                                  "no longer fits)");
             return -1;
@@ -428,45 +519,81 @@ int mr_load(mr_registry *reg, const char *path, const char *name,
      * (admission, slot reservation, publish) stays outside it so a waiting
      * caller sees the live registry and can be refused promptly on its slot
      * attempt once the prior load finishes. */
+    /* Host-RAM fit (pn_session_host_fit.h): the load sizes the session window
+     * so the registry's own state AND every eager scheduler slot fit the host,
+     * or refuses the load with the reason. */
+    pn_load_opts host_opts = opts ? *opts : (pn_load_opts){0};
+    host_opts.host_sessions = 1 + (bs_enabled() && n_placed > 0
+                                   ? resolved_max_concurrent : 0);
+    host_opts.card_sessions = bs_enabled() && n_placed > 0 ? resolved_max_concurrent : 0;
+    uint64_t refusals = pn_host_admit_thread_refusals();
+    uint64_t load_refusals = pn_load_thread_refusals();
     pthread_mutex_lock(&reg->upload_lock);
-    pn_model *model = pn_load_on(path, opts, n_placed ? placed : NULL,
+    pn_model *model = pn_load_on(path, &host_opts, n_placed ? placed : NULL,
                                  n_placed);
     pthread_mutex_unlock(&reg->upload_lock);
+    pn_ladder_kv_refusal_clear();
     pn_state *state = model ? pn_state_new(model) : NULL;
     if (!model || !state) {
-        if (model)
-            pn_model_free(model);
-        if (n_placed > 0)
-            pn_dm_release(name);
-        pthread_mutex_lock(&reg->lock);
-        memset(e, 0, sizeof(*e));
-        pthread_mutex_unlock(&reg->lock);
-        set_err(err, errlen, model ? "failed to create inference state"
-                                   : "failed to load model");
+        mr_load_abandon(reg, e, &binding, NULL, state, model);
+        if (pn_load_thread_refusals() != load_refusals)
+            set_err(err, errlen, pn_load_refusal_last());
+        else if (pn_ladder_kv_refusal())
+            set_err(err, errlen, pn_ladder_kv_refusal());
+        else if (pn_host_admit_thread_refusals() != refusals)
+            set_host_refusal_err(err, errlen);
+        else
+            set_err(err, errlen, model ? "failed to create inference state"
+                                       : "failed to load model");
         return -1;
+    }
+
+    /* C3: the batch scheduler for a GPU-resident model carves one block per
+     * session (qwen35moe: a KV ring row at ctx_cap + SSM image on its dies;
+     * the llama family: host KV — batch_sched_slots.h). Created BEFORE
+     * publish so a model whose blocks do not fit is refused here, at load,
+     * loudly — never discovered by a request. The slot count is the
+     * per-model CONCURRENCY cap (max_concurrent, = max_sessions unless set).
+     * An architecture the scheduler cannot hold serves single-user. */
+    pn_batch_sched *sched = NULL;
+    if (bs_enabled() && n_placed > 0 && !bs_slots_supported(model))
+        fprintf(stderr, "registry: '%s': no batched session storage for this "
+                "architecture; serving single-user\n", name);
+    if (bs_enabled() && n_placed > 0 && bs_slots_supported(model)) {
+        /* bs_create prechecks host RAM for eager slot states (llama-family
+         * host KV) before allocating any (bs_slots_precheck). */
+        sched = bs_create(model, resolved_max_concurrent, name);
+        if (!sched) {
+            mr_load_abandon(reg, e, &binding, NULL, state, model);
+            if (pn_ladder_kv_refusal())
+                set_err(err, errlen, pn_ladder_kv_refusal());
+            else if (pn_host_admit_thread_refusals() != refusals)
+                set_host_refusal_err(err, errlen);
+            else
+                set_err(err, errlen, "session blocks do not fit (lower "
+                                     "--max-sessions or --ctx-cap)");
+            return -1;
+        }
+        /* The scheduler is this model's admission authority: its slots hold
+         * the sessions, so it alone can tell a new session from a returning
+         * one without seating it on someone else's KV. */
+        bs_set_session_admission(sched, resolved_max_sessions,
+                                 ms_session_idle_ttl_ms());
+        fprintf(stderr, "registry: batch scheduler for '%s': %d session "
+                "blocks / concurrent decode slots (max_concurrent), %d "
+                "resident sessions (max_sessions)\n", name,
+                resolved_max_concurrent, resolved_max_sessions);
     }
 
     /* --- publish ---------------------------------------------------------- */
     if (pthread_mutex_init(&e->gen_lock, NULL) != 0) {
-        pn_state_free(state);
-        pn_model_free(model);
-        if (n_placed > 0)
-            pn_dm_release(name);
-        pthread_mutex_lock(&reg->lock);
-        memset(e, 0, sizeof(*e));
-        pthread_mutex_unlock(&reg->lock);
+        mr_load_abandon(reg, e, &binding, sched, state, model);
         set_err(err, errlen, "failed to init generation lock");
         return -1;
     }
     if (pthread_mutex_init(&e->pc_lock, NULL) != 0) {
         pthread_mutex_destroy(&e->gen_lock);
-        pn_state_free(state);
-        pn_model_free(model);
-        if (n_placed > 0)
-            pn_dm_release(name);
-        pthread_mutex_lock(&reg->lock);
-        memset(e, 0, sizeof(*e));
-        pthread_mutex_unlock(&reg->lock);
+        mr_load_abandon(reg, e, &binding, sched, state, model);
         set_err(err, errlen, "failed to init prefix-cache lock");
         return -1;
     }
@@ -474,10 +601,11 @@ int mr_load(mr_registry *reg, const char *path, const char *name,
     e->path = strdup(path);
     e->model = model;
     e->state = state;
-    e->sched = NULL;         /* C3: initialised below after unlock */
+    e->sched = sched;        /* C3: created above, before publish */
     e->prefix_cache = NULL;  /* PC1: initialised below after unlock */
     memcpy(e->dies, placed, (size_t)n_placed * sizeof(int));
     e->n_dies = n_placed;
+    e->die_binding = binding;   /* committed: the unload releases it now */
     e->reasoning_budget = reasoning_budget > 0 ? reasoning_budget : 0;
     e->max_sessions = resolved_max_sessions;
     e->max_concurrent = resolved_max_concurrent;
@@ -487,32 +615,6 @@ int mr_load(mr_registry *reg, const char *path, const char *name,
     e->unloading = false;
     reg->n++;
     pthread_mutex_unlock(&reg->lock);
-
-    /* C3: start the batch scheduler for GPU-resident models when enabled.
-     * Done after publish so the model is acquirable while the scheduler
-     * starts its driver thread (scheduler creation is fast — no GPU work). */
-    if (bs_enabled() && n_placed > 0) {
-        /* The scheduler's slot count is the per-model CONCURRENCY cap, not the
-         * compile-time BS_MAX_USERS: a model sized for N users must not admit
-         * more than N into a batched step. bs_create reserves an extra engine
-         * slot as the rebuild scratch on top of this, so the cap is the user
-         * slot count exactly. */
-        pn_batch_sched *sched = bs_create(model, resolved_max_concurrent, e->name);
-        if (sched) {
-            fprintf(stderr, "registry: batch scheduler for '%s': "
-                    "%d concurrent decode slots (max_concurrent), "
-                    "%d resident sessions (max_sessions)\n",
-                    e->name, resolved_max_concurrent, resolved_max_sessions);
-            /* Publish sched under the registry lock so concurrent acquires
-             * see a consistent view (sched==NULL means old path). */
-            pthread_mutex_lock(&reg->lock);
-            e->sched = sched;
-            pthread_mutex_unlock(&reg->lock);
-        } else {
-            fprintf(stderr, "registry: batch scheduler creation failed for "
-                    "'%s'; falling back to single-user mode\n", e->name);
-        }
-    }
 
     /* PC1: session prefix cache for GPU-resident models (the SSM
      * snapshot/restore primitive is CUDA-only).  max_sessions = the resolved
@@ -596,6 +698,49 @@ void mr_release(mr_registry *reg, mr_entry *entry)
     pthread_mutex_unlock(&reg->lock);
 }
 
+int mr_watch_pin(mr_registry *reg, mr_entry *entry)
+{
+    int rc = -1;
+
+    if (!reg || !entry)
+        return -1;
+    pthread_mutex_lock(&reg->lock);
+    if (entry->used && entry->model && !entry->unloading) {
+        entry->watch_refs++;
+        rc = 0;
+    }
+    pthread_mutex_unlock(&reg->lock);
+    return rc;
+}
+
+void mr_watch_unpin(mr_registry *reg, mr_entry *entry)
+{
+    if (!reg || !entry)
+        return;
+    pthread_mutex_lock(&reg->lock);
+    if (entry->watch_refs > 0)
+        entry->watch_refs--;
+    pthread_cond_broadcast(&reg->drained);
+    pthread_mutex_unlock(&reg->lock);
+}
+
+void mr_set_unload_hook(mr_registry *reg, mr_unload_hook_fn fn, void *ctx)
+{
+    if (!reg)
+        return;
+    pthread_mutex_lock(&reg->lock);
+    while (reg->unload_hook_busy > 0)
+        pthread_cond_wait(&reg->drained, &reg->lock);
+    reg->unload_hook = fn;
+    reg->unload_hook_ctx = ctx;
+    pthread_mutex_unlock(&reg->lock);
+}
+
+bool mr_turn_cancel_requested(const mr_entry *entry)
+{
+    return entry && __atomic_load_n(&entry->cancel_turns, __ATOMIC_ACQUIRE) != 0;
+}
+
 int mr_keepalive(mr_registry *reg)
 {
     int i, sent = 0;
@@ -644,13 +789,13 @@ int mr_trylock_generation(mr_entry *entry)
     return pthread_mutex_trylock(&entry->gen_lock);
 }
 
-/* Wait for `e->refs` to reach zero, at most `drain_ms` milliseconds (negative =
- * no deadline). Caller holds reg->lock; the lock is held again on return.
- * Returns 0 when the entry drained, -1 on timeout (refs still > 0). */
-static int drain_entry_locked(mr_registry *reg, mr_entry *e, int drain_ms)
+/* Wait for `*count` (an entry's refs or watch_refs) to reach zero, at most
+ * `drain_ms` milliseconds (negative = no deadline). Caller holds reg->lock; the
+ * lock is held again on return. Returns 0 when drained, -1 on timeout. */
+static int drain_count_locked(mr_registry *reg, const int *count, int drain_ms)
 {
     if (drain_ms < 0) {
-        while (e->refs > 0)
+        while (*count > 0)
             pthread_cond_wait(&reg->drained, &reg->lock);
         return 0;
     }
@@ -664,28 +809,90 @@ static int drain_entry_locked(mr_registry *reg, mr_entry *e, int drain_ms)
         deadline.tv_nsec -= 1000000000L;
     }
 
-    while (e->refs > 0) {
+    while (*count > 0) {
         int rc = pthread_cond_timedwait(&reg->drained, &reg->lock, &deadline);
         if (rc == ETIMEDOUT)
             break;
     }
-    return e->refs > 0 ? -1 : 0;
+    return *count > 0 ? -1 : 0;
 }
 
-/* Unload `name`, waiting at most `drain_ms` ms for in-flight references
- * (MR_UNLOAD_DRAIN_FOREVER = no deadline). On a drain timeout the entry is
- * rolled back — still resident, still acquirable, still bound to its dies — and
- * the refusal names the reason. See MR_UNLOAD_DRAIN_MS_DEFAULT for why the
- * public path must never wait indefinitely. */
-static int mr_unload_drain(mr_registry *reg, const char *name, int drain_ms,
-                           char *err, size_t errlen)
+/* Steps 1-2 of an unload (see mr_unload): let live turns finish within
+ * `drain_ms`, else ask them to stop and wait `cancel_ms` more. Caller holds
+ * reg->lock with e->unloading set. Returns 0 when no live reference is left. A
+ * negative drain_ms (shutdown) waits without a deadline and never cancels. */
+static int drain_live_turns_locked(mr_registry *reg, mr_entry *e, int drain_ms,
+                                   int cancel_ms)
+{
+    if (drain_count_locked(reg, &e->refs, drain_ms) == 0)
+        return 0;
+    fprintf(stderr, "registry: unload of '%s' — %d live turn(s) still running "
+            "after %d ms; cancelling\n", e->name, e->refs, drain_ms);
+    __atomic_store_n(&e->cancel_turns, 1, __ATOMIC_RELEASE);
+    return drain_count_locked(reg, &e->refs, cancel_ms);
+}
+
+/* Step 3 of an unload: run the unload hook (closes the entry's watches) with
+ * the registry lock dropped, then wait for the watch pins to go. Caller holds
+ * reg->lock; held again on return. Returns 0 when no watch pin is left. */
+static int close_watches_locked(mr_registry *reg, mr_entry *e)
+{
+    mr_unload_hook_fn hook = reg->unload_hook;
+    void *ctx = reg->unload_hook_ctx;
+
+    if (hook) {
+        reg->unload_hook_busy++;
+        pthread_mutex_unlock(&reg->lock);
+        hook(ctx, e);
+        pthread_mutex_lock(&reg->lock);
+        reg->unload_hook_busy--;
+        pthread_cond_broadcast(&reg->drained);
+    }
+    return drain_count_locked(reg, &e->watch_refs, MR_UNLOAD_WATCH_UNPIN_MS);
+}
+
+/* Put a refused unload back exactly as it was — resident, acquirable, holding
+ * its die binding — and fill the refusal. Caller holds reg->lock; released on
+ * return. The alternative (leave it deregistered and return success) is what
+ * stranded two dies in the field: the registry said the model was gone while
+ * its VRAM and its die budget were still held. */
+static int refuse_unload_unlock(mr_registry *reg, mr_entry *e, const char *name,
+                                int waited_ms, char *err, size_t errlen)
+{
+    int refs = e->refs, pins = e->watch_refs;
+    char msg[160];
+
+    e->unloading = false;
+    __atomic_store_n(&e->cancel_turns, 0, __ATOMIC_RELEASE);
+    pthread_mutex_unlock(&reg->lock);
+    /* Kept short on purpose: the caller's reason buffer is 160 bytes and a
+     * truncated multi-byte dash would land as mojibake in the JSON error. */
+    if (refs > 0)
+        snprintf(msg, sizeof(msg), "model is busy: %d live turn(s) did not stop "
+                 "within %d ms of a cancel; NOT unloaded", refs, waited_ms);
+    else
+        snprintf(msg, sizeof(msg), "model is busy: %d session watch(es) did not "
+                 "close; NOT unloaded", pins);
+    set_err(err, errlen, msg);
+    fprintf(stderr, "registry: REFUSED unload of '%s' — %s (nothing freed, "
+            "nothing stranded)\n", name, msg);
+    return -1;
+}
+
+/* Unload `name`: give live turns `drain_ms` to finish, then cancel them and
+ * give them `cancel_ms` to unwind (MR_UNLOAD_DRAIN_FOREVER = wait, never
+ * cancel — the shutdown path), close its watches, free it. A turn that will not
+ * stop rolls the entry back — still resident, acquirable, bound to its dies,
+ * watches untouched — and the refusal names the reason. */
+static int mr_unload_drain(mr_registry *reg, const char *name, int first_die,
+                           int drain_ms, int cancel_ms, char *err, size_t errlen)
 {
     if (!reg || !name || !*name) {
         set_err(err, errlen, "model name required");
         return -1;
     }
     pthread_mutex_lock(&reg->lock);
-    mr_entry *e = find_locked(reg, name, false);
+    mr_entry *e = mr_find_replica_locked(reg, name, first_die, false);
     if (!e || !e->model) {
         pthread_mutex_unlock(&reg->lock);
         set_err(err, errlen, "no such model");
@@ -696,31 +903,13 @@ static int mr_unload_drain(mr_registry *reg, const char *name, int drain_ms,
         set_err(err, errlen, "model is already unloading");
         return -1;
     }
-    e->unloading = true;            /* no new acquires while we try to drain */
+    e->unloading = true;            /* no new acquires or watch pins */
 
-    if (drain_entry_locked(reg, e, drain_ms) != 0) {
-        /* COULD NOT FREE. Put the entry back exactly as it was — resident,
-         * acquirable, holding its die binding — and refuse. The alternative
-         * (leave it deregistered and return success) is what stranded two dies
-         * in the field: the registry said the model was gone while its VRAM and
-         * its die budget were still held, and only a full serve restart got
-         * them back. */
-        int refs = e->refs;
-        e->unloading = false;
-        pthread_mutex_unlock(&reg->lock);
-        /* Kept short on purpose: the caller's reason buffer is 160 bytes and a
-         * truncated multi-byte dash would land as mojibake in the JSON error. */
-        char msg[160];
-        snprintf(msg, sizeof(msg),
-                 "model is busy: %d reference(s) in flight after %d ms; NOT "
-                 "unloaded (a live turn or an open /session/watch pins it)",
-                 refs, drain_ms);
-        set_err(err, errlen, msg);
-        fprintf(stderr, "registry: REFUSED unload of '%s' — %d in-flight "
-                "reference(s) did not drain in %d ms; the model stays resident "
-                "(nothing freed, nothing stranded)\n", name, refs, drain_ms);
-        return -1;
-    }
+    if (drain_live_turns_locked(reg, e, drain_ms, cancel_ms) != 0)
+        return refuse_unload_unlock(reg, e, name, cancel_ms, err, errlen);
+    if (close_watches_locked(reg, e) != 0)
+        return refuse_unload_unlock(reg, e, name, MR_UNLOAD_WATCH_UNPIN_MS,
+                                    err, errlen);
     /* Committed from here on: the entry drained, so every step below runs. */
     reg->n--;
 
@@ -732,6 +921,8 @@ static int mr_unload_drain(mr_registry *reg, const char *name, int drain_ms,
     pn_prefix_cache *prefix_cache = e->prefix_cache;
     char *path = e->path;
     int had_dies = e->n_dies;
+    pn_dm_binding_ref die_binding = e->die_binding;
+    uint64_t freed_serial = e->serial;
     char freed_name[MR_MAX_NAME];
     strncpy(freed_name, e->name, MR_MAX_NAME);
     freed_name[MR_MAX_NAME - 1] = '\0';
@@ -754,7 +945,8 @@ static int mr_unload_drain(mr_registry *reg, const char *name, int drain_ms,
      * the verdict: a release that matches no binding leaves the die budgeted
      * for a model that no longer exists, and the next load onto those dies is
      * refused by admission with nothing in the log to explain it. */
-    if (had_dies > 0 && pn_dm_release(freed_name) != 0)
+    pn_replica_affinity_forget_serial(freed_serial);
+    if (had_dies > 0 && pn_dm_release_ref(&die_binding) != 0)
         fprintf(stderr, "registry: WARNING unload '%s' found no die binding to "
                 "release — %d die(s) may stay budgeted until restart\n",
                 freed_name, had_dies);
@@ -768,12 +960,58 @@ static int mr_unload_drain(mr_registry *reg, const char *name, int drain_ms,
 
 int mr_unload(mr_registry *reg, const char *name, char *err, size_t errlen)
 {
-    return mr_unload_drain(reg, name, mr_unload_drain_ms(), err, errlen);
+    return mr_unload_replica(reg, name, -1, err, errlen);
+}
+
+int mr_unload_replica(mr_registry *reg, const char *name, int first_die, char *err,
+                      size_t errlen)
+{
+    return mr_unload_drain(reg, name, first_die,
+                           mr_env_ms("PN_UNLOAD_DRAIN_MS", MR_UNLOAD_DRAIN_MS_DEFAULT),
+                           mr_env_ms("PN_UNLOAD_CANCEL_MS", MR_UNLOAD_CANCEL_MS_DEFAULT),
+                           err, errlen);
 }
 
 uint64_t mr_weights_version(const mr_entry *entry)
 {
     return entry ? entry->weights_version : 0;
+}
+
+int mr_set_sampling_defaults(mr_registry *reg, const char *name,
+                             const pn_model_sampling *defaults)
+{
+    int found = 0;
+
+    if (!reg || !name || !defaults)
+        return -1;
+    pthread_mutex_lock(&reg->lock);
+    for (int i = 0; i < MR_MAX_MODELS; i++) {
+        mr_entry *e = &reg->entries[i];
+        if (e->used && strncmp(e->name, name, MR_MAX_NAME) == 0) {
+            e->sampling = *defaults;
+            found = 1;
+        }
+    }
+    pthread_mutex_unlock(&reg->lock);
+    return found ? 0 : -1;
+}
+
+int mr_set_reasoning_reserve(mr_registry *reg, const char *name, int reserve)
+{
+    int found = 0;
+
+    if (!reg || !name)
+        return -1;
+    pthread_mutex_lock(&reg->lock);
+    for (int i = 0; i < MR_MAX_MODELS; i++) {
+        mr_entry *e = &reg->entries[i];
+        if (e->used && strncmp(e->name, name, MR_MAX_NAME) == 0) {
+            e->reasoning_reserve = reserve > 0 ? reserve : 0;
+            found = 1;
+        }
+    }
+    pthread_mutex_unlock(&reg->lock);
+    return found ? 0 : -1;
 }
 
 int mr_count(mr_registry *reg)
@@ -811,6 +1049,7 @@ int mr_snapshot(mr_registry *reg, mr_info *out, int max)
         out[n].n_dies = e->n_dies;
         out[n].vram_bytes = e->vram_bytes;
         out[n].max_sessions = e->max_sessions;
+        out[n].sampling = e->sampling;
         out[n].max_concurrent = e->max_concurrent;
         /* CONFIGURED vs SERVED. bs_get_load already reports capacity 1 for a
          * NULL scheduler (the single-user trylock->429 path), which is the
@@ -824,6 +1063,12 @@ int mr_snapshot(mr_registry *reg, mr_info *out, int max)
         bs_load load = {0};
         bs_get_load(e->sched, &load);
         out[n].served_concurrency = load.capacity;
+        /* drop_last: the batched turn checkpoints, or (no scheduler) the
+         * single-user turn snapshot / the TT card checkpoint. */
+        out[n].think_history_drop_last =
+            e->sched ? bs_think_history_drop_last(e->sched)
+                     : bs_turn_ckpt_enabled() &&
+                       pn_prefix_cache_drop_last_supported(e->prefix_cache);
         /* Read the window HERE, under the registry lock, while the entry still
          * holds a live model pointer — the snapshot is a copy-out and its
          * consumers (the /v1/models + /admin writers) hold no ref on the model
@@ -836,6 +1081,16 @@ int mr_snapshot(mr_registry *reg, mr_info *out, int max)
         pn_model_attn_residency_read(e->model, &out[n].attn);
         out[n].minicpm_tool_dialect = mr_model_is_minicpm(e->model);
         out[n].refs = e->refs;
+        out[n].watch_refs = e->watch_refs;
+        out[n].replica = e->replica;
+        /* Seats actually held (scheduler slots / cache entries), not routing
+         * rows: those outlive a session's state and count watches. Lock-safe
+         * here for the reason given for bs_get_load above. */
+        ms_occupancy occ;
+        ms_session_occupancy(e, &occ);
+        out[n].sessions_used = occ.sessions_used;
+        out[n].slots_held = occ.slots_held;
+        out[n].seat_free = occ.seat_free;
         n++;
     }
     pthread_mutex_unlock(&reg->lock);
@@ -863,7 +1118,8 @@ void mr_free(mr_registry *reg)
         /* Shutdown drains without a deadline on purpose — see
          * MR_UNLOAD_DRAIN_FOREVER. A bounded drain here would turn a busy
          * model into an endless refuse/retry loop in this very while(1). */
-        mr_unload_drain(reg, name, MR_UNLOAD_DRAIN_FOREVER, NULL, 0);
+        mr_unload_drain(reg, name, -1, MR_UNLOAD_DRAIN_FOREVER,
+                        MR_UNLOAD_DRAIN_FOREVER, NULL, 0);
     }
     pthread_cond_destroy(&reg->drained);
     pthread_mutex_destroy(&reg->lock);

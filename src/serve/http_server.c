@@ -26,6 +26,7 @@
 #define HS_MAX_BODY_BYTES ((size_t)512 * 1024 * 1024)
 #include <errno.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -156,6 +157,16 @@ int hs_read_request(int client_fd, hs_request *req)
         size_t slen = e ? (size_t)(e - sid) : strlen(sid);
         req->session_id = strndup(sid, slen);
     }
+    const char *pin = find_header(buf, "X-Pantheon-Replica");
+    if (pin) {
+        const char *e = strstr(pin, "\r\n");
+        req->replica = strndup(pin, e ? (size_t)(e - pin) : strlen(pin));
+    }
+    const char *auth = find_header(buf, "Authorization");
+    if (auth) {
+        const char *e = strstr(auth, "\r\n");
+        req->authorization = strndup(auth, e ? (size_t)(e - auth) : strlen(auth));
+    }
 
     /* Body: read Content-Length bytes past the header terminator. */
     size_t body_offset = (size_t)(header_end - buf) + 4;
@@ -200,6 +211,8 @@ void hs_request_free(hs_request *req)
     free(req->path);
     free(req->body);
     free(req->session_id);
+    free(req->replica);
+    free(req->authorization);
     memset(req, 0, sizeof(*req));
 }
 
@@ -208,29 +221,72 @@ static const char *reason_phrase(int status)
 {
     switch (status) {
         case 200: return "OK";
+        case 202: return "Accepted";
         case 400: return "Bad Request";
+        case 401: return "Unauthorized";
+        case 403: return "Forbidden";
         case 404: return "Not Found";
         case 405: return "Method Not Allowed";
+        case 409: return "Conflict";
         case 413: return "Payload Too Large";
         case 429: return "Too Many Requests";
         case 500: return "Internal Server Error";
         case 503: return "Service Unavailable";
+        case 507: return "Insufficient Storage";
         default:  return "OK";
     }
+}
+
+/* This thread's headers for every response it sends (hs_set_thread_response_headers):
+ * one connection thread answers one request, so they belong to that request. */
+static _Thread_local char t_response_headers[HS_THREAD_HEADERS_MAX];
+
+void hs_set_thread_response_headers(const char *headers)
+{
+    if (!headers || strlen(headers) >= sizeof(t_response_headers))
+        headers = "";
+    snprintf(t_response_headers, sizeof(t_response_headers), "%s", headers);
+}
+
+const char *hs_thread_response_headers(void)
+{
+    return t_response_headers;
+}
+
+/* This thread's principal (hs_set_thread_principal): who the request is from. */
+static _Thread_local char t_principal[HS_PRINCIPAL_MAX];
+static _Thread_local int  t_principal_admin;
+
+void hs_set_thread_principal(const char *principal, int admin)
+{
+    if (!principal || strlen(principal) >= sizeof(t_principal))
+        principal = "";
+    snprintf(t_principal, sizeof(t_principal), "%s", principal);
+    t_principal_admin = principal[0] && admin;
+}
+
+const char *hs_thread_principal(void)
+{
+    return t_principal[0] ? t_principal : NULL;
+}
+
+int hs_thread_principal_admin(void)
+{
+    return t_principal_admin;
 }
 
 void hs_send_json(int client_fd, int status, const char *json_body)
 {
     size_t blen = json_body ? strlen(json_body) : 0;
-    char header[256];
+    char header[256 + HS_THREAD_HEADERS_MAX];
     int hn = snprintf(header, sizeof(header),
                       "HTTP/1.1 %d %s\r\n"
                       "Content-Type: application/json\r\n"
                       "Content-Length: %zu\r\n"
                       "Access-Control-Allow-Origin: *\r\n"
-                      "Connection: close\r\n\r\n",
-                      status, reason_phrase(status), blen);
-    if (hn < 0) return;
+                      "Connection: close\r\n%s\r\n",
+                      status, reason_phrase(status), blen, t_response_headers);
+    if (hn < 0 || (size_t)hn >= sizeof(header)) return;
     if (write_all(client_fd, header, (size_t)hn) != 0) return;
     if (blen) write_all(client_fd, json_body, blen);
 }
@@ -267,51 +323,81 @@ void hs_send_error_ex(int client_fd, int status, const char *type,
     }
 
     size_t blen = (size_t)bn;
-    char header[384];
+    char header[384 + HS_THREAD_HEADERS_MAX];
     int hn = snprintf(header, sizeof(header),
                       "HTTP/1.1 %d %s\r\n"
                       "Content-Type: application/json\r\n"
                       "Content-Length: %zu\r\n"
                       "Access-Control-Allow-Origin: *\r\n"
                       "Connection: close\r\n"
-                      "%s\r\n",          /* extra_headers + blank line */
-                      status, reason_phrase(status), blen, extra_headers);
-    if (hn < 0) return;
+                      "%s%s\r\n",        /* extra + thread headers, blank line */
+                      status, reason_phrase(status), blen, extra_headers,
+                      t_response_headers);
+    if (hn < 0 || (size_t)hn >= sizeof(header)) return;
     if (write_all(client_fd, header, (size_t)hn) != 0) return;
     write_all(client_fd, body, blen);
 }
 
-void hs_begin_sse(int client_fd)
+int hs_sse_send_timeout_ms(void)
 {
-    static const char header[] =
-        "HTTP/1.1 200 OK\r\n"
-        "Content-Type: text/event-stream\r\n"
-        "Cache-Control: no-cache\r\n"
-        "Access-Control-Allow-Origin: *\r\n"
-        "Connection: close\r\n\r\n";
-    write_all(client_fd, header, sizeof(header) - 1);
+    static int cached = -1;
+
+    if (cached < 0) {
+        const char *env = getenv("PN_SSE_SEND_TIMEOUT_MS");
+        char *end = NULL;
+        long v = env && *env ? strtol(env, &end, 10) : -1;
+        cached = (env && *env && end && *end == '\0' && v >= 0 && v <= 86400000L)
+               ? (int)v : 60000;
+    }
+    return cached;
 }
 
-void hs_send_sse(int client_fd, const char *json_data)
+int hs_begin_sse(int client_fd)
 {
-    write_all(client_fd, "data: ", 6);
-    write_all(client_fd, json_data, strlen(json_data));
-    write_all(client_fd, "\n\n", 2);
+    /* A peer that stops reading without closing (a vanished host, a frozen
+     * client) would otherwise block a write forever, and the turn holding a
+     * decode slot with it. With a send timeout the write fails and the turn
+     * stops like any other disconnect. */
+    int ms = hs_sse_send_timeout_ms();
+    if (ms > 0) {
+        struct timeval tv = { .tv_sec = ms / 1000, .tv_usec = (ms % 1000) * 1000 };
+        if (setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) != 0)
+            fprintf(stderr, "serve: SO_SNDTIMEO on a stream failed: %s\n", strerror(errno));
+    }
+    char header[256 + HS_THREAD_HEADERS_MAX];
+    int hn = snprintf(header, sizeof(header),
+                      "HTTP/1.1 200 OK\r\n"
+                      "Content-Type: text/event-stream\r\n"
+                      "Cache-Control: no-cache\r\n"
+                      "Access-Control-Allow-Origin: *\r\n"
+                      "Connection: close\r\n%s\r\n", t_response_headers);
+    if (hn <= 0 || (size_t)hn >= sizeof(header))
+        return -1;
+    return write_all(client_fd, header, (size_t)hn);
 }
 
-void hs_send_sse_comment(int client_fd, const char *text)
+int hs_send_sse(int client_fd, const char *json_data)
 {
-    write_all(client_fd, ": ", 2);
-    write_all(client_fd, text, strlen(text));
-    write_all(client_fd, "\n\n", 2);
+    if (write_all(client_fd, "data: ", 6) != 0 ||
+        write_all(client_fd, json_data, strlen(json_data)) != 0)
+        return -1;
+    return write_all(client_fd, "\n\n", 2);
 }
 
-void hs_end_sse(int client_fd)
+int hs_send_sse_comment(int client_fd, const char *text)
+{
+    if (write_all(client_fd, ": ", 2) != 0 ||
+        write_all(client_fd, text, strlen(text)) != 0)
+        return -1;
+    return write_all(client_fd, "\n\n", 2);
+}
+
+int hs_end_sse(int client_fd)
 {
     /* sizeof-1, not a hand-counted 13 — "data: [DONE]\n\n" is 14 bytes; writing 13
      * dropped the terminating blank line of the final SSE event. */
     static const char done[] = "data: [DONE]\n\n";
-    write_all(client_fd, done, sizeof(done) - 1);
+    return write_all(client_fd, done, sizeof(done) - 1);
 }
 
 void hs_close(int client_fd)
@@ -323,6 +409,13 @@ int hs_client_alive(int client_fd)
 {
     if (client_fd < 0)
         return 0;
+#ifdef POLLRDHUP
+    /* The peer's FIN shows here even when unread bytes are still queued, which
+     * the peek below would read as "open". */
+    struct pollfd pfd = { .fd = client_fd, .events = POLLIN | POLLRDHUP };
+    if (poll(&pfd, 1, 0) > 0 && (pfd.revents & (POLLRDHUP | POLLHUP | POLLERR | POLLNVAL)))
+        return 0;
+#endif
     /* Peek one byte without blocking: recv()==0 is an orderly peer close (the
      * client aborted / disconnected); EAGAIN is open-but-idle (the normal case
      * while we stream); >0 is buffered data (still open). */
@@ -333,4 +426,18 @@ int hs_client_alive(int client_fd)
     if (r < 0)
         return (errno == EAGAIN || errno == EWOULDBLOCK) ? 1 : 0;
     return 1;
+}
+
+static hs_auth_fn g_auth_fn;
+static void      *g_auth_user;
+
+void hs_set_auth_fn(hs_auth_fn fn, void *user)
+{
+    g_auth_fn = fn;
+    g_auth_user = user;
+}
+
+int hs_auth_check(int client_fd, const hs_request *req)
+{
+    return g_auth_fn ? g_auth_fn(client_fd, req, g_auth_user) : 0;
 }

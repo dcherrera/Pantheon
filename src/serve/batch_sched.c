@@ -24,30 +24,36 @@
  *         dumps that make a miss readable straight out of the serve log, and
  *         the session-substitution report (bs_slot_session_conflict), and
  *         per-conversation routing under one session id (bs_slot_reroute).
- * @issues A warm resume is only valid while the session's KV rows are still in
- *         a GPU ring (the host mirror is lazy — Phase 10b/INV3), so
- *         bs_warm_kv_reusable has to prove it before every warm rung.  How many
- *         sessions can hold a WARM rung at once is therefore a property of the
- *         decode-slot ring, and it is NOT one — it is however many are
- *         CONCURRENTLY ACTIVE.  rebuild_gpu_map compacts the active slots into
- *         GPU ring rows [0, n_active), so:
- *           - sessions whose turns OVERLAP occupy distinct rows and all keep
- *             their warm KV (measured on a K80 host 2026-08-02, saber-orch, two live
- *             sessions, both resuming at ~1.05 s TTFT);
- *           - sessions that run STRICTLY SEQUENTIALLY each compact alone to row
- *             0 and therefore overwrite each other's rows — every turn, so both
- *             fall to the system-prefix rung and their TTFT goes linear in
- *             conversation depth again (measured 2.2 -> 3.4 -> 4.3 s).
- *         The system-prefix rung is genuinely multi-session (its snapshots are
- *         per-slot host deep copies), so N sessions stay warm AT THAT TIER
- *         regardless of interleaving.
+ * @issues Each slot owns a fixed block on the card (GPU row = slot index: a
+ *         ctx_cap KV ring row per attention layer + an SSM image per SSM
+ *         layer), carved at bs_create; a model whose blocks do not fit is
+ *         refused at load. The step runs the active rows through a row map,
+ *         so nothing moves when conversations take turns, and a resumed turn
+ *         re-seeds from its block device to device — no host RAM. Until
+ *         2026-10-21 the active set was compacted into rows [0, n_active) and
+ *         sessions taking STRICT turns overwrote each other's rows (K80,
+ *         qwen36-stock, A ~10k / B 10k -> 29k: A2 128 s, B2 518 s, A3 129 s
+ *         TTFT); now A2/A3 resume in ~0.9 s. Block = 394 MiB per die at a
+ *         131072 ctx_cap (360 KV + 2.6 q4 shadows + 31.4 SSM).
+ *         Remaining per-session host footprint: the SYS1 system-prefix
+ *         snapshot (a host copy by design, ~62 MiB SSM + system KV).
+ *         The think-included rung resumes on the ids the model SAMPLED, so a
+ *         resumed turn can differ from a cold prefill of the re-tokenized
+ *         text (test_serve_sched_session_switch: B2/B3, main and here alike).
  * @todo None
  */
 
 #include "batch_sched.h"
+#include "../core/host_row_dump.h"
+#include "batch_sched_admission.h"
+#include "batch_sched_prefill_share.h"
+#include "batch_sched_slots.h"
+#include "batch_sched_spec.h"
+#include "batch_sched_watchdog.h"
 
 #include "request_profile.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
@@ -55,6 +61,8 @@
 #include <time.h>
 
 #include "../core/engine.h"          /* gpt2_bytes_decode (diagnostic dumps) */
+#include "../core/session_family.h"
+#include "../core/session_snapshot.h"
 #include "../core/mem/pn_mem_state.h"
 #include "../core/mem/pn_memwatch.h"
 #include "tokenizer/tokenizer.h"
@@ -68,7 +76,8 @@
 #include "../models/qwen35moe.h"
 
 /* Phase 10b: forward decl — defined with the SYS1 snapshot helpers below. */
-static void bs_sys_snap_unref(bs_slot *sl);
+static void bs_sys_snap_unref(const pn_batch_sched *sched, bs_slot *sl);
+static void make_deadline(struct timespec *ts, int wait_ms);
 
 /* ============================================================
  * Feature gate
@@ -104,6 +113,15 @@ bool bs_enabled(void)
 #endif
 }
 
+/* Monotonic ms: the driver's step timing, the slot LRU key and
+ * the turn owner's hold time. */
+static double bs_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1e3 + (double)ts.tv_nsec / 1e6;
+}
+
 /* ============================================================
  * GPU-ownership turnstile (see batch_sched.h) — FIFO tickets under mu.
  *
@@ -120,6 +138,7 @@ static void bs_gpu_acquire_locked(pn_batch_sched *sched)
     uint64_t my = sched->gpu_ticket_next++;
     while (sched->gpu_ticket_serving != my)
         pthread_cond_wait(&sched->cv_gpu, &sched->mu);
+    sched->gpu_turn_t0_ms = bs_now_ms();
 }
 
 static void bs_gpu_release_locked(pn_batch_sched *sched)
@@ -146,8 +165,6 @@ static void bs_gpu_release(pn_batch_sched *sched)
  * Driver thread — the heart of C3
  * ============================================================ */
 
-#ifdef USE_CUDA
-
 /* Per-step driver timing to stderr (M6 instrumentation), QWEN35_BS_STATS=1. */
 static int bs_stats_on(void)
 {
@@ -159,44 +176,29 @@ static int bs_stats_on(void)
     return v;
 }
 
-static double bs_now_ms(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec * 1e3 + (double)ts.tv_nsec / 1e6;
-}
-
 /*
- * Driver design — "dynamic-width step" (Phase D2):
+ * Driver design — fixed session rows (2026-10-21):
  *
- * The driver compacts the active (BOUND/DECODE) lanes into a contiguous
- * GPU index range [0, n_active) so `pn_qwen35moe_decode_slots` runs over
- * only the live users.  Idle lanes pay zero GPU compute.
- *
- * gpu_map[gpu_idx] = scheduler slot index.  The mapping is built/rebuilt
- * whenever active_set_changed is set (a user joined or left); rebuild_gpu_map
- * realizes the (arbitrary) permutation that compacts the active lanes to
- * [0, n_active), using the reserved scratch slot at index `cap` to break
- * cycles (the engine is bound with cap+1 slots).  Steady state (no
- * join/leave) has zero overhead.
+ * Every scheduler slot owns ONE persistent block on the card for its whole
+ * life: GPU row `i` of every attention layer's KV ring and every SSM layer's
+ * conv/recurrent image (carved at bs_create). A step runs over whichever
+ * slots are active, in any order, by handing pn_qwen35moe_decode_slots_rows
+ * the row map (gpu_map[k] = scheduler slot = GPU row). Nothing is compacted,
+ * moved or copied when the active set changes, so an idle session's KV + SSM
+ * stay exactly where its last turn left them and its next turn resumes from
+ * the card. (Until 2026-10-21 the active set was compacted into rows
+ * [0, n_active) by D2D moves, which overwrote idle sessions' rows whenever
+ * conversations took turns.)
  *
  * Correctness:
  *   - BOUND/DECODE lanes: carry their real token; BOUND → DECODE on first
  *     step.
- *   - PREFILL lanes: excluded from the compacted set (never stepped); the
- *     prefill's own GPU work is serialized by the turnstile.
- *   - IDLE lanes: excluded from the compacted set; never passed to the GPU.
+ *   - PREFILL and IDLE lanes are never in the map (never stepped).
  *   - A slot released mid-step has left DECODE before the driver reads mu
- *     again; its GPU slot's logits are discarded at deposit time.
- *   - A newly-BOUND slot (continuous batching join) is included in the
- *     NEXT step after its bind completes (bind sets active_set_changed and
- *     signals cv_work).  The bind itself owns the GPU turn so no
- *     interleaving with a step is possible.
- *   - A slot that turns IDLE during the step (released by its owner before
- *     the driver re-acquires mu for deposit): the deposit loop checks
- *     status == BS_SLOT_DECODE before writing logits, so it is skipped
- *     harmlessly — the slot's next owner will find it IDLE and its state
- *     reset on the next bs_prefill_begin.
+ *     again; its logits are discarded at deposit time.
+ *   - A newly-BOUND slot joins the NEXT step after its bind completes (bind
+ *     sets active_set_changed and signals cv_work). The bind owns the GPU
+ *     turn, so it can never interleave with a step.
  *
  * The step runs owning the GPU turn (no prefill can overlap) with mu
  * dropped while the GPU is busy (request threads keep posting/releasing).
@@ -246,166 +248,69 @@ static int gate_ok(pn_batch_sched *sched)
     return n_active;                  /* 0 ↔ nothing to step */
 }
 
-/* Rebuild the GPU-index → scheduler-slot compacted mapping (GPU turn owned,
- * mu held).  Called when active_set_changed is set (a user joined, left, or
- * finished).
- *
- * Compacts all active (BOUND/DECODE) scheduler slots to GPU indices [0, n_active).
- * The new GPU-index order mirrors the scheduler slot order (stable, lowest first).
- *
- * For each active slot:
- *   - Its CURRENT GPU index = the old gpu_map entry (for DECODE slots),
- *     or the scheduler slot index (for newly-BOUND slots, whose bind call
- *     in bs_slot_bind set g->slot_state[sched_slot_idx]).
- *   - Its TARGET GPU index = its rank in the compacted list (0, 1, 2, ...).
- *   - If current == target: no move needed (slot_state already correct).
- *   - If current != target: call pn_qwen35moe_decode_slot_move(current, target,
- *     cap) to D2D copy the SSM state from conv_slots[current] to conv_slots[target]
- *     and update g->slot_state[target] — without touching the stale host mirror.
- *
- * Moves realize an ARBITRARY permutation (both downward compaction and the
- * upward moves / cycles that concurrent multi-join produces): see the body
- * for the greedy place-into-free + cycle-break algorithm.  A move that is
- * genuinely upward is not a corruption — the old "src >= dst only" refusal
- * was the K>=5 empty-output bug.
- *
- * Returns n_active (≥ 1; the gate already ensured this), or -1 on failure.
- * Precondition: GPU turn owned, mu held.
- *
- * A slot the driver marked `finished` (EOS / budget, L3) is inactive here —
- * it drops out of the map exactly like a released slot. */
+/* The slot's walk has just been advanced by the token at ring position ring_w: note
+ * where forced reasoning first ended, so the owner flips its channel at that token
+ * (bs_slot_reasoning_ended).  Under mu. */
+void bs_slot_note_reasoning_end(bs_slot *sl)
+{
+    const pn_tool_grammar_hook *tgh = sl->sp.tool_grammar;
+
+    if (!sl->reason_end_at && tgh && tgh->reasoning_ended && tgh->st &&
+        tgh->reasoning_ended(tgh->st))
+        __atomic_store_n(&sl->reason_end_at, sl->ring_w, __ATOMIC_RELEASE);
+}
+
+bool bs_slot_reasoning_ended(pn_batch_sched *sched, int idx)
+{
+    static int red = -1;
+
+    if (!sched || idx < 0 || idx >= sched->cap)
+        return false;
+    int r = __atomic_load_n(&red, __ATOMIC_RELAXED);
+    if (r < 0) {
+        const char *e = getenv("PN_THINK_FLIP_RED");
+        r = e && e[0] == '1';
+        __atomic_store_n(&red, r, __ATOMIC_RELAXED);
+    }
+    const bs_slot *sl = &sched->slots[idx];
+    const int at = __atomic_load_n(&sl->reason_end_at, __ATOMIC_ACQUIRE);
+    return at > 0 && (r || sl->ring_r >= at);
+}
+
+#ifndef USE_CUDA
+/* No driver without CUDA: the ring push and the reasoning-end note of
+ * driver_emit_token, for the host tests. */
+int bs_slot_deposit_token(pn_batch_sched *sched, bs_slot *sl, uint32_t next)
+{
+    (void)sched;
+    if (!sl->ring || sl->ring_w >= sl->ring_cap)
+        return -1;
+    sl->ring[sl->ring_w++] = next;
+    sl->budget--;
+    bs_slot_note_reasoning_end(sl);
+    return 0;
+}
+#endif
+
+#ifdef USE_CUDA
+
+/* A slot the driver marked `finished` (EOS / budget, L3) is inactive: it drops
+ * out of the step exactly like a released slot. */
 static int slot_is_active(const bs_slot *sl)
 {
     return (sl->status == BS_SLOT_BOUND || sl->status == BS_SLOT_DECODE) &&
            !sl->finished;
 }
 
+/* Rebuild the list of active slots the next step runs (mu held). Each active
+ * slot decodes in its own fixed GPU row (= its slot index), so this is pure
+ * bookkeeping — no device work, nothing moves. Returns the active count. */
 static int rebuild_gpu_map(pn_batch_sched *sched)
 {
-    /* Build the target compacted list: all active sched slots in order. */
-    int target_sched[BS_MAX_SLOTS];   /* target_sched[gpu_rank] = sched_slot */
     int n_active = 0;
-    for (int i = 0; i < sched->cap; i++) {
-        bs_slot *sl = &sched->slots[i];
-        if (slot_is_active(sl))
-            target_sched[n_active++] = i;
-    }
-
-    /* Realize the (arbitrary) permutation that maps each active slot from its
-     * CURRENT GPU index (sl->gpu_idx — where its live decode state resides,
-     * set at bind to a free GPU index and maintained by every move below) to
-     * its TARGET GPU index (its rank in the compacted list).
-     *
-     * The old loop assumed every move packs DOWN (src >= dst) and refused any
-     * upward move.  That invariant does NOT hold: >=5 joiners binding
-     * concurrently at the highest free GPU indices (7,6,5,4,3) before the
-     * driver rebuilds get compacted to ranks (0,1,2,3,4), so the slot at
-     * gpu 3 must move UP to rank 4 (a gpu 3<->4 swap) — the refusal returned
-     * -1 and decode_slots then produced nothing for every user (the K>=5
-     * "all users emit empty content" bug).  A correct compaction must handle
-     * upward moves and cycles.
-     *
-     * occupied[p] = the active sched slot currently living at GPU index p, or
-     * -1 if free.  Realize the permutation greedily: repeatedly move any slot
-     * whose target rank is currently free into place (that frees its old
-     * index, unblocking others); when no such slot exists the remaining
-     * unplaced slots form a pure cycle, so break it by parking one slot at a
-     * free GPU index and continue.  Every move D2D-copies the SSM state and
-     * re-seeds the KV ring from the (current) host mirror, so a park + final
-     * move is correct.
-     *
-     * A free GPU index is ALWAYS available for the cycle break: users occupy
-     * only [0, cap), and the engine is bound with cap+1 slots, so index `cap`
-     * is a permanent scratch slot the decode step never touches (it runs over
-     * [0, n_active) with n_active <= cap).  This is essential at n_active ==
-     * cap: 8 joiners binding concurrently at the highest free indices produce
-     * a full reversal (gpu 7..0 -> ranks 0..7 = four 2-cycles) with no free
-     * index in [0, cap) — the scratch at `cap` breaks it.  Placed slots
-     * (gpu_idx == rank) are never disturbed again. */
-    const int scratch = sched->cap;       /* reserved cycle-break slot */
-    int occupied[BS_MAX_SLOTS];
-    for (int p = 0; p <= scratch; p++)
-        occupied[p] = -1;
-    for (int rank = 0; rank < n_active; rank++) {
-        int i = target_sched[rank];
-        int g = sched->slots[i].gpu_idx;
-        if (g < 0 || g >= sched->cap) {
-            fprintf(stderr, "[batch_sched] rebuild_gpu_map: sched slot %d has "
-                    "bad GPU index %d\n", i, g);
-            sched->active_set_changed = false;
-            return -1;
-        }
-        occupied[g] = i;
-    }
-
-    for (;;) {
-        int made_progress = 0;
-        int all_placed    = 1;
-        for (int rank = 0; rank < n_active; rank++) {
-            int i   = target_sched[rank];
-            int src = sched->slots[i].gpu_idx;
-            if (src == rank)
-                continue;                 /* already at its target */
-            all_placed = 0;
-            if (occupied[rank] >= 0)
-                continue;                 /* target still held; try later */
-            if (pn_qwen35moe_decode_slot_move(sched->model, src, rank,
-                                              sched->cap + 1) != 0) {
-                fprintf(stderr, "[batch_sched] rebuild_gpu_map: slot_move "
-                        "failed (sched=%d gpu %d→%d cap=%d)\n", i, src, rank,
-                        sched->cap);
-                sched->active_set_changed = false;
-                return -1;
-            }
-            occupied[src]           = -1;
-            occupied[rank]          = i;
-            sched->slots[i].gpu_idx = rank;
-            made_progress           = 1;
-        }
-        if (all_placed)
-            break;
-        if (!made_progress) {
-            /* Pure cycle: every unplaced slot's target is held by another
-             * unplaced slot.  Park the first unplaced slot at a free GPU
-             * index (the reserved scratch at `cap` is always free) to break
-             * the cycle. */
-            int tmp = -1;
-            for (int p = 0; p <= scratch; p++)
-                if (occupied[p] < 0) { tmp = p; break; }
-            if (tmp < 0) {
-                fprintf(stderr, "[batch_sched] rebuild_gpu_map: permutation "
-                        "cycle with no free GPU slot (n_active=%d cap=%d)\n",
-                        n_active, sched->cap);
-                sched->active_set_changed = false;
-                return -1;
-            }
-            for (int rank = 0; rank < n_active; rank++) {
-                int i   = target_sched[rank];
-                int src = sched->slots[i].gpu_idx;
-                if (src == rank)
-                    continue;
-                if (pn_qwen35moe_decode_slot_move(sched->model, src, tmp,
-                                                  sched->cap + 1) != 0) {
-                    fprintf(stderr, "[batch_sched] rebuild_gpu_map: park move "
-                            "failed (sched=%d gpu %d→%d cap=%d)\n", i, src, tmp,
-                            sched->cap);
-                    sched->active_set_changed = false;
-                    return -1;
-                }
-                occupied[src]           = -1;
-                occupied[tmp]           = i;
-                sched->slots[i].gpu_idx = tmp;
-                break;
-            }
-        }
-    }
-
-    /* Commit the new map: gpu rank -> sched slot (each slot's gpu_idx is now
-     * exactly its rank, set by the moves above). */
-    for (int rank = 0; rank < n_active; rank++) {
-        sched->gpu_map[rank] = target_sched[rank];
-        sched->slots[target_sched[rank]].gpu_idx = rank;
-    }
+    for (int i = 0; i < sched->cap; i++)
+        if (slot_is_active(&sched->slots[i]))
+            sched->gpu_map[n_active++] = i;
     sched->n_active_gpu       = n_active;
     sched->active_set_changed = false;
     return n_active;
@@ -518,6 +423,31 @@ static void driver_arm_full_logits(pn_batch_sched *sched, bs_slot *sl,
     pn_qwen35moe_state_set_full_logits(sl->state, need);
 }
 
+/* Whether token `tok` ends a line, for the reasoning close window.  The
+ * grammar hook's text when the request has one (no allocation), else the
+ * tokenizer's decode (GPT-2 byte-level pieces mapped back to bytes). */
+static bool driver_token_ends_line(pn_batch_sched *sched, const pn_tool_grammar_hook *tgh,
+                                   uint32_t tok)
+{
+    if (tgh && tgh->token_text) {
+        const char *txt = tgh->token_text(tgh->user, tok);
+        if (txt)
+            return pn_reasoning_piece_ends_line(txt);
+    }
+    if (!sched || !sched->model || !sched->model->tokenizer)
+        return false;
+    int id = (int)tok;
+    char *raw = ft_decode(sched->model->tokenizer, &id, 1);
+    if (!raw)
+        return false;
+    char *decoded = ft_get_model_type(sched->model->tokenizer) == 0
+                        ? gpt2_bytes_decode(raw) : NULL;
+    bool ends = pn_reasoning_piece_ends_line(decoded ? decoded : raw);
+    free(decoded);
+    free(raw);
+    return ends;
+}
+
 /* AUTO reasoning-budget force-close, PER SLOT, in the driver's sampler — the
  * batched twin of sg_run_completion's cap.  Returns the token this step must
  * push to the ring + step into the state:
@@ -537,7 +467,7 @@ static void driver_arm_full_logits(pn_batch_sched *sched, bs_slot *sl,
  * *inject_out is set true when the returned token is an injected close (the
  * caller then must NOT count it against the grammar again — it was fed here).
  * budget<=0 / not-think slots never enter here (guarded by the caller). */
-static uint32_t driver_reason_step(bs_slot *sl, uint32_t sampled,
+static uint32_t driver_reason_step(pn_batch_sched *sched, bs_slot *sl, uint32_t sampled,
                                    const pn_tool_grammar_hook *tgh,
                                    bool *inject_out)
 {
@@ -559,7 +489,8 @@ static uint32_t driver_reason_step(bs_slot *sl, uint32_t sampled,
              * landing window instead of forcing a frame around the unfinished
              * thought.  Runs AFTER the advance above, whose self-detection has
              * already set reasoning_ended — this adds the window on top.  NULL
-             * hook (or a dialect without a window) → pre-fix behavior. */
+             * hook (or a dialect without a window) → pre-fix behavior.  A
+             * "required" walk takes no window (tg_reasoning_end_injected). */
             if (tgh && tgh->reasoning_end_injected && tgh->st)
                 tgh->reasoning_end_injected(tgh->st);
         }
@@ -583,12 +514,362 @@ static uint32_t driver_reason_step(bs_slot *sl, uint32_t sampled,
         sl->reason_in_think = false;   /* model concluded on its own */
         return sampled;
     }
+    /* At the cap, or on the first line end inside the window just before it
+     * (reasoning_budget.h), so the thought ends on a whole line.  The token is
+     * only decoded inside that window. */
+    bool line_end = sl->reason_budget > 0 && !sl->reason_forced &&
+                    sl->reason_toks >= sl->reason_soft &&
+                    driver_token_ends_line(sched, tgh, sampled);
     if (sl->reason_budget > 0 && !sl->reason_forced &&
-        sl->reason_toks >= sl->reason_budget && !in_call) {
+        pn_reasoning_should_close(&(pn_reasoning_plan){ sl->reason_budget, sl->reason_soft },
+                                  sl->reason_toks, line_end) &&
+        !in_call) {
         sl->reason_forced = true;
         sl->reason_close_i = 0;   /* arm the injection for the next step(s) */
     }
     return sampled;
+}
+
+/* A token just stepped INTO the slot's state: PC-batched, append it to the committed-token
+ * log so ct_n == state->pos stays invariant (ct is pre-sized to prompt + budget at bind; on
+ * the impossible overflow, disarm: finalize then no-ops and the session re-prefills). */
+static void driver_log_committed(bs_slot *sl, uint32_t tok)
+{
+    if (!sl->armed_sid[0])
+        return;
+    if (sl->ct && sl->ct_n < sl->ct_cap)
+        sl->ct[sl->ct_n++] = tok;
+    else
+        sl->armed_sid[0] = '\0';
+}
+
+/* L3: a stepped token joins the slot's repeat window before the next draw. */
+static void driver_window_push(bs_slot *sl, uint32_t tok)
+{
+    if (sl->max_recent <= 0 || !sl->recent)
+        return;
+    if (sl->n_recent < sl->max_recent) {
+        sl->recent[sl->n_recent++] = tok;
+    } else {
+        memmove(sl->recent, sl->recent + 1, (size_t)(sl->max_recent - 1) * sizeof(uint32_t));
+        sl->recent[sl->max_recent - 1] = tok;
+    }
+}
+
+/* L3: push the token the driver chose for this slot to its output ring and decide whether
+ * the slot is finished (EOS / <|im_end|> / budget / a completed tool call). Under mu.
+ * Returns 1 when finished, 0 when `next` is the next step's input, -1 on a full ring. */
+static int driver_emit_token(pn_batch_sched *sched, bs_slot *sl, uint32_t next)
+{
+    const pn_tool_grammar_hook *tgh = sl->sp.tool_grammar;
+
+    if (!sl->ring || sl->ring_w >= sl->ring_cap)
+        return -1;
+    sl->ring[sl->ring_w++] = next;
+    sl->budget--;
+    bs_slot_note_reasoning_end(sl);
+    /* Grammar completion-stop (batched): the sampler (or the injection
+     * above) just advanced this slot's grammar by `next`; if that closed
+     * a whole tool call, finish the slot NOW so a forced call terminates
+     * right after "</function>"/"</tool_call>" instead of running to
+     * budget (the batched twin of the single-user break-on-complete).
+     * No-op when the slot carries no grammar hook. */
+    bool grammar_done = (tgh && tgh->complete && tgh->st &&
+                         tgh->complete(tgh->st));
+    /* Record the OUTCOME of a force-closed turn while the grammar hook
+     * is still live and held under mu: bs_slot_release reports it, and
+     * by then the request may have freed the hook. */
+    if (grammar_done && sl->reason_forced)
+        sl->reason_forced_call = true;
+    if ((int)next == sched->eos_id ||
+        (int)next == sched->im_end_id || sl->budget <= 0 ||
+        grammar_done) {
+        sl->finished = true;
+        sched->active_set_changed = true;
+        return 1;
+    }
+    sl->next_token  = next;
+    sl->token_ready = true;
+    return 0;
+}
+
+int bs_slot_deposit_token(pn_batch_sched *sched, bs_slot *sl, uint32_t next)
+{
+    return driver_emit_token(sched, sl, next);
+}
+
+#ifdef USE_CUDA
+/* Deposit one MTP cycle's tokens exactly as successive plain steps would have: the seed
+ * and every accepted draft were stepped into the state (committed: logged and windowed),
+ * each emitted token goes through the reasoning-budget accounting and the ring. Under mu. */
+static void driver_spec_deposit(pn_batch_sched *sched, bs_slot *sl, uint32_t seed,
+                                const uint32_t *emit, int ne)
+{
+    const pn_tool_grammar_hook *tgh = sl->sp.tool_grammar;
+
+    driver_log_committed(sl, seed);
+    driver_window_push(sl, seed);
+    for (int j = 0; j < ne; j++) {
+        bool injected = false;
+        /* The draws ran hook-free: advance the live walk as the sampler would have. */
+        if (tgh && tgh->advance && tgh->st && tgh->token_text) {
+            const char *text = tgh->token_text(tgh->user, emit[j]);
+            if (text)
+                tgh->advance(tgh->st, text);
+        }
+        uint32_t next = driver_reason_step(sched, sl, emit[j], tgh, &injected);
+        driver_arm_full_logits(sched, sl, 0);
+        int rc = driver_emit_token(sched, sl, next);
+        if (rc < 0) {
+            driver_error_slot(sched, sl);
+            return;
+        }
+        if (rc > 0)
+            break;
+        if (j < ne - 1) {
+            driver_log_committed(sl, next);
+            driver_window_push(sl, next);
+        }
+    }
+    pthread_cond_signal(&sl->cv);
+}
+
+/* The solo-slot step on an MTP model (mu held, GPU turn owned): one exact MTP cycle in
+ * place of a decode-slots step. Returns true when it handled the step (deposited, or
+ * errored the slot), false when the slot is not eligible (the caller steps it plain). */
+static bool driver_spec_step(pn_batch_sched *sched, int i, uint32_t seed)
+{
+    bs_slot *sl = &sched->slots[i];
+    uint32_t emit[PN_SPEC_DEPTH_MAX + 1];
+
+    if (!bs_spec_eligible(sched, sl))
+        return false;
+    const int cap = bs_spec_draft_cap(sl), row = sl->gpu_idx;
+    /* No drafts this step (the controller's cost model, or the budget): the slot's
+     * block is current, so the plain decode step is the cheaper exact choice. */
+    const int depth = sg_mtp_cuda_choose(&sl->mtp, sl->state->pos, cap);
+    if (depth < 1 || bs_spec_stress_plain(sl))
+        return false;
+    const double t_cycle = sg_mtp_cuda_now_ms();
+    const int n_recent = bs_spec_stage_window(sl, seed);
+    pn_sampling_params sp = sl->sp;   /* the draws advance this copy's RNG */
+    pthread_mutex_unlock(&sched->mu);
+    int ne = bs_spec_cycle_gpu(sched, sl, row, seed, depth, cap, &sp, n_recent, emit);
+    pthread_mutex_lock(&sched->mu);
+    if (sl->status != BS_SLOT_DECODE)
+        return true;   /* released mid-cycle: nothing to deposit */
+    if (ne < 1) {
+        fprintf(stderr, "[batch_sched] MTP cycle failed (slot=%d); erroring it out\n", i);
+        driver_error_slot(sched, sl);
+        return true;
+    }
+    sl->sp = sp;   /* the sampler state after this cycle's draws (RNG stream) */
+    driver_spec_deposit(sched, sl, seed, emit, ne);
+    sl->mtp.ms_cycle += sg_mtp_cuda_now_ms() - t_cycle;
+    return true;
+}
+#endif
+
+/* PN_HOST_TIMING (host_stage_timer.h): charge `ns` of `stage` to every slot of the step. */
+static void driver_ht_charge(pn_batch_sched *sched, const int *map, int n, pn_ht_stage stage,
+                             uint64_t ns)
+{
+    for (int k = 0; k < n; k++)
+        pn_ht_add(&sched->slots[map[k]].host, stage, ns);
+}
+
+/* The step's shared stages and launch stamps, charged to each slot it ran (mu held). */
+static void driver_ht_step(pn_batch_sched *sched, const int *map, int n, uint64_t gate0,
+                           uint64_t acq0, uint64_t acq1, uint64_t launch, uint64_t stepped,
+                           uint64_t cpu_ns)
+{
+    const uint64_t relocked = pn_ht_now();
+    const uint64_t run_delay = pn_ht_run_delay();
+
+    driver_ht_charge(sched, map, n, PN_HT_GATE, acq0 - gate0);
+    driver_ht_charge(sched, map, n, PN_HT_ACQUIRE, acq1 - acq0);
+    driver_ht_charge(sched, map, n, PN_HT_STEP, stepped - launch);
+    driver_ht_charge(sched, map, n, PN_HT_RELOCK, relocked - stepped);
+    for (int k = 0; k < n; k++) {
+        pn_host_timing *h = &sched->slots[map[k]].host;
+        if (!h->first_launch_ns) {
+            h->first_launch_ns = launch;
+            h->run_delay0_ns = run_delay;
+        }
+        h->last_launch_ns = launch;
+        h->last_step_ns = stepped - launch;
+        h->step_cpu_ns += cpu_ns;
+        h->run_delay_ns = run_delay - h->run_delay0_ns;
+        h->steps++;
+        h->width_sum += (uint32_t)n;
+    }
+}
+
+/* End of one slot's deposit. */
+static void driver_ht_deposited(bs_slot *sl, uint64_t now)
+{
+    sl->host.last_deposit_ns = now;
+}
+
+/* Per-request active-slot range for the [req] line (mu held). */
+static void driver_note_step_width(bs_slot *sl, int width)
+{
+    if (sl->req_active_min == 0 || width < sl->req_active_min)
+        sl->req_active_min = width;
+    if (width > sl->req_active_max)
+        sl->req_active_max = width;
+}
+
+/* Snapshot the next step (mu held, turn owned): refresh the active list if a
+ * user joined, left or finished since the last step, then tokens[] / states[]
+ * for the active slots, gpu_map_snap[k] = slot = its fixed GPU row. Returns
+ * the step width (0: every active slot was released meanwhile). */
+static int driver_snapshot_locked(pn_batch_sched *sched, uint32_t *tokens,
+                                  pn_state **states, int *gpu_map_snap)
+{
+    /* ── Refresh the active list if a user joined, left, or finished
+     *    since the last step (mu held; bookkeeping only). ── */
+    if (sched->active_set_changed)
+        (void)rebuild_gpu_map(sched);
+
+    /* ── Snapshot the step (mu held, turn owned): tokens[]/states[] for
+     *    the active slots, gpu_map_snap[k] = slot = its fixed GPU row. ── */
+    int snap_n = 0;
+    for (int g = 0; g < sched->n_active_gpu; g++) {
+        int i = sched->gpu_map[g];
+        if (i < 0 || i >= sched->cap)
+            continue;             /* stale map entry (should not happen) */
+        bs_slot *sl = &sched->slots[i];
+        states[snap_n] = sl->state;
+        if (sl->status == BS_SLOT_BOUND && !sl->finished) {
+            sl->status      = BS_SLOT_DECODE;   /* first step */
+            sl->token_ready = false;
+            tokens[snap_n] = sl->next_token;
+        } else if (sl->status == BS_SLOT_DECODE && !sl->finished) {
+            sl->token_ready = false;
+            tokens[snap_n] = sl->next_token;
+        } else {
+            /* Slot went IDLE/finished between gate_ok and the snapshot
+             * (owner released it); skip by not advancing snap_n. */
+            continue;
+        }
+        gpu_map_snap[snap_n] = i;
+        snap_n++;
+    }
+    return snap_n;
+}
+
+/* Deposit a finished step (mu held): rc is the step's result, lo[k] slot
+ * gpu_map_snap[k]'s logits, plain_ms the step's time. */
+static void driver_deposit_locked(pn_batch_sched *sched, const uint32_t *tokens,
+                                  const int *gpu_map_snap, int snap_n,
+                                  float *const *lo, int rc, double plain_ms)
+{
+    (void)plain_ms;   /* read only by the CUDA MTP accounting */
+    /* ── Deposit and wake each owner.  Use gpu_map_snap to reverse the
+     *    GPU-index → sched-slot mapping.  A slot released mid-step is
+     *    no longer DECODE and is skipped.
+     *
+     *    L3 (driver_sample): append the just-stepped token to the
+     *    slot's repeat window, sample the next token from its
+     *    (host-side, sparse top-k) logits — sequentially per slot, the
+     *    documented deterministic order — push it to the output ring
+     *    and re-arm token_ready, so the next step needs NOTHING from
+     *    the owners.  EOS/<|im_end|>/budget ends the slot's stepping
+     *    (finished; the owner drains and releases).
+     *
+     *    Legacy: deposit the logits pointer; the owner samples. ── */
+    for (int g = 0; g < snap_n; g++) {
+        int i = gpu_map_snap[g];
+        bs_slot *sl = &sched->slots[i];
+        if (sl->status != BS_SLOT_DECODE)
+            continue;
+        if (rc != 0) {
+            driver_error_slot(sched, sl);
+            continue;
+        }
+        /* PC-batched: tokens[g] was just stepped INTO sl->state (pos
+         * advanced by 1).  If this slot is armed for caching, append it to
+         * the committed-token log so ct_n == state->pos stays invariant.
+         * ct is pre-sized to prompt + budget at bind, so this never
+         * overflows; on the impossible overflow, disarm (finalize will
+         * then no-op → this session re-full-prefills next turn). */
+        driver_log_committed(sl, tokens[g]);
+        pn_ht_bind(&sl->host);
+        uint64_t ht = pn_ht_now();
+#ifdef USE_CUDA
+        if (snap_n == 1 && sl->mtp_on && !sl->pd_stepped)   /* price it (D = 0), feed the head its row */
+            bs_spec_after_plain_step(sched, sl, tokens[g], plain_ms);
+        ht = pn_ht_lap(PN_HT_MTP_PUSH, ht);
+#endif
+        if (!sched->driver_sample) {
+            sl->logits       = lo[g];
+            sl->logits_ready = true;
+            pthread_cond_signal(&sl->cv);
+            continue;
+        }
+        /* L3 in-driver sampling. */
+        driver_window_push(sl, tokens[g]);
+        const pn_tool_grammar_hook *tgh = sl->sp.tool_grammar;
+        /* AUTO reasoning-budget force-close (per slot).  When a "</think>"
+         * close is queued (the budget tripped on a prior step) inject it
+         * WITHOUT sampling — advancing the grammar over it — so the KV/SSM
+         * steps over the close exactly as if the model had emitted it.
+         * Otherwise sample normally, then account the token toward the
+         * budget (arming the injection when it trips).  Slots with no budget
+         * are byte-identical: driver_reason_step returns `sampled` untouched
+         * (reason_in_think stays false). */
+        bool injected = false;
+        uint32_t next;
+        /* PN_GRAMMAR_ARM_STALE falsifier only: the walk's mask-active value
+         * BEFORE this step's advance — the stale reading the window exists
+         * to avoid.  Not read on the shipping path. */
+        int active_before = (bs_grammar_arm_stale_on() && tgh &&
+                             tgh->refresh && tgh->st)
+                                ? tgh->refresh(tgh->st) : 0;
+        if (sl->reason_close_i < sl->reason_close_n) {
+            next = driver_reason_step(sched, sl, 0, tgh, &injected);
+            ht = pn_ht_lap(PN_HT_REASON, ht);
+        } else {
+            const int dumped = pn_hrd_enabled() && pn_hrd_begin(lo[g], sched->n_vocab, &sl->sp, sl->recent,
+                                            sl->n_recent,
+                                            tgh && tgh->refresh && tgh->st
+                                                ? tgh->refresh(tgh->st) : 0);
+            ht = dumped ? pn_ht_now() : ht;   /* the copy is not sampler time */
+            next = pn_sample_next_token(lo[g], sched->n_vocab,
+                                        &sl->sp, sl->recent,
+                                        sl->n_recent);
+            ht = pn_ht_lap(PN_HT_SAMPLE, ht);
+            if (dumped)
+                pn_hrd_end(next);
+            next = driver_reason_step(sched, sl, next, tgh, &injected);
+            ht = pn_ht_lap(PN_HT_REASON, ht);
+        }
+        /* Every mutation this step can make to the grammar walk has now
+         * happened (the sampler advanced over a drawn token; the force-close
+         * advanced over an injected one).  Arm the next step's row from the
+         * walk as it now stands — the driver issues that step itself, still
+         * holding mu, so this write provably precedes the read. */
+        driver_arm_full_logits(sched, sl, active_before);
+        ht = pn_ht_lap(PN_HT_ARM, ht);
+        int emitted = driver_emit_token(sched, sl, next);
+        if (emitted < 0) {
+            /* Cannot happen (ring_cap == bind budget); defensive. */
+            driver_error_slot(sched, sl);
+            pn_ht_bind(NULL);
+            continue;
+        }
+#ifdef USE_CUDA
+        if (emitted == 0 && snap_n == 1 && sl->mtp_on && !sl->pd_stepped && tgh &&
+            bs_spec_shadow_on())
+            bs_spec_shadow_step(sched, sl);
+#endif
+        pthread_cond_signal(&sl->cv);
+        ht = pn_ht_lap(PN_HT_EMIT, ht);
+        driver_ht_deposited(sl, ht);
+        pn_ht_bind(NULL);
+    }
+    sched->driver_steps++;
 }
 
 static void *driver_thread(void *arg)
@@ -609,11 +890,13 @@ static void *driver_thread(void *arg)
     pthread_mutex_lock(&sched->mu);
     for (;;) {
         /* ── Wait for the gate (predicate re-checked under mu). ── */
+        const uint64_t ht_gate0 = pn_ht_now();
         while (!sched->shutdown && !gate_ok(sched))
             pthread_cond_wait(&sched->cv_work, &sched->mu);
         if (sched->shutdown)
             break;
         double t_gate = stats ? bs_now_ms() : 0.0;
+        const uint64_t ht_acq0 = pn_ht_now();
 
         /* ── Take the GPU turn — FIFO behind any prefiller already queued
          *    (initial join or L2 chunk re-acquire), so the driver can never
@@ -621,6 +904,7 @@ static void *driver_thread(void *arg)
          *    free-running L3 step loop.  cv_gpu waits release mu, so owners
          *    keep posting/releasing meanwhile. ── */
         bs_gpu_acquire_locked(sched);
+        const uint64_t ht_acq1 = pn_ht_now();
 
         /* Re-check the gate: it may have closed while we waited for the
          * turn (a release, an error).  Back off by releasing the turn. */
@@ -632,66 +916,39 @@ static void *driver_thread(void *arg)
             continue;
         }
 
-        /* ── Rebuild the compacted GPU map if the active set changed (a
-         *    user joined, left, or finished since the last step).  GPU turn
-         *    owned + mu held.  On failure, error out all active slots. ── */
-        if (sched->active_set_changed) {
-            int rn = rebuild_gpu_map(sched);
-            if (rn < 0) {
-                /* Hard GPU failure: error every active slot (BOUND included
-                 * — its owner is parked in await_first/pop_token) so owners
-                 * unblock and release; a later joiner triggers a fresh
-                 * rebuild attempt. */
-                for (int i = 0; i < sched->cap; i++) {
-                    bs_slot *sl = &sched->slots[i];
-                    if (sl->status == BS_SLOT_DECODE ||
-                        sl->status == BS_SLOT_BOUND)
-                        driver_error_slot(sched, sl);
-                }
-                bs_gpu_release_locked(sched);
-                continue;
-            }
-            n_active = rn;
-        }
-
-        /* ── Snapshot the compacted step (mu held, turn owned).
-         *    Build tokens[]/states[] over GPU indices [0, n_active). ── */
-        int snap_n = 0;
-        for (int g = 0; g < sched->n_active_gpu; g++) {
-            int i = sched->gpu_map[g];
-            if (i < 0 || i >= sched->cap)
-                continue;             /* stale map entry (should not happen) */
-            bs_slot *sl = &sched->slots[i];
-            states[snap_n] = sl->state;
-            if (sl->status == BS_SLOT_BOUND && !sl->finished) {
-                sl->status      = BS_SLOT_DECODE;   /* first step */
-                sl->token_ready = false;
-                tokens[snap_n] = sl->next_token;
-            } else if (sl->status == BS_SLOT_DECODE && !sl->finished) {
-                sl->token_ready = false;
-                tokens[snap_n] = sl->next_token;
-            } else {
-                /* Slot went IDLE/finished between gate_ok and the snapshot
-                 * (owner released it); skip by not advancing snap_n. */
-                continue;
-            }
-            gpu_map_snap[snap_n] = i;
-            snap_n++;
-        }
+        int snap_n = driver_snapshot_locked(sched, tokens, states, gpu_map_snap);
         /* snap_n may be < n_active if a release raced us; that's fine. */
+        for (int k = 0; k < snap_n; k++)
+            driver_note_step_width(&sched->slots[gpu_map_snap[k]], snap_n);
         if (snap_n == 0) {
             /* Nothing left to step (all active slots were released). */
             bs_gpu_release_locked(sched);
             continue;
         }
 
+#ifdef USE_CUDA
+        /* Slots an overlap cycle stepped are the driver's again (pd_stepped). */
+        for (int k = 0; k < snap_n; k++)
+            sched->slots[gpu_map_snap[k]].pd_stepped = false;
+        /* ── Solo slot on an MTP model: one exact MTP cycle instead of a
+         *    one-token step (batch_sched_spec.h). ── */
+        if (snap_n == 1 && driver_spec_step(sched, gpu_map_snap[0], tokens[0])) {
+            sched->driver_steps++;
+            bs_gpu_release_locked(sched);
+            continue;
+        }
+#endif
         /* ── GPU step: turn owned (no prefill can overlap), mu dropped
          *    (owners keep draining rings / releasing meanwhile). ── */
         pthread_mutex_unlock(&sched->mu);
-        double t_launch = stats ? bs_now_ms() : 0.0;
+        double t_launch = bs_now_ms();
+        const uint64_t ht_launch = pn_ht_now();
+        const uint64_t ht_cpu0 = pn_ht_on() ? pn_ht_thread_cpu() : 0;
         memset(lo, 0, sizeof(lo));
-        int rc = pn_qwen35moe_decode_slots(sched->model, tokens, states,
-                                           snap_n, lo);
+        int rc = bs_slots_step(sched, tokens, states, gpu_map_snap, snap_n, lo);
+        const double plain_ms = bs_now_ms() - t_launch;
+        const uint64_t ht_stepped = pn_ht_now();
+        const uint64_t ht_cpu1 = pn_ht_on() ? pn_ht_thread_cpu() : 0;
         /* Phase 0: split the step into the GPU forward and the host-side
          * per-slot deposit+sampling that follows it, so `samp_ms` can be read
          * against K directly (the per-slot sampler is sequential, so it is
@@ -699,123 +956,18 @@ static void *driver_thread(void *arg)
          * lock wait is not charged to either. */
         double t_dec = stats ? bs_now_ms() : 0.0;
         pthread_mutex_lock(&sched->mu);
+        if (pn_ht_on())
+            driver_ht_step(sched, gpu_map_snap, snap_n, ht_gate0, ht_acq0, ht_acq1, ht_launch,
+                           ht_stepped, ht_cpu1 - ht_cpu0);
 
         if (rc != 0)
             fprintf(stderr, "[batch_sched] decode_slots failed (n=%d); "
                     "erroring out active slots\n", snap_n);
 
-        /* ── Deposit and wake each owner.  Use gpu_map_snap to reverse the
-         *    GPU-index → sched-slot mapping.  A slot released mid-step is
-         *    no longer DECODE and is skipped.
-         *
-         *    L3 (driver_sample): append the just-stepped token to the
-         *    slot's repeat window, sample the next token from its
-         *    (host-side, sparse top-k) logits — sequentially per slot, the
-         *    documented deterministic order — push it to the output ring
-         *    and re-arm token_ready, so the next step needs NOTHING from
-         *    the owners.  EOS/<|im_end|>/budget ends the slot's stepping
-         *    (finished; the owner drains and releases).
-         *
-         *    Legacy: deposit the logits pointer; the owner samples. ── */
-        for (int g = 0; g < snap_n; g++) {
-            int i = gpu_map_snap[g];
-            bs_slot *sl = &sched->slots[i];
-            if (sl->status != BS_SLOT_DECODE)
-                continue;
-            if (rc != 0) {
-                driver_error_slot(sched, sl);
-                continue;
-            }
-            /* PC-batched: tokens[g] was just stepped INTO sl->state (pos
-             * advanced by 1).  If this slot is armed for caching, append it to
-             * the committed-token log so ct_n == state->pos stays invariant.
-             * ct is pre-sized to prompt + budget at bind, so this never
-             * overflows; on the impossible overflow, disarm (finalize will
-             * then no-op → this session re-full-prefills next turn). */
-            if (sl->armed_sid[0]) {
-                if (sl->ct && sl->ct_n < sl->ct_cap)
-                    sl->ct[sl->ct_n++] = tokens[g];
-                else
-                    sl->armed_sid[0] = '\0';
-            }
-            if (!sched->driver_sample) {
-                sl->logits       = lo[g];
-                sl->logits_ready = true;
-                pthread_cond_signal(&sl->cv);
-                continue;
-            }
-            /* L3 in-driver sampling. */
-            if (sl->max_recent > 0 && sl->recent) {
-                if (sl->n_recent < sl->max_recent) {
-                    sl->recent[sl->n_recent++] = tokens[g];
-                } else {
-                    memmove(sl->recent, sl->recent + 1,
-                            (size_t)(sl->max_recent - 1) * sizeof(uint32_t));
-                    sl->recent[sl->max_recent - 1] = tokens[g];
-                }
-            }
-            const pn_tool_grammar_hook *tgh = sl->sp.tool_grammar;
-            /* AUTO reasoning-budget force-close (per slot).  When a "</think>"
-             * close is queued (the budget tripped on a prior step) inject it
-             * WITHOUT sampling — advancing the grammar over it — so the KV/SSM
-             * steps over the close exactly as if the model had emitted it.
-             * Otherwise sample normally, then account the token toward the
-             * budget (arming the injection when it trips).  Slots with no budget
-             * are byte-identical: driver_reason_step returns `sampled` untouched
-             * (reason_in_think stays false). */
-            bool injected = false;
-            uint32_t next;
-            /* PN_GRAMMAR_ARM_STALE falsifier only: the walk's mask-active value
-             * BEFORE this step's advance — the stale reading the window exists
-             * to avoid.  Not read on the shipping path. */
-            int active_before = (bs_grammar_arm_stale_on() && tgh &&
-                                 tgh->refresh && tgh->st)
-                                    ? tgh->refresh(tgh->st) : 0;
-            if (sl->reason_close_i < sl->reason_close_n) {
-                next = driver_reason_step(sl, 0, tgh, &injected);
-            } else {
-                next = pn_sample_next_token(lo[g], sched->n_vocab,
-                                            &sl->sp, sl->recent,
-                                            sl->n_recent);
-                next = driver_reason_step(sl, next, tgh, &injected);
-            }
-            /* Every mutation this step can make to the grammar walk has now
-             * happened (the sampler advanced over a drawn token; the force-close
-             * advanced over an injected one).  Arm the next step's row from the
-             * walk as it now stands — the driver issues that step itself, still
-             * holding mu, so this write provably precedes the read. */
-            driver_arm_full_logits(sched, sl, active_before);
-            if (!sl->ring || sl->ring_w >= sl->ring_cap) {
-                /* Cannot happen (ring_cap == bind budget); defensive. */
-                driver_error_slot(sched, sl);
-                continue;
-            }
-            sl->ring[sl->ring_w++] = next;
-            sl->budget--;
-            /* Grammar completion-stop (batched): the sampler (or the injection
-             * above) just advanced this slot's grammar by `next`; if that closed
-             * a whole tool call, finish the slot NOW so a forced call terminates
-             * right after "</function>"/"</tool_call>" instead of running to
-             * budget (the batched twin of the single-user break-on-complete).
-             * No-op when the slot carries no grammar hook. */
-            bool grammar_done = (tgh && tgh->complete && tgh->st &&
-                                 tgh->complete(tgh->st));
-            /* Record the OUTCOME of a force-closed turn while the grammar hook
-             * is still live and held under mu: bs_slot_release reports it, and
-             * by then the request may have freed the hook. */
-            if (grammar_done && sl->reason_forced)
-                sl->reason_forced_call = true;
-            if ((int)next == sched->eos_id ||
-                (int)next == sched->im_end_id || sl->budget <= 0 ||
-                grammar_done) {
-                sl->finished = true;
-                sched->active_set_changed = true;
-            } else {
-                sl->next_token  = next;
-                sl->token_ready = true;
-            }
-            pthread_cond_signal(&sl->cv);
-        }
+        driver_deposit_locked(sched, tokens, gpu_map_snap, snap_n, lo, rc, plain_ms);
+        if (rc == 0)   /* what an overlap cycle of this width is held to */
+            bs_pd_budget_note_plain(&sched->pd_budget, snap_n, bs_now_ms() - t_launch);
+        const uint64_t ht_rel0 = pn_ht_now();
         bs_gpu_release_locked(sched);
 
         if (stats) {
@@ -829,6 +981,8 @@ static void *driver_thread(void *arg)
                     t_dec - t_launch, t_done - t_dec);
             t_prev_done = t_done;
         }
+        if (ht_rel0)
+            driver_ht_charge(sched, gpu_map_snap, snap_n, PN_HT_RELEASE, pn_ht_now() - ht_rel0);
     }
 
     /* Shutdown: wake every parked owner (their wait predicate checks
@@ -840,34 +994,96 @@ static void *driver_thread(void *arg)
 }
 
 /* ============================================================
- * Lazy GPU lane registration
+ * Session blocks — carved and registered at load
  *
- * Called from bs_slot_bind with the GPU turn owned (so no other prefill,
- * bind or decode step can interleave — the double-entry race that wedged the
- * K80 is structurally impossible: the second binder queues on the turnstile
- * for its whole prefill and sees slots_gpu_init == true).  Registers every lane's
- * pn_state* with the GPU (allocates the slot-major conv/ssm buffers once and
- * seeds each lane) so decode_slots finds a valid slot_state[i] for every i.
- *
- * Fail-soft: a bind error propagates -1 immediately; nothing waits on it.
+ * Every lane gets its own persistent block on the card (GPU row i: a ctx_cap
+ * KV ring row per attention layer + an SSM image per SSM layer) for the
+ * scheduler's whole life. Carving at load is what makes "it does not fit" a
+ * load-time refusal instead of a request-time failure, and binding each lane
+ * once registers its pn_state with its row so a step can run any subset of
+ * rows. Runs before the driver thread exists, so nothing can interleave.
+ * The llama family keeps its sessions in host KV instead (no card block;
+ * batch_sched_slots.h), and its fit was checked before the states existed.
  * ============================================================ */
-static int bs_lazy_init_gpu(pn_batch_sched *sched)
+static int bs_carve_session_blocks(pn_batch_sched *sched)
 {
-    /* Bind cap+1 engine slots: the extra top index is the rebuild_gpu_map
-     * cycle-break scratch (users occupy [0, cap); decode never steps it). */
+    if (bs_slots_carve(sched) != 0) {
+        fprintf(stderr, "[batch_sched] FATAL: cannot carve %d session blocks "
+                "for '%s' %s - lower --max-sessions or --ctx-cap\n", sched->cap,
+                sched->model_name[0] ? sched->model_name : "?",
+                sched->slot_store == BS_SLOT_STORE_HOST_KV
+                    ? "(host KV + logits row per session)"
+                    : "on its dies (KV ring row at ctx_cap + SSM image per "
+                      "session)");
+        return -1;
+    }
     for (int i = 0; i < sched->cap; i++) {
-        if (pn_qwen35moe_decode_slot_bind(sched->model,
-                                          sched->slots[i].state,
-                                          i, sched->cap + 1) != 0) {
-            fprintf(stderr, "[batch_sched] lazy gpu init: bind failed "
-                    "(slot=%d cap=%d)\n", i, sched->cap);
+        if (bs_slots_bind(sched, sched->slots[i].state, i) != 0) {
+            fprintf(stderr, "[batch_sched] FATAL: registering session block "
+                    "%d of %d failed\n", i, sched->cap);
             return -1;
         }
     }
-    pthread_mutex_lock(&sched->mu);
-    sched->slots_gpu_init = true;      /* driver reads this under mu */
-    pthread_mutex_unlock(&sched->mu);
+    sched->slots_gpu_init = true;
+    fprintf(stderr, "[batch_sched] carved %d session blocks for '%s'\n",
+            sched->cap, sched->model_name[0] ? sched->model_name : "?");
     return 0;
+}
+
+/* ============================================================
+ * QWEN35_BS_PD_OVERLAP — the decode half of a prefill overlap cycle
+ *
+ * While a prefiller holds the GPU turn it runs, between its prefill pieces,
+ * the very step the driver would have run next: the same snapshot
+ * (driver_snapshot_locked), the same deposit and in-driver sampling
+ * (driver_deposit_locked), so each slot's tokens are exactly the driver's.
+ * The driver itself stays parked on its turnstile ticket meanwhile, and
+ * re-reads the active set when it next gets the turn.
+ * ============================================================ */
+
+int bs_pd_cycle(pn_batch_sched *sched, void *cursor)
+{
+    uint32_t  tokens[BS_MAX_SLOTS];
+    pn_state *states[BS_MAX_SLOTS];
+    float    *lo[BS_MAX_SLOTS];
+    int       gpu_map_snap[BS_MAX_SLOTS];
+
+    pthread_mutex_lock(&sched->mu);
+    int snap_n = gate_ok(sched) ? driver_snapshot_locked(sched, tokens, states, gpu_map_snap)
+                                : 0;
+    if (snap_n == 0) {
+        pthread_mutex_unlock(&sched->mu);
+        return 1;
+    }
+    for (int k = 0; k < snap_n; k++) {
+        sched->slots[gpu_map_snap[k]].pd_stepped = true;
+        driver_note_step_width(&sched->slots[gpu_map_snap[k]], snap_n);
+    }
+    const int pieces = sched->pd_budget.pieces;
+    pthread_mutex_unlock(&sched->mu);
+
+    const double t_launch = bs_now_ms();
+    memset(lo, 0, sizeof(lo));
+    int rc = bs_slots_pd_cycle(sched, cursor, tokens, states, gpu_map_snap, snap_n, lo,
+                               pieces);
+    const double step_ms = bs_now_ms() - t_launch;
+
+    pthread_mutex_lock(&sched->mu);
+    if (rc != 0)
+        fprintf(stderr, "[batch_sched] overlap cycle failed (n=%d); erroring out active "
+                "slots\n", snap_n);
+    driver_deposit_locked(sched, tokens, gpu_map_snap, snap_n, lo, rc, step_ms);
+    const double cycle_ms = bs_now_ms() - t_launch;
+    if (bs_stats_on()) {
+        double ph[PN_QWEN35MOE_PD_PHASES];
+        bs_slots_pd_phase_ms(cursor, ph);
+        fprintf(stderr, "[bs] pd n=%d cycle_ms=%.1f plain_ms=%.1f pieces=%d "
+                "ph=%.1f/%.1f/%.1f/%.1f/%.1f/%.1f/%.1f\n", snap_n, cycle_ms,
+                snap_n <= BS_PD_MAX_WIDTH ? sched->pd_budget.plain_ms[snap_n] : 0.0,
+                pieces, ph[0], ph[1], ph[2], ph[3], ph[4], ph[5], ph[6]);
+    }
+    pthread_mutex_unlock(&sched->mu);
+    return rc ? -1 : 0;
 }
 #endif /* USE_CUDA — driver_thread and helpers */
 
@@ -882,20 +1098,27 @@ pn_batch_sched *bs_create(pn_model *model, int cap, const char *model_name)
     return NULL;   /* batch decode requires USE_CUDA */
 #else
     if (!model || cap <= 0 || cap > BS_MAX_USERS)
-        return NULL;   /* BS_MAX_SLOTS reserves the top index as scratch */
+        return NULL;
+    if (!bs_slots_supported(model)) {
+        fprintf(stderr, "[batch_sched] '%s': this architecture has no batched "
+                "session storage\n", model_name && model_name[0] ? model_name
+                                                            : "?");
+        return NULL;
+    }
 
     /* Clamp to the memory-pressure concurrency ceiling up front so the
-     * per-bind ladder guard can never refuse the lazy init later (which
-     * would have turned every request into a 500).  We bind cap+1 engine
-     * slots (the extra one is the rebuild scratch), so leave room for it
-     * under the ceiling: cap ≤ ceiling-1. */
+     * per-bind ladder guard can never refuse a bind later (which would turn
+     * every request into a 500). One block per slot, no scratch row. */
     int ceiling = pn_qwen35moe_gpu_ladder_max_slots();
-    if (ceiling > 1 && cap > ceiling - 1) {
+    if (cap > ceiling) {
         fprintf(stderr, "[batch_sched] capping slots %d -> %d "
-                "(memory-pressure ladder ceiling %d, incl. 1 scratch)\n",
-                cap, ceiling - 1, ceiling);
-        cap = ceiling - 1;
+                "(memory-pressure ladder ceiling)\n", cap, ceiling);
+        cap = ceiling;
     }
+    /* A HOST_KV session is an eager host allocation (pn_state_new below):
+     * refuse a set that does not fit BEFORE allocating it. */
+    if (bs_slots_precheck(model, cap, model_name) != 0)
+        return NULL;
 
     pn_batch_sched *sched = calloc(1, sizeof(*sched));
     /* Stamp the log name BEFORE the driver thread starts, so a force-close
@@ -907,10 +1130,12 @@ pn_batch_sched *bs_create(pn_model *model, int cap, const char *model_name)
 
     sched->model = model;
     sched->cap   = cap;
+    sched->slot_store = bs_slot_store_for(model);
 
     /* GPU turnstile: ticket 0 is the first served. */
     sched->gpu_ticket_next    = 0;
     sched->gpu_ticket_serving = 0;
+    bs_pd_budget_init(&sched->pd_budget, bs_pd_pieces_parse(getenv("QWEN35_BS_PD_PIECES")));
 
     /* L3 — in-driver sampling (default ON; QWEN35_BS_DRIVER_SAMPLE=0
      * restores the legacy owner-side lockstep). */
@@ -919,6 +1144,10 @@ pn_batch_sched *bs_create(pn_model *model, int cap, const char *model_name)
         sched->driver_sample = !(env && env[0] == '0');
     }
     sched->n_vocab   = model->config.n_vocab;
+    sched->mtp       = sg_mtp_cuda_available(model);
+    if (sched->mtp)
+        fprintf(stderr, "[batch_sched] MTP head loaded: a solo decoding slot speculates "
+                "(exact; PN_MTP_SERVE_SPEC=0 off)\n");
     sched->eos_id    = model->tokenizer ? ft_eos_id(model->tokenizer) : -1;
     sched->im_end_id = model->tokenizer
                            ? ft_token_to_id(model->tokenizer, "<|im_end|>")
@@ -975,15 +1204,27 @@ pn_batch_sched *bs_create(pn_model *model, int cap, const char *model_name)
         }
     }
 
-    /* GPU lane registration is LAZY: no GPU work here.  Binding all lanes
-     * (cuMemAlloc for the slot-major buffers) immediately after the model
-     * upload hangs on K80 because the CUDA context has not settled after a
-     * multi-minute weight upload.  Deferred to the first bs_slot_bind. */
-    sched->slots_gpu_init     = false;
     sched->n_active_gpu       = 0;
     sched->active_set_changed = false;
     for (int i = 0; i < BS_MAX_SLOTS; i++)
         sched->gpu_map[i] = -1;
+
+    /* Carve every session's block on the card NOW, at load: a model whose
+     * max_sessions blocks do not fit is refused here, loudly, rather than
+     * failing a request later. */
+    if (bs_carve_session_blocks(sched) != 0) {
+        bs_slots_free(sched);
+        for (int i = 0; i < cap; i++) {
+            pn_state_free(sched->slots[i].state);
+            pthread_cond_destroy(&sched->slots[i].cv);
+        }
+        pthread_cond_destroy(&sched->cv_idle);
+        pthread_cond_destroy(&sched->cv_work);
+        pthread_mutex_destroy(&sched->mu);
+        pthread_cond_destroy(&sched->cv_gpu);
+        free(sched);
+        return NULL;
+    }
 
     /* D1: per-model overflow queue.  Read queue depth from env. */
     sched->n_queued   = 0;
@@ -1003,6 +1244,7 @@ pn_batch_sched *bs_create(pn_model *model, int cap, const char *model_name)
     sched->shutdown = false;
     if (pthread_create(&sched->driver, NULL, driver_thread, sched) != 0) {
         sched->driver_running = false;
+        bs_slots_free(sched);
         for (int i = 0; i < cap; i++) {
             pn_state_free(sched->slots[i].state);
             pthread_cond_destroy(&sched->slots[i].cv);
@@ -1061,9 +1303,18 @@ void bs_destroy(pn_batch_sched *sched)
         free(sched->slots[i].pend_vis);
         free(sched->slots[i].pend_vis_think);
         free(sched->slots[i].ct);     /* PC-batched committed-token log */
-        bs_sys_snap_unref(&sched->slots[i]);
+        bs_turn_ckpt_free(&sched->slots[i].ckpt);
+        bs_turn_ckpt_free(&sched->slots[i].partial);
+        bs_turn_ckpt_free(&sched->slots[i].divck);
+#ifdef USE_CUDA
+        sg_mtp_cuda_end(&sched->slots[i].mtp);
+#endif
+        bs_sys_snap_unref(sched, &sched->slots[i]);
         free(sched->slots[i].sys_tokens);   /* SYS1-batched boundary snapshot */
     }
+#ifdef USE_CUDA
+    bs_slots_free(sched);
+#endif
     pthread_cond_destroy(&sched->cv_idle);
     pthread_cond_destroy(&sched->cv_work);
     pthread_mutex_destroy(&sched->mu);
@@ -1092,56 +1343,72 @@ static void bs_slot_mark_prefill(bs_slot *sl)
     sl->gpu_idx      = -1;   /* no GPU decode state until bind */
 }
 
-/* Claim one IDLE slot (already under mu) and mark it PREFILL.  With a
- * non-empty `sid`, preference order (cheapest resume first):
+/* The least recently active IDLE slot of `sid`'s family, or -1: the
+ * conversation the user touched last keeps its warm KV.  Under mu. */
+static int family_lru_idle(const pn_batch_sched *sched, const char *sid)
+{
+    int lru = -1;
+
+    for (int i = 0; i < sched->cap; i++) {
+        const bs_slot *sl = &sched->slots[i];
+        const char *owner = bs_slot_session_owner(sl);
+        if (sl->status == BS_SLOT_IDLE && owner &&
+            pn_session_same_family(owner, sid) &&
+            (lru < 0 || sl->last_active_ms < sched->slots[lru].last_active_ms))
+            lru = i;
+    }
+    return lru;
+}
+
+/* Claim one IDLE slot (already under mu), mark it PREFILL and record `sid` as
+ * the session it runs for.  Preference order (cheapest resume first):
  *   1. THIS session's warm IDLE slot (committed history → append delta);
  *   2. the IDLE slot holding THIS session's system-prefix snapshot
  *      (SYS1-batched: a divergent turn still resumes at the boundary —
  *      matters when the warm history was invalidated but the snapshot,
  *      which survives resets, was not);
- *   3. any free slot (this turn full-prefills).
- * Returns the slot index >= 0, or -1 if none free. */
+ *   3. an IDLE slot no session holds (this turn full-prefills) — for a
+ *      family that already holds a slot, only while that leaves a seat for
+ *      every family admission could still let in
+ *      (bs_family_may_take_extra_locked); otherwise it waits for its own;
+ *   4. the least recently active IDLE slot of THIS session's family (another
+ *      conversation of the same user gives way).
+ * Never a slot another family holds: its KV would be erased to seat this one
+ * (admission refuses instead — batch_sched_admission.h).  No `sid` takes only
+ * step 3.  Returns the slot index >= 0, or -1 if none fits. */
 static int try_claim_idle(pn_batch_sched *sched, const char *sid)
 {
-    if (sid && sid[0]) {
-        for (int i = 0; i < sched->cap; i++) {
-            bs_slot *sl = &sched->slots[i];
-            if (sl->status == BS_SLOT_IDLE && sl->sid[0] &&
-                strncmp(sl->sid, sid, sizeof(sl->sid)) == 0) {
-                bs_slot_mark_prefill(sl);
-                return i;
-            }
-        }
-        for (int i = 0; i < sched->cap; i++) {
-            bs_slot *sl = &sched->slots[i];
-            if (sl->status == BS_SLOT_IDLE && sl->sys_sid[0] &&
-                strncmp(sl->sys_sid, sid, sizeof(sl->sys_sid)) == 0) {
-                bs_slot_mark_prefill(sl);
-                return i;
-            }
-        }
-    }
-    /* No slot holds anything for THIS session. Prefer one that holds nothing for
-     * ANYONE: taking the first idle slot evicts its warm history + system-prefix
-     * snapshot, and it always picks slot 0, so a second session (a tab's reflect
-     * pass, a second mode, a second tab) destroyed the first session's cache
-     * while the model still had idle cold slots. */
-    for (int i = 0; i < sched->cap; i++) {
+    int found = -1;
+    bool has_sid = sid && sid[0];
+
+    for (int i = 0; has_sid && found < 0 && i < sched->cap; i++) {
         bs_slot *sl = &sched->slots[i];
-        if (sl->status == BS_SLOT_IDLE && !sl->sid[0] && !sl->sys_sid[0]) {
-            bs_slot_mark_prefill(sl);
-            return i;
-        }
+        if (sl->status == BS_SLOT_IDLE && sl->sid[0] &&
+            strncmp(sl->sid, sid, sizeof(sl->sid)) == 0)
+            found = i;
     }
-    /* Every idle slot is warm for someone else — one of them has to lose. */
-    for (int i = 0; i < sched->cap; i++) {
+    for (int i = 0; has_sid && found < 0 && i < sched->cap; i++) {
         bs_slot *sl = &sched->slots[i];
-        if (sl->status == BS_SLOT_IDLE) {
-            bs_slot_mark_prefill(sl);
-            return i;
-        }
+        if (sl->status == BS_SLOT_IDLE && sl->sys_sid[0] &&
+            strncmp(sl->sys_sid, sid, sizeof(sl->sys_sid)) == 0)
+            found = i;
     }
-    return -1;
+    bool cold_ok = found >= 0 || !has_sid ||
+                   !bs_family_holds_slot_locked(sched, sid) ||
+                   bs_family_may_take_extra_locked(sched);
+    for (int i = 0; cold_ok && found < 0 && i < sched->cap; i++) {
+        bs_slot *sl = &sched->slots[i];
+        if (sl->status == BS_SLOT_IDLE && !bs_slot_session_owner(sl))
+            found = i;
+    }
+    if (has_sid && found < 0)
+        found = family_lru_idle(sched, sid);
+    if (found >= 0) {
+        bs_slot_mark_prefill(&sched->slots[found]);
+        snprintf(sched->slots[found].claim_sid,
+                 sizeof(sched->slots[found].claim_sid), "%s", has_sid ? sid : "");
+    }
+    return found;
 }
 
 int bs_slot_acquire(pn_batch_sched *sched)
@@ -1181,7 +1448,7 @@ static void bs_slot_reset_state(pn_batch_sched *sched, int idx)
      * Forget the bindings so the upcoming prefill re-seeds every GPU shadow
      * from the freshly-zeroed host mirror.  Safe under the GPU turn: no
      * forward can race this host-side bookkeeping. */
-    pn_qwen35moe_gpu_forget_state(sched->model, sched->slots[idx].state);
+    bs_slots_forget(sched, sched->slots[idx].state);
 #endif
     /* The warm state is gone — this slot no longer holds any session. */
     sched->slots[idx].sid[0] = '\0';
@@ -1189,6 +1456,9 @@ static void bs_slot_reset_state(pn_batch_sched *sched, int idx)
     bs_slot_clear_projections(&sched->slots[idx]);
     sched->slots[idx].ct_keep = 0;
     sched->slots[idx].ct_prompt_from = 0;
+    bs_turn_ckpt_forget(&sched->slots[idx].ckpt);
+    bs_turn_ckpt_forget(&sched->slots[idx].partial);
+    bs_turn_ckpt_forget(&sched->slots[idx].divck);
 }
 
 void bs_prefill_begin(pn_batch_sched *sched, int idx)
@@ -1221,8 +1491,7 @@ void bs_prefill_resume(pn_batch_sched *sched, int idx, const char *sid,
  * shares the qwen35moe dual-state machinery — same rule as prefix_cache.c.) */
 static int bs_sys_snapshot_supported(const pn_batch_sched *sched)
 {
-    return sched->model->config.arch == PN_ARCH_QWEN35MOE ||
-           sched->model->config.arch == PN_ARCH_BONSAI;
+    return pn_session_snapshot_supported(sched->model->config.arch);
 }
 
 /* Does this slot hold a boundary snapshot for EXACTLY this session + system
@@ -1242,7 +1511,7 @@ static int bs_sys_snap_matches(const bs_slot *sl, const char *sid,
  * projections, the boundary snapshot) change only under mu or while owned. ── */
 
 /* What an IDLE slot's cached state is worth to this prompt. */
-enum { BS_FIT_NONE, BS_FIT_SYS, BS_FIT_WARM };
+enum { BS_FIT_NONE, BS_FIT_SYS, BS_FIT_CKPT, BS_FIT_WARM };
 
 /* Is p[0..n) a strict prefix of tokens[0..n_ctx)? */
 static int bs_is_strict_prefix(const uint32_t *p, int n,
@@ -1263,6 +1532,9 @@ static int bs_slot_fit(const bs_slot *sl, const char *sid,
          bs_is_strict_prefix(sl->vis, sl->vis_n, tokens, n_ctx) ||
          bs_is_strict_prefix(sl->vis_think, sl->vis_think_n, tokens, n_ctx)))
         return BS_FIT_WARM;
+    if (bs_turn_ckpt_fits(&sl->partial, sid, tokens, n_ctx) ||
+        bs_turn_ckpt_fits(&sl->ckpt, sid, tokens, n_ctx))
+        return BS_FIT_CKPT;
     if (sys_len > 0 && sys_len < n_ctx &&
         bs_sys_snap_matches(sl, sid, tokens, sys_len))
         return BS_FIT_SYS;
@@ -1295,10 +1567,13 @@ static int bs_reroute_target_locked(const pn_batch_sched *sched, int idx,
     if (best_fit != BS_FIT_NONE || !bs_slot_holds_sid(&sched->slots[idx], sid))
         return best;
     /* A new conversation under this id: keep the other one's cache if a cold
-     * slot can take this one instead. */
+     * slot can take this one instead — and that slot is not a seat another
+     * family could still need (the family holds `idx` already). */
+    if (!bs_family_may_take_extra_locked(sched))
+        return idx;
     for (int i = 0; i < sched->cap; i++) {
         const bs_slot *sl = &sched->slots[i];
-        if (sl->status == BS_SLOT_IDLE && !sl->sid[0] && !sl->sys_sid[0])
+        if (sl->status == BS_SLOT_IDLE && !bs_slot_session_owner(sl))
             return i;
     }
     return idx;
@@ -1316,9 +1591,12 @@ int bs_slot_reroute(pn_batch_sched *sched, int idx, const char *sid,
     if (to != idx) {
         fit = bs_slot_fit(&sched->slots[to], sid, tokens, n_ctx, sys_len);
         bs_slot_mark_prefill(&sched->slots[to]);
+        memcpy(sched->slots[to].claim_sid, sched->slots[idx].claim_sid,
+               sizeof(sched->slots[to].claim_sid));
         /* Claimed but never touched (no GPU turn, no state, no bind): handing
          * it back is just the status flip; its warm fields stay as they were. */
         sched->slots[idx].status = BS_SLOT_IDLE;
+        sched->slots[idx].claim_sid[0] = '\0';
         pthread_cond_broadcast(&sched->cv_idle);
     }
     pthread_mutex_unlock(&sched->mu);
@@ -1334,14 +1612,14 @@ int bs_slot_reroute(pn_batch_sched *sched, int idx, const char *sid,
 /* Phase 10b: release a slot's reference on its boundary snapshot. A shared
  * snapshot (sys_snap_refs non-NULL) is freed only when the last sharer lets
  * go; a private one is freed immediately. */
-static void bs_sys_snap_unref(bs_slot *sl)
+static void bs_sys_snap_unref(const pn_batch_sched *sched, bs_slot *sl)
 {
     if (sl->sys_snap && sl->sys_snap_refs && --(*sl->sys_snap_refs) > 0) {
         sl->sys_snap = NULL;
         sl->sys_snap_refs = NULL;
         return;
     }
-    pn_qwen35moe_state_snapshot_free(sl->sys_snap);
+    pn_session_snapshot_free(sched->model->config.arch, sl->sys_snap);
     free(sl->sys_snap_refs);
     sl->sys_snap = NULL;
     sl->sys_snap_refs = NULL;
@@ -1351,7 +1629,7 @@ static void bs_sys_snap_unref(bs_slot *sl)
  * sys_sid is cleared under mu — the affinity scans read it. */
 static void bs_sys_snap_drop(pn_batch_sched *sched, bs_slot *sl)
 {
-    bs_sys_snap_unref(sl);
+    bs_sys_snap_unref(sched, sl);
     sl->sys_len = 0;
     pthread_mutex_lock(&sched->mu);
     sl->sys_sid[0] = '\0';
@@ -1371,11 +1649,12 @@ static int bs_sys_snap_restore(pn_batch_sched *sched, bs_slot *sl, int sys_len)
 {
     if (!bs_sys_snapshot_supported(sched))
         return -1;
-    if (pn_qwen35moe_state_restore(sl->state->kv_cache, sl->sys_snap) != 0)
+    if (pn_session_snapshot_restore(sched->model->config.arch,
+                                    sl->state->kv_cache, sl->sys_snap) != 0)
         return -1;
     sl->state->pos = sys_len;
 #ifdef USE_CUDA
-    pn_qwen35moe_gpu_forget_state(sched->model, sl->state);
+    bs_slots_forget(sched, sl->state);
 #endif
     return 0;
 }
@@ -1617,33 +1896,25 @@ bool bs_slot_session_conflict(const pn_batch_sched *sched, int idx)
     return sched->slots[idx].sid_conflict;
 }
 
-/* Is this slot's warm KV actually RE-USABLE, and not merely bookkept?
+/* Is this slot's warm state actually RE-USABLE, and not merely bookkept?
  *
- * Phase 10b (INV3) made the host KV mirror LAZY: between turns a session's rows
- * live in a GPU ring, not in host RAM, and bs_slot_finalize deliberately does not
- * materialize them (that is the per-session host footprint lazy mode removed).
- * A warm resume then forgets the GPU bindings and re-uploads from the host
- * mirror — which only works while a ring still holds the content.  When another
- * session's forward has taken the ring in between, nothing does, and the
- * resumed forward FAILS ITS STEP ("host mirror STALE and no GPU ring source"):
- * the turn returns with zero tokens generated.  Measured on the K80 test machine
- * 2026-08-02, four consecutive turns produced an EMPTY response this way.
- *
- * So the warm rungs must prove the rows are reachable before committing to
- * them.  Materializing the mirror here does that and makes the re-upload sound;
- * it is bounded by the session's own context (a few MiB over PCIe, once per
- * resumed turn) and it costs no host RAM the state had not already allocated.
- * A failure is not an error — it means another session won the ring, so the
- * caller falls through to a rung that re-prefills.
+ * A session's KV + SSM live in its own block on the card (GPU row = slot
+ * index, carved at load), never in host RAM between turns. The warm rungs
+ * resume from that block — the delta prefill re-seeds the shared buffers from
+ * it device to device — so they must prove the block still holds exactly
+ * this session's committed state (SSM image at pos, KV rows [0, pos)).
+ * Nothing in the normal flow can take the block away; this guards the
+ * edges (a reset, an aborted turn, eager mode's different bookkeeping), and
+ * a failure just means the caller falls through to a re-prefilling rung.
  *
  * GPU turn must be held. */
 static bool bs_warm_kv_reusable(pn_batch_sched *sched, bs_slot *sl)
 {
 #ifdef USE_CUDA
-    if (pn_qwen35moe_gpu_state_to_host(sched->model, sl->state) != 0) {
+    if (!bs_slots_live_resumable(sched, sl->state, sl->slot_idx)) {
         if (pn_reqprof_enabled())
-            fprintf(stderr, "[reqprof] warm resume refused slot=%d sid=%s: this "
-                    "session's KV rows are no longer in any GPU ring\n",
+            fprintf(stderr, "[reqprof] warm resume refused slot=%d sid=%s: "
+                    "the session block no longer holds this state\n",
                     sl->slot_idx, sl->sid);
         return false;
     }
@@ -1760,7 +2031,7 @@ static int bs_projection_resume(pn_batch_sched *sched, int idx,
      * claimed the shared SSM/KV buffers between this session's turns, so forget
      * the GPU bindings and let the delta prefill re-upload [0, hist_n) from the
      * warm host mirror finalize left authoritative. */
-    pn_qwen35moe_gpu_forget_state(sched->model, sl->state);
+    bs_slots_forget(sched, sl->state);
 #endif
     sl->ct_keep = sl->hist_n;
     sl->ct_prompt_from = hit->n;
@@ -1897,17 +2168,207 @@ void bs_slot_note_visible(pn_batch_sched *sched, int idx,
     }
 }
 
-void bs_prefill_resume_sys(pn_batch_sched *sched, int idx, const char *sid,
-                           const uint32_t *tokens, int n_ctx, int sys_len,
-                           int *delta_start, int *capture_sys)
+/* First index where p[0, n) and tokens[0, n_ctx) differ (min(n, n_ctx) when
+ * one is a prefix of the other). */
+static int bs_first_diff(const uint32_t *p, int n, const uint32_t *tokens,
+                         int n_ctx)
 {
-    if (delta_start)
-        *delta_start = 0;
-    if (capture_sys)
-        *capture_sys = 0;
+    int m = n < n_ctx ? n : n_ctx;
+    for (int i = 0; i < m; i++)
+        if (p[i] != tokens[i])
+            return i;
+    return m;
+}
+
+/* Why a request falls to the system-prefix rung, in one short phrase for the
+ * `sys-prefix reuse` line: where it left the slot's committed history for this
+ * session (a history edit, e.g. a client rewriting old messages), or that the
+ * slot held none of it. Cheap: one pass over at most hist_n tokens. */
+static void bs_reread_cause(const bs_slot *sl, const char *sid,
+                            const uint32_t *tokens, int n_ctx, char *out,
+                            size_t cap)
+{
+    bool own = sl->sid[0] && strncmp(sl->sid, sid, sizeof(sl->sid)) == 0;
+    if (own && sl->hist_n > 0)
+        snprintf(out, cap, "history diverged at %d of %d",
+                 bs_first_diff(sl->hist, sl->hist_n, tokens, n_ctx),
+                 sl->hist_n);
+    else if (sl->ckpt.valid &&
+             strncmp(sl->ckpt.sid, sid, sizeof(sl->ckpt.sid)) == 0)
+        snprintf(out, cap, "checkpoint diverged at %d of %d",
+                 bs_first_diff(sl->ckpt.client, sl->ckpt.client_n, tokens,
+                               n_ctx), sl->ckpt.client_n);
+    else
+        snprintf(out, cap, "slot held no history of this session");
+}
+
+/* Rung 1, append resume: THIS slot's warm state belongs to `sid`, its
+ * committed history is an exact prefix of the new context, and the state sits
+ * exactly at that history's end (pos == hist_n).  The agentic append case:
+ * prefill only [hist_n, n_ctx).  hist_n < n_ctx is strict so at least one delta
+ * token remains to recover the next-token logits (the degenerate full-hit never
+ * happens in a real chat turn — an assistant opener is always appended — and
+ * falls through to a full reset).  1 resumed (*delta set), 0 not applicable. */
+static int bs_exact_append_resume(pn_batch_sched *sched, int idx,
+                                  const char *sid, const uint32_t *tokens,
+                                  int n_ctx, int *delta)
+{
+    bs_slot *sl = &sched->slots[idx];
+    if (!(sid && sid[0] && sl->sid[0] &&
+          strncmp(sl->sid, sid, sizeof(sl->sid)) == 0 &&
+          sl->hist_n > 0 && sl->hist_n < n_ctx &&
+          (int)sl->state->pos == sl->hist_n &&
+          memcmp(sl->hist, tokens,
+                 (size_t)sl->hist_n * sizeof(uint32_t)) == 0 &&
+          bs_warm_kv_reusable(sched, sl)))
+        return 0;
+    *delta = sl->hist_n;   /* warm: resume, do NOT reset */
+#ifdef USE_CUDA
+    /* Force every GPU shadow of this warm state to re-seed from its HOST
+     * mirror on the delta-prefill forward.  Between this session's turns
+     * another session's forward may have claimed the shared SSM buffers /
+     * the shared KV ring, and this state's own live decode advanced its
+     * per-slot buffers (not the shared ones the prefill forward re-seeds).
+     * finalize left the host mirror authoritative at pos==hist_n; forgetting
+     * the GPU bindings (host-bookkeeping only — the host mirror is NOT
+     * touched) makes the resumed forward re-upload [0,hist_n) SSM + KV from
+     * that warm mirror, then continue the delta.  Safe under the GPU turn
+     * just acquired. */
+    bs_slots_forget(sched, sl->state);
+#endif
+    return 1;
+}
+
+/* The warm rungs (1 to 1d) that `think_history` allows, in ladder order.
+ * Returns the rung that resumed (*delta set), or PN_RESUME_COLD when none did
+ * and the caller falls to the system prefix. */
+static pn_resume_kind bs_resume_warm_rung(pn_batch_sched *sched, int idx,
+                                          const char *sid,
+                                          const uint32_t *tokens, int n_ctx,
+                                          pn_think_history think_history,
+                                          int *delta)
+{
+    /* as_sent: the KV must be the request as rendered; every warm rung can
+     * leave think blocks in it that the request does not carry. */
+    if (think_history == PN_THINK_HISTORY_AS_SENT)
+        return PN_RESUME_COLD;
+    /* drop_last: the request is the last turn's start plus that turn's
+     * content without its think block; resume at the turn checkpoint when its
+     * KV is exactly the request's prefix, else fall to the system prefix. */
+    if (think_history == PN_THINK_HISTORY_DROP_LAST)
+        return bs_turn_ckpt_resume_exact(sched, idx, sid, tokens, n_ctx, delta)
+                   ? PN_RESUME_TURN_CKPT : PN_RESUME_COLD;
+    if (bs_exact_append_resume(sched, idx, sid, tokens, n_ctx, delta))
+        return PN_RESUME_EXACT;
+    /* 1b. Projection append resume — the client's re-render of the history
+     *     differs from the committed KV only in the think blocks, either
+     *     because it dropped them or because it sent the reasoning back as
+     *     text.  See bs_projection_resume. */
+    if (bs_projection_resume(sched, idx, sid, tokens, n_ctx, delta))
+        return PN_RESUME_PROJECTION;
+    /* 1c, aborted prefill: the client hung up mid-prefill and resent (or
+     * extended) the request; the slot kept what was already computed. */
+    if (bs_partial_prefill_resume(sched, idx, sid, tokens, n_ctx, delta))
+        return PN_RESUME_PARTIAL;
+    /* 1c. Turn-start checkpoint — the client dropped or rewrote the last
+     *     turn's reply (a reasoning-only turn, an interrupt, an aborted
+     *     prefill), but everything before it is unchanged.  See
+     *     batch_sched_turn_checkpoint.h. */
+    if (bs_turn_ckpt_resume(sched, idx, sid, tokens, n_ctx, delta))
+        return PN_RESUME_TURN_CKPT;
+    /* 1d. Divergence checkpoint — the client rewrote history after a head it
+     *     keeps (a context compaction); resume where the previous rewrite left
+     *     the history.  See batch_sched_turn_checkpoint.h. */
+    if (bs_div_ckpt_resume(sched, idx, sid, tokens, n_ctx, delta))
+        return PN_RESUME_DIV_CKPT;
+    return PN_RESUME_COLD;
+}
+
+/* Rungs 2 and 3, after every allowed warm rung missed.
+ *
+ * 2. System-prefix resume: divergent history but this slot holds THIS
+ *    session's boundary snapshot over these exact system tokens (the
+ *    reasoning-model turn).  Restore it and prefill only the conversation.
+ *    The stale committed history is dropped — bs_slot_finalize rebuilds it at
+ *    end of turn.
+ * 3. Fresh/diverged with no usable snapshot: full reset + prefill.
+ *
+ * Returns PN_RESUME_SYS_PREFIX or PN_RESUME_COLD and sets *delta. */
+static pn_resume_kind bs_resume_sys_or_cold(pn_batch_sched *sched, int idx,
+                                            const char *sid,
+                                            const uint32_t *tokens, int n_ctx,
+                                            int sys_len, int sys_ok, int *delta)
+{
+    bs_slot *sl = &sched->slots[idx];
+    /* Before the fallbacks mutate this slot, decide whether the miss is an
+     * ordinary history divergence or a second conversation wearing this
+     * session's id — and say so out loud. */
+    bs_note_session_substitution(sched, idx, sid, tokens, n_ctx, sys_len);
+    bs_log_append_resume_miss(sched->model, idx, sid, sl, tokens, n_ctx);
+    if (sys_ok && bs_sys_snap_matches(sl, sid, tokens, sys_len)) {
+        /* Where the conversation left what this slot holds (for the re-read
+         * census; read before the history is dropped). */
+        char why[96];
+        bs_reread_cause(sl, sid, tokens, n_ctx, why, sizeof(why));
+        if (bs_sys_snap_restore(sched, sl, sys_len) == 0) {
+            pthread_mutex_lock(&sched->mu);
+            sl->sid[0] = '\0';   /* history no longer matches the state */
+            sl->hist_n = 0;
+            bs_slot_clear_projections(sl);
+            pthread_mutex_unlock(&sched->mu);
+            bs_turn_ckpt_forget(&sl->ckpt);
+            fprintf(stderr, "[batch_sched] sys-prefix reuse slot=%d "
+                    "sid=%s: resume at %d, prefill %d of %d tokens (%s)\n",
+                    idx, sid, sys_len, n_ctx - sys_len, n_ctx, why);
+            *delta = sys_len;
+            return PN_RESUME_SYS_PREFIX;
+        }
+        /* Restore refused (dim/KV-mode change): the snapshot can never apply
+         * again — drop it so a capture can replace it.  Nothing was written
+         * (the restore validates dims before any copy). */
+        bs_sys_snap_drop(sched, sl);
+    }
+    bs_slot_reset_state(sched, idx);
+    *delta = 0;
+    return PN_RESUME_COLD;
+}
+
+/* About how many tokens a request will prefill: the prompt past where it
+ * leaves the history slot idx holds for its session (the whole prompt when
+ * the slot holds another one). Read before the turn: the slot is this
+ * request's own and nothing else writes its history meanwhile. >= 1. */
+static int bs_pd_wait_estimate(const pn_batch_sched *sched, int idx, const char *sid,
+                               const uint32_t *tokens, int n_ctx)
+{
+    const bs_slot *sl = &sched->slots[idx];
+    int same = 0;
+    if (sid && sid[0] && sl->sid[0] && strncmp(sl->sid, sid, sizeof(sl->sid)) == 0 &&
+        sl->hist && sl->hist_n > 0) {
+        const int n = sl->hist_n < n_ctx ? sl->hist_n : n_ctx;
+        while (same < n && sl->hist[same] == tokens[same])
+            same++;
+    }
+    return n_ctx - same > 0 ? n_ctx - same : 1;
+}
+
+void bs_prefill_resume_think(pn_batch_sched *sched, int idx, const char *sid,
+                             const uint32_t *tokens, int n_ctx, int sys_len,
+                             pn_think_history think_history,
+                             bs_resume_outcome *out)
+{
+    bs_resume_outcome none = { 0, 0, PN_RESUME_COLD };
+    if (out)
+        *out = none;
     if (!sched || idx < 0 || idx >= sched->cap || !tokens || n_ctx <= 0)
         return;
-    bs_gpu_acquire(sched);   /* same GPU-owner contract as bs_prefill_begin */
+    /* Same GPU-owner contract as bs_prefill_begin; the wait advertises this
+     * prefill's size for shortest-prefill-first (bs_pd_shorter_waiting). */
+    const int est = bs_pd_wait_estimate(sched, idx, sid, tokens, n_ctx);
+    pthread_mutex_lock(&sched->mu);
+    sched->slots[idx].pf_wait_est = est;
+    bs_gpu_acquire_locked(sched);
+    sched->slots[idx].pf_wait_est = 0;
+    pthread_mutex_unlock(&sched->mu);
 
     bs_slot *sl = &sched->slots[idx];
     /* A system prefix is only usable when a conversation follows it. */
@@ -1918,87 +2379,51 @@ void bs_prefill_resume_sys(pn_batch_sched *sched, int idx, const char *sid,
     sl->ct_keep = 0;
     sl->ct_prompt_from = 0;
     sl->sid_conflict = false;
-    /* Resume ladder — mirrors pn_prefix_cache_acquire_sys.
-     *
-     * 1. Append resume: THIS slot's warm state belongs to `sid`, its committed
-     *    history is an exact prefix of the new context, and the state sits
-     *    exactly at that history's end (pos == hist_n).  The agentic append
-     *    case: prefill only [hist_n, n_ctx).  hist_n < n_ctx is strict so at
-     *    least one delta token remains to recover the next-token logits (the
-     *    degenerate full-hit never happens in a real chat turn — an assistant
-     *    opener is always appended — and falls through to a full reset). */
-    if (sid && sid[0] && sl->sid[0] &&
-        strncmp(sl->sid, sid, sizeof(sl->sid)) == 0 &&
-        sl->hist_n > 0 && sl->hist_n < n_ctx &&
-        (int)sl->state->pos == sl->hist_n &&
-        memcmp(sl->hist, tokens,
-               (size_t)sl->hist_n * sizeof(uint32_t)) == 0 &&
-        bs_warm_kv_reusable(sched, sl)) {
-        delta = sl->hist_n;   /* warm: resume, do NOT reset */
-#ifdef USE_CUDA
-        /* Force every GPU shadow of this warm state to re-seed from its HOST
-         * mirror on the delta-prefill forward.  Between this session's turns
-         * another session's forward may have claimed the shared SSM buffers /
-         * the shared KV ring, and this state's own live decode advanced its
-         * per-slot buffers (not the shared ones the prefill forward re-seeds).
-         * finalize left the host mirror authoritative at pos==hist_n; forgetting
-         * the GPU bindings (host-bookkeeping only — the host mirror is NOT
-         * touched) makes the resumed forward re-upload [0,hist_n) SSM + KV from
-         * that warm mirror, then continue the delta.  Safe under the GPU turn
-         * just acquired. */
-        pn_qwen35moe_gpu_forget_state(sched->model, sl->state);
-#endif
-    } else if (bs_projection_resume(sched, idx, sid, tokens, n_ctx, &delta)) {
-        /* 1b. Projection append resume — the client's re-render of the history
-         *     differs from the committed KV only in the think blocks, either
-         *     because it dropped them or because it sent the reasoning back as
-         *     text.  See bs_projection_resume. */
-    } else {
-        /* 2. System-prefix resume: divergent history but this slot holds THIS
-         *    session's boundary snapshot over these exact system tokens (the
-         *    reasoning-model turn).  Restore it and prefill only the
-         *    conversation.  The stale committed history is dropped —
-         *    bs_slot_finalize rebuilds it at end of turn. */
-        /* Both warm rungs missed.  Before the fallbacks mutate this slot,
-         * decide whether the miss is an ordinary history divergence or a second
-         * conversation wearing this session's id — and say so out loud. */
-        bs_note_session_substitution(sched, idx, sid, tokens, n_ctx, sys_len);
-        bs_log_append_resume_miss(sched->model, idx, sid, sl, tokens, n_ctx);
-        int resumed = 0;
-        if (sys_ok && bs_sys_snap_matches(sl, sid, tokens, sys_len)) {
-            if (bs_sys_snap_restore(sched, sl, sys_len) == 0) {
-                resumed = 1;
-                delta = sys_len;
-                pthread_mutex_lock(&sched->mu);
-                sl->sid[0] = '\0';   /* history no longer matches the state */
-                sl->hist_n = 0;
-                bs_slot_clear_projections(sl);
-                pthread_mutex_unlock(&sched->mu);
-                fprintf(stderr, "[batch_sched] sys-prefix reuse slot=%d "
-                        "sid=%s: resume at %d, prefill %d of %d tokens\n",
-                        idx, sid, sys_len, n_ctx - sys_len, n_ctx);
-            } else {
-                /* Restore refused (dim/KV-mode change): the snapshot can never
-                 * apply again — drop it so a capture can replace it.  Nothing
-                 * was written (the restore validates dims before any copy). */
-                bs_sys_snap_drop(sched, sl);
-            }
-        }
-        /* 3. Fresh/diverged with no usable snapshot: full reset + prefill. */
-        if (!resumed) {
-            bs_slot_reset_state(sched, idx);
-            delta = 0;
-        }
-    }
+    /* Where this request leaves what the slot holds for the session (rung 1d
+     * plans a checkpoint there), read before any rung rewrites the history. */
+    const int div_point = bs_div_point(sched, idx, sid, tokens, n_ctx);
+    /* Resume ladder — mirrors pn_prefix_cache_acquire_sys. */
+    pn_resume_kind kind = bs_resume_warm_rung(sched, idx, sid, tokens, n_ctx,
+                                              think_history, &delta);
+    if (kind == PN_RESUME_COLD)
+        kind = bs_resume_sys_or_cold(sched, idx, sid, tokens, n_ctx, sys_len,
+                                     sys_ok, &delta);
+    if (think_history != PN_THINK_HISTORY_KEEP)
+        fprintf(stderr, "[batch_sched] think_history=%s slot=%d sid=%s: "
+                "resume %s at %d, prefill %d of %d tokens\n",
+                think_history == PN_THINK_HISTORY_AS_SENT ? "as_sent"
+                                                          : "drop_last",
+                idx, sid ? sid : "", pn_resume_kind_name(kind), delta,
+                n_ctx - delta, n_ctx);
 
+    /* An aborted prefill's record is single-use: it was either resumed (its
+     * tokens are the history now) or the rung that ran replaced the state. */
+    bs_turn_ckpt_forget(&sl->partial);
+    bs_div_ckpt_plan(sched, idx, div_point, delta, n_ctx);
+
+    if (!out)
+        return;
+    out->delta_start = delta;
+    out->kind = kind;
     /* Full prefill ahead + no snapshot covering these exact system tokens →
      * ask the caller to capture the boundary state mid-prefill (replacing a
      * stale snapshot from a changed system prompt or another session). */
-    if (capture_sys && delta == 0 && sys_ok && bs_sys_snapshot_supported(sched)
-        && !bs_sys_snap_matches(sl, sid, tokens, sys_len))
-        *capture_sys = 1;
+    out->capture_sys = delta == 0 && sys_ok &&
+                       bs_sys_snapshot_supported(sched) &&
+                       !bs_sys_snap_matches(sl, sid, tokens, sys_len);
+}
+
+void bs_prefill_resume_sys(pn_batch_sched *sched, int idx, const char *sid,
+                           const uint32_t *tokens, int n_ctx, int sys_len,
+                           int *delta_start, int *capture_sys)
+{
+    bs_resume_outcome out;
+    bs_prefill_resume_think(sched, idx, sid, tokens, n_ctx, sys_len,
+                            PN_THINK_HISTORY_KEEP, &out);
     if (delta_start)
-        *delta_start = delta;
+        *delta_start = out.delta_start;
+    if (capture_sys)
+        *capture_sys = out.capture_sys;
 }
 
 int bs_prefill_capture_sys(pn_batch_sched *sched, int idx, const char *sid,
@@ -2041,7 +2466,7 @@ int bs_prefill_capture_sys(pn_batch_sched *sched, int idx, const char *sid,
         if (!st_tok)
             break;       /* fall through to a private capture */
         memcpy(st_tok, tokens, (size_t)sys_len * sizeof(uint32_t));
-        bs_sys_snap_unref(sl);
+        bs_sys_snap_unref(sched, sl);
         sl->sys_snap = o->sys_snap;
         sl->sys_snap_refs = o->sys_snap_refs;
         ++(*sl->sys_snap_refs);
@@ -2062,20 +2487,21 @@ int bs_prefill_capture_sys(pn_batch_sched *sched, int idx, const char *sid,
      * performs at every chunk boundary, so continuing the prefill afterwards
      * is unaffected (the GPU state is read, not invalidated, and no other
      * forward can interleave: the GPU turn is held). */
-    if (pn_qwen35moe_gpu_state_to_host(sched->model, sl->state) != 0)
+    if (bs_slots_state_to_host(sched, sl->state) != 0)
         return -1;
 #endif
 
-    void *snap = pn_qwen35moe_state_snapshot(sl->state->kv_cache, sys_len);
+    const pn_arch arch = sched->model->config.arch;
+    void *snap = pn_session_snapshot_capture(arch, sl->state->kv_cache, sys_len);
     if (!snap)
         return -1;
     uint32_t *st = realloc(sl->sys_tokens, (size_t)sys_len * sizeof(uint32_t));
     if (!st) {
-        pn_qwen35moe_state_snapshot_free(snap);
+        pn_session_snapshot_free(arch, snap);
         return -1;
     }
     memcpy(st, tokens, (size_t)sys_len * sizeof(uint32_t));
-    bs_sys_snap_unref(sl);
+    bs_sys_snap_unref(sched, sl);
     sl->sys_snap = snap;
     sl->sys_snap_refs = NULL;   /* private until another slot shares it */
     sl->sys_tokens = st;
@@ -2108,11 +2534,15 @@ int bs_slot_finalize(pn_batch_sched *sched, int idx)
     if (!armed)
         return 0;   /* not caching this turn */
 
-    bs_gpu_acquire(sched);   /* exclusive: no decode step / rebuild can run */
-    /* Read gpu_idx UNDER the GPU turn: rebuild_gpu_map (which relocates a
-     * slot's gpu_idx via decode_slot_move) only runs inside the driver's turn,
-     * so while we hold the turn gpu_idx cannot move out from under us. */
+    /* Exclusive: no decode step / rebuild can run.  Counted while queued so a
+     * prefiller holding the turn yields at its next chunk boundary instead of
+     * holding this finished reply behind its whole prompt. */
     pthread_mutex_lock(&sched->mu);
+    sched->n_finalize_waiting++;
+    bs_gpu_acquire_locked(sched);
+    sched->n_finalize_waiting--;
+    /* gpu_idx is this slot's fixed block row (== idx) once bound this turn,
+     * -1 if the turn never bound one. */
     int gpu_idx = sl->gpu_idx;
     pthread_mutex_unlock(&sched->mu);
     int rc = 0;
@@ -2120,24 +2550,17 @@ int bs_slot_finalize(pn_batch_sched *sched, int idx)
     if (gpu_idx < 0) {
         rc = -1;   /* slot never bound a GPU decode state (e.g. EOS at token 1) */
     } else {
-        /* Refresh the host mirror and pull this slot's per-slot SSM images
-         * back into the pn_state host mirror. Phase 10b lazy-mirror mode:
-         * KV stays in the GPU slot ring between turns (the warm resume path
-         * re-uses it in place; a rebind seeds it D2D), so only the SSM half
-         * is captured — materializing the KV here would recreate the exact
-         * per-session host footprint lazy mode removes. Eager mode keeps
-         * the full legacy capture. */
+        /* Lazy mode: the session's KV + SSM stay in its block on the card
+         * (GPU row gpu_idx == idx) — nothing to capture; just confirm the
+         * block holds the committed state. Eager mode keeps the full legacy
+         * host capture. */
         if (pn_qwen35moe_host_kv_mirror_eager()) {
-            if (pn_qwen35moe_gpu_state_to_host(sched->model, sl->state) != 0)
+            if (bs_slots_state_to_host(sched, sl->state) != 0 ||
+                bs_slots_row_ssm_to_host(sched, gpu_idx, sl->state) != 0)
                 rc = -1;
-        } else if (pn_qwen35moe_gpu_state_ssm_to_host(sched->model,
-                                                      sl->state) != 0) {
+        } else if (!bs_slots_row_holds_state(sched, gpu_idx, sl->state)) {
             rc = -1;
         }
-        if (rc == 0 &&
-            pn_qwen35moe_decode_slot_ssm_to_host(sched->model, gpu_idx,
-                                                 sl->state) != 0)
-            rc = -1;
     }
 #else
     (void)gpu_idx;
@@ -2212,6 +2635,7 @@ static void bs_slot_reserve_locked(bs_slot *sl)
 static void bs_slot_unreserve_locked(pn_batch_sched *sched, bs_slot *sl)
 {
     sl->status = BS_SLOT_IDLE;
+    sl->claim_sid[0] = '\0';
     pthread_cond_broadcast(&sched->cv_idle);
 }
 
@@ -2264,13 +2688,15 @@ bs_session_result bs_session_export(pn_batch_sched *sched, const char *sid,
     if (rc == BS_SESSION_OK) {
         bs_gpu_acquire(sched);   /* exclusive: no decode step can move the ring */
 #ifdef USE_CUDA
-        /* INV3: the KV rows live in the GPU decode-slot ring, not in a host
-         * mirror.  gpu_state_to_host drives qw_kv_layer_materialize for every
-         * layer still flagged stale, bounded to [0, min(pos, max_seq)), and
-         * fails loudly if no ring holds the content rather than serialising a
-         * stale mirror.  The SSM half of the slot's mirror is already current
-         * (bs_slot_finalize pulled the per-slot images down at commit time). */
-        if (pn_qwen35moe_gpu_state_to_host(sched->model, sl->state) != 0) {
+        /* The session lives in its block on the card (GPU row idx). Export is
+         * the one deliberate copy to host: the KV rows [0, min(pos, max_seq))
+         * via gpu_state_to_host (fails loudly if no ring holds them) and the
+         * SSM image from the block, so the blob can go to the client. */
+        bool lazy = !pn_qwen35moe_host_kv_mirror_eager();
+        if ((lazy &&
+             (!bs_slots_row_holds_state(sched, idx, sl->state) ||
+              bs_slots_row_ssm_to_host(sched, idx, sl->state) != 0)) ||
+            bs_slots_state_to_host(sched, sl->state) != 0) {
             /* No GPU ring still holds this session's rows — another session
              * took the ring after this slot was released.  The state is gone,
              * not broken: report NOT_FOUND so the client falls back to replay,
@@ -2288,7 +2714,8 @@ bs_session_result bs_session_export(pn_batch_sched *sched, const char *sid,
         }
 #endif
         if (rc == BS_SESSION_OK) {
-            snap = pn_qwen35moe_state_snapshot(sl->state->kv_cache, n_tok);
+            snap = pn_session_snapshot_capture(sched->model->config.arch,
+                                               sl->state->kv_cache, n_tok);
             if (!snap)
                 rc = BS_SESSION_ERROR;
         }
@@ -2300,7 +2727,7 @@ bs_session_result bs_session_export(pn_batch_sched *sched, const char *sid,
     if (rc == BS_SESSION_OK) {
         toks = (uint32_t *)malloc((size_t)n_tok * sizeof(uint32_t));
         if (!toks) {
-            pn_qwen35moe_state_snapshot_free(snap);
+            pn_session_snapshot_free(sched->model->config.arch, snap);
             snap = NULL;
             rc = BS_SESSION_ERROR;
         } else {
@@ -2330,29 +2757,20 @@ bs_session_result bs_session_restore(pn_batch_sched *sched, const char *sid,
         return BS_SESSION_ERROR;
     if (!bs_sys_snapshot_supported(sched))
         return BS_SESSION_ERROR;
-    if (pn_qwen35moe_state_snapshot_pos(snap) != n_tok)
+    if (pn_session_snapshot_pos(sched->model->config.arch, snap) != n_tok)
         return BS_SESSION_ERROR;
 
-    /* Prefer this session's own slot (a re-restore replaces its warm state),
-     * then any IDLE slot.  Never displace an active one. */
+    /* Seat it as a chat turn would be (session admission, then this session's
+     * own slot — a re-restore replaces its warm state — else a slot nobody
+     * holds, else its own family's).  Never displace an active slot or
+     * another family's warm one. */
     pthread_mutex_lock(&sched->mu);
-    int idx = -1;
-    for (int i = 0; i < sched->cap && idx < 0; i++) {
-        bs_slot *s = &sched->slots[i];
-        if (s->status == BS_SLOT_IDLE && s->sid[0] &&
-            strncmp(s->sid, sid, sizeof(s->sid)) == 0)
-            idx = i;
-    }
-    for (int i = 0; i < sched->cap && idx < 0; i++)
-        if (sched->slots[i].status == BS_SLOT_IDLE)
-            idx = i;
-    if (idx < 0) {
-        pthread_mutex_unlock(&sched->mu);
-        return BS_SESSION_BUSY;
-    }
-    bs_slot *sl = &sched->slots[idx];
-    bs_slot_reserve_locked(sl);
+    int idx = bs_admission_check_locked(sched, sid) == BS_ACQUIRE_OK
+            ? try_claim_idle(sched, sid) : -1;
     pthread_mutex_unlock(&sched->mu);
+    if (idx < 0)
+        return BS_SESSION_BUSY;
+    bs_slot *sl = &sched->slots[idx];
 
     /* Grow the history buffer BEFORE mutating the state, so an OOM leaves the
      * slot's previous warm state intact rather than half-replaced. */
@@ -2373,12 +2791,13 @@ bs_session_result bs_session_restore(pn_batch_sched *sched, const char *sid,
          * and the next prefill re-uploads [0, n_tok) from the restored mirror.
          * The explicit forget covers the SSM shadows the same way — exactly the
          * SYS1-batched boundary-restore protocol (bs_sys_snap_restore). */
-        if (pn_qwen35moe_state_restore(sl->state->kv_cache, snap) != 0) {
+        if (pn_session_snapshot_restore(sched->model->config.arch,
+                                        sl->state->kv_cache, snap) != 0) {
             rc = BS_SESSION_ERROR;
         } else {
             sl->state->pos = n_tok;
 #ifdef USE_CUDA
-            pn_qwen35moe_gpu_forget_state(sched->model, sl->state);
+            bs_slots_forget(sched, sl->state);
 #endif
         }
         bs_gpu_release(sched);
@@ -2394,6 +2813,7 @@ bs_session_result bs_session_restore(pn_batch_sched *sched, const char *sid,
         bs_slot_clear_projections(sl);
         snprintf(sl->sid, sizeof(sl->sid), "%s", sid);
         sl->armed_sid[0] = '\0';
+        sl->last_active_ms = bs_now_ms();   /* the idle reaper's clock */
     } else {
         /* The state may have been partially written — do not advertise it. */
         sl->sid[0] = '\0';
@@ -2430,12 +2850,28 @@ static void bs_session_release_match(pn_batch_sched *sched, const char *key,
                          (n ? strncmp(sl->sys_sid, key, n) == 0
                             : strncmp(sl->sys_sid, key,
                                       sizeof(sl->sys_sid)) == 0));
+        int ckpt_mine = (sl->status == BS_SLOT_IDLE && sl->ckpt.valid &&
+                         (n ? strncmp(sl->ckpt.sid, key, n) == 0
+                            : strncmp(sl->ckpt.sid, key,
+                                      sizeof(sl->ckpt.sid)) == 0));
+        int partial_mine = (sl->status == BS_SLOT_IDLE && sl->partial.valid &&
+                            (n ? strncmp(sl->partial.sid, key, n) == 0
+                               : strncmp(sl->partial.sid, key,
+                                         sizeof(sl->partial.sid)) == 0));
         if (mine) {
             sl->sid[0] = '\0';
             sl->hist_n = 0;
             bs_slot_clear_projections(sl);
             sl->armed_sid[0] = '\0';
         }
+        if (ckpt_mine)
+            bs_turn_ckpt_forget(&sl->ckpt);
+        if (sl->status == BS_SLOT_IDLE && sl->divck.valid &&
+            (n ? strncmp(sl->divck.sid, key, n) == 0
+               : strncmp(sl->divck.sid, key, sizeof(sl->divck.sid)) == 0))
+            bs_turn_ckpt_forget(&sl->divck);
+        if (partial_mine)
+            bs_turn_ckpt_forget(&sl->partial);
         pthread_mutex_unlock(&sched->mu);
         /* bs_sys_snap_drop takes mu itself for the sys_sid clear. */
         if (snap_mine)
@@ -2461,56 +2897,252 @@ void bs_session_release_by_prefix(pn_batch_sched *sched,
     bs_session_release_match(sched, base_prefix, strlen(base_prefix));
 }
 
+void bs_slot_drop_session(pn_batch_sched *sched, bs_slot *sl)
+{
+    pthread_mutex_lock(&sched->mu);
+    sl->sid[0] = '\0';
+    sl->hist_n = 0;
+    bs_slot_clear_projections(sl);
+    sl->armed_sid[0] = '\0';
+    bs_turn_ckpt_forget(&sl->ckpt);
+    bs_turn_ckpt_forget(&sl->partial);
+    bs_turn_ckpt_forget(&sl->divck);
+    pthread_mutex_unlock(&sched->mu);
+    bs_sys_snap_drop(sched, sl);   /* takes mu itself for the sys_sid clear */
+}
+
+void bs_set_session_admission(pn_batch_sched *sched, int max_sessions,
+                              uint64_t idle_ttl_ms)
+{
+    if (!sched)
+        return;
+    pthread_mutex_lock(&sched->mu);
+    sched->max_sessions = max_sessions > 0 ? max_sessions : 0;
+    sched->session_idle_ttl_ms = idle_ttl_ms;
+    pthread_mutex_unlock(&sched->mu);
+}
+
+void bs_set_watch_hook(pn_batch_sched *sched, pn_session_watched_fn fn,
+                       void *ctx)
+{
+    if (!sched)
+        return;
+    pthread_mutex_lock(&sched->mu);
+    sched->watch_fn = fn;
+    sched->watch_ctx = fn ? ctx : NULL;
+    pthread_mutex_unlock(&sched->mu);
+}
+
+bool bs_session_seat_free(pn_batch_sched *sched)
+{
+    if (!sched)
+        return false;
+    pthread_mutex_lock(&sched->mu);
+    bool free_seat = bs_admission_seat_free_locked(sched);
+    pthread_mutex_unlock(&sched->mu);
+    return free_seat;
+}
+
+int bs_session_count(pn_batch_sched *sched)
+{
+    if (!sched)
+        return 0;
+    pthread_mutex_lock(&sched->mu);
+    int n = bs_family_count_locked(sched);
+    pthread_mutex_unlock(&sched->mu);
+    return n;
+}
+
+void bs_session_occupancy(pn_batch_sched *sched, bs_occupancy *out)
+{
+    if (!out)
+        return;
+    memset(out, 0, sizeof(*out));
+    if (!sched)
+        return;
+    pthread_mutex_lock(&sched->mu);
+    out->families = bs_family_count_locked(sched);
+    out->max_sessions = sched->max_sessions > 0 ? sched->max_sessions
+                                                : sched->cap;
+    out->slots = sched->cap;
+    out->slots_free = bs_unheld_count_locked(sched);
+    out->slots_held = sched->cap - out->slots_free;
+    out->seat_free = bs_admission_seat_free_locked(sched);
+    pthread_mutex_unlock(&sched->mu);
+}
+
+/* QWEN35_BS_PREFILL_DECODE_SHARE, read once (batch_sched_prefill_share.h). */
+static int bs_prefill_decode_share(void)
+{
+    static int v = -1;
+    if (v < 0)
+        v = bs_prefill_decode_share_parse(
+            getenv("QWEN35_BS_PREFILL_DECODE_SHARE"));
+    return v;
+}
+
+/* Under mu: is any slot still decoding (BOUND/DECODE, not finished)? Unlike
+ * gate_ok this ignores token_ready, which is false while a step is in flight. */
+static bool bs_any_decoding_locked(const pn_batch_sched *sched)
+{
+    for (int i = 0; i < sched->cap; i++) {
+        const bs_slot *sl = &sched->slots[i];
+        if ((sl->status == BS_SLOT_DECODE || sl->status == BS_SLOT_BOUND) &&
+            !sl->finished)
+            return true;
+    }
+    return false;
+}
+
+/* Under mu, the GPU turn just released: let the driver step the decoders for
+ * up to `window_ms` before the caller re-queues for the turn. Wakes on every
+ * turn release (cv_gpu) and stops early when nothing is left to decode or the
+ * scheduler shuts down. Holds no ticket meanwhile, so the free-running driver
+ * (and any other prefiller) takes turns. */
+static void bs_prefill_stand_aside_locked(pn_batch_sched *sched,
+                                          double window_ms)
+{
+    if (window_ms <= 0.0)
+        return;
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    const long long ns = (long long)(window_ms * 1e6);
+    deadline.tv_sec += (time_t)(ns / 1000000000LL);
+    deadline.tv_nsec += (long)(ns % 1000000000LL);
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    while (!sched->shutdown && bs_any_decoding_locked(sched)) {
+        if (pthread_cond_timedwait(&sched->cv_gpu, &sched->mu, &deadline) ==
+            ETIMEDOUT)
+            break;
+    }
+}
 void bs_prefill_yield(pn_batch_sched *sched, int idx)
 {
-#ifdef USE_CUDA
     if (!sched || idx < 0 || idx >= sched->cap)
         return;
 
-    /* Only worth a handoff when the driver actually has a step to run
-     * (gate open: >=1 active slot, tokens ready).  Racing a token post /
-     * release here is harmless — worst case one missed (or one empty)
-     * interleave window. */
+    /* Only worth a handoff when a turn waiter would put tokens in front of a
+     * client: the driver with a step to run (gate open: >=1 active slot,
+     * tokens ready), or a finished slot queued in bs_slot_finalize, whose
+     * reply is sent only after it.  A queued prefiller alone is no reason —
+     * alternating two prompts chunk by chunk delays both first tokens.
+     * Racing a token post / release / finalize here is harmless — worst case
+     * one missed (or one empty) interleave window. */
     pthread_mutex_lock(&sched->mu);
-    int runnable = gate_ok(sched);
+    const int runnable = gate_ok(sched);
+    const int finalizers = sched->n_finalize_waiting;
     pthread_mutex_unlock(&sched->mu);
-    if (!runnable)
+    if (!runnable && !finalizers)
         return;                      /* keep the turn; nothing to interleave */
 
+#ifdef USE_CUDA
     /* Phase 9b: a pipelined prefill chunk deliberately returns with die B's
      * segment still in flight.  This is the point where the GPU turn is handed
      * to somebody else, so drain both dies FIRST — explicitly, rather than
      * leaning on state_to_host's per-layer syncs, which skip any layer whose
      * GPU buffer is not currently this state's image and are therefore not a
      * guaranteed full drain.  ~1 µs on an idle stream, only on a real
-     * handover, and a no-op when the pipeline is off. */
-    pn_qwen35moe_prefill_drain_cuda(sched->model);
-
-    /* Make this slot's host mirror authoritative BEFORE letting any other
-     * forward at the GPU (the prefix-cache eviction protocol): the next
-     * chunk then re-seeds from the mirror via the ordinary
-     * seed-on-host-change path even if an interleaved forward claimed the
-     * live SSM buffers / shared KV ring.  On failure keep the turn —
-     * resuming without a valid mirror would be unsafe, and keeping it is
-     * always safe (just no interleave). */
-    if (pn_qwen35moe_gpu_state_to_host(sched->model,
-                                       sched->slots[idx].state) != 0) {
-        fprintf(stderr, "[batch_sched] prefill_yield: state_to_host failed "
-                "(slot=%d); continuing without yield\n", idx);
+     * handover, and a no-op when the pipeline is off (bs_slots_save_live
+     * drains before it saves).
+     *
+     * Save the prefill so far into this session's OWN block on the card
+     * BEFORE letting any other forward at the GPU: an interleaved prefill
+     * reuses the shared SSM buffers and the single-user KV ring, and the
+     * next chunk then re-seeds from the block device to device (eager mode:
+     * from the host mirror, its legacy protocol). The slot is in PREFILL, so
+     * no decode step touches its row meanwhile. On failure keep the turn —
+     * keeping it is always safe (just no interleave). */
+    if (bs_slots_save_live(sched, sched->slots[idx].state, idx) != 0) {
+        fprintf(stderr, "[batch_sched] prefill_yield: saving the prefill "
+                "failed (slot=%d); continuing without yield\n", idx);
         return;
     }
+#endif
 
     pthread_mutex_lock(&sched->mu);
+    const double held_ms = bs_now_ms() - sched->gpu_turn_t0_ms;
+    const double window_ms =
+        bs_prefill_decode_window_ms(held_ms, bs_prefill_decode_share());
+    const uint64_t steps0 = sched->driver_steps;
     bs_gpu_release_locked(sched);
     pthread_cond_signal(&sched->cv_work);  /* the driver may be parked */
-    /* Re-acquire FIFO: the driver (and any earlier waiter) goes first —
-     * this is the chunk → step → chunk alternation. */
+    bs_prefill_stand_aside_locked(sched, window_ms);
+    const uint64_t steps = sched->driver_steps - steps0;
+    /* Re-acquire FIFO: the driver, a queued finalize (and any earlier waiter)
+     * go first — this is the chunk → step(s) → chunk alternation. */
     bs_gpu_acquire_locked(sched);
     pthread_mutex_unlock(&sched->mu);
+    if (bs_stats_on())
+        fprintf(stderr, "[bs] prefill_yield slot=%d chunk_ms=%.1f "
+                "window_ms=%.1f decode_steps=%llu finalizers=%d\n", idx,
+                held_ms, window_ms, (unsigned long long)steps, finalizers);
+}
+
+bool bs_pd_overlap_on(const pn_batch_sched *sched)
+{
+#ifdef USE_CUDA
+    return sched && sched->driver_sample && pn_qwen35moe_pd_overlap_enabled();
 #else
-    (void)sched; (void)idx;
+    (void)sched;
+    return false;
 #endif
 }
+
+bool bs_pd_shorter_waiting(pn_batch_sched *sched, int remaining)
+{
+    if (!sched)
+        return false;
+    bool shorter = false;
+    pthread_mutex_lock(&sched->mu);
+    for (int i = 0; i < sched->cap && !shorter; i++) {
+        const int est = sched->slots[i].pf_wait_est;
+        shorter = est > 0 && est + BS_PD_SRPT_MARGIN < remaining;
+    }
+    pthread_mutex_unlock(&sched->mu);
+    return shorter;
+}
+
+int bs_pd_finalize_waiting(pn_batch_sched *sched)
+{
+    if (!sched)
+        return 0;
+    pthread_mutex_lock(&sched->mu);
+    const int n = sched->n_finalize_waiting;
+    pthread_mutex_unlock(&sched->mu);
+    return n;
+}
+
+void bs_pd_yield(pn_batch_sched *sched, int idx)
+{
+    if (!sched || idx < 0 || idx >= sched->cap)
+        return;
+#ifdef USE_CUDA
+    /* Same save as bs_prefill_yield: any forward that runs before this turn
+     * comes back may claim the live buffers; the next piece re-seeds from the
+     * slot's own block. On failure keep the turn (always safe). */
+    if (bs_slots_save_live(sched, sched->slots[idx].state, idx) != 0) {
+        fprintf(stderr, "[batch_sched] pd_yield: saving the prefill failed (slot=%d); "
+                "continuing without yield\n", idx);
+        return;
+    }
+#endif
+    pthread_mutex_lock(&sched->mu);
+    bs_gpu_release_locked(sched);
+    pthread_cond_signal(&sched->cv_work);   /* the driver may be parked */
+    bs_gpu_acquire_locked(sched);           /* FIFO: every earlier waiter goes first */
+    pthread_mutex_unlock(&sched->mu);
+}
+
+#ifndef USE_CUDA
+int bs_pd_cycle(pn_batch_sched *sched, void *cursor)
+{
+    (void)sched; (void)cursor;
+    return 1;
+}
+#endif
 
 void bs_prefill_abort(pn_batch_sched *sched, int idx)
 {
@@ -2527,6 +3159,37 @@ void bs_prefill_abort_reset(pn_batch_sched *sched, int idx)
     /* Still owning the GPU turn here (the range helper re-acquires after every
      * yield), which is bs_slot_reset_state's precondition. */
     bs_slot_reset_state(sched, idx);
+    bs_gpu_release(sched);
+    bs_slot_release(sched, idx);
+}
+
+void bs_prefill_abort_keep(pn_batch_sched *sched, int idx, const char *sid,
+                           const uint32_t *prompt, int n_prompt, int sys_len)
+{
+    if (!sched || idx < 0 || idx >= sched->cap)
+        return;
+    bs_slot *sl = &sched->slots[idx];
+    int kept = bs_partial_prefill_keep(sched, idx, sid, prompt, n_prompt,
+                                       sys_len) == 0;
+    if (!kept && (!bs_turn_ckpt_enabled() || !sl->ckpt.valid)) {
+        bs_prefill_abort_reset(sched, idx);
+        return;
+    }
+    /* No committed history describes the state (the prefill stopped
+     * part-way); the kept prefix and the checkpoint do. Keep the session id
+     * so the next turn is routed here. */
+    pthread_mutex_lock(&sched->mu);
+    snprintf(sl->sid, sizeof(sl->sid), "%s",
+             kept ? sl->partial.sid : sl->ckpt.sid);
+    sl->hist_n = 0;
+    bs_slot_clear_projections(sl);
+    pthread_mutex_unlock(&sched->mu);
+    sl->ct_keep = 0;
+    sl->ct_prompt_from = 0;
+    if (sl->ckpt.valid)
+        fprintf(stderr, "[batch_sched] slot %d: prefill aborted; keeping the "
+                "turn checkpoint of sid=%s (%d tokens)\n", idx, sl->ckpt.sid,
+                sl->ckpt.client_n);
     bs_gpu_release(sched);
     bs_slot_release(sched, idx);
 }
@@ -2600,81 +3263,21 @@ static int bs_slot_bind_common(pn_batch_sched *sched, int idx,
     /* The GPU turn is owned (bs_prefill_begin) — this whole section is
      * atomic w.r.t. every other forward on this model. */
 
-    /* The batched decode seeds each slot from this state, and a GPU prefill
-     * leaves the host mirror stale (B2).  Refresh the B3 SSM host copy now,
-     * while the live GPU state is still this request's (the slot SSM seed
-     * in decode_slot_bind reads the host mirror).  Phase 10b lazy-mirror
-     * mode skips the KV half: the prefill rows are in the single-user GPU
-     * ring and the first slots step D2D-seeds the slot ring from it — no
-     * host round-trip.  Eager mode keeps the full legacy capture. */
-    if (pn_qwen35moe_host_kv_mirror_eager()) {
-        if (pn_qwen35moe_gpu_state_to_host(sched->model,
-                                           sched->slots[idx].state) != 0) {
-            fprintf(stderr, "[batch_sched] state_to_host failed (slot=%d)\n",
-                    idx);
-            goto fail;
-        }
-    } else if (pn_qwen35moe_gpu_state_ssm_to_host(sched->model,
-                                                  sched->slots[idx].state)
-               != 0) {
-        fprintf(stderr, "[batch_sched] ssm_to_host failed (slot=%d)\n", idx);
+    /* Eager mode (QWEN35_HOST_KV_MIRROR=1) keeps its legacy host capture.
+     * Lazy mode needs none: the bind below snapshots the live SSM and tops up
+     * the prefilled KV rows device-to-device into this slot's OWN block (GPU
+     * row idx, carved at bs_create), so a session's state never visits host
+     * RAM between its turns. */
+    if (pn_qwen35moe_host_kv_mirror_eager() &&
+        bs_slots_state_to_host(sched, sched->slots[idx].state) != 0) {
+        fprintf(stderr, "[batch_sched] state_to_host failed (slot=%d)\n", idx);
         goto fail;
     }
 
-    /* Lazy lane registration on the first bind ever (serialized by the GPU
-     * turn; runs at most once).  Registering lane idx here uses this state's
-     * now-authoritative host mirror, and re-binding it below is harmless. */
-    if (!sched->slots_gpu_init) {
-        if (bs_lazy_init_gpu(sched) != 0)
-            goto fail;
-    }
-
-    /* Pick a FREE GPU slot index for this joiner: the lowest GPU index not
-     * currently claimed by ANY active slot's gpu_idx.  This is the
-     * continuous-batching fix — binding at the SCHEDULER slot index (the old
-     * code) could, after a compaction diverged gpu-index from sched-index,
-     * land on top of an in-flight decoder and corrupt it (decode_slots then
-     * failed its slot_state validation).
-     *
-     * Scanning claimed gpu_idx (not n_active_gpu) is required for the
-     * CONCURRENT-START case: several joiners bind back-to-back, each under
-     * the GPU turn, BEFORE the driver rebuilds — so n_active_gpu is still
-     * stale and would hand them all the same index.  Every active slot's
-     * gpu_idx is already set at its own bind, so the scan sees them.  Read
-     * under mu (the driver and other binds write gpu_idx under mu). */
-    pthread_mutex_lock(&sched->mu);
-    bool claimed[BS_MAX_SLOTS] = { false };
-    for (int i = 0; i < sched->cap; i++) {
-        bs_slot *o = &sched->slots[i];
-        if (i != idx && slot_is_active(o) && o->gpu_idx >= 0 &&
-            o->gpu_idx < sched->cap)
-            claimed[o->gpu_idx] = true;
-    }
-    /* Scan from the TOP down for the highest free GPU index.  Binding high
-     * tends to keep a joiner's gpu_idx >= its compacted rank, so the common
-     * case is a downward compaction; but this is only a hint now, not a
-     * correctness requirement — rebuild_gpu_map realizes an arbitrary
-     * permutation, so the >=5-concurrent-joiners layout that forces an
-     * upward move / cycle is handled correctly rather than refused. */
-    int gpu_slot = -1;
-    for (int g = sched->cap - 1; g >= 0; g--)
-        if (!claimed[g]) { gpu_slot = g; break; }
-    pthread_mutex_unlock(&sched->mu);
-    if (gpu_slot < 0) {
-        /* Every GPU index claimed — cannot happen (at most `cap` slots exist
-         * and this one is not yet active), but fail cleanly if it does. */
-        fprintf(stderr, "[batch_sched] bind: no free GPU slot (slot=%d)\n",
-                idx);
-        goto fail;
-    }
-
-    /* Snapshot this request's post-prefill SSM state into GPU slot gpu_slot.
-     * cap+1 slots are bound (top index reserved as rebuild scratch). */
-    if (pn_qwen35moe_decode_slot_bind(sched->model,
-                                      sched->slots[idx].state,
-                                      gpu_slot, sched->cap + 1) != 0) {
-        fprintf(stderr, "[batch_sched] slot_bind failed (slot=%d gpu=%d)\n",
-                idx, gpu_slot);
+    /* The slot's block is GPU row idx for its whole life. */
+    const int gpu_slot = idx;
+    if (bs_slots_bind(sched, sched->slots[idx].state, gpu_slot) != 0) {
+        fprintf(stderr, "[batch_sched] slot_bind failed (slot=%d)\n", idx);
         goto fail;
     }
 
@@ -2696,6 +3299,7 @@ static int bs_slot_bind_common(pn_batch_sched *sched, int idx,
             sl->ring_cap   = max_new > 0 ? max_new : 0;
             sl->ring_r     = 0;
             sl->ring_w     = 0;
+            sl->reason_end_at = 0;
             sl->budget     = max_new;
             /* max_tokens == 1: nothing for the driver to step. */
             sl->finished   = (max_new <= 0);
@@ -2707,6 +3311,7 @@ static int bs_slot_bind_common(pn_batch_sched *sched, int idx,
             sl->ring_cap   = 0;
             sl->ring_r     = 0;
             sl->ring_w     = 0;
+            sl->reason_end_at = 0;
             sl->budget     = 0;
             sl->finished   = false;
         }
@@ -2727,12 +3332,32 @@ static int bs_slot_bind_common(pn_batch_sched *sched, int idx,
         }
         sl->pend_vis_n = 0;
         sl->pend_vis_think_n = 0;
+        sl->req_active_min = 0;
+        sl->req_active_max = 0;
+        memset(&sl->host, 0, sizeof(sl->host));
+        /* MTP speculation for this request: a fresh depth controller and window. */
+        sl->pd_stepped = false;
+        sl->mtp_on = sched->mtp && sp &&
+                     sg_mtp_cuda_begin(&sl->mtp, sched->model, max_recent) == 0;
+        if (sl->mtp_on)
+            bs_spec_arm_controller(sl);
+        const char *plain_why = sp ? bs_spec_plain_reason(sched, sp) : NULL;
+        if (plain_why)
+            fprintf(stderr, "[spec] census: mode=%s path=batched slot=%d\n", plain_why, idx);
+#ifdef USE_CUDA
+        else if (sl->mtp_on && sp->tool_grammar && bs_spec_grammar_draws(sp->tool_grammar))
+            fprintf(stderr, "[spec] census: mode=mtp-grammar path=batched slot=%d\n", idx);
+#endif
+        sl->spec_live_pos = -1;
         sl->status       = BS_SLOT_BOUND;
     }
     /* A new user is joining the active set — the driver must rebuild the
      * compacted GPU map before the next step to include this slot. */
     sched->active_set_changed = true;
     pthread_cond_signal(&sched->cv_work);   /* gate may open */
+    /* The slot left PREFILL: a same-session resend waiting on it (see
+     * bs_slot_acquire_or_wait) stops waiting. */
+    pthread_cond_broadcast(&sched->cv_idle);
     bs_gpu_release_locked(sched);
     pthread_mutex_unlock(&sched->mu);
     return 0;
@@ -2772,7 +3397,7 @@ int bs_slot_bind_ex(pn_batch_sched *sched, int idx, uint32_t first_token,
 }
 
 void bs_slot_arm_reasoning_budget(pn_batch_sched *sched, int idx,
-                                  int reason_budget, bool in_think,
+                                  const pn_reasoning_plan *plan, bool in_think,
                                   const uint32_t *close_ids, int n_close,
                                   uint32_t first_token)
 {
@@ -2786,7 +3411,8 @@ void bs_slot_arm_reasoning_budget(pn_batch_sched *sched, int idx,
 
     pthread_mutex_lock(&sched->mu);
     bs_slot *sl = &sched->slots[idx];
-    sl->reason_budget   = reason_budget > 0 ? reason_budget : 0;
+    sl->reason_budget   = plan && plan->hard > 0 ? plan->hard : 0;
+    sl->reason_soft     = sl->reason_budget > 0 ? plan->soft : 0;
     sl->reason_in_think = (sl->reason_budget > 0) && in_think && n_close > 0;
     sl->reason_toks     = 0;
     sl->reason_forced   = false;
@@ -2818,8 +3444,22 @@ void bs_slot_arm_reasoning_budget(pn_batch_sched *sched, int idx,
 static int slot_wait_logits(pn_batch_sched *sched, bs_slot *sl,
                             float **logits_out)
 {
-    while (!sl->logits_ready && !sched->shutdown)
-        pthread_cond_wait(&sl->cv, &sched->mu);
+    /* Bounded by the decode watchdog (batch_sched_watchdog.h): a step that
+     * never comes back must not hold the slot and its stream forever. */
+    int stall_ms = bs_decode_stall_ms();
+    struct timespec until;
+    make_deadline(&until, stall_ms);
+    while (!sl->logits_ready && !sched->shutdown) {
+        if (stall_ms <= 0) {
+            pthread_cond_wait(&sl->cv, &sched->mu);
+        } else if (pthread_cond_timedwait(&sl->cv, &sched->mu, &until) == ETIMEDOUT &&
+                   !sl->logits_ready) {
+            fprintf(stderr, "[batch_sched] slot %d: no logits for %d ms - step stalled, "
+                    "the owner releases the slot\n", sl->slot_idx, stall_ms);
+            pthread_mutex_unlock(&sched->mu);
+            return -1;
+        }
+    }
 
     if (sched->shutdown || !sl->logits) {
         pthread_mutex_unlock(&sched->mu);
@@ -2890,12 +3530,50 @@ bool bs_driver_sampling(const pn_batch_sched *sched)
     return sched && sched->driver_sample;
 }
 
+/* PN_SERVE_TOKEN_HASH=1 (exactness gates): one line per released slot with an FNV-1a over
+ * the token ids it emitted, so two serve runs compare token for token, not by text. */
+static bool bs_token_hash_on(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *env = getenv("PN_SERVE_TOKEN_HASH");
+        v = (env && env[0] && env[0] != '0') ? 1 : 0;
+    }
+    return v;
+}
+
+static void bs_report_token_hash(const bs_slot *sl, int idx)
+{
+    uint64_t h = 1469598103934665603ULL;
+
+    for (int i = 0; sl->ring && i < sl->ring_w; i++)
+        for (int b = 0; b < 4; b++)
+            h = (h ^ ((sl->ring[i] >> (8 * b)) & 0xffu)) * 1099511628211ULL;
+    fprintf(stderr, "[serve] token hash slot=%d sid=%s n=%d fnv1a=%016llx\n", idx,
+            sl->sid[0] ? sl->sid : "-", sl->ring_w, (unsigned long long)h);
+}
+
 void bs_slot_release(pn_batch_sched *sched, int idx)
 {
+    bs_slot_release_stats(sched, idx, NULL);
+}
+
+void bs_slot_release_stats(pn_batch_sched *sched, int idx, bs_request_stats *out)
+{
+    if (out)
+        memset(out, 0, sizeof(*out));
     if (!sched || idx < 0 || idx >= sched->cap)
         return;
     pthread_mutex_lock(&sched->mu);
     bs_slot *sl = &sched->slots[idx];
+    if (out && sl->status != BS_SLOT_IDLE) {
+        out->active_min = sl->req_active_min;
+        out->active_max = sl->req_active_max;
+        out->host = sl->host;
+#ifdef USE_CUDA
+        out->mtp_cycles = sl->mtp_on ? sl->mtp.cycles : 0;
+#endif
+    }
     /* Only the owner calls release, and it does so exactly once, so any
      * non-IDLE status here belongs to this owner: free the slot directly.
      * The driver never retires slots on its own — a mid-step release just
@@ -2905,7 +3583,17 @@ void bs_slot_release(pn_batch_sched *sched, int idx)
     bool was_active = (sl->status == BS_SLOT_BOUND ||
                        sl->status == BS_SLOT_DECODE);
     if (sl->status != BS_SLOT_IDLE) {
+        if (bs_token_hash_on())
+            bs_report_token_hash(sl, idx);
+#ifdef USE_CUDA
+        if (sl->mtp_on && bs_spec_shadow_on())
+            bs_spec_shadow_report(sl, idx);
+        if (sl->mtp_on)
+            sg_mtp_cuda_report(&sl->mtp, sl->ring_w);
+        sl->mtp_on = false;
+#endif
         sl->status       = BS_SLOT_IDLE;
+        sl->claim_sid[0] = '\0';   /* the slot's warm fields say who holds it now */
         sl->logits       = NULL;
         sl->logits_ready = false;
         sl->token_ready  = false;
@@ -2918,6 +3606,7 @@ void bs_slot_release(pn_batch_sched *sched, int idx)
         sl->ring_cap   = 0;
         sl->ring_r     = 0;
         sl->ring_w     = 0;
+        sl->reason_end_at = 0;
         sl->budget     = 0;
         sl->finished   = false;
         sl->step_error = false;
@@ -2960,6 +3649,7 @@ void bs_slot_release(pn_batch_sched *sched, int idx)
          * here would race the driver's turn-held decode_slots read. */
         sl->gpu_idx    = -1;
     }
+    sl->last_active_ms = bs_now_ms();   /* LRU key for try_claim_idle */
     /* A user left the active set — the driver must rebuild the compacted GPU
      * map before the next step so the vacated GPU slot is not stepped. */
     if (was_active)
@@ -2983,6 +3673,31 @@ static void make_deadline(struct timespec *ts, int wait_ms)
     ts->tv_nsec  = ns % 1000000000L;
 }
 
+/* Is a slot still prefilling a request of `sid`?  Under mu. */
+static bool same_session_prefilling_locked(const pn_batch_sched *sched,
+                                           const char *sid)
+{
+    if (!sid || !sid[0])
+        return false;
+    for (int i = 0; i < sched->cap; i++) {
+        const bs_slot *sl = &sched->slots[i];
+        if (sl->status == BS_SLOT_PREFILL &&
+            strncmp(sl->claim_sid, sid, sizeof(sl->claim_sid)) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* PN_SAME_SESSION_WAIT_MS (default 30000; 0 = off), capped by wait_ms. */
+static int same_session_wait_ms(int wait_ms)
+{
+    const char *env = getenv("PN_SAME_SESSION_WAIT_MS");
+    int ms = (env && env[0]) ? atoi(env) : 30000;
+    if (ms < 0)
+        ms = 0;
+    return ms < wait_ms ? ms : (wait_ms > 0 ? wait_ms : 0);
+}
+
 bs_acquire_result bs_slot_acquire_or_wait(pn_batch_sched *sched,
                                           int wait_ms,
                                           int *slot_out,
@@ -2993,6 +3708,9 @@ bs_acquire_result bs_slot_acquire_or_wait(pn_batch_sched *sched,
     if (retry_after_s) *retry_after_s = 0;
     if (!sched)        return BS_ACQUIRE_429;
 
+    /* A dead client's idle seat goes back before the seat count is read. */
+    bs_admission_reap_idle(sched, sid, bs_now_ms());
+
     pthread_mutex_lock(&sched->mu);
 
     if (sched->shutdown) {
@@ -3000,8 +3718,25 @@ bs_acquire_result bs_slot_acquire_or_wait(pn_batch_sched *sched,
         return BS_ACQUIRE_SHUTDOWN;
     }
 
+    /* Session admission, atomically with the claim below (both under mu): a
+     * refused session is told now, never queued behind seats that will not
+     * free for it. */
+    if (bs_admission_check_locked(sched, sid) != BS_ACQUIRE_OK) {
+        pthread_mutex_unlock(&sched->mu);
+        if (retry_after_s) *retry_after_s = 30;
+        return BS_ACQUIRE_AT_CAPACITY;
+    }
+
+    /* A resend of a request this session is still prefilling waits for that
+     * slot (see batch_sched.h): its kept prefix will be there. */
+    int hold_ms = same_session_wait_ms(wait_ms);
+    bool hold = hold_ms > 0 && sched->n_queued < sched->queue_cap &&
+                same_session_prefilling_locked(sched, sid);
+    struct timespec hold_until;
+    make_deadline(&hold_until, hold_ms);
+
     /* Fast path: slot free and pressure OK — claim immediately. */
-    if (sched->pressure_level < BS_PRESSURE_HOLD_LEVEL) {
+    if (!hold && sched->pressure_level < BS_PRESSURE_HOLD_LEVEL) {
         int s = try_claim_idle(sched, sid);
         if (s >= 0) {
             pthread_mutex_unlock(&sched->mu);
@@ -3039,6 +3774,13 @@ bs_acquire_result bs_slot_acquire_or_wait(pn_batch_sched *sched,
             break;
         }
 
+        /* Other families may have taken the last seats while we waited. */
+        if (bs_admission_check_locked(sched, sid) != BS_ACQUIRE_OK) {
+            if (retry_after_s) *retry_after_s = 30;
+            result = BS_ACQUIRE_AT_CAPACITY;
+            break;
+        }
+
         /* D3: if pressure is TIGHT/CRITICAL, stay queued — don't admit a new
          * prefill that could OOM.  But if CRITICAL and queue is now full
          * (more callers arrived while we waited), fail with 503. */
@@ -3063,6 +3805,23 @@ bs_acquire_result bs_slot_acquire_or_wait(pn_batch_sched *sched,
                 break;
             }
             continue;   /* re-check all conditions */
+        }
+
+        /* Same-session resend: wait for the slot still prefilling it. */
+        if (hold && same_session_prefilling_locked(sched, sid)) {
+            struct timespec now;
+            clock_gettime(CLOCK_REALTIME, &now);
+            if (now.tv_sec < hold_until.tv_sec ||
+                (now.tv_sec == hold_until.tv_sec &&
+                 now.tv_nsec < hold_until.tv_nsec)) {
+                (void)pthread_cond_timedwait(&sched->cv_idle, &sched->mu,
+                                             &hold_until);
+                continue;   /* re-check all conditions */
+            }
+            hold = false;   /* waited long enough: claim as before */
+            fprintf(stderr, "[batch_sched] sid=%s: its earlier request is "
+                    "still prefilling after %d ms; claiming another slot\n",
+                    sid, hold_ms);
         }
 
         /* Pressure OK: try to claim a slot. */

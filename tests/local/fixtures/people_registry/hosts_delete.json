@@ -1,0 +1,6 @@
+{"endpoint":"POST /local/hosts/<key>/delete","class":"device",
+ "request":{},
+ "status":200,
+ "response":{"deleted":"c-0123456789ab"},
+ "errors":[{"when":"no row with that key","status":404,"type":"not_found"},
+           {"when":"the caller's person does not own the row","status":403,"type":"forbidden"}]}

@@ -87,8 +87,15 @@
 #ifdef USE_TT
 
 #include "pn_tt_device_internal.h"
+#include "pn_tt_moe.h"
+#include "pn_tt_host_gap.h"
+#include "pn_tt_topk_tail.h"
+#include "pn_tt_topk_rows.h"
 #include "pn_tt_core_boot_guard.h"
+#include "pn_tt_core_list.h"
 #include "pn_tt_eltwise_group.h"
+#include "pn_tt_group_pull.h"
+#include "pn_tt_swiglu_fuse.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -129,8 +136,7 @@
  *  nothing on the card and makes the result block readable as evidence rather than as one
  *  number that could be anything. */
 #define PN_TT_TOPK_SELECT 8u
-/** Per-call N ceiling (the kernel's kTopkMaxSelect): sampled requests ask for 64. */
-#define PN_TT_TOPK_SELECT_MAX 64u
+/* Per-call N ceiling PN_TT_TOPK_SELECT_MAX: pn_tt_topk_rows.h (sampled requests ask for 64). */
 
 /** The greedy sampler state this file arms: temperature <= 0 is a pure argmax on the RAW
  *  values, which is exactly what a host serial scan over the same row computes — that is
@@ -166,9 +172,17 @@ static const char *const pn_tt_oncard_names[PN_TT_ONCARD_COUNT] = { "norm", "swi
  *  whole run rather than once, because these break an op and not a single descriptor. */
 bool pn_tt_red(const char *name)
 {
-    const char *value = getenv(PN_TT_RED_ENV);
+    /* Read once (getenv scans the environment; this is called per descriptor). */
+    static char red[128];
+    static int read = 0;
 
-    return value && *value && strcmp(value, name) == 0;
+    if (!read) {
+        const char *value = getenv(PN_TT_RED_ENV);
+
+        snprintf(red, sizeof(red), "%s", value ? value : "");
+        read = 1;
+    }
+    return red[0] && strcmp(red, name) == 0;
 }
 
 /* ================================================================
@@ -408,23 +422,17 @@ int pn_tt_activation_alloc(pn_tt_device *device, uint32_t tile_count,
                                        out_activation);
 }
 
-int pn_tt_activation_alloc_rows(pn_tt_device *device, uint32_t tile_count, uint32_t tile_rows,
-                                pn_tt_activation *out_activation)
+/* Allocate and zero one strip, its DRAM taken by `alloc` (round-robin or emptiest bank). */
+static int pn_tt_activation_alloc_rows_with(pn_tt_device *device, uint32_t tile_count,
+                                            uint32_t tile_rows, pn_tt_activation *out_activation,
+                                            int (*alloc)(pn_tt_device *, size_t, ft_tt_buffer *))
 {
     ft_tt_buffer buffer;
-    uint32_t bank;
 
     if (!device || !out_activation || tile_count == 0u || tile_rows == 0u ||
         tile_rows > PN_TT_STRIP_MAX_TILE_ROWS || device->dram_bank_count == 0u)
         return -1;
-    /* Round-robin the strips across banks so the reader pulling an operand and the writer
-     * pushing a result are not usually the same endpoint — Phase 6.7 measured two endpoints
-     * on one NoC row sharing a ceiling. */
-    bank = device->strip_bank_cursor % device->dram_bank_count;
-    device->strip_bank_cursor++;
-    if (ft_tt_buffer_alloc(&device->allocator, FT_TT_MEM_SPACE_DRAM, bank,
-                           (size_t)tile_count * tile_rows * PN_TT_TILE_BF16,
-                           &buffer) != FT_TT_OK) {
+    if (alloc(device, (size_t)tile_count * tile_rows * PN_TT_TILE_BF16, &buffer) != 0) {
         fprintf(stderr, "pn_tt: DRAM full allocating a %u-tile x %u-band activation strip\n",
                 tile_count, tile_rows);
         return -1;
@@ -448,6 +456,23 @@ int pn_tt_activation_alloc_rows(pn_tt_device *device, uint32_t tile_count, uint3
         return -1;
     }
     return 0;
+}
+
+int pn_tt_activation_alloc_rows(pn_tt_device *device, uint32_t tile_count, uint32_t tile_rows,
+                                pn_tt_activation *out_activation)
+{
+    /* Round-robin the strips across banks so the reader pulling an operand and the writer
+     * pushing a result are not usually the same endpoint — Phase 6.7 measured two endpoints
+     * on one NoC row sharing a ceiling. */
+    return pn_tt_activation_alloc_rows_with(device, tile_count, tile_rows, out_activation,
+                                            pn_tt_dram_alloc_any);
+}
+
+int pn_tt_activation_alloc_rows_emptiest(pn_tt_device *device, uint32_t tile_count,
+                                         uint32_t tile_rows, pn_tt_activation *out_activation)
+{
+    return pn_tt_activation_alloc_rows_with(device, tile_count, tile_rows, out_activation,
+                                            pn_tt_dram_alloc_emptiest);
 }
 
 int pn_tt_activation_alloc_replicated(pn_tt_device *device, uint32_t tile_count,
@@ -793,6 +818,33 @@ int pn_tt_activation_fill_bands(pn_tt_device *device, const pn_tt_activation *ac
     return 0;
 }
 
+int pn_tt_activation_zero_band_range(pn_tt_device *device, const pn_tt_activation *activation,
+                                     uint32_t first, uint32_t end)
+{
+    if (!device || !activation)
+        return -1;
+    if (first >= end)
+        return 0;
+    if (pn_tt_matvec_flush(device) != 0)
+        return -1;
+    for (uint32_t replica = 0u; replica < activation->replica_count; replica++) {
+        const size_t band = (size_t)activation->tile_count * PN_TT_TILE_BF16;
+        const uint32_t rows = activation->tile_rows ? activation->tile_rows : 1u;
+
+        if (end > rows)
+            end = rows;
+        if (first >= end)
+            return 0;
+        if (pn_tt_fill_dram(device, activation->replica_bank[replica],
+                            activation->replica_address[replica] -
+                                (uint32_t)((size_t)activation->row_offset * band) +
+                                (uint32_t)((size_t)first * band),
+                            band * (end - first), 0u) != 0)
+            return -1;
+    }
+    return 0;
+}
+
 void pn_tt_vec_probe_apply(uint32_t *words)
 {
     static int probe = -1;
@@ -819,6 +871,12 @@ void pn_tt_device_set_topk_row(pn_tt_device *device, uint32_t row)
 {
     if (device && row < 32u)
         device->topk_row = row;
+}
+
+void pn_tt_device_set_topk_drain_only(pn_tt_device *device, bool drain)
+{
+    if (device)
+        device->topk_drain_only = drain;
 }
 
 void pn_tt_device_set_verify_rows(pn_tt_device *device, uint32_t rows)
@@ -1000,20 +1058,23 @@ bool pn_tt_prepare_family(pn_tt_device *device, pn_tt_residency *residency, cons
  *
  * @return the holder's name, or NULL when the core is free
  */
-static const char *pn_tt_core_holder(const pn_tt_device *device, uint32_t core,
-                                     const pn_tt_residency *except)
+const char *pn_tt_core_holder(const pn_tt_device *device, uint32_t core,
+                              const pn_tt_residency *except)
 {
     /* EIGHT named residencies are pushed below, not six. At the shipped four-way head split
      * with both head-norm widths live the table holds 12 of the 15 the old sizing gave, so it
      * never overflowed — but a split of 8 with two widths needs 16, and the failure would be a
      * stack write past the array on exactly the hybrid configuration this check exists for.
      * `pn_tt_device_residency_stat()` sizes the same list at 7 and is the one that was right. */
-    const pn_tt_residency *others[10u + (PN_TT_TOPK_MAX_MEMBERS - 1u) +
+    const pn_tt_residency *others[10u + (PN_TT_REDUCE_MAX_MEMBERS - 2u) +
+                                  (PN_TT_TOPK_MAX_MEMBERS - 1u) +
                                   PN_TT_RENDER_DIRECTIONS * PN_TT_RENDER_SPLIT_MAX_MEMBERS +
                                   (PN_TT_GDN_MAX_MEMBERS - 1u) +
                                   (PN_TT_GDNC_MAX_MEMBERS - 1u) +
                                   (PN_TT_ELTWISE_MAX_MEMBERS - 1u) +
-                                  (PN_TT_ATTN_MAX_MEMBERS - 1u) +
+                                  (PN_TT_ATTN_MAX_MEMBERS - 1u) + PN_TT_ATTN_SPLITK_MAX_EXTRA +
+                                  PN_TT_ATTN_GRID_MAX_MEMBERS +
+                                  (PN_TT_KV_APPEND_MAX_MEMBERS - 1u) +
                                   PN_TT_HEAD_NORM_MAX_WIDTHS * PN_TT_HEAD_NORM_MAX_MEMBERS];
     uint32_t count = 0u;
     uint32_t index;
@@ -1022,13 +1083,30 @@ static const char *pn_tt_core_holder(const pn_tt_device *device, uint32_t core,
      * The group is checked first because it is the one set that MOVES with a knob. */
     if (device->core_index == core)
         return "matmul member 0";
-    for (index = 0; index < device->group.member_count; index++) {
+    /* THE MoE BLOCK's router and expert residencies (pn_tt_moe.c). */
+    {
+        const char *moe = pn_tt_moe_core_holder(device, core, except);
+
+        if (moe)
+            return moe;
+    }
+    /* L1a: members 1.. parked and lent to the prefill hold nothing until they return. */
+    for (index = 0; !device->group.members_lent && index < device->group.member_count;
+         index++) {
         if (device->group.member[index].core_index == core)
             return "a matmul group member";
     }
+    /* THE PREFILL GRID, while booted (it parks after each prefill). A family re-armed onto a
+     * grid core mid-prefill would boot a second firmware under a live triad. */
+    for (index = 0; index < (uint32_t)(sizeof(device->group.grid) /
+                                       sizeof(device->group.grid[0])); index++) {
+        if (device->group.grid[index].booted && device->group.grid[index].core_index == core)
+            return "a prefill grid core";
+    }
 
     others[count++] = &device->reduce;
-    others[count++] = &device->reduce_member;
+    for (index = 0; index + 1u < PN_TT_REDUCE_MAX_MEMBERS; index++)
+        others[count++] = &device->reduce_member[index];
     others[count++] = &device->eltwise;
     others[count++] = &device->sample;
     for (index = 0; index + 1u < device->sample_members; index++)
@@ -1079,9 +1157,16 @@ static const char *pn_tt_core_holder(const pn_tt_device *device, uint32_t core,
         for (member = 1u; member < device->head_norm[index].members; member++)
             others[count++] = &device->head_norm[index].member[member - 1u];
     }
-    /* AND THE ATTENTION CHUNK MIXER'S HEAD-SPLIT MEMBERS. */
+    /* AND THE ATTENTION CHUNK MIXER'S HEAD-SPLIT MEMBERS, AND THE KV APPEND SPLIT'S. */
     for (index = 0; index + 1u < device->attention_members; index++)
         others[count++] = &device->attention_member[index];
+    for (index = 0; index < device->attention_splitk_extras; index++)
+        others[count++] = &device->attention_splitk_extra[index];
+    /* AND C's members borrowed onto the lent grid cores, while they live. */
+    for (index = 0; index < device->attention_grid_count; index++)
+        others[count++] = &device->attention_grid[index];
+    for (index = 0; index + 1u < device->memory_members; index++)
+        others[count++] = &device->memory_member[index];
     for (index = 0; index < count; index++) {
         if (others[index] == except || !others[index]->core_booted)
             continue;
@@ -1243,7 +1328,84 @@ bool pn_tt_start_family(pn_tt_residency *residency)
     return true;
 }
 
+void pn_tt_norm_schedule_fit(pn_tt_norm_schedule *schedule, ft_tt_op_reduce_residency *residency,
+                             const char *what)
+{
+    residency->stage_pages = schedule->stage_pages;
+    residency->input_rows = schedule->input_rows;
+    if (ft_tt_op_reduce_max_tile_cols(residency) >= residency->max_tile_cols)
+        return;
+    fprintf(stderr, "pn_tt: the %s P3 norm schedule (K=%u, %u input rows) does not fit Wt=%u "
+                    "— running the pre-P3 schedule\n", what, schedule->stage_pages,
+            schedule->input_rows, residency->max_tile_cols);
+    pn_tt_norm_schedule_model(false, residency->max_tile_cols, 0u, 0u, schedule);
+    residency->stage_pages = 0u;
+    residency->input_rows = 0u;
+}
+
+void pn_tt_norm_schedule_words(const pn_tt_norm_schedule *schedule, uint32_t *words)
+{
+    if (schedule->half_read && pn_tt_red("norm_fast_face0"))
+        words[FT_TT_OP_REDUCE_SCHEDULE] |= FT_TT_OP_REDUCE_SCHED_RED_FACE0;
+}
+
+/** The model norm's P3 schedule at `tile_cols`, from the knobs (pn_tt_norm_schedule.h). */
+static void pn_tt_reduce_schedule_plan(pn_tt_device *device, uint32_t tile_cols)
+{
+    pn_tt_norm_schedule_model(pn_tt_env_u32(PN_TT_NORM_FAST_ENV, 1u) != 0u, tile_cols,
+                              pn_tt_env_u32(PN_TT_NORM_DEPTH_ENV, PN_TT_NORM_DEPTH_DEFAULT),
+                              pn_tt_env_u32(PN_TT_NORM_CHUNK_ENV, PN_TT_NORM_CHUNK_DEFAULT),
+                              &device->reduce_schedule);
+}
+
 /** The reduce residency, sized for RMS norm at ONE width. */
+/** L4 knobs. `PN_TT_REDUCE_CORES` members (default 2, ON since 2026-10-05: decode 16.10 ->
+ *  16.28, prefill 335.3 -> 339.5, IDENTICAL); member 1 on `PN_TT_CORE_REDUCE_MEMBER` (88), or
+ *  members 1..N-1 from `PN_TT_REDUCE_MEMBER_CORE_LIST` ("88,59,60", pn_tt_core_list.h), which a
+ *  split wider than 2 needs (decode frontier N, 2026-11-19). */
+#define PN_TT_REDUCE_CORES_ENV          "PN_TT_REDUCE_CORES"
+#define PN_TT_REDUCE_CORES_DEFAULT      2u
+#define PN_TT_REDUCE_MEMBER_CORE_ENV    "PN_TT_REDUCE_MEMBER_CORE_LIST"
+#define PN_TT_REDUCE_MEMBER_CORE_DEFAULT 88u
+#define PN_TT_REDUCE_CORE_INDEX_MAX     139u
+
+/** How many members split a `tile_cols`-wide norm: the knob, clamped to the cap and lowered
+ *  to a divisor of the row (every slice the same width, ftr_slice's rule). */
+static uint32_t pn_tt_reduce_member_count(uint32_t tile_cols)
+{
+    uint32_t members = pn_tt_env_u32(PN_TT_REDUCE_CORES_ENV, PN_TT_REDUCE_CORES_DEFAULT);
+
+    if (members > PN_TT_REDUCE_MAX_MEMBERS)
+        members = PN_TT_REDUCE_MAX_MEMBERS;
+    while (members > 1u && tile_cols % members != 0u)
+        members--;
+    return members ? members : 1u;
+}
+
+/** Member `m`'s core (1..): the list's entry m-1 when the list is set, else 88 for member 1
+ *  and no core (an index past the part, so the arm refuses) for the rest. */
+static uint32_t pn_tt_reduce_member_core(uint32_t m)
+{
+    static uint32_t listed[PN_TT_REDUCE_MAX_MEMBERS];
+    static int count = -2;
+
+    if (count == -2) {
+        const char *list = getenv(PN_TT_REDUCE_MEMBER_CORE_ENV);
+
+        count = pn_tt_core_list_parse(list, listed, PN_TT_REDUCE_MAX_MEMBERS,
+                                      PN_TT_REDUCE_CORE_INDEX_MAX);
+        if (count < 0)
+            fprintf(stderr, "pn_tt: %s=%s is not a core list — the norm split stays at one "
+                            "member\n", PN_TT_REDUCE_MEMBER_CORE_ENV, list);
+    }
+    if (count > 0)
+        return (uint32_t)count >= m ? listed[m - 1u] : UINT32_MAX;
+    if (count < 0)
+        return UINT32_MAX;
+    return m == 1u ? pn_tt_env_u32("PN_TT_CORE_REDUCE_MEMBER", PN_TT_REDUCE_MEMBER_CORE_DEFAULT)
+                   : UINT32_MAX;
+}
+
 static bool pn_tt_arm_reduce(pn_tt_device *device, uint32_t norm_tile_cols)
 {
     static const ft_tt_op_reduce_function members[] = { FT_TT_OP_REDUCE_FN_RMS_NORM };
@@ -1256,6 +1418,10 @@ static bool pn_tt_arm_reduce(pn_tt_device *device, uint32_t norm_tile_cols)
                 norm_tile_cols);
         return false;
     }
+    /* P3: the schedule decides the scratch and cb_out depth, so it is fixed HERE, once, and
+     * every placement below (member, idle fill, re-arms) and every descriptor uses it. */
+    pn_tt_reduce_schedule_plan(device, norm_tile_cols);
+    pn_tt_norm_schedule_fit(&device->reduce_schedule, &residency, "reduce");
     if (!pn_tt_prepare_family(device, &device->reduce, PN_TT_REDUCE_PROGRAM, "reduce",
                               PN_TT_CORE_REDUCE_ENV, PN_TT_CORE_REDUCE_DEFAULT,
                               PN_TT_ONCARD_TRIAD_MASK))
@@ -1293,46 +1459,71 @@ static bool pn_tt_arm_reduce(pn_tt_device *device, uint32_t norm_tile_cols)
             fprintf(stderr, "pn_tt: IDLE FILL — %u idle reduce residencies on cores 0..%u\n",
                     device->idle_fill_count, device->idle_fill_count - 1u);
     }
-    /* L4: a second member over the same placement. Its failure is not fatal — the norm then
-     * runs whole on member 0. */
-    if (device->reduce_members != 1u && pn_tt_env_u32("PN_TT_REDUCE_CORES", 2u) >= 2u /* L4 ON since 2026-10-05: decode 16.10 -> 16.28, prefill 335.3 -> 339.5, IDENTICAL */ &&
-        (norm_tile_cols % 2u) == 0u && !device->reduce_member.running) {
+    /* L4: extra members over the same placement. A failure is not fatal — the norm then runs
+     * on the members that came up, or whole on member 0. */
+    if (device->reduce_members != 1u && !device->reduce_member[0].running) {
+        const uint32_t members = pn_tt_reduce_member_count(norm_tile_cols);
+        uint32_t m;
+
         device->reduce_members = 1u;
-        if (pn_tt_prepare_family(device, &device->reduce_member, PN_TT_REDUCE_PROGRAM,
-                                 "reduce-member", "PN_TT_CORE_REDUCE_MEMBER", 88u,
-                                 PN_TT_ONCARD_TRIAD_MASK)) {
-            if (ft_tt_op_reduce_place_cbs(&residency, placed, device->reduce_member.cb_buffer,
-                                          sizeof(device->reduce_member.cb_buffer),
-                                          &device->reduce_member.cb_mask) == FT_TT_OK &&
-                pn_tt_start_family(&device->reduce_member))
-                device->reduce_members = 2u;
-            else
-                pn_tt_residency_release(&device->reduce_member);
+        for (m = 1u; m < members; m++) {
+            pn_tt_residency *member = &device->reduce_member[m - 1u];
+
+            if (pn_tt_reduce_member_core(m) == UINT32_MAX) {
+                fprintf(stderr, "pn_tt: reduce member %u has no core — set %s\n", m,
+                        PN_TT_REDUCE_MEMBER_CORE_ENV);
+                break;
+            }
+            if (!pn_tt_prepare_family_on_core(device, member, PN_TT_REDUCE_PROGRAM,
+                                              "reduce-member", PN_TT_REDUCE_MEMBER_CORE_ENV,
+                                              pn_tt_reduce_member_core(m),
+                                              PN_TT_ONCARD_TRIAD_MASK))
+                break;
+            if (ft_tt_op_reduce_place_cbs(&residency, placed, member->cb_buffer,
+                                          sizeof(member->cb_buffer), &member->cb_mask) != FT_TT_OK ||
+                !pn_tt_start_family(member)) {
+                pn_tt_residency_release(member);
+                break;
+            }
+            device->reduce_members++;
         }
-        fprintf(stderr, "pn_tt: reduce COLUMN SPLIT — %u member(s)\n", device->reduce_members);
+        /* A split that did not fully arm runs on member 0 alone: slices are a divisor of the
+         * row, so a partial set cannot cover it. Released rather than left idle. */
+        if (device->reduce_members != members) {
+            for (m = 0; m + 1u < device->reduce_members; m++)
+                pn_tt_residency_release(&device->reduce_member[m]);
+            device->reduce_members = members > 1u ? 1u : device->reduce_members;
+        }
+        if (members > 1u)
+            fprintf(stderr, "pn_tt: reduce COLUMN SPLIT — %u member(s)\n",
+                    device->reduce_members);
     }
     return true;
 }
 
-/** L4: re-arm the reduce member alone (same placement as member 0). */
-static bool pn_tt_rearm_reduce_member(pn_tt_device *device)
+/** L4: re-arm reduce member `m` (1..) alone, on its core, with member 0's placement. */
+static bool pn_tt_rearm_reduce_member(pn_tt_device *device, uint32_t m)
 {
-    static const ft_tt_op_reduce_function members[] = { FT_TT_OP_REDUCE_FN_RMS_NORM };
+    static const ft_tt_op_reduce_function functions[] = { FT_TT_OP_REDUCE_FN_RMS_NORM };
+    pn_tt_residency *member = &device->reduce_member[m - 1u];
     ft_tt_op_reduce_residency residency;
     ft_tt_launch_cb_entry placed[FT_TT_OP_REDUCE_CB_COUNT];
 
-    pn_tt_residency_stop(&device->reduce_member);
-    pn_tt_residency_release(&device->reduce_member);
+    pn_tt_residency_stop(member);
+    pn_tt_residency_release(member);
     device->oncard_restarts++;
-    return ft_tt_op_reduce_residency_for(members, 1u, device->reduce_tile_cols,
-                                         PN_TT_TILE_BF16, &residency) == FT_TT_OK &&
-           pn_tt_prepare_family(device, &device->reduce_member, PN_TT_REDUCE_PROGRAM,
-                                "reduce-member", "PN_TT_CORE_REDUCE_MEMBER", 88u,
-                                PN_TT_ONCARD_TRIAD_MASK) &&
-           ft_tt_op_reduce_place_cbs(&residency, placed, device->reduce_member.cb_buffer,
-                                     sizeof(device->reduce_member.cb_buffer),
-                                     &device->reduce_member.cb_mask) == FT_TT_OK &&
-           pn_tt_start_family(&device->reduce_member);
+    if (ft_tt_op_reduce_residency_for(functions, 1u, device->reduce_tile_cols, PN_TT_TILE_BF16,
+                                      &residency) != FT_TT_OK)
+        return false;
+    /* P3: member 0's placement, so every member takes the same descriptors. */
+    residency.stage_pages = device->reduce_schedule.stage_pages;
+    residency.input_rows = device->reduce_schedule.input_rows;
+    return pn_tt_prepare_family_on_core(device, member, PN_TT_REDUCE_PROGRAM, "reduce-member",
+                                        PN_TT_REDUCE_MEMBER_CORE_ENV,
+                                        pn_tt_reduce_member_core(m), PN_TT_ONCARD_TRIAD_MASK) &&
+           ft_tt_op_reduce_place_cbs(&residency, placed, member->cb_buffer,
+                                     sizeof(member->cb_buffer), &member->cb_mask) == FT_TT_OK &&
+           pn_tt_start_family(member);
 }
 
 /**
@@ -1653,9 +1844,7 @@ int pn_tt_reduce_constants_upload(pn_tt_device *device, ft_tt_op_reduce_function
         free(constants);
         return -1;
     }
-    if (ft_tt_buffer_alloc(&device->allocator, FT_TT_MEM_SPACE_DRAM,
-                           device->strip_bank_cursor++ % device->dram_bank_count, bytes,
-                           &buffer) != FT_TT_OK) {
+    if (pn_tt_dram_alloc_any(device, bytes, &buffer) != 0) {
         free(constants);
         fprintf(stderr, "pn_tt: DRAM full uploading norm constants\n");
         return -1;
@@ -1688,6 +1877,67 @@ int pn_tt_norm_constants_upload(pn_tt_device *device, const float *gamma, uint32
                                          PN_TT_TILE_BF16, out_constants);
 }
 
+/** Every split member running and the row dividing into their slices. */
+static bool pn_tt_reduce_split_ready(const pn_tt_device *device, uint32_t tile_cols)
+{
+    uint32_t m;
+
+    if (tile_cols % device->reduce_members != 0u)
+        return false;
+    for (m = 0; m + 1u < device->reduce_members; m++)
+        if (!device->reduce_member[m].running)
+            return false;
+    return true;
+}
+
+/**
+ * L4 COLUMN SPLIT over `reduce_members`: every member reduces the whole row in the same order
+ * (so rstd is the same bits), member m finishes slice m (kRedFinal byte 3 = members << 4 | m).
+ * RED `reduce_slice_dup`: member 1 also writes slice 0, so slice 1 is never written.
+ * @return 0, or -1 when a member could not be re-armed and re-run
+ */
+static int pn_tt_rms_norm_split(pn_tt_device *device, const uint32_t *words)
+{
+    const uint32_t members = device->reduce_members;
+    uint32_t slices[PN_TT_REDUCE_MAX_MEMBERS][FT_TT_OP_VECTOR_WORDS];
+    pn_tt_residency *set[PN_TT_REDUCE_MAX_MEMBERS];
+    bool bad[PN_TT_REDUCE_MAX_MEMBERS];
+    uint32_t m;
+
+    for (m = 0; m < members; m++) {
+        const uint32_t slice = m == 1u && pn_tt_red("reduce_slice_dup") ? 0u : m;
+
+        memcpy(slices[m], words, sizeof(slices[m]));
+        slices[m][FT_TT_OP_REDUCE_FINAL] = (words[FT_TT_OP_REDUCE_FINAL] & 0x00FFFFFFu) |
+                                           (((members << 4) | slice) << 24);
+        set[m] = m == 0u ? &device->reduce : &device->reduce_member[m - 1u];
+        bad[m] = false;
+    }
+    if (pn_tt_group_pull_decide(&device->reduce_pull, pn_tt_group_pull_decode(device), set,
+                                members, members, "reduce")) {
+        /* S1: `reduce` posts only once every member has; one await. */
+        (void)pn_tt_group_pull_enqueue(&device->reduce_pull, true, set, members,
+                                       FT_TT_QUEUE_OP_REDUCE, slices[0], bad);
+        (void)pn_tt_group_pull_await(&device->reduce_pull, true, set, members, bad, NULL);
+    } else {
+        for (m = 0; m < members; m++)
+            bad[m] = pn_tt_residency_enqueue(set[m], FT_TT_QUEUE_OP_REDUCE, slices[m], 1u) != 0;
+        for (m = 0; m < members; m++)
+            if (!bad[m] && pn_tt_residency_await(set[m], PN_TT_OP_TIMEOUT_MS) != 0)
+                bad[m] = true;
+    }
+    for (m = 0; m < members; m++) {
+        if (!bad[m])
+            continue;
+        if (!(m == 0u ? pn_tt_oncard_rearm(device, &device->reduce)
+                      : pn_tt_rearm_reduce_member(device, m)) ||
+            pn_tt_residency_submit(set[m], FT_TT_QUEUE_OP_REDUCE, slices[m],
+                                   PN_TT_OP_TIMEOUT_MS) != 0)
+            return -1;
+    }
+    return 0;
+}
+
 int pn_tt_rms_norm(pn_tt_device *device, const pn_tt_norm_constants *constants,
                    const pn_tt_activation *input, const pn_tt_activation *output)
 {
@@ -1697,9 +1947,13 @@ int pn_tt_rms_norm(pn_tt_device *device, const pn_tt_norm_constants *constants,
 
     if (!device || !constants || !input || !output || !device->reduce.running)
         return -1;
+    if (pn_tt_fuse_probe_bits() & PN_TT_FUSE_PROBE_NORM)
+        return 0;
+    pn_tt_host_gap_split("norm");
     /* Chained projections are awaited HERE — pn_tt_device.h, pn_tt_matvec_enqueue. */
     if (pn_tt_matvec_flush(device) != 0)
         return -1;
+    pn_tt_host_gap_split("norm-encode");
     if (constants->tile_cols != device->reduce_tile_cols ||
         input->tile_count < constants->tile_cols || output->tile_count < constants->tile_cols) {
         fprintf(stderr, "pn_tt: rms_norm Wt=%u is not the Wt=%u this residency was placed "
@@ -1724,7 +1978,15 @@ int pn_tt_rms_norm(pn_tt_device *device, const pn_tt_norm_constants *constants,
     if (output->active_rows && output->active_rows < request.row_blocks)
         request.row_blocks = output->active_rows;
     request.tile_cols = constants->tile_cols;
-    request.prefetch_tiles = constants->tile_cols;
+    /* P3 (pn_tt_norm_schedule.h): streamed at a block depth, half reads, the chain in runs.
+     * The pre-P3 schedule is depth = Wt and zeros, i.e. these lines before P3. */
+    request.prefetch_tiles = device->reduce_schedule.prefetch_tiles
+                                 ? device->reduce_schedule.prefetch_tiles
+                                 : constants->tile_cols;
+    request.chain_chunk =
+        pn_tt_norm_schedule_chunk_for(&device->reduce_schedule, constants->tile_cols);
+    request.stream_input = device->reduce_schedule.stream_input;
+    request.half_read = device->reduce_schedule.half_read;
     request.input = pn_tt_operand(device, input);
     request.constants.x = (uint16_t)device->dram[constants->bank].x;
     request.constants.y = (uint16_t)device->dram[constants->bank].y;
@@ -1734,6 +1996,7 @@ int pn_tt_rms_norm(pn_tt_device *device, const pn_tt_norm_constants *constants,
     if (ft_tt_op_reduce_parameters(&request, words) != FT_TT_OK)
         return -1;
     pn_tt_vec_probe_apply(words);
+    pn_tt_norm_schedule_words(&device->reduce_schedule, words);
     /* M3 HALF TILE (word 3 bit 23, resident_vector_protocol.h ftv_half_tile): a single-token
      * forward's elementwise FPU passes run on faces 0-1. `PN_TT_REDUCE_HALF` 0 off, 1 (default)
      * honour the single-row promise, 2 RED: every descriptor, multi-row prefill too. */
@@ -1748,34 +2011,9 @@ int pn_tt_rms_norm(pn_tt_device *device, const pn_tt_norm_constants *constants,
     }
 
     started = pn_tt_now_seconds();
-    if (device->reduce_members == 2u && device->reduce_member.running &&
-        (constants->tile_cols % 2u) == 0u) {
-        /* L4 COLUMN SPLIT: both members reduce the whole row; member m finishes half m. RED
-         * `reduce_slice_dup`: member 1 also writes half 0, so half 1 is never written. */
-        uint32_t second[FT_TT_OP_VECTOR_WORDS];
-        int rc0, rc1 = 0;
-
-        memcpy(second, words, sizeof(second));
-        words[FT_TT_OP_REDUCE_FINAL] = (words[FT_TT_OP_REDUCE_FINAL] & 0x00FFFFFFu) |
-                                       (0x20u << 24);
-        second[FT_TT_OP_REDUCE_FINAL] =
-            (second[FT_TT_OP_REDUCE_FINAL] & 0x00FFFFFFu) |
-            ((pn_tt_red("reduce_slice_dup") ? 0x20u : 0x21u) << 24);
-        rc0 = pn_tt_residency_enqueue(&device->reduce, FT_TT_QUEUE_OP_REDUCE, words, 1u);
-        if (pn_tt_residency_enqueue(&device->reduce_member, FT_TT_QUEUE_OP_REDUCE, second, 1u) !=
-            0)
-            rc1 = -1;
-        if (rc0 == 0 && pn_tt_residency_await(&device->reduce, PN_TT_OP_TIMEOUT_MS) != 0)
-            rc0 = -1;
-        if (rc1 == 0 && pn_tt_residency_await(&device->reduce_member, PN_TT_OP_TIMEOUT_MS) != 0)
-            rc1 = -1;
-        if (rc0 != 0 && (!pn_tt_oncard_rearm(device, &device->reduce) ||
-                         pn_tt_residency_submit(&device->reduce, FT_TT_QUEUE_OP_REDUCE, words,
-                                                PN_TT_OP_TIMEOUT_MS) != 0))
-            return -1;
-        if (rc1 != 0 && (!pn_tt_rearm_reduce_member(device) ||
-                         pn_tt_residency_submit(&device->reduce_member, FT_TT_QUEUE_OP_REDUCE,
-                                                second, PN_TT_OP_TIMEOUT_MS) != 0))
+    if (device->reduce_members > 1u &&
+        pn_tt_reduce_split_ready(device, constants->tile_cols)) {
+        if (pn_tt_rms_norm_split(device, words) != 0)
             return -1;
         pn_tt_oncard_account(device, "reduce", "rms_norm", constants->tile_cols,
                              pn_tt_now_seconds() - started);
@@ -1843,17 +2081,8 @@ static int pn_tt_eltwise(pn_tt_device *device, ft_tt_op_vector_function function
     request.function = function;
     request.tile_count = tiles;
     request.prefetch_tiles = device->eltwise_depth;
-    {
-        static int row0_mode = -1;
-
-        if (row0_mode < 0)
-            row0_mode = (int)pn_tt_env_u32("PN_TT_ELTWISE_ROW0", 1u);
-        request.row0 = row0_mode == 2 ||
-                               (row0_mode == 1 &&
-                                (device->single_row ||
-                                 (device->verify_rows && device->verify_rows <= 4u)))
-                           ? 1u : 0u;
-    }
+    /* ONE rule for every silu row-0 pass (the fused SwiGLU descriptor asks the same one). */
+    request.row0 = pn_tt_eltwise_silu_row0(device) ? 1u : 0u;
     request.input_a = pn_tt_operand(device, a);
     if (b)
         request.input_b = pn_tt_operand(device, b);
@@ -1890,9 +2119,20 @@ static int pn_tt_eltwise(pn_tt_device *device, ft_tt_op_vector_function function
     return 0;
 }
 
+uint32_t pn_tt_fuse_probe_bits(void)
+{
+    static int bits = -1;
+
+    if (bits < 0)
+        bits = (int)pn_tt_env_u32("PN_TT_FUSE_PROBE", 0u);
+    return (uint32_t)bits;
+}
+
 int pn_tt_add(pn_tt_device *device, const pn_tt_activation *a, const pn_tt_activation *b,
               const pn_tt_activation *output)
 {
+    if (pn_tt_fuse_probe_bits() & PN_TT_FUSE_PROBE_ADD)
+        return 0;
     /* RED PROOF: the residual becomes a subtraction. */
     return pn_tt_eltwise(device, pn_tt_red("residual_sub") ? FT_TT_OP_VECTOR_FN_SUB
                                                            : FT_TT_OP_VECTOR_FN_ADD,
@@ -1904,9 +2144,17 @@ int pn_tt_silu_mul(pn_tt_device *device, const pn_tt_activation *a, const pn_tt_
 {
     /* RED PROOF: the two operands of the gate swap, which is the mutation a SwiGLU is most
      * likely to suffer for real and the one a shape check cannot see — both are n_ff. */
+    if (pn_tt_fuse_probe_bits() & PN_TT_FUSE_PROBE_SILU_MUL)
+        return 0;
     if (pn_tt_red("swiglu_swap"))
         return pn_tt_eltwise(device, FT_TT_OP_VECTOR_FN_SILU_MUL, b, a, output);
     return pn_tt_eltwise(device, FT_TT_OP_VECTOR_FN_SILU_MUL, a, b, output);
+}
+
+int pn_tt_mul(pn_tt_device *device, const pn_tt_activation *a, const pn_tt_activation *b,
+              const pn_tt_activation *output)
+{
+    return pn_tt_eltwise(device, FT_TT_OP_VECTOR_FN_MUL, a, b, output);
 }
 
 int pn_tt_sigmoid_mul(pn_tt_device *device, const pn_tt_activation *gate,
@@ -1933,49 +2181,14 @@ int pn_tt_sigmoid_mul(pn_tt_device *device, const pn_tt_activation *gate,
     return pn_tt_eltwise(device, FT_TT_OP_VECTOR_FN_MUL, scratch, b, output);
 }
 
-/** The kernel's order: key(bf16) descending, then index ascending (resident_topk_protocol.h). */
-static uint32_t pn_tt_topk_key(float value)
-{
-    uint32_t bits;
-    uint32_t u;
-
-    memcpy(&bits, &value, sizeof(bits));
-    u = bits >> 16;
-    return (u & 0x8000u) ? (uint16_t)~u : (uint16_t)(u | 0x8000u);
-}
-
-/** L3: every member selects over its slice, the host merges exactly. */
-/* S2e (`PN_TT_TOPK_BULK`, default 1): the result block in ONE bulk L1 read (16 B-rounded)
- * instead of the register accessor's word by word. */
-static int pn_tt_topk_read_block(pn_tt_device *device, uint32_t x, uint32_t y, uint32_t address,
-                                 uint32_t *block, size_t bytes)
-{
-    static int bulk = -1;
-    uint32_t staged[(FT_TT_OP_SAMPLE_RESULT_BYTES + 15u) / 4u];
-    const size_t rounded = (bytes + 15u) & ~(size_t)15u;
-    int rc;
-
-    if (bulk < 0)
-        bulk = (int)pn_tt_env_u32("PN_TT_TOPK_BULK", 1u);
-    if (!bulk || (address & 15u) != 0u || rounded > sizeof(staged) || !device->runtime.bulk_l1.read)
-        return device->runtime.noc.read(device->runtime.noc.user, (uint16_t)x, (uint16_t)y,
-                                        address, block, bytes);
-    rc = device->runtime.bulk_l1.read(device->runtime.bulk_l1.user, (uint16_t)x, (uint16_t)y,
-                                      address, staged, rounded);
-    if (rc == FT_TT_OK)
-        memcpy(block, staged, bytes);
-    return rc;
-}
-
+/** L3: every member selects over its slice, the host merges exactly (pn_tt_topk_rows.c). */
 static int pn_tt_topk_split(pn_tt_device *device, const pn_tt_activation *logits,
                             uint32_t count, uint32_t *out_indices, float *out_values,
                             uint32_t *out_count)
 {
     const uint32_t members = device->sample_members;
     const uint32_t slice = device->sample_tile_count / members;
-    uint32_t all_index[PN_TT_TOPK_MAX_MEMBERS * PN_TT_TOPK_SELECT_MAX];
-    float all_value[PN_TT_TOPK_MAX_MEMBERS * PN_TT_TOPK_SELECT_MAX];
-    uint32_t total = 0u, m, k;
+    uint32_t m;
     const bool red = pn_tt_red("topk_split_no_offset");
     double started = pn_tt_now_seconds();
     int failed = 0;
@@ -1989,14 +2202,22 @@ static int pn_tt_topk_split(pn_tt_device *device, const pn_tt_activation *logits
         request.tile_count = slice;
         request.row = device->topk_row;
         request.select_count = count;
+        if (device->topk_drain_only)
+            request.flags |= FT_TT_OP_SAMPLE_FLAG_DRAIN_ONLY;
         request.prefetch_tiles = device->sample_depth;
         request.logits = pn_tt_operand(device, logits);
         request.logits.address += m * slice * PN_TT_TILE_BF16;
         request.result_address =
             m == 0u ? device->sample_result_address : device->sample_member_result[m - 1u];
+        request.helper_area = pn_tt_topk_helper_area(request.result_address);
+        /* RED `topk_helper_drop`: NCRISC merges without helper 2's tiles — must DIFFER. */
+        if (pn_tt_red("topk_helper_drop"))
+            request.flags |= FT_TT_OP_SAMPLE_FLAG_RED_DROP_HELPER;
         request.state_address =
             m == 0u ? device->sample_state_address : device->sample_member_state[m - 1u];
-        if (ft_tt_op_sample_parameters(&request, words) != FT_TT_OK ||
+        if (!pn_tt_topk_tail_prepare(device, r->core_x, r->core_y, request.result_address,
+                                     &request) ||
+            ft_tt_op_sample_parameters(&request, words) != FT_TT_OK ||
             pn_tt_residency_enqueue(r, FT_TT_QUEUE_OP_TOPK, words, 1u) != 0)
             failed = 1;
     }
@@ -2010,6 +2231,9 @@ static int pn_tt_topk_split(pn_tt_device *device, const pn_tt_activation *logits
         /* A member that idled out (a long prefill) or refused: re-arm the set and run the
          * whole split once more — TOPK has no side effect but its result blocks. */
         static int retrying;
+
+        if (retrying)
+            pn_tt_topk_dump_failure(device);
 
         if (retrying)
             return -1;
@@ -2031,51 +2255,13 @@ static int pn_tt_topk_split(pn_tt_device *device, const pn_tt_activation *logits
     }
     for (m = 0; m < members; m++) {
         const pn_tt_residency *r = m == 0u ? &device->sample : &device->sample_member[m - 1u];
-        uint32_t block[FT_TT_OP_SAMPLE_RESULT_HEADER_WORDS +
-                       PN_TT_TOPK_SELECT_MAX * FT_TT_OP_SAMPLE_PAIR_WORDS];
-        uint32_t indices[PN_TT_TOPK_SELECT_MAX];
-        float values[PN_TT_TOPK_SELECT_MAX];
-        const size_t bytes = (FT_TT_OP_SAMPLE_RESULT_HEADER_WORDS +
-                              count * FT_TT_OP_SAMPLE_PAIR_WORDS) * sizeof(uint32_t);
-        uint32_t produced = 0u;
 
-        if (pn_tt_topk_read_block(device, r->core_x, r->core_y,
-                                  m == 0u ? device->sample_result_address
-                                          : device->sample_member_result[m - 1u],
-                                  block, bytes) != FT_TT_OK ||
-            ft_tt_op_sample_result_decode(block, count, indices, values, &produced,
-                                          NULL) != FT_TT_OK)
-            return -1;
-        device->bytes_read += bytes;
-        for (k = 0; k < produced; k++) {
-            all_index[total] = indices[k] + (red ? 0u : m * slice * 32u);
-            all_value[total] = values[k];
-            total++;
-        }
+        pn_tt_topk_tail_collect(device, r->core_x, r->core_y,
+                                m == 0u ? device->sample_result_address
+                                        : device->sample_member_result[m - 1u]);
     }
-    /* Insertion sort, the kernel's comparator: key desc, then index asc. */
-    for (k = 1; k < total; k++) {
-        const uint32_t ix = all_index[k];
-        const float v = all_value[k];
-        const uint32_t key = pn_tt_topk_key(v);
-        uint32_t j = k;
-
-        while (j > 0u && (pn_tt_topk_key(all_value[j - 1u]) < key ||
-                          (pn_tt_topk_key(all_value[j - 1u]) == key && all_index[j - 1u] > ix))) {
-            all_index[j] = all_index[j - 1u];
-            all_value[j] = all_value[j - 1u];
-            j--;
-        }
-        all_index[j] = ix;
-        all_value[j] = v;
-    }
-    if (total > count)
-        total = count;
-    for (k = 0; k < total; k++) {
-        out_indices[k] = all_index[k];
-        out_values[k] = all_value[k];
-    }
-    *out_count = total;
+    if (pn_tt_topk_merge_members(device, count, 0u, red, out_indices, out_values, out_count) != 0)
+        return -1;
     pn_tt_oncard_account(device, "topk", "select", device->sample_tile_count,
                          pn_tt_now_seconds() - started);
     return 0;
@@ -2114,8 +2300,11 @@ int pn_tt_topk(pn_tt_device *device, const pn_tt_activation *logits, uint32_t co
     request.prefetch_tiles = device->sample_depth;
     request.logits = pn_tt_operand(device, logits);
     request.result_address = device->sample_result_address;
+    request.helper_area = pn_tt_topk_helper_area(request.result_address);
     request.state_address = device->sample_state_address;
-    if (ft_tt_op_sample_parameters(&request, words) != FT_TT_OK)
+    if (!pn_tt_topk_tail_prepare(device, device->sample.core_x, device->sample.core_y,
+                                 request.result_address, &request) ||
+        ft_tt_op_sample_parameters(&request, words) != FT_TT_OK)
         return -1;
 
     started = pn_tt_now_seconds();
@@ -2127,8 +2316,11 @@ int pn_tt_topk(pn_tt_device *device, const pn_tt_activation *logits, uint32_t co
             return -1;
         request.prefetch_tiles = device->sample_depth;
         request.result_address = device->sample_result_address;
+        request.helper_area = pn_tt_topk_helper_area(request.result_address);
         request.state_address = device->sample_state_address;
-        if (ft_tt_op_sample_parameters(&request, words) != FT_TT_OK ||
+        if (!pn_tt_topk_tail_prepare(device, device->sample.core_x, device->sample.core_y,
+                                     request.result_address, &request) ||
+            ft_tt_op_sample_parameters(&request, words) != FT_TT_OK ||
             pn_tt_residency_submit(&device->sample, FT_TT_QUEUE_OP_TOPK, words,
                                    PN_TT_OP_TIMEOUT_MS) != 0)
             return -1;
@@ -2136,7 +2328,7 @@ int pn_tt_topk(pn_tt_device *device, const pn_tt_activation *logits, uint32_t co
     /* The result block is in L1 on the sampling core, so it takes the REGISTER accessor —
      * the bulk one refuses a non-DRAM address by design. It is ~96 bytes against the
      * 261,120 the logit row would have been. */
-    rc = pn_tt_topk_read_block(device, device->sample.core_x, device->sample.core_y,
+    rc = pn_tt_topk_read_result(device, device->sample.core_x, device->sample.core_y,
                                device->sample_result_address, block, bytes);
     if (rc != FT_TT_OK) {
         fprintf(stderr, "pn_tt: the top-N result block did not read back: %s\n",
@@ -2144,6 +2336,8 @@ int pn_tt_topk(pn_tt_device *device, const pn_tt_activation *logits, uint32_t co
         return -1;
     }
     device->bytes_read += bytes;
+    pn_tt_topk_tail_collect(device, device->sample.core_x, device->sample.core_y,
+                            device->sample_result_address);
     {
         uint32_t indices[PN_TT_TOPK_SELECT_MAX];
         float values[PN_TT_TOPK_SELECT_MAX];

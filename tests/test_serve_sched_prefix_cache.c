@@ -224,7 +224,7 @@ int main(int argc, char **argv)
     }
 
     /* ── Cached batched run: 4 users concurrent, 3 growing turns each. ── */
-    pn_batch_sched *sched = bs_create(model, N_USERS);
+    pn_batch_sched *sched = bs_create(model, N_USERS, NULL);
     if (!sched) { fprintf(stderr, "bs_create failed\n"); return 1; }
     fprintf(stderr, "\nPC-batched gate: %d users x %d turns, driver_sample=%d\n",
             N_USERS, N_TURNS, bs_driver_sampling(sched) ? 1 : 0);

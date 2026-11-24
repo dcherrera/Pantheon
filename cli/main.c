@@ -11,6 +11,7 @@
 #include "../src/core/chat.h"
 #include "../src/serve/serve_command.h"
 #include "../src/serve/router_command.h"
+#include "../src/local/local_command.h"
 #include "tensor/tensor.h"
 
 #define PN_VERSION "0.4.0"
@@ -30,7 +31,11 @@ static void print_usage(const char *prog) {
     printf("  --temperature <f>     Sampling temperature (default: 0.8)\n");
     printf("  --top-p <f>           Nucleus sampling threshold (default: 0.9)\n");
     printf("  --top-k <n>           Top-k sampling (default: 40)\n");
+    printf("  --ctx-cap <n>         Per-session context window in tokens (default: the\n");
+    printf("                        model's, capped to what host RAM can admit)\n");
     printf("  --quantize            INT8 quantize weights at load time\n");
+    printf("  --cpu                 Run on the host CPU forward (an accelerator build\n");
+    printf("                        otherwise refuses a load its devices cannot take)\n");
     printf("  --bench               Run benchmark (report tok/s and memory)\n");
     printf("  --help                Show this help\n");
     printf("  --version             Show version, compiled backend and build commit\n");
@@ -56,6 +61,9 @@ int main(int argc, char **argv) {
      * Pure host-side networking, no model load / CUDA. */
     if (argc > 1 && strcmp(argv[1], "router") == 0)
         return pn_router_main(argc - 1, argv + 1);
+    /* `pantheon local ...` is the appliance mode of the serve (src/local/). */
+    if (argc > 1 && strcmp(argv[1], "local") == 0)
+        return pn_local_main(argc - 1, argv + 1);
 
     const char *model_path = NULL;
     const char *config_path = NULL;
@@ -66,7 +74,9 @@ int main(int argc, char **argv) {
     int bench = 0;
     int chat_mode = 0;
     int quantize = 0;
+    int cpu_only = 0;
     int raw = 0;   /* --raw: bypass the chat template in one-shot --prompt mode */
+    int ctx_cap = 0;   /* --ctx-cap: operator-chosen window (refused if it won't fit) */
     pn_sampling_params params = pn_sampling_defaults();
 
     /* Parse arguments */
@@ -101,12 +111,16 @@ int main(int argc, char **argv) {
             vocab_path = argv[++i];
         } else if (strcmp(argv[i], "--quantize") == 0) {
             quantize = 1;
+        } else if (strcmp(argv[i], "--cpu") == 0) {
+            cpu_only = 1;
         } else if (strcmp(argv[i], "--prompt") == 0 && i + 1 < argc) {
             prompt = argv[++i];
         } else if (strcmp(argv[i], "--chat") == 0) {
             chat_mode = 1;
         } else if (strcmp(argv[i], "--system") == 0 && i + 1 < argc) {
             system_prompt = argv[++i];
+        } else if (strcmp(argv[i], "--ctx-cap") == 0 && i + 1 < argc) {
+            ctx_cap = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--max-tokens") == 0 && i + 1 < argc) {
             max_tokens = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--temperature") == 0 && i + 1 < argc) {
@@ -155,7 +169,9 @@ int main(int argc, char **argv) {
     /* Load model */
     if (model_path) {
         double t0 = pn_time_ms();
-        pn_load_opts opts = { .vocab_path = vocab_path, .config_path = config_path, .quantize = quantize };
+        pn_load_opts opts = { .vocab_path = vocab_path, .config_path = config_path,
+                              .quantize = quantize, .ctx_cap = ctx_cap,
+                              .cpu_only = cpu_only };
         pn_model *model = pn_load_ex(model_path, &opts);
         if (!model) {
             fprintf(stderr, "Failed to load model: %s\n", model_path);

@@ -66,8 +66,9 @@
  * ---------------------------------------------------------------------------
  * THE KNOBS
  * ---------------------------------------------------------------------------
- *   `PN_TT_ELTWISE_CORES=N`              members, 1 = the pre-split path byte for byte
- *   `PN_TT_ELTWISE_MEMBER_CORE_FIRST=C`  where members 1..N-1 start (106)
+ *   `PN_TT_ELTWISE_CORES=N`              members, 1 = the pre-split path byte for byte (4)
+ *   `PN_TT_ELTWISE_MEMBER_CORE_LIST=a,b` the cores of members 1..N-1 (112,48,49)
+ *   `PN_TT_ELTWISE_MEMBER_CORE_FIRST=C`  members 1..N-1 on C, C+1, ... (used when no list)
  *   `PN_TT_ELTWISE_DEPTH=D`              CAP on the block depth, for the knee control below
  *
  * `PN_TT_ELTWISE_DEPTH` exists because **the depth MOVES WITH THE MEMBER COUNT and would
@@ -98,9 +99,10 @@
  * SET PER SLICE, and publishes to the members as well — they were being armed with no table
  * at all, which is not "no mirroring" but "whatever that L1 region held".
  *
- * @status SHIPPED ON at `PN_TT_ELTWISE_CORES=2`, the measured knee: 5.01 -> 5.17 tok/s
- *         against a control re-taken the same hour. `pn_tt_eltwise_group.c` carries the
- *         ladder, the fit and why 2 rather than 8.
+ * @status SHIPPED ON at `PN_TT_ELTWISE_CORES=4` (2026-10-21, under the on-card puller: MTP
+ *         decode +2.3%, IDENTICAL), members on 112, 48, 49 — the map above predates PX7 and
+ *         the prefill grid; the live map is the "residency up" lines. Was 2 while the host
+ *         issued every descriptor. `pn_tt_eltwise_group.c` carries the ladder and the fit.
  * @issues None
  * @todo None
  */
@@ -129,6 +131,25 @@ typedef struct pn_tt_device pn_tt_device;
 #define PN_TT_ELTWISE_PROGRAM      "eltwise"
 #define PN_TT_CORE_ELTWISE_ENV     "PN_TT_CORE_ELTWISE"
 #define PN_TT_CORE_ELTWISE_DEFAULT 73u
+
+/** W1a WIDE members: `PN_TT_ELTWISE_WIDE_CORES` more eltwise residencies from
+ *  `PN_TT_ELTWISE_WIDE_CORE_FIRST` (58) that only the prefill SwiGLU's wide descriptors use.
+ *  DEFAULT 5 (58..62) since 2026-10-26 (was 13, W1a 2026-10-08; 12 armed, 58..69, at the
+ *  16-member cap with 4 decode members): 63..70 go to the prefill attention members 8..15
+ *  (pn_tt_attention.c). `=13` restores the old layout, and the attention split then defaults
+ *  back to 8. `=0` off. */
+#define PN_TT_ELTWISE_WIDE_CORES_ENV      "PN_TT_ELTWISE_WIDE_CORES"
+#define PN_TT_ELTWISE_WIDE_CORES_DEFAULT  5u
+#define PN_TT_ELTWISE_WIDE_CORE_ENV       "PN_TT_ELTWISE_WIDE_CORE_FIRST"
+#define PN_TT_ELTWISE_WIDE_CORE_DEFAULT   58u
+/** The first core NOT in the wide eltwise block (58..70 is the clear region it draws from). */
+#define PN_TT_ELTWISE_WIDE_REGION_END     71u
+
+/** How many WIDE members the env asks for (default `PN_TT_ELTWISE_WIDE_CORES_DEFAULT`). */
+uint32_t pn_tt_eltwise_wide_core_count(void);
+
+/** The first WIDE member's core (default `PN_TT_ELTWISE_WIDE_CORE_DEFAULT`). */
+uint32_t pn_tt_eltwise_wide_core_first(void);
 
 /**
  * Decide the split for `tile_counts` BEFORE anything is placed, and report it.

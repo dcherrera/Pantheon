@@ -4,7 +4,7 @@
  * @file   qwen35moe_attn.c
  * @brief  Full-attention block for Qwen3.5-MoE, one token at a time.
  *
- * Written from a behaviour specification (plans/cleanroom_r2_qwen35_spec.md); no ggml or llama.cpp source was consulted.
+ * Written from a behaviour specification (cleanroom_r2_qwen35_spec.md, recorded in docs/cleanroom/README.md); no ggml or llama.cpp source was consulted.
  *
  * @status None
  * @issues A failure at the scores allocation leaves the KV appended and k mutated. Negative

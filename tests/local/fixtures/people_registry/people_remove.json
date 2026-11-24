@@ -1,0 +1,7 @@
+{"endpoint":"POST /local/people/remove","class":"admin",
+ "request":{"id":"p55aa66bb"},
+ "status":200,
+ "response":{"removed":"p55aa66bb","keys_revoked":3,"sessions_removed":2},
+ "errors":[{"when":"removing the last admin","status":409,"type":"last_admin"},
+           {"when":"removing an admin not below the caller in the admin tree","status":403,"type":"admin_above"},
+           {"when":"no person with that id","status":404,"type":"not_found"}]}

@@ -24,10 +24,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 /* 4. Project headers */
 #include "../core/qweight.h"
 #include "../formats/gguf_dequant.h"
+#include "../core/mem/pn_host_admission.h"
 #include "qwen35moe_internal.h"
 #include "qwen35moe_kv_q4.h"
 
@@ -64,6 +67,10 @@ struct pn_qwen35moe_model {
 
     pn_gguf_file *gguf;         /* kept open (mmap backing) */
 
+    /* QWEN35_MTP=1: the kept MTP draft head (has_mtp), outside the trunk layers. */
+    pn_qwen35moe_mtp_head mtp;
+    int has_mtp;
+
     /* GPU residency handle (opaque pn_qwen35moe_gpu, defined in
      * qwen35moe_forward_cuda.c). NULL when CUDA is unavailable or the model
      * was not uploaded. Held here so the single-die GPU forward can find its
@@ -77,6 +84,12 @@ struct pn_qwen35moe_model {
     int gpu_dies[8];
     int n_gpu_dies;
 
+    /* KV cache format the load asked for (pn_kv_format; 0 = QWEN35_KV_Q4 default).
+     * Read by every state's KV init and the die admission. */
+    int kv_format;
+    /* Decode blocks the serve carves on the card (pn_load_opts.card_sessions). */
+    int card_sessions;
+
     /* Where a DETACHED accelerator matvec seam is parked. This family's accelerator is a
      * hook on cfg.mv rather than a separate forward, so a parity harness needs somewhere to
      * put it while it runs the CPU oracle in the same process.
@@ -88,9 +101,31 @@ struct pn_qwen35moe_model {
  * Config reading
  * ============================================================ */
 
+/* MTP Gate 2 draft-cost bench: QWEN35_BENCH_EXTRA_LAYER_FROM=S
+ * keeps the GGUF's trailing MTP block as a 41st layer, typed ATTENTION, whose attention + MoE
+ * tensors are read from blk.S — S = the MTP block itself (its Q8_0 weights) or 39 (a copy of the
+ * trunk's last attention layer, i.e. a head requantized like the trunk). The decode step then
+ * costs one more such layer, which is what an MTP draft forward costs minus eh_proj and the LM
+ * head. The output is NOT the model's. Unset (default) = -1 = the head is dropped as before. */
+static int qwen35moe_bench_extra_layer_src(void)
+{
+    const char *v = getenv("QWEN35_BENCH_EXTRA_LAYER_FROM");
+    return (v && *v) ? atoi(v) : -1;
+}
+
+/* QWEN35_MTP=1 keeps the GGUF's trailing MTP block as a separate draft head
+ * (pn_qwen35moe_model_mtp) instead of dropping it. The trunk is unchanged either way. */
+static int qwen35moe_mtp_wanted(void)
+{
+    const char *v = getenv("QWEN35_MTP");
+    return v && v[0] && v[0] != '0';
+}
+
 static int qwen35moe_read_config(pn_gguf_file *gguf, pn_qwen35moe_config *qc,
                                  pn_config *config)
 {
+    qc->bench_extra_layer = -1;
+    qc->mtp_layer = -1;
     /* Two GGUF families share this loader: Nex-N2-mini tags
      * general.architecture="qwen35moe" (routed MoE), PrismML Bonsai-27B tags
      * "qwen35" (dense SwiGLU FFN). The metadata keys are prefixed by the arch
@@ -216,13 +251,27 @@ static int qwen35moe_read_config(pn_gguf_file *gguf, pn_qwen35moe_config *qc,
      * it from the layer count. Additive: Nex-N2 (40 layers, every block a real
      * hybrid layer) never trips this, so it is a no-op there. */
     if (qc->n_layer >= 2) {
-        char mtp_key[64];
+        char mtp_key[64], mtp_norm_key[64];
         snprintf(mtp_key, sizeof(mtp_key), "blk.%d.nextn.eh_proj.weight", qc->n_layer - 1);
-        if (pn_gguf_find_tensor(gguf, mtp_key) != NULL) {
-            fprintf(stderr, "qwen35moe: dropping trailing MTP/NextN head (block %d, has "
-                            "nextn.eh_proj); loading %d transformer layers\n",
-                            qc->n_layer - 1, qc->n_layer - 1);
-            qc->n_layer -= 1;
+        /* A METADATA GGUF (foundry ft_tt_gguf_slim: keys + 1-D tensors, the matmul weights on
+         * the card) has no eh_proj, but keeps the block's 1-D `nextn.enorm`: the same marker. */
+        snprintf(mtp_norm_key, sizeof(mtp_norm_key), "blk.%d.nextn.enorm.weight", qc->n_layer - 1);
+        if (pn_gguf_find_tensor(gguf, mtp_key) != NULL || pn_gguf_find_tensor(gguf, mtp_norm_key) != NULL) {
+            if (qwen35moe_bench_extra_layer_src() >= 0) {
+                fprintf(stderr, "qwen35moe: QWEN35_BENCH_EXTRA_LAYER_FROM=%d — keeping block "
+                                "%d as an extra ATTENTION layer (cost bench only; output is "
+                                "not the model's)\n",
+                                qwen35moe_bench_extra_layer_src(), qc->n_layer - 1);
+                qc->bench_extra_layer = qc->n_layer - 1;
+            } else {
+                if (qwen35moe_mtp_wanted())
+                    qc->mtp_layer = qc->n_layer - 1;
+                fprintf(stderr, "qwen35moe: %s trailing MTP/NextN head (block %d, has "
+                                "nextn.eh_proj); loading %d transformer layers\n",
+                                qc->mtp_layer >= 0 ? "keeping (QWEN35_MTP=1) the" : "dropping",
+                                qc->n_layer - 1, qc->n_layer - 1);
+                qc->n_layer -= 1;
+            }
         }
     }
 
@@ -300,6 +349,38 @@ static float *qwen35moe_load_f32(pn_gguf_file *gguf, const char *name)
 
 /* Load the shared-expert MoE block for one layer. Routed experts are sliced
  * from the merged 3D *_exps tensors (zero-copy). Returns 0 on success. */
+/* Every consumer of the shared-expert scalar gate (CPU qwen35moe_moe.c, the GPU
+ * upload) reads it as n_embd F32. The trunk stores it F32; the MTP head
+ * (blk.40 of the bartowski Qwen3.6 GGUF) stores it BF16, which those readers
+ * turned into garbage — NaN logits, and an illegal-address fault in the device
+ * top-k. Widen a BF16 vector into an owned F32 copy (exact: BF16 is the top 16
+ * bits of an F32) and repoint the weight at it; refuse any other type. */
+static int qwen35moe_gate_vec_to_f32(pn_qweight *w, float **owned, int layer)
+{
+    *owned = NULL;
+    if (w->type == GGUF_QUANT_F32)
+        return 0;
+    size_t n = (size_t)w->rows * (size_t)w->cols;
+    if (w->type != GGUF_QUANT_BF16 || n == 0) {
+        fprintf(stderr, "qwen35moe: blk.%d.ffn_gate_inp_shexp has type %d — "
+                "only F32 and BF16 are supported\n", layer, (int)w->type);
+        return -1;
+    }
+    float *f = malloc(n * sizeof(float));
+    if (!f)
+        return -1;
+    const uint16_t *src = (const uint16_t *)w->data;
+    for (size_t k = 0; k < n; k++) {
+        uint32_t bits = (uint32_t)src[k] << 16;
+        memcpy(&f[k], &bits, sizeof(bits));
+    }
+    *owned = f;
+    w->data = f;
+    w->type = GGUF_QUANT_F32;
+    w->row_stride = (size_t)w->cols * sizeof(float);
+    return 0;
+}
+
 static int qwen35moe_load_moe(pn_gguf_file *gguf, const pn_qwen35moe_config *qc,
                               int i, pn_qwen35moe_moe *moe)
 {
@@ -392,8 +473,8 @@ static int qwen35moe_load_moe(pn_gguf_file *gguf, const pn_qwen35moe_config *qc,
     snprintf(name, sizeof(name), "blk.%d.ffn_gate_inp_shexp.weight", i);
     if (pn_qweight_from_gguf(&moe->ffn_gate_inp_shexp, gguf, name) < 0)
         return -1;
-
-    return 0;
+    return qwen35moe_gate_vec_to_f32(&moe->ffn_gate_inp_shexp,
+                                     &moe->gate_inp_shexp_f32, i);
 }
 
 /* Load one SSM (Gated-Delta-Net) layer. Returns 0 on success. */
@@ -475,6 +556,68 @@ static int qwen35moe_load_attn_layer(pn_gguf_file *gguf, const pn_qwen35moe_conf
     return qwen35moe_load_moe(gguf, qc, i, &l->moe);
 }
 
+/* Split eh_proj [n_embd rows][2 n_embd cols] into its two column halves (owned copies), so the
+ * head never needs the concatenated [embedding | hidden] input row. Byte-exact slices: only
+ * types whose blocks tile n_embd are accepted. */
+static int qwen35moe_split_eh_proj(const pn_qweight *full, int n_embd, pn_qwen35moe_mtp_head *h)
+{
+    int block = full->type == GGUF_QUANT_Q8_0 ? 32
+              : (full->type == GGUF_QUANT_F32 || full->type == GGUF_QUANT_F16 ||
+                 full->type == GGUF_QUANT_BF16) ? 1 : 0;
+    if (!block || full->cols != 2 * n_embd || n_embd % block || full->row_stride % 2) {
+        fprintf(stderr, "qwen35moe: MTP eh_proj type %d [%d x %d] cannot be split\n",
+                (int)full->type, full->rows, full->cols);
+        return -1;
+    }
+    size_t half = full->row_stride / 2, rows = (size_t)full->rows;
+    unsigned char *bytes = malloc(2 * half * rows);
+    if (!bytes)
+        return -1;
+    for (size_t r = 0; r < rows; r++) {
+        const unsigned char *src = (const unsigned char *)full->data + r * full->row_stride;
+        memcpy(bytes + r * half, src, half);
+        memcpy(bytes + (rows + r) * half, src + half, half);
+    }
+    h->eh_bytes = bytes;
+    h->eh_e = *full;
+    h->eh_e.data = bytes;
+    h->eh_e.cols = n_embd;
+    h->eh_e.row_stride = half;
+    h->eh_h = h->eh_e;
+    h->eh_h.data = bytes + rows * half;
+    return 0;
+}
+
+/* Load the kept MTP head (qc->mtp_layer): its attention + MoE block like a trunk attention
+ * layer, the eh_proj halves and its three norms. */
+static int qwen35moe_load_mtp_head(pn_gguf_file *gguf, const pn_qwen35moe_config *qc,
+                                   pn_qwen35moe_mtp_head *h)
+{
+    char name[128];
+    pn_qweight full;
+    int b = qc->mtp_layer;
+
+    h->block = b;
+    if (qwen35moe_load_attn_layer(gguf, qc, b, &h->layer) < 0)
+        return -1;
+    snprintf(name, sizeof(name), "blk.%d.nextn.eh_proj.weight", b);
+    if (pn_qweight_from_gguf(&full, gguf, name) < 0 ||
+        qwen35moe_split_eh_proj(&full, qc->n_embd, h) < 0)
+        return -1;
+    snprintf(name, sizeof(name), "blk.%d.nextn.enorm.weight", b);
+    if (!(h->enorm = qwen35moe_load_f32(gguf, name)))
+        return -1;
+    snprintf(name, sizeof(name), "blk.%d.nextn.hnorm.weight", b);
+    if (!(h->hnorm = qwen35moe_load_f32(gguf, name)))
+        return -1;
+    snprintf(name, sizeof(name), "blk.%d.nextn.shared_head_norm.weight", b);
+    if (!(h->head_norm = qwen35moe_load_f32(gguf, name)))
+        return -1;
+    fprintf(stderr, "qwen35moe: MTP head loaded (block %d, eh_proj type %d, experts type %d)\n",
+            b, (int)h->eh_e.type, (int)h->layer.moe.ffn_gate_shexp.type);
+    return 0;
+}
+
 /* ============================================================
  * Public: load
  * ============================================================ */
@@ -531,7 +674,9 @@ pn_qwen35moe_model *pn_qwen35moe_load(pn_gguf_file *gguf, pn_config *config)
             fprintf(stderr, "qwen35moe: failed to load token_embd.weight\n");
             goto fail;
         }
-        m->output_f32 = malloc(embd_numel * sizeof(float));
+        m->output_f32 = pn_host_admit_weight_copy(embd_numel * sizeof(float),
+                                                  "tied output (lm_head)") == 0
+                            ? malloc(embd_numel * sizeof(float)) : NULL;
         if (!m->output_f32)
             goto fail;
         memcpy(m->output_f32, m->token_embd, embd_numel * sizeof(float));
@@ -546,7 +691,7 @@ pn_qwen35moe_model *pn_qwen35moe_load(pn_gguf_file *gguf, pn_config *config)
     if (!m->block_type || !m->block_index)
         goto fail;
     for (int i = 0; i < qc->n_layer; i++) {
-        if (qwen35moe_is_attn_layer(qc, i)) {
+        if (qwen35moe_is_attn_layer(qc, i) || i == qc->bench_extra_layer) {
             m->block_type[i] = PN_QWEN35MOE_LAYER_ATTN;
             m->block_index[i] = m->n_attn++;
         } else {
@@ -564,8 +709,9 @@ pn_qwen35moe_model *pn_qwen35moe_load(pn_gguf_file *gguf, pn_config *config)
     for (int i = 0; i < qc->n_layer; i++) {
         int idx = m->block_index[i];
         int rc;
+        int src = i == qc->bench_extra_layer ? qwen35moe_bench_extra_layer_src() : i;
         if (m->block_type[i] == PN_QWEN35MOE_LAYER_ATTN)
-            rc = qwen35moe_load_attn_layer(gguf, qc, i, &m->attn_layers[idx]);
+            rc = qwen35moe_load_attn_layer(gguf, qc, src, &m->attn_layers[idx]);
         else
             rc = qwen35moe_load_ssm_layer(gguf, qc, i, &m->ssm_layers[idx]);
         if (rc < 0) {
@@ -578,6 +724,13 @@ pn_qwen35moe_model *pn_qwen35moe_load(pn_gguf_file *gguf, pn_config *config)
     fprintf(stderr, "\n");
     fprintf(stderr, "qwen35moe: loaded %d SSM + %d attention layers\n",
             m->n_ssm, m->n_attn);
+    if (qc->mtp_layer >= 0) {
+        if (qwen35moe_load_mtp_head(gguf, qc, &m->mtp) < 0) {
+            fprintf(stderr, "qwen35moe: failed to load the MTP head\n");
+            goto fail;
+        }
+        m->has_mtp = 1;
+    }
 
     return m;
 
@@ -592,6 +745,8 @@ fail:
 
 static void qwen35moe_free_moe(pn_qwen35moe_moe *moe)
 {
+    free(moe->gate_inp_shexp_f32);
+    moe->gate_inp_shexp_f32 = NULL;
     free(moe->gate_exps);
     moe->gate_exps = NULL;
     free(moe->up_exps);
@@ -642,6 +797,19 @@ void pn_qwen35moe_free(pn_qwen35moe_model *model)
             qwen35moe_free_moe(&l->moe);
         }
         free(model->attn_layers);
+    }
+
+    if (model->mtp.block > 0) {
+        pn_qwen35moe_attn_layer *l = &model->mtp.layer;
+        free(l->attn_norm);
+        free(l->post_attention_norm);
+        free(l->attn_q_norm);
+        free(l->attn_k_norm);
+        qwen35moe_free_moe(&l->moe);
+        free(model->mtp.eh_bytes);
+        free(model->mtp.enorm);
+        free(model->mtp.hnorm);
+        free(model->mtp.head_norm);
     }
 
     free(model->block_type);
@@ -801,6 +969,31 @@ void pn_qwen35moe_model_embed_row(const pn_qwen35moe_model *m, uint32_t token,
     }
 }
 
+size_t pn_qwen35moe_model_embed_prefault(const pn_qwen35moe_model *m)
+{
+    const long page = sysconf(_SC_PAGESIZE) > 0 ? sysconf(_SC_PAGESIZE) : 4096;
+    pn_gguf_tensor_info *info;
+    const volatile unsigned char *p;
+    uintptr_t start, end;
+    size_t bytes, off;
+    unsigned sum = 0u;
+
+    if (m->token_embd || !m->gguf)
+        return 0u;
+    info = pn_gguf_find_tensor(m->gguf, "token_embd.weight");
+    if (!info)
+        return 0u;
+    bytes = pn_gguf_type_size(info->type, (size_t)m->cfg.n_vocab * (size_t)m->cfg.n_embd);
+    p = (const volatile unsigned char *)m->gguf->data + info->offset;
+    start = (uintptr_t)p & ~(uintptr_t)(page - 1);
+    end = (uintptr_t)p + bytes;
+    (void)madvise((void *)start, end - start, MADV_WILLNEED);
+    for (off = 0; off < bytes; off += (size_t)page)
+        sum += p[off];
+    (void)sum;
+    return bytes;
+}
+
 const float *pn_qwen35moe_model_output_norm(const pn_qwen35moe_model *m)
 {
     return m->output_norm;
@@ -809,6 +1002,11 @@ const float *pn_qwen35moe_model_output_norm(const pn_qwen35moe_model *m)
 const pn_qweight *pn_qwen35moe_model_output(const pn_qwen35moe_model *m)
 {
     return &m->output;
+}
+
+const pn_qwen35moe_mtp_head *pn_qwen35moe_model_mtp(const pn_qwen35moe_model *m)
+{
+    return m && m->has_mtp ? &m->mtp : NULL;
 }
 
 /* Mutable views of the same three objects, for a GPU backend that must attach
@@ -967,6 +1165,39 @@ void pn_qwen35moe_model_set_gpu(pn_qwen35moe_model *m, void *gpu)
  * gpu_die_ids()/gpu_split_layer() in qwen35moe_forward_cuda.c can prefer it
  * over the QWEN35_GPU_DIE_A/B env knobs. Capped at the struct's 8 entries
  * (the forward consumes at most 2 today). */
+void pn_qwen35moe_model_set_kv_format(pn_qwen35moe_model *m, int kv_format)
+{
+    if (m)
+        m->kv_format = kv_format;
+}
+
+void pn_qwen35moe_model_set_card_sessions(pn_qwen35moe_model *m, int n)
+{
+    if (m)
+        m->card_sessions = n > 0 ? n : 0;
+}
+
+int pn_qwen35moe_model_card_sessions(const pn_qwen35moe_model *m)
+{
+    return m ? m->card_sessions : 0;
+}
+
+int pn_qwen35moe_model_kv_format(const pn_qwen35moe_model *m)
+{
+    return m ? m->kv_format : PN_KV_FORMAT_DEFAULT;
+}
+
+int pn_qwen35moe_model_kv_q4(const pn_qwen35moe_model *m)
+{
+    int f = pn_qwen35moe_model_kv_format(m);
+
+    if (f == PN_KV_FORMAT_Q4)
+        return 1;
+    if (f == PN_KV_FORMAT_FP32)
+        return 0;
+    return pn_qwen35moe_kv_q4_on();
+}
+
 void pn_qwen35moe_model_set_dies(pn_qwen35moe_model *m, const int *dies, int n)
 {
     if (!m)
@@ -1005,6 +1236,12 @@ int pn_qwen35moe_owns_state(const pn_model *model)
     if (!model) return 0;
     return model->config.arch == PN_ARCH_QWEN35MOE ||
            model->config.arch == PN_ARCH_BONSAI;
+}
+
+int pn_qwen35moe_dense_ffn(const pn_model *model)
+{
+    if (!pn_qwen35moe_owns_state(model) || !model->weights) return 0;
+    return pn_qwen35moe_model_config((const pn_qwen35moe_model *)model->weights)->dense_ffn;
 }
 
 void pn_qwen35moe_state_set_full_logits(pn_state *state, int on)

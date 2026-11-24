@@ -100,6 +100,7 @@
 #include <string.h>
 
 #include "../accel/tt/pn_tt_gdn.h"
+#include "../accel/tt/pn_tt_gdn_conv_share.h"
 #include "../accel/tt/pn_tt_gdnc.h"
 
 int pn_qwen35_tt_gdn_arm(pn_qwen35_tt *g, pn_qwen35moe_model *m,
@@ -127,6 +128,8 @@ int pn_qwen35_tt_gdn_arm(pn_qwen35_tt *g, pn_qwen35moe_model *m,
     shape.conv_dim = (uint32_t)cfg->conv_dim;
     shape.conv_taps = (uint32_t)cfg->ssm_conv;
     shape.layer_count = (uint32_t)ssm_layers;
+    /* Option D, under the fit policy only: one conv weight for both GDN families. */
+    pn_tt_gdn_conv_share_request(g->device, pn_tt_gdn_conv_share_wanted(g->fit_policy));
     if (pn_tt_device_arm_gdn(g->device, &shape) != 0)
         return -1;
     if (!pn_tt_gdn_is_armed(g->device))
@@ -135,7 +138,7 @@ int pn_qwen35_tt_gdn_arm(pn_qwen35_tt *g, pn_qwen35moe_model *m,
      * SAME conv window and the SAME recurrent state, so there is nothing for it to carry
      * without them. Default OFF; `PN_TT_PREFILL_GDNC=1` asks for it. It is never fatal: an
      * unarmed chunkwise family leaves the prefill on the per-position path. */
-    if (pn_tt_device_arm_gdnc(g->device) != 0)
+    if (pn_tt_device_arm_gdnc(g->device) != 0 || pn_tt_gdn_conv_share_bind(g->device) != 0)
         return -1;
 
     /* The conv weight is a per-layer CONSTANT and the transpose into tap-major planes is a
@@ -160,6 +163,12 @@ int pn_qwen35_tt_gdn_arm(pn_qwen35_tt *g, pn_qwen35moe_model *m,
          * exists so the SHIPPED decode plane is not touched by prefill work at all. */
         if (pn_tt_gdnc_is_armed(g->device) &&
             pn_tt_gdnc_conv_weight_upload(g->device, (uint32_t)idx, l->ssm_conv1d) != 0) {
+            /* Shared, that constant IS the decode weight: nothing else will write it. */
+            if (pn_tt_gdn_conv_weight_is_shared(g->device)) {
+                fprintf(stderr, "qwen35_tt: SSM layer %d's shared conv weight did not stage — "
+                                "the GDN block stays on the host\n", layer);
+                return -1;
+            }
             fprintf(stderr, "qwen35_tt: SSM layer %d's ROW-REPLICATED conv weight did not "
                             "stage — the chunkwise mixers are unusable and prefill stays "
                             "per-position\n", layer);

@@ -72,13 +72,10 @@ int pn_tt_fp32_strip_alloc(pn_tt_device *device, uint32_t tile_count,
 {
     const size_t bytes = (size_t)tile_count * PN_TT_TILE_FP32;
     ft_tt_buffer buffer;
-    uint32_t bank;
 
     if (!device || !out_strip || tile_count == 0u || device->dram_bank_count == 0u)
         return -1;
-    bank = device->strip_bank_cursor++ % device->dram_bank_count;
-    if (ft_tt_buffer_alloc(&device->allocator, FT_TT_MEM_SPACE_DRAM, bank, bytes, &buffer) !=
-        FT_TT_OK) {
+    if (pn_tt_dram_alloc_any(device, bytes, &buffer) != 0) {
         fprintf(stderr, "pn_tt: DRAM full allocating a %u-tile Float32 strip\n", tile_count);
         return -1;
     }

@@ -25,10 +25,14 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "qwen35moe.h"
 #include "qwen35moe_internal.h"
 
 #include "../accel/tt/pn_tt_device.h"
 #include "../accel/tt/pn_tt_fp32_strip.h"
+#include "../accel/tt/pn_tt_norm_role_plan.h"
+#include "../accel/tt/pn_tt_prefill_reserve.h"
+#include "../accel/tt/pn_tt_strip_placement.h"
 #include "../core/engine.h"
 
 /** How many (index, value) pairs the card's exact top-N returns when the logit row stays
@@ -54,6 +58,12 @@
 typedef struct {
     const pn_qweight *key;
     pn_tt_weight card;
+    /** A joint Q+gate weight uploaded as its halves (`card` = Q, `gate` = gate): the seam runs
+     *  both and re-interleaves per head (`split_heads` x `split_head_dim`). */
+    bool split;
+    pn_tt_weight gate;
+    uint32_t split_heads;
+    uint32_t split_head_dim;
 } pn_qwen35_tt_binding;
 
 /**
@@ -76,11 +86,15 @@ typedef struct {
     pn_tt_weight ssm_out;    /**< gated -> the block output */
 
     /* Attention layers */
-    pn_tt_weight attn_q;     /**< x -> Q and its output gate, INTERLEAVED per head */
+    /** x -> Q and its output gate, INTERLEAVED per head. When `attn_q_split` it is the SHAPE
+     *  only (no DRAM): the joint tensor was uploaded as its two halves at load. */
+    pn_tt_weight attn_q;
+    bool attn_q_split;
     pn_tt_weight attn_k;
     pn_tt_weight attn_v;
     pn_tt_weight attn_output;
-    /** The two DE-INTERLEAVED halves of `attn_q`, staged only when attention is on the card.
+    /** The two DE-INTERLEAVED halves of `attn_q`, uploaded at load in the joint tensor's place
+     *  when on-card attention is requested (`attn_q_split`), else staged by the attention arm.
      *  A joint projection cannot be read in place by either the QK-norm or flash decode, and
      *  permuting the WEIGHT costs one upload at load and nothing per token —
      *  `src/accel/tt/pn_tt_column_runs.h` prices that against the alternatives. */
@@ -162,6 +176,20 @@ typedef struct {
     pn_qwen35_tt_binding *bindings;
     int n_bindings;
     int n_expected;
+    /** Qwen3.6 MoE CENSUS arm (`PN_TT_Q36_CENSUS=1`, the fit):
+     *  the MoE checkpoint armed with its SHARED expert bound as the dense FFN and the routed
+     *  experts not uploaded — every non-weight buffer at 3.6's geometry, for the DRAM census.
+     *  Its tokens are NOT the model's; the serve says so on every arm. */
+    bool moe_census;
+    /** The ROUTED-EXPERT block on the card (qwen35moe_moe_tt.c, qwen36 plan Phase 5.4): the
+     *  MoE checkpoint with its router, experts and shared expert on Tensix. `moe_layers`
+     *  holds each layer's stacks and router; the shared expert binds as ffn_gate/up/down. */
+    bool moe;
+    struct pn_qwen35_tt_moe_layer *moe_layers; /**< n_layer + 1: the last is the MTP head's */
+    bool moe_mtp;                              /**< moe_layers[n_layer] placed (plan S6) */
+    uint32_t spec_rows_cap;                    /**< verify rows reserved (MoE; dense under the fit policy); 0 = no cap */
+    struct pn_qwen35_tt_moe_strips *moe_strips;
+    pn_qwen35moe_model *moe_model; /**< for the per-layer gate's CPU oracle */
 
     /* The RESIDENT arm. `resident` is false when any of norm / SwiGLU / residual failed to
      * arm; the forward then runs the seam arm and says so once. */
@@ -188,6 +216,7 @@ typedef struct {
     float *h_beta;    /**< ssm_dt_rank, rounded up to a tile */
     float *h_gated;   /**< ssm_d_inner */
     float *h_qg;      /**< 2 * head_dim * n_head */
+    float *h_qg_parts; /**< the same width: the Q half then the gate half, before interleave */
     float *h_k;       /**< head_dim * n_head_kv */
     float *h_v;       /**< head_dim * n_head_kv */
     float *h_attn;    /**< head_dim * n_head */
@@ -238,6 +267,9 @@ typedef struct {
      *  paths compute them on the card (no alpha/beta read back), every other TT path computes
      *  the SAME integer function on the host — so prefill, verify and plain decode agree. */
     bool gdn_det_gates;
+    /** The layer in flight runs on the EXACT card gates (pn_tt_gdnc_table_arm): its DELTA
+     *  descriptors look the host's gates up; set with `gdn_card_gate` by the band loop. */
+    bool gdn_table_gate;
     /** PM 7 ITEM 7 step 1: the streamed band loop's PIPELINE — band b's gated RMS norm, narrow
      *  and output gate run (deferred) under band b+1's CONV / L2 / DELTA instead of before them.
      *  Same ops, same operands, same order per buffer: bit-exact. `gdn_pipe_stage` 1 = the
@@ -246,6 +278,16 @@ typedef struct {
     int gdn_pipe_stage;
     int gdn_pipe_layer;
     pn_tt_activation gdn_pipe_z, gdn_pipe_gated;
+    /** Prefill lane PIPE 2 (`PN_TT_GDN_PIPE=2`): band b's DELTA is left IN FLIGHT and band
+     *  b+1's widen + CONV queue behind it on the second buffer parity; band b's RMS / narrow /
+     *  gate follow one band later. `gdn_pipe2_inflight` = band (layer `gdn_pipe2_layer`,
+     *  parity `gdn_pipe2_parity`, views `gdn_pipe2_z` / `_gated`) has its DELTA queued. */
+    bool gdn_pipe2;
+    bool gdn_pipe2_inflight;
+    uint32_t gdn_pipe2_parity;
+    int gdn_pipe2_layer;
+    int gdn_pipe2_vheads;
+    pn_tt_activation gdn_pipe2_z, gdn_pipe2_gated;
     float *gdn_chunk_beta;
     /** THE PHASE-ISOLATION ARM's row shuttle: `32 * conv_dim` and `32 * v_heads * state`
      *  floats. NULL unless `PN_TT_PREFILL_GDNC_PHASE` names something other than `both`, so
@@ -315,12 +357,27 @@ typedef struct {
         int pend_base, pend_n;
         bool pend_tall;
         uint32_t pend_tok[16];
+        /* TTFT lane (qwen35moe_mtp_prompt_defer_tt.c, `PN_TT_MTP_PROMPT_DEFER`): the LAST
+         * prompt pass's MTP layer, recorded by the pass (pending), owed once the tail forward
+         * has made the logits, and run before anything that reads the MTP KV or overwrites
+         * the tall hidden it consumes. `prompt_owner` = the pn_qwen35moe_state it belongs to. */
+        bool prompt_pending, prompt_owed, prompt_grid_kept;
+        const void *prompt_owner;
+        int prompt_base, prompt_rows, prompt_cap;
+        uint32_t *prompt_next;
+        uint64_t prompt_settled, prompt_dropped;
+        double prompt_ms;
         uint64_t steps, heads;
         double ms;
         /** The last draft's confidence: its softmax over the head's top-k values (1 on the
          *  dense path). Read by the adaptive draft count (`PN_TT_SPEC_ADAPT`). */
         float last_conf;
         uint64_t adapt_stops;      /**< cycles the adaptive count ended early */
+        /* SAMPLED drafts (pn_qwen35moe_tt_mtp_draft_ex): each head's top-N goes to `draw`,
+         * which picks the draft; `draw_index` counts the heads of the current draft call. */
+        pn_spec_draft_fn draw;
+        void *draw_ctx;
+        int draw_index;
         /* S2c: the DRAFT VOCABULARY (`PN_TT_MTP_VOCAB_TILES=N`): the LM head's first N tile
          * columns (ids < 32N, BPE rank ~ frequency) + the special-token tail, staged as its own
          * weight; its logits strip is pre-filled -inf so top-k never picks an unwritten tile.
@@ -329,6 +386,18 @@ typedef struct {
         pn_tt_weight head_sub;
         pn_tt_activation logits_sub;
         uint32_t sub_tiles, sub_tail_first;
+        /* THE TREE PROBE (`PN_TT_SPEC_TREE_PROBE=1`, diagnostics, no card work): each head of
+         * the current draft call keeps its top pairs; the verify then books, per draft
+         * position, how often it was reached / accepted and the rank of the emitted token
+         * among the head's pairs where the draft was refused — what a sibling candidate at
+         * that position would have bought (qwen35_tt_tree_probe). */
+        int probe_heads;
+        uint32_t probe_ids[16][PN_QWEN35_TT_TOPK_GREEDY];
+        float probe_vals[16][PN_QWEN35_TT_TOPK_GREEDY];
+        uint32_t probe_n[16], probe_best[16];
+        uint64_t probe_cycles, probe_rows, probe_tokens, probe_skipped;
+        uint64_t probe_reach[16], probe_acc[16];
+        uint64_t probe_rank[16][PN_QWEN35_TT_TOPK_GREEDY + 1]; /**< [pos][rank], last = miss */
     } mtp;
     float *h_attn_card;  /**< the card answer, for the crossed control only */
 
@@ -340,6 +409,12 @@ typedef struct {
     uint32_t topk_index[PN_QWEN35_TT_TOPK_PAIRS];
     float topk_value[PN_QWEN35_TT_TOPK_PAIRS];
     uint32_t topk_count;
+    /** LAUNCH lane (`PN_TT_ROW_RESET`): the host row the last sparse head wrote — `-INFINITY`
+     *  everywhere but `row_index[0..row_count)` — or NULL when that is not known (a dense
+     *  head ran, or none yet). The next sparse head resets those entries instead of the row. */
+    float *row_sparse;
+    uint32_t row_index[PN_QWEN35_TT_TOPK_PAIRS];
+    uint32_t row_count;
     /** Speculative sampling: every verify row's top-N, kept by pn_qwen35_tt_head_rows(). */
     uint32_t spec_topk_index[16][PN_QWEN35_TT_TOPK_PAIRS];
     float spec_topk_value[16][PN_QWEN35_TT_TOPK_PAIRS];
@@ -352,6 +427,16 @@ typedef struct {
     uint64_t mv_on_host;   /**< a weight the table does not hold; should be 0 */
     uint64_t mv_failed;    /**< the card was asked and refused; should be 0 */
     int failure_reported;  /**< the first failure prints; the rest only count */
+    /** S3a: the last out-projection already wrote hidden + projection into the spare strip
+     *  (pn_qwen35_tt_project_out), so the next residual step only flips the slot. Cleared by
+     *  every pn_qwen35_tt_project() and by the residual step that consumes it. */
+    int residual_fused;
+    /** P0 persistent norm role (accel/tt/pn_tt_norm_role.h): `norm_role_tried` once the arm
+     *  was attempted; `norm_role_active` for the forward in flight, whose norms are role steps
+     *  and whose residual steps fold into them (`norm_role_cursor`). */
+    bool norm_role_tried;
+    bool norm_role_active;
+    pn_tt_norm_role_cursor norm_role_cursor;
 
     /* The wall-clock reconciliation. The four device counters time the SEAMS — a tilize and
      * a link write, a dispatch, a link read and a de-tilize, an on-card descriptor — and
@@ -422,6 +507,24 @@ typedef struct {
     /** The pn_state whose sequence the card's K/V and carried state hold now (the last one a
      *  forward, a verify or a prefill ran for). */
     const pn_state *card_owner;
+    /** The FIT POLICY (qwen35moe_tt_fit_plan.h): main's placement does not fit this card, so
+     *  options A (at load), B and C (tall strips) apply. False = main's placement exactly. */
+    bool fit_policy;
+    /** The fit policy's LEVERS were picked at the decide (qwen35moe_tt_fit_plan.h): the tall
+     *  set takes `fit_tall_rows` bands and `fit_outproj_mirrors`, the GDNC its copy count
+     *  (pn_tt_gdnc_request_replicas). False = the env / defaults. */
+    bool fit_levers;
+    uint32_t fit_tall_rows;
+    bool fit_outproj_mirrors;
+    /** Lever V: the MTP draft reads its LM-head columns of `output` in place (no staged copy). */
+    bool fit_draft_view;
+    /** The load could not reserve the prefix checkpoint's twins: no checkpoint is taken and no
+     *  prefill retries the reservation (qwen35moe_fit_tt.c). */
+    bool ckpt_off;
+    /** The last `pn_qwen35moe_prefill_tt()` ABORTED part way: the card's state was partly
+     *  written, the session was invalidated, and the caller must fail the request rather than
+     *  replay it per token (pn_qwen35_tt_prefill_abort). */
+    bool prefill_aborted;
 } pn_qwen35_tt;
 
 /* ============================================================
@@ -518,10 +621,24 @@ typedef struct pn_qwen35_tt_overlap_next {
 } pn_qwen35_tt_overlap_next;
 
 uint32_t pn_qwen35_tt_overlap_bands(void);
+/** G.3: the super-band span for a pass of `bands` (`PN_TT_PREFILL_OVERLAP=S` fixes it, 0 off;
+ *  unset: half the pass, at least 13). The replica map is keyed with the same span. */
+uint32_t pn_qwen35_tt_overlap_span(uint32_t bands);
 bool pn_qwen35_tt_wavefront_enabled(void);
 bool pn_qwen35_tt_overlap_layer(pn_qwen35_tt *g, int ssm_index, uint32_t bands);
-int pn_qwen35_tt_overlap_superband(pn_qwen35_tt *g, const pn_qwen35_tt_layer *d, uint32_t band,
-                                   uint32_t span, const pn_qwen35_tt_overlap_next *next);
+/** O.1: plan layer `d`'s super-band jobs over `bands` (`pipe_depth`: bands the chain's gates
+ *  trail their band). @return 0, or -1 (no plan; the caller runs the layer without overlap). */
+int pn_qwen35_tt_overlap_layer_begin(pn_qwen35_tt *g, const pn_qwen35_tt_layer *d,
+                                     uint32_t bands, uint32_t pipe_depth,
+                                     const pn_qwen35_tt_overlap_next *next,
+                                     const pn_tt_activation *mixer, const pn_tt_weight *out_weight);
+/** A: may an attention layer of `bands` run its out-proj and FFN under its band loop
+ *  (`PN_TT_PREFILL_OV_ATTN`, default on)? */
+bool pn_qwen35_tt_overlap_attention(pn_qwen35_tt *g, uint32_t bands);
+/** Run the steps due after band `band` (`band == bands`: the layer's tail, everything left). */
+int pn_qwen35_tt_overlap_tick(pn_qwen35_tt *g, uint32_t band);
+/** Drop the layer's plan (an error path): the grid waited, nothing more runs. */
+void pn_qwen35_tt_overlap_abort(pn_qwen35_tt *g);
 /** Has the wavefront already run SSM layer `ssm_index`'s attn-norm, in-proj and read posts for
  *  all `bands`? `forget` drops it (a new pass, an abort). */
 bool pn_qwen35_tt_overlap_prepared(int ssm_index, uint32_t bands);
@@ -532,8 +649,6 @@ bool pn_qwen35_tt_overlap_gates_prepared(int ssm_index, uint32_t bands);
 /** PM 7 ITEM 5: the wavefront prepares the next layer's gates on the card (not reads). */
 void pn_qwen35_tt_overlap_set_card_gates(bool on);
 void pn_qwen35_tt_overlap_forget(void);
-int pn_qwen35_tt_overlap_advance(pn_qwen35_tt *g);
-int pn_qwen35_tt_overlap_drain(pn_qwen35_tt *g);
 double pn_qwen35_tt_overlap_take_seconds(void);
 void pn_qwen35_tt_overlap_report(void);
 
@@ -555,6 +670,32 @@ void pn_qwen35_tt_overlap_report(void);
  */
 int pn_qwen35_tt_resident_arm(pn_qwen35_tt *g, pn_qwen35moe_model *m,
                               const pn_qwen35moe_config *cfg);
+
+/**
+ * The MoE block (qwen35moe_moe_tt.c). `bind` places every layer's expert stacks and router
+ * after the dense load; `arm` boots the block's residencies and allocates its strips (inside
+ * the resident arm, after the on-card families); `ffn` replaces the dense SwiGLU for one layer
+ * and leaves shared + routed in `card.project`; `release` frees the host side.
+ */
+int pn_qwen35_tt_moe_bind(pn_qwen35_tt *g, pn_qwen35moe_model *m, const pn_qwen35moe_config *cfg);
+int pn_qwen35_tt_moe_arm(pn_qwen35_tt *g, const pn_qwen35moe_config *cfg);
+int pn_qwen35_tt_moe_ffn(pn_qwen35_tt *g, const pn_qwen35_tt_layer *d, int layer);
+/** BATCHED PREFILL (plan S1): the MoE FFN of one layer over a pass's `bands` bands (the tall
+ *  strips seeked to the pass): routed groups in LIST mode + the shared expert, into
+ *  `card.project`. `ready` says whether the prefill strips were armed. */
+bool pn_qwen35_tt_moe_prefill_ready(const pn_qwen35_tt *g);
+int pn_qwen35_tt_moe_prefill_ffn(pn_qwen35_tt *g, const pn_qwen35_tt_layer *d, int layer,
+                                 uint32_t bands);
+/** The MoE FFN of a verify pass (plan S6): CONCAT routing over the pass's `rows` (one band),
+ *  so every row's output is the decode token's, bit for bit. */
+/** Place the MTP head's MoE layer (extra artifact: mtp.ffn_*_exps, mtp.ffn_gate_inp and the
+ *  shared gate) as moe_layers[n_layer]. 0, or -1 (no MTP on the MoE). */
+int pn_qwen35_tt_moe_bind_mtp(pn_qwen35_tt *g, const pn_qwen35moe_config *cfg);
+int pn_qwen35_tt_moe_verify_ffn(pn_qwen35_tt *g, const pn_qwen35_tt_layer *d, int layer,
+                                uint32_t rows);
+void pn_qwen35_tt_moe_release(pn_qwen35_tt *g);
+/** Tiles the MoE block's SwiGLU / scale descriptors carry (k * expert ff + shared ff) / 32. */
+uint32_t pn_qwen35_tt_moe_eltwise_tiles(const pn_qwen35moe_config *cfg);
 
 /** Release whatever `pn_qwen35_tt_resident_arm` allocated on the host side. */
 void pn_qwen35_tt_resident_release(pn_qwen35_tt *g);
@@ -631,6 +772,10 @@ int pn_qwen35_tt_attn_arm(pn_qwen35_tt *g, pn_qwen35moe_model *m,
 /** Did the on-card attention arm come up for this run? */
 bool pn_qwen35_tt_attn_is_on_card(const pn_qwen35_tt *g);
 
+/** `model`'s qwen35 TT residency, or NULL: no residency, or not a qwen35-family model at all
+ *  (its weights are then not a pn_qwen35moe_model, so nothing may read them as one). */
+pn_qwen35_tt *pn_qwen35_tt_of(const pn_model *model);
+
 /**
  * One attention layer entirely on the card, leaving the block output in `g->card.project`.
  *
@@ -672,6 +817,24 @@ int pn_qwen35_tt_attn_core_card(pn_qwen35_tt *g, const pn_qwen35_tt_layer *d,
                                 const pn_qwen35moe_config *cfg, int attn_index, int pos,
                                 int seq_len);
 
+/** Prefill lane ATTENTION PIPE (`PN_TT_ATTN_PIPE`): the chunk core split — QK norms + RoPE
+ *  (`prep`), then K/V appends + attention left in flight (`issue`, pn_tt_attention_settle()
+ *  before its output is read). */
+int pn_qwen35_tt_attn_chunk_prep(pn_qwen35_tt *g, const pn_qwen35_tt_layer *d,
+                                 const pn_qwen35moe_config *cfg, int base_pos, int rows);
+int pn_qwen35_tt_attn_chunk_issue(pn_qwen35_tt *g, int attn_index, int base_pos, int rows);
+/** Deep-queued prefill attention (pn_tt_attn_deep.h): a band's K/V appends (awaited), and its
+ *  head descriptors queued on the members (nothing awaited; pn_tt_attention_chunk_drain()). */
+int pn_qwen35_tt_attn_chunk_append(pn_qwen35_tt *g, int attn_index, int base_pos, int rows);
+int pn_qwen35_tt_attn_chunk_queue(pn_qwen35_tt *g, int attn_index, int base_pos, int rows);
+
+/** K4H (pn_tt_kv_rotate.h): after RoPE, `q_rot * H -> q` and `k_rot * H -> attn_k` when the
+ *  KV type rotates (else a no-op); then `_query()` / `_key()` name the strips the attention
+ *  reads and the append writes from: `q` / `attn_k` rotating, `q_rot` / `k_rot` otherwise. */
+int pn_qwen35_tt_attn_rotate(pn_qwen35_tt *g, const pn_qwen35moe_config *cfg);
+pn_tt_activation *pn_qwen35_tt_attn_query(pn_qwen35_tt *g);
+pn_tt_activation *pn_qwen35_tt_attn_key(pn_qwen35_tt *g);
+
 /**
  * The same block over a CHUNK of `rows` consecutive positions, in rows 0..rows-1 of the
  * strips the projections already wrote.
@@ -699,12 +862,80 @@ void pn_qwen35_tt_prefill_release(pn_qwen35_tt *g);
 /** PHASE G option 3: allocate the prefill-only tall strip set (`PN_TT_PREFILL_TILE_ROWS`),
  *  after the decode strips and the attention strips exist. 0 also when the knob is off. */
 int pn_qwen35_tt_prefill_tall_alloc(pn_qwen35_tt *g);
+
+/**
+ * The prefill-only tall set as placement requests, one per strip in the batched passes' strip
+ * order: each strip's width and mirror count, with `tile_count` 0 for a strip that gets no
+ * tall copy (the logit row; under `fit_policy`, option C, also the joint `attn_qg` when
+ * attention is on the card). The gated out-projection strips take `device_replicas` mirrors
+ * when `outproj_mirrors`. Without `fit_policy` the set is exactly main's.
+ * @return requests written, at most `max`
+ */
+size_t pn_qwen35_tt_tall_requests(pn_qwen35_tt *g, uint32_t device_replicas,
+                                  bool outproj_mirrors, bool fit_policy,
+                                  pn_tt_strip_request *out, size_t max);
+/** The prefill-only tall set's height from `PN_TT_PREFILL_TILE_ROWS` (default 64): 0 when off
+ *  or not a power of two in 2..64. */
+uint32_t pn_qwen35_tt_tall_rows_wanted(void);
+/** `PN_TT_OUTPROJ_MIRRORS` (default on): the gated tall strips are mirrored. */
+bool pn_qwen35_tt_outproj_mirrors_wanted(void);
+
+/**
+ * THE TT LOAD-TIME FIT (qwen35moe_fit_tt.c).
+ *
+ * `fit_decide`: with the artifact open and no weight placed, compute main's DRAM floor
+ * (qwen35moe_tt_fit_plan.h) and, when it does not leave the card's headroom or leaves its
+ * fullest bank under the bank headroom, take the fit policy: `attn_q` goes up as its halves
+ * (option A). Never fails the load; prints the decision.
+ *
+ * `prefill_reserve`: after the tall strips, count every buffer a batched prefill used to
+ * allocate later (pn_tt_prefill_reserve.h) against the real per-bank free bytes, and allocate
+ * them. Mandatory buffers short -> -1 (the load refuses, the shortfall named). The prefix
+ * checkpoint short -> served with the checkpoint OFF (`g->ckpt_off`), said once.
+ */
+void pn_qwen35_tt_fit_decide(pn_qwen35_tt *g, const pn_qwen35moe_config *cfg, int n_ssm,
+                             int n_attn);
+int pn_qwen35_tt_prefill_reserve(pn_qwen35_tt *g);
+
+/** The exact card gates (qwen35moe_gate_tables.h) are wanted: `PN_TT_GDN_TABLE_GATES` unset or
+ *  not `0`. The fit floor prices them; the arm then builds, checks and uploads them. */
+bool pn_qwen35_tt_gate_tables_wanted(void);
+
+/** THE EXACT CARD GATES in decode and the verify, for layer `ssm_index`: the tables armed (no
+ *  det gates), `PN_TT_GDN_TABLE_DECODE` not 0, and the layer's decode table block bound — then
+ *  the next DELTA descriptors name it (pn_tt_gdn_table_gate, cleared by the strip function
+ *  after its DELTAs) and the caller reads no alpha/beta back and passes NULL gates. false:
+ *  the host gates, nothing changed. */
+bool pn_qwen35_tt_table_decode_gates(pn_qwen35_tt *g, int ssm_index);
+
+/** What a DRAM bank must keep when the gate tables go in: the 128 MiB bank rule, plus the MTP
+ *  verify slots' share when they are still to come (main's placement allocates them at the
+ *  first verify). */
+uint64_t pn_qwen35_tt_gate_tables_keep_free(pn_qwen35_tt *g);
+
+/** L2: mirror the decode `ssm_gated` / attention `gated` strips from the DRAM left after the
+ *  arm and republish the replica map (qwen35moe_outproj_mirrors_tt.c). 0 also when off or
+ *  declined; -1 on a failed allocation or publish. */
+int pn_qwen35_tt_decode_outproj_mirrors(pn_qwen35_tt *g);
+
+/**
+ * A batched prefill that failed PART WAY: the card's carried state and K/V hold some of the
+ * prompt. Logs `reason`, drops the prefix checkpoint, forgets that the card holds `state`'s
+ * sequence, rewinds `state` to position 0 and sets `g->prefill_aborted`, so the caller fails
+ * the request (pn_qwen35moe_prefill_tt_aborted) and the next request starts a fresh sequence,
+ * which re-zeroes the carried state. Never reused.
+ * @return NULL always
+ */
+tm_tensor *pn_qwen35_tt_prefill_abort(pn_qwen35_tt *g, pn_state *state, const char *reason,
+                                      int positions_done);
+
 /** STEP 4 S2 — the speculative verify (qwen35moe_prefill_tt.c). */
 int pn_qwen35_tt_spec_verify(pn_qwen35_tt *g, pn_qwen35moe_model *m,
                              const pn_qwen35moe_config *cfg, pn_qwen35moe_state *st,
                              const uint32_t *tokens, int rows, int base_pos,
                              uint32_t *argmax_out);
-int pn_qwen35_tt_spec_rollback(pn_qwen35_tt *g, const pn_qwen35moe_config *cfg, int last_kept);
+int pn_qwen35_tt_spec_rollback(pn_qwen35_tt *g, const pn_qwen35moe_config *cfg, int rows,
+                               int last_kept);
 /** STEP 4 S2b — the MTP draft head (qwen35moe_resident_tt.c). arm: place the second
  *  artifact's weights (after the attention arm, which reserved its KV region). step: one MTP
  *  position — hidden row `h_row` of `h_src` (NULL: the chained `mtp.h`) and the embedding of
@@ -712,10 +943,26 @@ int pn_qwen35_tt_spec_rollback(pn_qwen35_tt *g, const pn_qwen35moe_config *cfg, 
  *  prefill_layer (qwen35moe_prefill_tt.c, inside a batched pass): the same over a pass's rows,
  *  writing the MTP KV for the prompt. */
 void pn_qwen35_tt_mtp_resolve(pn_qwen35_tt *g, const char *trunk_artifact);
+/** Rows a default verify takes: the MTP drafts a cycle (`PN_TT_SPEC`, 3 unless set) + the seed. */
+uint32_t pn_qwen35_tt_mtp_verify_rows(void);
+/** LM-head columns the MTP arm stages for its draft vocabulary out of `total` (0 = the whole
+ *  head, read in place; `PN_TT_MTP_VOCAB_TILES`), as pn_qwen35_tt_mtp_arm takes them. */
+uint32_t pn_qwen35_tt_mtp_draft_columns(uint32_t total);
+
+/** `PN_TT_MTP_DRAFT_VIEW`: 1 the draft reads the LM head in place (lever V), 0 it stages its
+ *  copy, -1 unset (the fit decides). */
+int pn_qwen35_tt_mtp_draft_view_env(void);
 int pn_qwen35_tt_mtp_arm(pn_qwen35_tt *g, pn_qwen35moe_model *m, const pn_qwen35moe_config *cfg);
 int pn_qwen35_tt_mtp_step(pn_qwen35_tt *g, pn_qwen35moe_model *m, const pn_qwen35moe_config *cfg,
                           pn_qwen35moe_state *st, uint32_t token, const pn_tt_activation *h_src,
                           uint32_t h_row, int pos, bool want_head, uint32_t *argmax_out);
+/** `PN_TT_DUMP_HIDDEN` + `_LAST=1` under speculative decode: the COMMITTED verify rows' last-trunk-layer
+ *  hidden (row copy + one row read each), records as the per-token dump's. 0 when off. */
+int pn_qwen35_tt_dump_verify_rows(pn_qwen35_tt *g, const pn_qwen35moe_config *cfg,
+                                  const pn_tt_activation *src, const uint32_t *tokens, int rows,
+                                  int pos);
+/** `PN_TT_SPEC_TREE_PROBE=1`: the tree probe is on (read once). */
+bool pn_qwen35_tt_tree_probe_on(void);
 int pn_qwen35_tt_mtp_head_row(pn_qwen35_tt *g, pn_qwen35moe_state *st,
                               const pn_tt_activation *src, uint32_t row, uint32_t *argmax_out);
 /** S2f: the MTP catch-up over `rows` committed verify rows in ONE pass (qwen35moe_prefill_tt.c):
@@ -725,8 +972,32 @@ int pn_qwen35_tt_mtp_catchup_rows(pn_qwen35_tt *g, pn_qwen35moe_model *m,
                                   const pn_qwen35moe_config *cfg, pn_qwen35moe_state *st,
                                   const uint32_t *next, int rows, int base_pos,
                                   uint32_t *argmax_out);
+/** TTFT lane: the prompt's MTP layer over `rows` rows at base_pos, run OUTSIDE the prefill
+ *  (qwen35moe_prefill_tt.c): tall strips in, the layer on the hidden the last pass left, flush,
+ *  grid end, decode strips back. Bit-identical to the in-pass layer. @return 0, or -1 */
+int pn_qwen35_tt_prefill_mtp_prompt_run(pn_qwen35_tt *g, pn_qwen35moe_model *m,
+                                        const pn_qwen35moe_config *cfg, const uint32_t *next,
+                                        int rows, int base_pos);
+/** TTFT lane (qwen35moe_mtp_prompt_defer_tt.c). wanted: defer the last pass's layer.
+ *  owe: the pass records it (pending). arm: the tail forward is done, the layer is owed by
+ *  `owner`. settle: run it now if `owner` holds it, else drop it. drop: forget it (the card's
+ *  sequence moved on) and end the grid kept for it. idle: the serve's idle tick (ends a kept
+ *  grid while it is owed or forgotten in a stream). free: buffers. */
+bool pn_qwen35_tt_mtp_prompt_defer_wanted(const pn_qwen35_tt *g);
+int pn_qwen35_tt_mtp_prompt_owe(pn_qwen35_tt *g, const uint32_t *next, int rows, int base_pos);
+void pn_qwen35_tt_mtp_prompt_arm(pn_qwen35_tt *g, const void *owner);
+int pn_qwen35_tt_mtp_prompt_settle(pn_qwen35_tt *g, pn_qwen35moe_model *m,
+                                   const pn_qwen35moe_config *cfg, const void *owner);
+void pn_qwen35_tt_mtp_prompt_drop(pn_qwen35_tt *g, const char *why);
+/** drop, from inside a stream: no card access (the idle tick ends the kept grid). */
+void pn_qwen35_tt_mtp_prompt_forget(pn_qwen35_tt *g, const char *why);
+void pn_qwen35_tt_mtp_prompt_idle(pn_qwen35_tt *g);
+void pn_qwen35_tt_mtp_prompt_free(pn_qwen35_tt *g);
 int pn_qwen35_tt_attn_split_q(pn_qwen35_tt *g, const pn_qwen35moe_config *cfg, const char *name,
                               bool extra, pn_qwen35_tt_layer *slot);
+/** Q `[h0 | h1 | ...]` and gate halves back into the joint `[h0 Q | h0 gate | h1 Q | ...]`. */
+void pn_qwen35_tt_interleave_qg(const float *q, const float *gate, uint32_t heads,
+                                uint32_t head_dim, float *qg);
 /** The decode head (final norm, LM head, top-k into st->logits) on the decode hidden's row 0,
  *  under the single-row promise — exactly what a single-position forward runs. */
 int pn_qwen35_tt_head_row(pn_qwen35_tt *g, pn_qwen35moe_state *st);
@@ -754,6 +1025,31 @@ void pn_qwen35_tt_attn_release(pn_qwen35_tt *g);
  *  the evidence that the card ran the forward, and two counters would be two answers. */
 int pn_qwen35_tt_project(pn_qwen35_tt *g, const pn_tt_weight *w, const pn_tt_activation *in,
                          const pn_tt_activation *out, bool wait);
+
+/**
+ * S3a: an out-projection (`ssm_out`, `attn_output`, `ffn_down`) whose result the next residual
+ * step adds to the stream. With `PN_TT_FUSE_RESADD=1` and a shape the RESADD kernel serves it
+ * writes hidden + bf16(in . w) straight into the spare residual strip and sets
+ * `residual_fused`, so the residual step only flips the slot; otherwise it is today's
+ * pn_qwen35_tt_project(w, in, project, wait) and the residual step adds. Not fused while the
+ * attention compare arm reads `project`.
+ *
+ * @return 0, or -1 (the projection failed; the token is refused, as pn_qwen35_tt_project)
+ */
+int pn_qwen35_tt_project_out(pn_qwen35_tt *g, const pn_tt_weight *w, const pn_tt_activation *in);
+
+/**
+ * S3b: the dense SwiGLU's gate, up and silu(gate) * up as ONE fused projection when
+ * `PN_TT_FUSE_SWIGLU=1` and the shape fits (pn_tt_matvec_enqueue_swiglu()), else the
+ * unfused gate and up (chained), a flush and pn_tt_silu_mul() — today's sequence, byte for
+ * byte. Either way `swiglu` holds silu(in . gate) * (in . up) once the next flush (the
+ * down projection's) has run. Counted as two projections either way.
+ *
+ * @return 0, or -1 (a projection failed; the token is refused, as pn_qwen35_tt_project)
+ */
+int pn_qwen35_tt_swiglu(pn_qwen35_tt *g, const pn_tt_weight *gate, const pn_tt_weight *up,
+                        const pn_tt_activation *in, const pn_tt_activation *gate_out,
+                        const pn_tt_activation *up_out, const pn_tt_activation *swiglu);
 
 /**
  * One SSM layer's recurrence, with `conv1d + SiLU` and the delta rule on the card.
@@ -846,6 +1142,11 @@ bool pn_qwen35_tt_gdn_card_gate_possible(void);
  *  @return 0 or -1. Safe when nothing is pending. */
 int pn_qwen35_tt_gdn_pipe_drain(pn_qwen35_tt *g);
 
+/** Prefill lane PIPE 2: finish only the TAIL (narrow + gate) of the band whose RMS is pending,
+ *  leaving an in-flight DELTA alone (what an overlap mid-step needs). `pn_qwen35_tt_gdn_pipe_drain`
+ *  finishes everything, the in-flight band included. */
+int pn_qwen35_tt_gdn_pipe_drain_tail(pn_qwen35_tt *g);
+
 int pn_qwen35_tt_gdn_strip_chunk(pn_qwen35_tt *g, const pn_qwen35moe_ssm_layer *l,
                                  const pn_qwen35moe_config *cfg, int ssm_index,
                                  const pn_tt_activation *qkv, const pn_tt_activation *z,
@@ -928,6 +1229,11 @@ void pn_qwen35_tt_gdn_normcheck_report(const pn_qwen35_tt *g);
 
 /** Free the probe's strips and constants. Safe on a run that never armed it. */
 void pn_qwen35_tt_gdn_normcheck_release(pn_qwen35_tt *g);
+
+/** `PN_TT_ROW_RESET` (LAUNCH lane, default on, `=0` off): sparse host logit rows are reset,
+ *  not refilled; the plain forward's tensor is built from the pairs instead of copied and
+ *  carries their ids for the sampler (engine.h pn_sampler_row_hint). */
+bool pn_qwen35_tt_row_reset_on(void);
 
 #endif /* USE_TT */
 

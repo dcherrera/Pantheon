@@ -445,6 +445,32 @@ static void test_budget_force_close_flips_to_content(void) {
     em_free(&em);
 }
 
+/* Qwen3.8 eval run 3 (2026-11-14): with the close one token (248069), the same text
+ * spelled out of ordinary tokens (`</` `think` `>\`) is reasoning — it was routed to
+ * content mid-thought, and the rest of the reasoning became the answer. */
+static void test_spelled_think_close_stays_reasoning(void) {
+    split_sink s = {0};
+    emitter em;
+    em_init(&em, split_cb, &s, NULL, 0, /*has_tools=*/true, TC_DIALECT_QWEN_XML);
+    em_set_think_close_token(&em);
+
+    em_feed(&em, "write \"\\n");
+    em_feed(&em, "</");
+    em_feed(&em, "think");
+    em_feed(&em, ">\\");
+    em_feed(&em, "n\"");
+    ASSERT_TRUE(em.in_think == 1);
+    ASSERT_STR_EQ(s.c, "");
+
+    em_feed(&em, "</think>");
+    ASSERT_TRUE(em.in_think == 0);
+    em_feed(&em, "Done.");
+    em_flush(&em);
+    ASSERT_STR_EQ(s.r, "write \"\\n</think>\\n\"");
+    ASSERT_STR_EQ(s.c, "Done.");
+    em_free(&em);
+}
+
 /* ============================================================
  * Ornith JSON dialect (TC_DIALECT_ORNITH_JSON): a ```json fence / plausible
  * bare "{" diverts to the tool channel; XML openers are NOT watched.
@@ -698,6 +724,7 @@ int main(void) {
     RUN_TEST(no_opener_all_content);
     RUN_TEST(minicpm_opener_captured);
     RUN_TEST(minicpm_opener_split);
+    RUN_TEST(spelled_think_close_stays_reasoning);
     RUN_TEST(minicpm_opener_tools_off_stays_content);
     RUN_TEST(forced_value_wrapper_captured);
     RUN_TEST(split_opener_after_equals);

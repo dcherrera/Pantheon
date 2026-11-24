@@ -4,13 +4,13 @@
  * @file model_session.c
  * @brief The session-state facade — see model_session.h for the contract and
  *        for why serve code must not reach past it into `entry->prefix_cache`
- *        or `entry->sched`.
+ *        or `entry->sched` — and the table of which person each serve session
+ *        belongs to (people registry §4.8).
  *
  * Lock discipline (identical on every operation here):
- *   - BATCHED path: the scheduler owns the state, and `bs_session_*` take
- *     `sched->mu` + the GPU turnstile themselves.  `pc_lock` is still taken
- *     around the prefix-cache bookkeeping calls (admit/touch) because those
- *     run concurrently from request threads.
+ *   - BATCHED path: the scheduler owns the state (and admits sessions), and
+ *     `bs_session_*` take `sched->mu` + the GPU turnstile themselves.  The
+ *     model's prefix cache is not used on this path.
  *   - SINGLE-USER path: `gen_lock` serializes the cache ops against that
  *     model's generation (the cache is documented thread-unsafe and the
  *     single-user generation mutates the very states we touch).
@@ -18,13 +18,32 @@
 
 #include "model_session.h"
 
+#include <pthread.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
 #include "batch_sched.h"
+#include "replica_affinity.h"
 #include "../core/prefix_cache.h"
+#include "../core/session_family.h"
 #include "../core/session_snapshot.h"
+
+/* Both stores keep a session id's first 63 bytes, so a binding does too. */
+#define MS_SID_KEY 64
+
+/* One session id bound to a person (ms_session_principal_check). */
+typedef struct {
+    char     sid[MS_SID_KEY];
+    char     principal[MS_PRINCIPAL_MAX];
+    uint64_t serial;    /* the entry of its last bind (single-user seats) */
+    uint64_t last_ms;   /* last use: the least recent goes when the table is full */
+} ms_binding;
+
+static ms_binding      g_bindings[MS_PRINCIPAL_BINDINGS_MAX];
+static int             g_n_bindings;
+static pthread_mutex_t g_bindings_lock = PTHREAD_MUTEX_INITIALIZER;
 
 uint64_t ms_now_ms(void)
 {
@@ -155,33 +174,222 @@ ms_result ms_session_restore(mr_entry *entry, const char *sid,
     return rc == 0 ? MS_OK : MS_BAD_SNAPSHOT;
 }
 
+/* Forget the bindings of `sid` (by_prefix: of every id starting with it). */
+static void principal_forget(const char *sid, bool by_prefix)
+{
+    char key[MS_SID_KEY];
+    size_t n = 0;
+
+    snprintf(key, sizeof(key), "%s", sid);
+    n = strlen(key);
+    pthread_mutex_lock(&g_bindings_lock);
+    for (int i = 0; i < g_n_bindings;) {
+        const char *b = g_bindings[i].sid;
+        if (by_prefix ? strncmp(b, key, n) != 0 : strcmp(b, key) != 0) {
+            i++;
+            continue;
+        }
+        g_bindings[i] = g_bindings[--g_n_bindings];
+    }
+    pthread_mutex_unlock(&g_bindings_lock);
+}
+
 void ms_session_release(mr_entry *entry, const char *sid)
 {
     if (!entry || !sid || !sid[0])
         return;
-    if (entry->sched)
+    /* Batched: the session (and its seat) is its warm decode slot; the prefix
+     * cache holds nothing on this path. */
+    if (entry->sched) {
         bs_session_release(entry->sched, sid);
-    if (!entry->prefix_cache)
-        return;
-    /* The prefix cache still holds this model's admission bookkeeping on the
-     * batched path (and the whole session on the single-user path), so clear
-     * it either way. */
-    pthread_mutex_t *lock = entry->sched ? &entry->pc_lock : &entry->gen_lock;
-    pthread_mutex_lock(lock);
-    pn_prefix_cache_release_session(entry->prefix_cache, sid);
-    pthread_mutex_unlock(lock);
+    } else if (entry->prefix_cache) {
+        pthread_mutex_lock(&entry->gen_lock);
+        pn_prefix_cache_release_session(entry->prefix_cache, sid);
+        pthread_mutex_unlock(&entry->gen_lock);
+    }
+    principal_forget(sid, false);
 }
 
 void ms_session_release_by_prefix(mr_entry *entry, const char *base_prefix)
 {
     if (!entry || !base_prefix || !base_prefix[0])
         return;
-    if (entry->sched)
+    if (entry->sched) {
         bs_session_release_by_prefix(entry->sched, base_prefix);
-    if (!entry->prefix_cache)
+    } else if (entry->prefix_cache) {
+        pthread_mutex_lock(&entry->gen_lock);
+        pn_prefix_cache_release_by_prefix(entry->prefix_cache, base_prefix);
+        pthread_mutex_unlock(&entry->gen_lock);
+    }
+    principal_forget(base_prefix, true);
+}
+
+/* A slot for a new binding: a free one, else the least recently used (logged:
+ * that session can then be bound again by whoever uses it next). */
+static int principal_slot_locked(void)
+{
+    int oldest = 0;
+
+    if (g_n_bindings < MS_PRINCIPAL_BINDINGS_MAX)
+        return g_n_bindings++;
+    for (int i = 1; i < g_n_bindings; i++)
+        if (g_bindings[i].last_ms < g_bindings[oldest].last_ms)
+            oldest = i;
+    fprintf(stderr, "serve: session owner table full (%d); the least recently used "
+            "binding is forgotten\n", MS_PRINCIPAL_BINDINGS_MAX);
+    return oldest;
+}
+
+ms_result ms_session_principal_check(mr_entry *entry, const char *sid, const char *principal,
+                                     bool admin, ms_principal_use use)
+{
+    char key[MS_SID_KEY];
+    int exact = -1, mine = 0;
+
+    if (!principal || !principal[0] || !sid || !sid[0])
+        return MS_OK;
+    snprintf(key, sizeof(key), "%s", sid);
+    pthread_mutex_lock(&g_bindings_lock);
+    for (int i = 0; i < g_n_bindings; i++) {
+        if (!pn_session_same_family(g_bindings[i].sid, key))
+            continue;
+        if (strcmp(g_bindings[i].principal, principal) != 0) {
+            pthread_mutex_unlock(&g_bindings_lock);
+            return MS_NOT_YOURS;
+        }
+        mine = 1;
+        if (strcmp(g_bindings[i].sid, key) == 0)
+            exact = i;
+    }
+    if (use == MS_PRINCIPAL_EXPORT && !mine && !admin) {
+        pthread_mutex_unlock(&g_bindings_lock);
+        return MS_NOT_YOURS;
+    }
+    if (use == MS_PRINCIPAL_BIND) {
+        if (exact < 0) {
+            exact = principal_slot_locked();
+            memcpy(g_bindings[exact].sid, key, sizeof(key));
+            snprintf(g_bindings[exact].principal, MS_PRINCIPAL_MAX, "%s", principal);
+        }
+        g_bindings[exact].serial = entry ? entry->serial : 0;
+    }
+    if (exact >= 0)
+        g_bindings[exact].last_ms = ms_now_ms();
+    pthread_mutex_unlock(&g_bindings_lock);
+    return MS_OK;
+}
+
+/* Does binding `b` hold a seat on `entry` (ms_seats_by_principal)? */
+static bool binding_holds_seat(mr_entry *entry, const ms_binding *b)
+{
+    if (entry->sched)
+        return bs_session_family_holds(entry->sched, b->sid);
+    return b->serial == entry->serial;
+}
+
+int ms_seats_by_principal(mr_entry *entry, ms_principal_seats *out, int max)
+{
+    ms_binding *copy = NULL;
+    bool *held = NULL;
+    int n = 0, n_out = 0;
+
+    if (!entry || !out || max <= 0)
+        return 0;
+    copy = malloc(sizeof(*copy) * MS_PRINCIPAL_BINDINGS_MAX);
+    held = calloc(MS_PRINCIPAL_BINDINGS_MAX, sizeof(*held));
+    if (!copy || !held)
+        goto done;
+    pthread_mutex_lock(&g_bindings_lock);
+    n = g_n_bindings;
+    memcpy(copy, g_bindings, sizeof(*copy) * (size_t)n);
+    pthread_mutex_unlock(&g_bindings_lock);
+    for (int i = 0; i < n; i++) {
+        held[i] = binding_holds_seat(entry, &copy[i]);
+        /* One family of one person is one seat, however many of its ids are bound. */
+        for (int j = 0; held[i] && j < i; j++)
+            if (held[j] && strcmp(copy[j].principal, copy[i].principal) == 0 &&
+                pn_session_same_family(copy[j].sid, copy[i].sid))
+                held[i] = false;
+        if (!held[i])
+            continue;
+        int k = 0;
+        while (k < n_out && strcmp(out[k].principal, copy[i].principal) != 0)
+            k++;
+        if (k == n_out && n_out < max) {
+            memset(&out[k], 0, sizeof(out[k]));
+            snprintf(out[k].principal, sizeof(out[k].principal), "%s", copy[i].principal);
+            n_out++;
+        }
+        if (k < n_out)
+            out[k].held++;
+    }
+done:
+    free(copy);
+    free(held);
+    return n_out;
+}
+
+int ms_sessions_used(mr_entry *entry)
+{
+    if (!entry)
+        return 0;
+    if (entry->sched)
+        return bs_session_count(entry->sched);
+    if (entry->prefix_cache)
+        return pn_prefix_cache_session_count(entry->prefix_cache);
+    /* No session store (a CPU copy): a session is only its routing binding. */
+    return pn_replica_affinity_count(entry->serial);
+}
+
+void ms_session_occupancy(const mr_entry *entry, ms_occupancy *out)
+{
+    if (!out)
         return;
-    pthread_mutex_t *lock = entry->sched ? &entry->pc_lock : &entry->gen_lock;
-    pthread_mutex_lock(lock);
-    pn_prefix_cache_release_by_prefix(entry->prefix_cache, base_prefix);
-    pthread_mutex_unlock(lock);
+    memset(out, 0, sizeof(*out));
+    if (!entry)
+        return;
+    if (entry->sched) {
+        bs_occupancy o;
+        bs_session_occupancy(entry->sched, &o);
+        out->sessions_used = o.families;
+        out->max_sessions = o.max_sessions;
+        out->slots_held = o.slots_held;
+        out->slots_free = o.slots_free;
+        out->seat_free = o.seat_free;
+        return;
+    }
+    /* No decode slots: a seat is one session, so held == used. */
+    out->max_sessions = entry->max_sessions;
+    if (entry->prefix_cache) {
+        out->sessions_used = pn_prefix_cache_session_count(entry->prefix_cache);
+        out->max_sessions = pn_prefix_cache_max_sessions(entry->prefix_cache);
+        out->seat_free = out->sessions_used < out->max_sessions;
+    } else {
+        out->sessions_used = pn_replica_affinity_count(entry->serial);
+        out->seat_free = true;
+    }
+    out->slots_held = out->sessions_used;
+    out->slots_free = out->max_sessions > out->sessions_used
+                    ? out->max_sessions - out->sessions_used : 0;
+}
+
+bool ms_session_holds_seat(mr_entry *entry, const char *sid)
+{
+    if (!entry || !sid || !sid[0])
+        return false;
+    if (entry->sched)
+        return bs_session_family_holds(entry->sched, sid);
+    return true;
+}
+
+bool ms_session_seat_free(mr_entry *entry)
+{
+    if (!entry)
+        return false;
+    if (entry->sched)
+        return bs_session_seat_free(entry->sched);
+    if (entry->prefix_cache)   /* the cache's own cap is what admission enforces */
+        return pn_prefix_cache_session_count(entry->prefix_cache) <
+               pn_prefix_cache_max_sessions(entry->prefix_cache);
+    return true;   /* nothing to hold: no session cap is enforced */
 }

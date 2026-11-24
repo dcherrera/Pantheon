@@ -36,20 +36,25 @@
  *         not here: the scheduler's slots own their pn_states, so sharing this
  *         cache's per-session states would mix two ownership models.
  *
- * @warning On the BATCHED path (`mr_entry.sched` non-NULL) this cache holds
- *          ADMISSION BOOKKEEPING ONLY — nothing calls its acquire, so it has no
- *          entries and no session state at all; the sessions live in the
- *          scheduler's decode slots.  Serve code must therefore never reach for
- *          `entry->prefix_cache` directly to find a session: go through the
- *          model_session.h facade, which has both arms.  Session export,
- *          restore and release each shipped against this cache alone and each
- *          silently covered only the single-user path until that facade existed.
+ * @warning On the BATCHED path (`mr_entry.sched` non-NULL) this cache is NOT
+ *          USED — nothing calls its acquire, so it has no entries and no
+ *          session state at all; the sessions live in the scheduler's decode
+ *          slots, and the scheduler is also that path's admission authority
+ *          (batch_sched_admission.h).  Serve code must therefore never reach
+ *          for `entry->prefix_cache` directly to find, admit or count a
+ *          session: go through the model_session.h facade, which has both
+ *          arms.  Session export, restore and release each shipped against
+ *          this cache alone and each silently covered only the single-user
+ *          path until that facade existed; admission did the same until
+ *          2026-11-05 (an empty cache admits everyone, so max_sessions was
+ *          never enforced on a batched model).
  */
 
 #ifndef PN_PREFIX_CACHE_H
 #define PN_PREFIX_CACHE_H
 
 #include "engine.h"
+#include "think_history.h"
 #include <stdint.h>
 
 /* Opaque session prefix cache. Concrete definition in prefix_cache.c. */
@@ -116,6 +121,23 @@ void pn_prefix_cache_set_watch_hook(pn_prefix_cache *cache,
 void pn_prefix_cache_free(pn_prefix_cache *cache);
 
 /**
+ * Session families holding entries now (what max_sessions counts). A snapshot
+ * republished on every entry change, so it may be read WITHOUT the lock that
+ * serializes the cache (e.g. under the registry lock for sessions_used and
+ * replica routing). 0 for a NULL cache.
+ *
+ * Thread-safe: yes (atomic read). Reentrant: yes. Signal-safe: no
+ */
+int pn_prefix_cache_session_count(const pn_prefix_cache *cache);
+
+/**
+ * The cache's max_sessions (fixed at pn_prefix_cache_new). 0 for NULL.
+ *
+ * Thread-safe: yes (immutable). Reentrant: yes. Signal-safe: no
+ */
+int pn_prefix_cache_max_sessions(const pn_prefix_cache *cache);
+
+/**
  * Session admission (K80 serving-ops Phase 5). Decide whether session `sid` may
  * take (or already holds) one of the cache's live slots — WITHOUT allocating.
  * Call this before pn_prefix_cache_acquire on the request path.
@@ -124,11 +146,12 @@ void pn_prefix_cache_free(pn_prefix_cache *cache);
  *   1. Reap idle slots: any slot untouched for >= `idle_ttl_ms` (its last
  *      acquire/commit was that long ago) is freed here, so a returning-later
  *      user frees room for a waiting one. `idle_ttl_ms <= 0` disables reaping.
- *   2. If `sid` already holds a slot → PN_ADMIT_OK (it always resumes).
+ *   2. If `sid`'s session family (session_family.h: the id, or "<id>-<more>")
+ *      already holds a slot → PN_ADMIT_OK (it always resumes).
  *   3. Else if a slot is free (or one was just reaped), or fewer than
- *      max_sessions distinct ids hold the slots (one holds a spare
+ *      max_sessions families hold the slots (one holds a spare
  *      conversation the acquire will evict) → PN_ADMIT_OK.
- *   4. Else (max_sessions live, non-idle ids) → PN_ADMIT_AT_CAPACITY.
+ *   4. Else (max_sessions live, non-idle families) → PN_ADMIT_AT_CAPACITY.
  * Reaping is per conversation entry (each has its own last-activity time).
  *
  * On PN_SESSION_ADMIT_AT_CAPACITY the caller should REFUSE the new session
@@ -232,6 +255,67 @@ pn_state *pn_prefix_cache_acquire_sys(pn_prefix_cache *cache, const char *sid,
                                       const uint32_t *tokens, int n_ctx,
                                       int sys_len, int *delta_start,
                                       int *capture_sys);
+
+/** What pn_prefix_cache_acquire_bounded is asked to honour. */
+typedef struct {
+    int  sys_len;          /* as pn_prefix_cache_acquire_sys (0: none) */
+    int  resume_ceiling;   /* last prompt position a resume may start from */
+    bool drop_last;        /* think_history drop_last: try the turn snapshot
+                            * first (pn_prefix_cache_capture_turn) */
+} pn_prefix_acquire_opts;
+
+/** What pn_prefix_cache_acquire_bounded decided. */
+typedef struct {
+    int            delta_start;   /* as pn_prefix_cache_acquire_sys */
+    int            capture_sys;   /* as pn_prefix_cache_acquire_sys */
+    pn_resume_kind kind;          /* the tier that ran (usage `resume`) */
+} pn_prefix_acquire_result;
+
+/**
+ * pn_prefix_cache_acquire_sys with a resume ceiling, reporting the tier that
+ * ran. With drop_last, the turn snapshot is tried first: it resumes at the
+ * snapshot's position when the prompt starts with its tokens. Otherwise no
+ * tier resumes past prompt position `resume_ceiling`: the append tier
+ * and the Tenstorrent card checkpoint are skipped when they would, the plain-KV
+ * LCP rewind is clamped to it, and the system-prefix tier needs
+ * sys_len <= resume_ceiling. A ceiling >= n_ctx is pn_prefix_cache_acquire_sys
+ * exactly. `think_history: "as_sent"` passes the request's first think block
+ * (core/think_history.h), so no earlier think block is resumed over.
+ *
+ * @param opts            system prefix, resume ceiling, drop_last
+ * @param out             receives delta_start, capture_sys and the tier
+ * @return                The session's pn_state, or NULL on failure.
+ *
+ * Thread-safe: no
+ */
+pn_state *pn_prefix_cache_acquire_bounded(pn_prefix_cache *cache,
+                                          const char *sid,
+                                          const uint32_t *tokens, int n_ctx,
+                                          const pn_prefix_acquire_opts *opts,
+                                          pn_prefix_acquire_result *out);
+
+/** Can this cache keep turn snapshots (the qwen35 dual state with its KV on
+ *  the host side: the archs SYS1 supports)? */
+bool pn_prefix_cache_turn_snapshot_supported(const pn_prefix_cache *cache);
+
+/** Does this cache serve think_history drop_last: the turn snapshot, or on
+ *  Tenstorrent (K/V on the card) the card's multi-turn prefill checkpoint? */
+bool pn_prefix_cache_drop_last_supported(const pn_prefix_cache *cache);
+
+/**
+ * Save session `sid`'s TURN snapshot: the caller just prefilled tokens[0, cut)
+ * (the request's own messages, sg_prompt_bounds.turn_start) and the state sits
+ * there. A recurrent snapshot (SSM images + q4 shadows; the KV rows stay in
+ * the state) replaces the previous one. A later acquire with drop_last whose
+ * prompt starts with tokens[0, cut) resumes there. Host RAM: the SSM images
+ * (Qwen3.6 ~63 MiB), admitted like the system-prefix snapshot.
+ *
+ * @return 0 saved, -1 not (unsupported arch, wrong position, no memory)
+ *
+ * Thread-safe: no (serialize with acquire/commit)
+ */
+int pn_prefix_cache_capture_turn(pn_prefix_cache *cache, const char *sid,
+                                 const uint32_t *tokens, int cut);
 
 /**
  * How many of this turn's prompt tokens the cache let the caller SKIP — the

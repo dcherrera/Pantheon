@@ -15,6 +15,7 @@
 #include "pn_tt_gdn_layout.h"
 
 #include <stddef.h>
+#include <string.h>
 
 #include "tt/ft_tt_tilize.h"
 
@@ -53,6 +54,28 @@ int pn_tt_gdn_stage_plane(const float *source, uint32_t first, uint32_t stride,
         scratch[channel] = source[(size_t)first + (size_t)channel * stride];
     if (ft_tt_tilize_strip(scratch, sizeof(*scratch), 1u, conv_dim,
                            (size_t)conv_dim * sizeof(*scratch), tiles_out) != FT_TT_TILIZE_OK)
+        return -1;
+    return 0;
+}
+
+int pn_tt_gdnc_stage_weight_column(const float *weight, uint32_t taps, uint32_t tap,
+                                   uint32_t column, bool row0_only, float *plane,
+                                   unsigned char *tile_out)
+{
+    const uint32_t dim = PN_TT_GDN_LAYOUT_TILE_DIM;
+    uint32_t row;
+    uint32_t lane;
+
+    if (!weight || !plane || !tile_out || taps == 0u || tap >= taps)
+        return -1;
+    memset(plane, 0, (size_t)dim * dim * sizeof(*plane));
+    /* `w[c][tap]` at EVERY row: the tap coefficient is constant across a chunk's positions and
+     * the broadcast surface is BROADCAST_COL only — there is no row broadcast. */
+    for (row = 0; row < (row0_only ? 1u : dim); row++)
+        for (lane = 0; lane < dim; lane++)
+            plane[row * dim + lane] = weight[((size_t)column * dim + lane) * taps + tap];
+    if (ft_tt_tilize_strip(plane, sizeof(*plane), dim, dim, (size_t)dim * sizeof(*plane),
+                           tile_out) != FT_TT_TILIZE_OK)
         return -1;
     return 0;
 }

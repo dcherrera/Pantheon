@@ -70,6 +70,14 @@ typedef struct {
                                  * saber's (they share the global env otherwise). */
 } pn_config;
 
+/* The dense (llama-family) per-session KV ring length in positions: the GGUF
+ * context, bounded by sliding_window, ctx_cap and PN_SESSION_MAX_CTX
+ * (default 40000). pn_state_new sizes the ring with exactly this. */
+int pn_dense_session_max_seq(const pn_config *cfg);
+
+/* Bytes of the dense per-session scratch arena pn_state_new allocates. */
+size_t pn_dense_arena_bytes(const pn_config *cfg);
+
 /* Effective per-head dimension (explicit head_dim, else derived). */
 static inline int pn_head_dim(const pn_config *c) {
     return c->head_dim > 0 ? c->head_dim : (c->n_head ? c->n_embd / c->n_head : 0);
@@ -96,9 +104,16 @@ struct pn_model {
     pn_forward_fn forward;      /* Architecture's forward pass */
     ft_tokenizer *tokenizer;    /* BPE tokenizer */
     char *path;                 /* Model file path */
+    char *card_artifact;        /* the prebuilt TT artifact pn_load found beside a card
+                                 * metadata GGUF and attached (pn_gguf_attach_card_artifact);
+                                 * the TT backends load it as-is. NULL otherwise. */
     int chat_style;             /* pn_chat_style enum */
     int chat_add_bos;           /* template prepends bos_token (e.g. MiniCPM5) */
+    int chat_trim_content;      /* template |trims message content (Qwen3.5+) */
     void *vision;               /* pn_vision_model* for VLMs (NULL otherwise) */
+    uint64_t host_admitted;     /* host bytes admitted while loading (anonymous
+                                 * weight copies; pn_host_admission.h), released
+                                 * by pn_model_free */
 #ifdef USE_THREADS
     struct fw_pool *pool;       /* Thread pool for parallel ops */
 #endif
@@ -123,6 +138,8 @@ struct pn_state {
     pn_config *config;          /* Reference to model config */
     struct pn_arena *arena;     /* Per-token scratch arena */
     const float *embd_override; /* if set, forward uses this embedding (image token) */
+    uint64_t host_admitted;     /* host bytes admitted for this state
+                                 * (pn_host_admission.h); released on free */
 };
 
 /* Attach a vision encoder (clip mmproj GGUF) to a loaded model, for pn_describe. */
@@ -173,12 +190,28 @@ int pn_model_graph_residency_read(const pn_model *model,
 int pn_model_attn_residency_read(const pn_model *model,
                                  pn_model_attn_residency *out);
 
+/**
+ * Whether the model's forward runs on an accelerator (CUDA or Tenstorrent). False
+ * for the host CPU forward, including an upload that failed and fell back to it.
+ * The Metal Phase 0 scaffold computes on the CPU and reports false.
+ *
+ * Thread-safe: yes. Reentrant: yes. Signal-safe: yes
+ */
+bool pn_model_on_accelerator(const pn_model *model);
+
 /* Detect model architecture from file */
 pn_arch pn_detect_arch(const char *path);
 
 /* Detect file format (GGUF vs safetensors) */
 bool pn_is_gguf(const char *path);
 bool pn_is_safetensors(const char *path);
+
+/* KV cache format a load asks for (pn_load_opts.kv_format). */
+typedef enum {
+    PN_KV_FORMAT_DEFAULT = 0,   /* QWEN35_KV_Q4 (default Q4 on qwen35); ladder may tighten */
+    PN_KV_FORMAT_FP32    = 1,   /* fp32 KV, never switched */
+    PN_KV_FORMAT_Q4      = 2,   /* TurboQuant Q4 KV */
+} pn_kv_format;
 
 /* Load options for pn_load_ex() */
 typedef struct {
@@ -188,6 +221,21 @@ typedef struct {
     int  ctx_cap;             /* KV Phase 1: per-model per-session context cap in
                                * tokens (KV ring window). 0 = unset. Set BEFORE
                                * weight upload so the ring is sized per model. */
+    int  host_sessions;       /* sessions the caller will allocate (host-RAM
+                               * fit, pn_session_host_fit.h). 0 = 1. */
+    int  card_sessions;       /* decode blocks the caller will carve on the
+                               * card (the batch scheduler's slot count), so
+                               * the die gate prices them. 0 = none (a
+                               * single-user serve; one ring is charged). */
+    bool cpu_only;            /* host CPU forward only: no accelerator upload in
+                               * any build, and no die placement (Local `cpu`
+                               * profile). */
+    int  kv_format;           /* pn_kv_format: the KV cache format this load asked
+                               * for (qwen35 family). DEFAULT = QWEN35_KV_Q4 / the
+                               * serve default, and the memory ladder may switch a
+                               * new cache to Q4; an explicit FP32 / Q4 is never
+                               * changed (a pressure that would switch FP32 refuses
+                               * the cache instead). */
 } pn_load_opts;
 
 /* Extended model loading with options (safetensors + GGUF) */
@@ -298,6 +346,16 @@ int pn_spec_generate(pn_model *model, pn_state *state, uint32_t seed,
 int pn_sampler_grammar_shortlist(float *logits, int n_vocab, const pn_sampling_params *params,
                                  const uint32_t *recent_tokens, int n_recent);
 
+/* The draw from a row pn_sampler_grammar_shortlist rewrote (params->tool_grammar NULL): the
+ * row is final, so the top-N verdict, refill and tail planner are skipped — as sample_token
+ * does for a row its own mask decided.  A decided row may hold fewer survivors than top_k
+ * (the outside bound), which the tail planner would otherwise take for a top-N row whose
+ * top-k reaches past it.  The same tokens as pn_sample_next_token wherever that one is exact.
+ *
+ * Thread-safe: as pn_sample_next_token */
+uint32_t pn_sample_decided_row(float *logits, int n_vocab, pn_sampling_params *params,
+                               uint32_t *recent_tokens, int n_recent);
+
 /* Public wrapper around the internal token sampler so external decode drivers
  * reuse the EXACT sampling path (repeat penalty -> temperature -> top-k ->
  * top-p -> cumulative draw; temperature <= 0 is greedy argmax) instead of
@@ -310,6 +368,33 @@ int pn_sampler_grammar_shortlist(float *logits, int n_vocab, const pn_sampling_p
 uint32_t pn_sample_next_token(float *logits, int n_vocab,
                               pn_sampling_params *params,
                               uint32_t *recent_tokens, int n_recent);
+
+/* pn_sample_next_token on a TOP-N row (-INFINITY outside its pairs, e.g. the CUDA verify's
+ * presented rows): the same token, forced through the sparse-survivor path (the survivors
+ * only, not a softmax over n_vocab — ~8 ms a sampled draw at 248K vocab on a 2-core K80 host).
+ * Byte-identical by test_sparse_sampler_identity; a dense row takes the full path anyway.
+ *
+ * Thread-safe: as pn_sample_next_token */
+uint32_t pn_sample_next_token_topn(float *logits, int n_vocab, pn_sampling_params *params,
+                                   uint32_t *recent_tokens, int n_recent);
+
+/* Free the calling thread's sampler buffers (sampler scratch, logprob snapshot,
+ * grammar verdict/need scratch). Runs automatically when a thread that
+ * allocated them exits; call it directly only to drop them earlier. The next
+ * sample on the thread reallocates them.
+ *
+ * Thread-safe: yes (touches only the caller's own buffers) */
+void pn_sampler_thread_release(void);
+
+/* SURVIVOR HINT: `t` (a forward's logit tensor) carries its finite entries' ids — `t->nnz`
+ * of them, ascending, as uint32 right after its `numel` floats — when a backend built the
+ * row sparse itself (TT, `PN_TT_ROW_RESET`, default on). Call right before sampling `t->data`: that
+ * one draw reads the list instead of scanning the row. No-op for any other tensor.
+ *
+ * Thread-safe: per thread    Reentrant: no */
+void pn_sampler_row_hint(const tm_tensor *t);
+/* How many survivor scans a hint replaced (the gate asserts it advances). */
+unsigned long pn_sampler_row_hint_uses(void);
 
 /* Sparse-survivor sampler fast path (PN_SPARSE_SAMPLER) — see engine.c.
  * Covers BOTH decode modes: the temperature>0 sampler and the temperature<=0
@@ -327,9 +412,23 @@ uint32_t pn_sample_next_token(float *logits, int n_vocab,
 void pn_sampler_set_sparse(int on);
 void pn_sampler_clear_sparse(void);
 unsigned long pn_sampler_sparse_hits(void);
+/** Dense-path draws decided by the margin draw (sampler_margin_draw.h); gates assert it moves. */
+unsigned long pn_sampler_margin_draws(void);
+struct pn_spec_proposal;
+/** True speculative sampling's per-request counts (spec_sampling_chooser.h). */
+typedef struct pn_spec_rule_stats {
+    unsigned long drafted;    /**< drafts drawn from the MTP head's q */
+    unsigned long rule_rows;  /**< verify rows decided by min(1, p/q) + residual */
+    unsigned long accepted;   /**< of those, drafts accepted */
+    unsigned long fallback;   /**< draft rows decided by a plain draw (p not exact on top-N) */
+    double sum_acceptance;    /**< sum over rule rows of sum min(p, q) */
+} pn_spec_rule_stats;
 /** Speculative sampling's chooser state (pn_spec_sample_choose, a pn_spec_choose_fn): the
  *  request's params, an n_vocab row buffer, a copy of the repeat window advanced per draw,
- *  and the verify row being chosen (reset to 0 before each cycle). */
+ *  and the verify row being chosen (reset to 0 before each cycle).
+ *  TRUE SPECULATIVE SAMPLING (spec_sampling_chooser.h) when `q` is set: the drafts were drawn
+ *  by pn_spec_sample_draft from q[i] and row i < n_q is decided by min(1, p/q) + residual;
+ *  NULL keeps the shared-randomness rule (argmax drafts, accept iff the plain draw equals). */
 typedef struct pn_spec_sample_ctx {
     pn_sampling_params *params;
     float *row;
@@ -337,6 +436,12 @@ typedef struct pn_spec_sample_ctx {
     uint32_t *recent;
     int n_recent, max_recent;
     int row_index;
+    struct pn_spec_proposal *q;  /**< [16]: this cycle's draft proposals, or NULL */
+    int n_q;                     /**< drafts drawn this cycle (reset to 0 before drafting) */
+    uint32_t no_draft[2];        /**< tokens never drafted (stop tokens a cycle cuts at) */
+    int n_no_draft;
+    uint32_t *draft_recent;      /**< [max_recent] scratch: the window for a draft */
+    pn_spec_rule_stats stats;
 } pn_spec_sample_ctx;
 /** Equal to qwen35moe.h's PN_SPEC_CHOOSE_DEFER. */
 #define PN_SPEC_CHOOSE_DEFER_TOKEN 0xFFFFFFFFu
@@ -345,6 +450,25 @@ typedef struct pn_spec_sample_ctx {
  *  decided exactly by its top-N. */
 uint32_t pn_spec_sample_choose(void *ctx, const uint32_t *index, const float *value,
                                uint32_t count);
+/** The sampler's FINAL distribution over a sparse row (-INFINITY outside its survivors), as
+ *  the plain sampled draw would use it: client surgery, repetition penalty, temperature,
+ *  top-k (renormalised), top-p. `row` is penalised in place on success and untouched on
+ *  failure. `require_exact`: refuse a top-N row that cannot decide the draw exactly
+ *  (pn_sampler_topn_row_exact). Writes the survivors in ascending id order.
+ *  @return S (1..cap), or -1 (greedy, a grammar hook, a dense row, more than `cap`
+ *  survivors, or not exact) */
+int pn_sampler_row_final_probs(float *row, int n_vocab, pn_sampling_params *params,
+                               const uint32_t *recent, int n_recent, bool require_exact,
+                               int *ids, float *probs, int cap);
+/** pn_sampler_row_final_probs over (index, value) pairs directly (no vocabulary-sized row):
+ *  the same penalties token by token, the same tail. For a proposal distribution, not the
+ *  plain draw. @return S, or -1 */
+int pn_sampler_pairs_final_probs(const uint32_t *index, const float *value, uint32_t count,
+                                 int n_vocab, const pn_sampling_params *params,
+                                 const uint32_t *recent, int n_recent, int *ids, float *probs,
+                                 int cap);
+/** One uniform in [0, 1) from the request's stream (its seeded RNG, else rand()). */
+float pn_sampler_uniform(pn_sampling_params *params);
 /** Top-N rows the sampler swapped for the dense row (pn_sampling_params.dense_row). */
 unsigned long pn_sampler_topn_refills(void);
 /** Can this top-N row (-INFINITY outside N entries) decide a sampled draw exactly as the
@@ -352,6 +476,19 @@ unsigned long pn_sampler_topn_refills(void);
 bool pn_sampler_topn_row_exact(const float *logits, int n_vocab,
                                const pn_sampling_params *params,
                                const uint32_t *recent, int n_recent);
+/** How a sampled draw on a top-N row is decided: EXACT from the N (top-k inside it), TAIL by
+ *  the tail planner (top-k off or past the N; *bound = the N's smallest raw logit), REFILL
+ *  from the dense row (a logit bias, a raising penalty, or a top-k set that may leave the N). */
+typedef enum { PN_TOPN_EXACT = 0, PN_TOPN_TAIL, PN_TOPN_REFILL } pn_topn_verdict;
+pn_topn_verdict pn_sampler_topn_row_verdict(const float *logits, int n_vocab,
+                                            const pn_sampling_params *params,
+                                            const uint32_t *recent, int n_recent, float *bound);
+/** Draws decided by the tail planner: from the N (nucleus or mixture head), the mixture's
+ *  residual (dense row after the draw), and the plans that needed the dense row outright. */
+void pn_sampler_tail_counts(unsigned long *from_n, unsigned long *residual,
+                            unsigned long *dense);
+/** Rows whose tail bound came from the device's counts (pn_sampling_params.tail_counts). */
+unsigned long pn_sampler_tail_count_calls(void);
 
 /* Grammar-mask density invariant — see the full-logits arming-window block in
  * serve_generation.c.
@@ -377,6 +514,9 @@ unsigned long pn_sampler_grammar_fullscan_steps(void);
 /** Masked steps applied by fetching only the dense chunks that hold an allowed
  *  token (pn_sampling_params.dense_chunks) instead of the whole row. */
 unsigned long pn_sampler_grammar_chunk_steps(void);
+/** Shortlist decisions made by the outside bound (grammar_mask_shortlist.h), row 0 draws and
+ *  speculative verify rows alike (PN_GRAMMAR_EXACT_BOUND=0: always 0). */
+unsigned long pn_sampler_grammar_bound_steps(void);
 double pn_sampler_grammar_mask_seconds(void);
 unsigned long pn_sampler_grammar_sparse_rows(void);
 

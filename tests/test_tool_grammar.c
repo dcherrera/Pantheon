@@ -1690,6 +1690,54 @@ static void test_required_think_gated_reasoning_is_free(void) {
     jr_free(tools);
 }
 
+/* Qwen3.8 eval run 3 (2026-11-14): reasoning about a test, the model wrote the C
+ * string "\n</think>\n" out of ORDINARY tokens — `</` 510, `think` 26003, `>\`
+ * 8189 — while its real close is one token (248069).  The text match ended
+ * reasoning there and compelled the call from the next token: the model, mid-string,
+ * could only take the whitespace the opener allows and wrote "   \r" to max_tokens. */
+static const char *const SPELLED_CLOSE[] = {
+    "\"<think>\\n\" + trim(reasoning) + \"\\n", "</", "think", ">\\", "n\");",
+};
+#define N_SPELLED_CLOSE ((int)(sizeof(SPELLED_CLOSE) / sizeof(SPELLED_CLOSE[0])))
+
+static void test_required_spelled_think_close_is_reasoning(void) {
+    jr_value *tools = jr_parse(TOOLS_JSON);
+    tg_grammar *g = tg_build(tools);
+    tg_state *text_mode = tg_state_new_required(g, true);
+    tg_state *st = tg_state_new_required(g, true);
+    bool ok;
+
+    /* Text mode reproduces the failure: after `>\` only whitespace or '<' is left. */
+    for (int i = 0; i < N_SPELLED_CLOSE - 1; i++)
+        tg_advance(text_mode, SPELLED_CLOSE[i]);
+    ASSERT_TRUE(tg_forced_reasoning_ended(text_mode));
+    ASSERT_FALSE(tg_token_allowed(text_mode, "n\");"));
+    ASSERT_TRUE(tg_token_allowed(text_mode, "   \r"));
+
+    /* Token mode: the spelled close is reasoning, nothing is compelled. */
+    tg_set_think_close_token(st);
+    for (int i = 0; i < N_SPELLED_CLOSE; i++) {
+        ASSERT_TRUE(tg_token_allowed(st, SPELLED_CLOSE[i]));
+        tg_advance(st, SPELLED_CLOSE[i]);
+        ASSERT_FALSE(tg_mask_active(st));
+    }
+    ASSERT_FALSE(tg_forced_reasoning_ended(st));
+
+    /* The close token still closes, and the call is compelled from the next token. */
+    tg_advance(st, "</think>");
+    ASSERT_TRUE(tg_forced_reasoning_ended(st));
+    ASSERT_TRUE(tg_mask_active(st));
+    ASSERT_FALSE(tg_token_allowed(st, "n\");"));
+    feed_forced(st, "\n<tool_call>\n<function=read>\n<parameter=path>\nsrc/main.c\n"
+                    "</parameter>\n</function>\n</tool_call>", &ok);
+    ASSERT_TRUE(ok);
+    ASSERT_TRUE(tg_complete(st));
+    tg_state_free(st);
+    tg_state_free(text_mode);
+    tg_free(g);
+    jr_free(tools);
+}
+
 /* "required" with NO open think block (thinking off): compelled from token 0. */
 static void test_required_without_think_compels_from_start(void) {
     jr_value *tools = jr_parse(TOOLS_JSON);
@@ -1705,8 +1753,9 @@ static void test_required_without_think_compels_from_start(void) {
 }
 
 /* The serve's reasoning_budget force-close: the injected "</think>" ends the
- * think-gated block and grants the landing window; the model's own close then
- * compels the call. */
+ * think-gated block and compels the call from the next token — no landing
+ * window on a "required" walk (the model wrote its thought on as prose and ran
+ * to max_tokens with no call; test_tool_grammar_forced_close_call.c). */
 static void test_required_injected_close_lands(void) {
     jr_value *tools = jr_parse(TOOLS_JSON);
     tg_grammar *g = tg_build(tools);
@@ -1716,13 +1765,11 @@ static void test_required_injected_close_lands(void) {
     ASSERT_FALSE(tg_mask_active(st));
     tg_advance(st, "</think>");            /* the serve's injected close */
     tg_reasoning_end_injected(st);
-    ASSERT_FALSE(tg_mask_active(st));      /* landing: the sentence may finish */
-    feed_forced(st, " and then I read it.", &ok);
+    ASSERT_INT_EQ(tg_debug_landing_chars(st), 0);
+    ASSERT_TRUE(tg_mask_active(st));       /* compelled at once */
+    ASSERT_FALSE(tg_token_allowed(st, " and then I read it."));
+    feed_forced(st, "\n<tool_call>\n<function=read>\n", &ok);
     ASSERT_TRUE(ok);
-    feed_forced(st, "</think>", &ok);      /* the model's own close */
-    ASSERT_TRUE(ok);
-    ASSERT_TRUE(tg_mask_active(st));
-    ASSERT_FALSE(tg_token_allowed(st, "prose"));
     tg_state_free(st);
     tg_free(g);
     jr_free(tools);
@@ -1908,6 +1955,7 @@ int main(void) {
     RUN_TEST(string_parameters_stay_free_text);
     RUN_TEST(build_guards);
     RUN_TEST(required_think_gated_reasoning_is_free);
+    RUN_TEST(required_spelled_think_close_is_reasoning);
     RUN_TEST(required_without_think_compels_from_start);
     RUN_TEST(required_injected_close_lands);
     RUN_TEST(required_end_and_closing_text);

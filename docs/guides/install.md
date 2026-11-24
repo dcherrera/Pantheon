@@ -6,10 +6,10 @@ Build and run Pantheon on each supported platform. For a first run, see
 ## Requirements
 
 - A C11 compiler and `make`.
-- Foundry, a git submodule at `./foundry`. Clone with
+- Foundry. In the public repository it is a git submodule at `./foundry`; clone with
   `git clone --recursive https://git.teamide.dev/David/Pantheon.git`; in an existing
   clone run `git submodule update --init`. The Makefile looks for Foundry in this order:
-  `FOUNDRY=/path/to/foundry`, then `./foundry` (the submodule, or a symlink), then
+  `FOUNDRY=/path/to/foundry`, then `./foundry` (the submodule, or a symlink in a development checkout), then
   `../foundry` (a sibling checkout). If none exists the build stops with
   `Foundry not found at ...`.
 - Nothing else for a CPU build. BLAS, threads and accelerators are opt-in flags.

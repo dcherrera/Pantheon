@@ -31,15 +31,16 @@ static int lookup_env(const char *name, int fallback)
     return value && *value ? atoi(value) : fallback;
 }
 
-int sg_spec_lookup_init(sg_spec_lookup *lookup, const uint32_t *prompt, int n_prompt,
-                        int max_new)
+/* Copy the prompt and arm `mode` with at most k drafts a cycle and suffix matches >= min. */
+static int lookup_arm(sg_spec_lookup *lookup, const uint32_t *prompt, int n_prompt, int max_new,
+                      int mode, int k, int min_ngram)
 {
     memset(lookup, 0, sizeof(*lookup));
-    lookup->mode = lookup_env("PN_TT_SPEC_LOOKUP", 2);
+    lookup->mode = mode;
     if (lookup->mode <= 0 || !prompt || n_prompt < 0 || max_new < 0)
         return 0;
-    lookup->k = lookup_env("PN_TT_SPEC_LOOKUP_K", 6);
-    lookup->min_ngram = lookup_env("PN_TT_SPEC_LOOKUP_MIN", 3);
+    lookup->k = k;
+    lookup->min_ngram = min_ngram;
     if (lookup->k < 1 || lookup->min_ngram < 1)
         return 0;
     if (lookup->k > 15)
@@ -54,6 +55,24 @@ int sg_spec_lookup_init(sg_spec_lookup *lookup, const uint32_t *prompt, int n_pr
                           LOOKUP_COOL_CYCLES);
     lookup->on = true;
     return 0;
+}
+
+int sg_spec_lookup_init(sg_spec_lookup *lookup, const uint32_t *prompt, int n_prompt,
+                        int max_new)
+{
+    return lookup_arm(lookup, prompt, n_prompt, max_new, lookup_env("PN_TT_SPEC_LOOKUP", 2),
+                      lookup_env("PN_TT_SPEC_LOOKUP_K", 6), lookup_env("PN_TT_SPEC_LOOKUP_MIN", 3));
+}
+
+int sg_spec_lookup_init_cuda(sg_spec_lookup *lookup, const uint32_t *prompt, int n_prompt,
+                             int max_new)
+{
+    int k = lookup_env("QWEN35_MTP_LOOKUP_K", 4);
+
+    if (k > 4)
+        k = 4;   /* the CUDA verify takes <= 5 rows */
+    return lookup_arm(lookup, prompt, n_prompt, max_new, lookup_env("QWEN35_MTP_LOOKUP", 0), k,
+                      lookup_env("QWEN35_MTP_LOOKUP_MIN", 5));
 }
 
 bool sg_spec_lookup_agrees(const sg_spec_lookup *lookup, uint32_t looked_first,

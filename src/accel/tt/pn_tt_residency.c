@@ -11,6 +11,8 @@
 
 #ifdef USE_TT
 
+#include "pn_tt_dispatch.h"
+#include "pn_tt_host_gap.h"
 #include "pn_tt_residency.h"
 
 #include <stdio.h>
@@ -24,6 +26,7 @@
 #include "tt/ft_tt_op_dispatch.h"
 #include "tt/ft_tt_op_l1_layout.h"
 #include "tt/ft_tt_program_resolve.h"
+#include "tt/kernels/resident_precondition_protocol.h"
 
 /** Consecutive empty polls before a resident kernel returns on its own, and spins inside
  *  ONE circular-buffer wait before it abandons that wait. Neither may be 0: an unbounded
@@ -294,21 +297,35 @@ uint32_t pn_tt_residency_queue_capacity(void)
     return cached;
 }
 
+int pn_tt_residency_clear_precondition(const ft_tt_noc_access *noc, uint16_t x, uint16_t y)
+{
+    static const uint8_t zeros[kPreRegionEnd - kPreSidecarOffset];
+
+    return noc->write(noc->user, x, y, FT_TT_OP_QUEUE_BASE + (uint32_t)kPreSidecarOffset, zeros,
+                      sizeof(zeros));
+}
+
 static int residency_start(pn_tt_residency *residency)
 {
     static const unsigned processors[5] = { FT_TT_PROC_DM0, FT_TT_PROC_DM1, FT_TT_PROC_MATH0,
                                             FT_TT_PROC_MATH1, FT_TT_PROC_MATH2 };
-    uint32_t args[5][FT_TT_QUEUE_KERNEL_ARG_COUNT];
+    uint32_t args[5][FT_TT_QUEUE_KERNEL_ARG_COUNT + PN_TT_RESIDENCY_TAIL_ARGS];
     ft_tt_op_args blocks[5];
     unsigned index;
     int rc;
 
     if (!residency || !residency->core_booted || residency->running)
         return -1;
+    if (residency->tail_count[0] > PN_TT_RESIDENCY_TAIL_ARGS ||
+        residency->tail_count[1] > PN_TT_RESIDENCY_TAIL_ARGS)
+        return -1;
 
     rc = ft_tt_queue_init(&residency->runtime->noc, residency->core_x, residency->core_y,
                           FT_TT_OP_QUEUE_BASE, pn_tt_residency_queue_capacity(),
                           ft_tt_queue_make_nonce(), &residency->queue);
+    if (rc == FT_TT_OK)
+        rc = pn_tt_residency_clear_precondition(&residency->runtime->noc, residency->core_x,
+                                                residency->core_y);
     /* ASKED, NOT ASSUMED. `FT_TT_OP_QUEUE_BASE` is 16-byte aligned today, so `line` is
      * reachable today — but a queue placed on a word boundary is legal to
      * `ft_tt_queue_init()`, works through the WORD32 accessor, and would make every BLOCK16
@@ -376,6 +393,12 @@ static int residency_start(pn_tt_residency *residency)
         blocks[index].processor = processors[index];
         blocks[index].values = args[index];
         blocks[index].count = FT_TT_QUEUE_KERNEL_ARG_COUNT;
+        /* The data movers' tails (pn_tt_residency.h `tail_args`), after the queue's ten. */
+        if (index < 2u && residency->tail_count[index] > 0u) {
+            memcpy(&args[index][FT_TT_QUEUE_KERNEL_ARG_COUNT], residency->tail_args[index],
+                   residency->tail_count[index] * sizeof(uint32_t));
+            blocks[index].count = FT_TT_QUEUE_KERNEL_ARG_COUNT + residency->tail_count[index];
+        }
     }
     if (residency_red_posts_group()) {
         fprintf(stderr, "pn_tt: RED PROOF residency_posts_group — %s is claimed to arm the "
@@ -744,9 +767,16 @@ long pn_tt_residency_idle_retire_limit_ms(void)
  *  idle exit (~8 s) — for short-gap bisects only. */
 bool pn_tt_idle_retire_allowed(const char *name)
 {
-    const char *only = getenv("PN_TT_IDLE_RETIRE_ONLY");
+    static char only[64];
+    static int read = 0;
 
-    return !only || !*only || (name && strcmp(only, name) == 0);
+    if (!read) {
+        const char *value = getenv("PN_TT_IDLE_RETIRE_ONLY");
+
+        snprintf(only, sizeof(only), "%s", value ? value : "");
+        read = 1;
+    }
+    return !only[0] || (name && strcmp(only, name) == 0);
 }
 
 static bool residency_idle_retire(pn_tt_residency *residency)
@@ -766,6 +796,11 @@ static bool residency_idle_retire(pn_tt_residency *residency)
     pn_tt_residency_stop(residency);
     residency->idle_retires++;
     return true;
+}
+
+bool pn_tt_residency_enqueue_ready(pn_tt_residency *residency)
+{
+    return residency && residency->running && !residency_idle_retire(residency);
 }
 
 int pn_tt_residency_write_param_extension(pn_tt_residency *residency, uint32_t offset,
@@ -789,15 +824,11 @@ int pn_tt_residency_write_param_extension(pn_tt_residency *residency, uint32_t o
     return 0;
 }
 
-int pn_tt_residency_enqueue(pn_tt_residency *residency, uint32_t opcode,
-                            const uint32_t *parameters, uint32_t repeat)
-{
-    return pn_tt_residency_enqueue_group(residency, opcode, parameters, repeat, 0u, NULL);
-}
-
-int pn_tt_residency_enqueue_group(pn_tt_residency *residency, uint32_t opcode,
-                                  const uint32_t *parameters, uint32_t repeat,
-                                  uint32_t sequence, uint32_t *out_token)
+/** The enqueue every variant above shares; `pull` / `pull_target` / `sequence` are the
+ *  descriptor's a3 / a4 / a5, all 0 for a descriptor that pulls and posts nothing. */
+static int residency_enqueue(pn_tt_residency *residency, uint32_t opcode,
+                             const uint32_t *parameters, uint32_t repeat, uint32_t pull,
+                             uint32_t pull_target, uint32_t sequence, uint32_t *out_token)
 {
     ft_tt_queue_descriptor descriptor[PN_TT_RESIDENCY_QUEUE_CAPACITY];
     const ft_tt_noc_access *payload;
@@ -809,6 +840,7 @@ int pn_tt_residency_enqueue_group(pn_tt_residency *residency, uint32_t opcode,
 
     if (!residency || !residency->running || !parameters || repeat == 0u)
         return -1;
+    pn_tt_host_gap_split("enqueue");
     if (repeat > residency->queue.capacity)
         repeat = residency->queue.capacity;
     /* PM 8: A DEFERRED RESIDENCY QUEUES SEVERAL DESCRIPTORS BEFORE ONE AWAIT. A full ring
@@ -832,6 +864,12 @@ int pn_tt_residency_enqueue_group(pn_tt_residency *residency, uint32_t opcode,
      * the head bump is on `noc` on BOTH — a four-byte write at a word address cannot come
      * through the 16-byte L1 accessor at all (pn_tt_issue.h). */
     payload = pn_tt_issue_access(residency->runtime, residency->issue_shape);
+    /* HOST GAP: which residency; phase "live" when the host issues it itself (dispatch
+     * neither replaying nor streaming). */
+    if (pn_tt_dispatch_quiet())
+        pn_tt_host_gap_mark("live", residency->name);
+    else
+        pn_tt_host_gap_split(residency->name);
 
     at = pn_tt_residency_now();
     rc = ft_tt_queue_write_op_parameters(payload, &residency->queue,
@@ -854,6 +892,9 @@ int pn_tt_residency_enqueue_group(pn_tt_residency *residency, uint32_t opcode,
          * the NoC. So the descriptor a caller that never asked for a group sends is byte for
          * byte the one this function has always sent. */
         descriptor[index].a5 = sequence;
+        /* S1 group pull (pn_tt_group_pull.h): member 0 of a split vector descriptor. */
+        descriptor[index].a3 = pull;
+        descriptor[index].a4 = pull_target;
     }
     /* READ BEFORE `ft_tt_queue_stage()` MOVES `issued`. The token the group check must match
      * is the one stamped on the LAST descriptor of this enqueue, which is
@@ -906,6 +947,108 @@ int pn_tt_residency_enqueue_group(pn_tt_residency *residency, uint32_t opcode,
         FT_TT_QUEUE_PARAM_WORDS * 4u + repeat * FT_TT_QUEUE_DESCRIPTOR_BYTES);
     residency->ops += repeat;
     return 0;
+}
+
+int pn_tt_residency_enqueue(pn_tt_residency *residency, uint32_t opcode,
+                            const uint32_t *parameters, uint32_t repeat)
+{
+    return residency_enqueue(residency, opcode, parameters, repeat, 0u, 0u, 0u, NULL);
+}
+
+int pn_tt_residency_enqueue_group(pn_tt_residency *residency, uint32_t opcode,
+                                  const uint32_t *parameters, uint32_t repeat,
+                                  uint32_t sequence, uint32_t *out_token)
+{
+    return residency_enqueue(residency, opcode, parameters, repeat, 0u, 0u, sequence, out_token);
+}
+
+int pn_tt_residency_enqueue_pull(pn_tt_residency *residency, uint32_t opcode,
+                                 const uint32_t *parameters, uint32_t a3, uint32_t a4,
+                                 uint32_t a5)
+{
+    return residency_enqueue(residency, opcode, parameters, 1u, a3, a4, a5, NULL);
+}
+
+int pn_tt_residency_enqueue_cached(pn_tt_residency *residency, uint32_t opcode,
+                                   uint32_t param_address, uint32_t a1, uint32_t a2, uint32_t a3,
+                                   uint32_t a4, uint32_t a5)
+{
+    ft_tt_queue_descriptor descriptor;
+    const ft_tt_noc_access *payload;
+    double at;
+    int rc;
+
+    if (!residency || !residency->running || param_address == 0u || residency->defer_await)
+        return -1;
+    pn_tt_host_gap_split("enqueue");
+    payload = pn_tt_issue_access(residency->runtime, residency->issue_shape);
+    if (pn_tt_dispatch_quiet())
+        pn_tt_host_gap_mark("live", residency->name);
+    else
+        pn_tt_host_gap_split(residency->name);
+    if (residency_idle_retire(residency))
+        return -1;
+    memset(&descriptor, 0, sizeof(descriptor));
+    descriptor.opcode = opcode;
+    descriptor.a0 = param_address;
+    descriptor.a1 = a1;
+    descriptor.a2 = a2;
+    descriptor.a3 = a3;
+    descriptor.a4 = a4;
+    descriptor.a5 = a5;
+    at = pn_tt_residency_now();
+    rc = ft_tt_queue_stage(payload, &residency->queue, &descriptor, 1u);
+    residency->issue_ring_seconds += pn_tt_residency_now() - at;
+    if (rc == FT_TT_OK) {
+        at = pn_tt_residency_now();
+        rc = ft_tt_queue_publish(&residency->runtime->noc, &residency->queue);
+        residency->issue_head_seconds += pn_tt_residency_now() - at;
+    }
+    if (rc != FT_TT_OK) {
+        fprintf(stderr, "pn_tt: %s enqueue failed: %s\n", residency->name,
+                ft_tt_error_string(rc));
+        return -1;
+    }
+    residency->issues++;
+    residency->unawaited += 1u;
+    residency->issue_accesses += pn_tt_issue_accesses(residency->issue_shape,
+                                                      FT_TT_QUEUE_DESCRIPTOR_BYTES);
+    residency->ops += 1u;
+    return 0;
+}
+
+int pn_tt_residency_enqueue_words(pn_tt_residency *residency, uint32_t opcode,
+                                  const uint32_t *parameters, uint32_t a1, uint32_t a2,
+                                  uint32_t a3, uint32_t a4, uint32_t a5)
+{
+    uint32_t address = 0u;
+    double at;
+    int rc;
+
+    if (!residency || !residency->running || !parameters || residency->defer_await)
+        return -1;
+    at = pn_tt_residency_now();
+    rc = ft_tt_queue_write_op_parameters(pn_tt_issue_access(residency->runtime,
+                                                            residency->issue_shape),
+                                         &residency->queue,
+                                         PN_TT_RESIDENCY_PARAM_SLOT + residency->param_slot,
+                                         parameters, &address);
+    residency->issue_param_seconds += pn_tt_residency_now() - at;
+    if (rc != FT_TT_OK) {
+        fprintf(stderr, "pn_tt: %s parameter block refused: %s\n", residency->name,
+                ft_tt_error_string(rc));
+        return -1;
+    }
+    return pn_tt_residency_enqueue_cached(residency, opcode, address, a1, a2, a3, a4, a5);
+}
+
+void pn_tt_residency_mark_settled(pn_tt_residency *residency)
+{
+    if (!residency || !residency->running)
+        return;
+    residency->unawaited = 0u;
+    residency->await_pending = false;
+    residency->last_alive_seconds = pn_tt_residency_now();
 }
 
 int pn_tt_residency_await(pn_tt_residency *residency, uint32_t timeout_ms)
@@ -998,6 +1141,20 @@ int pn_tt_residency_settle(pn_tt_residency *residency, uint32_t timeout_ms)
 
     if (!residency || !residency->await_pending)
         return 0;
+    deferring = residency->defer_await;
+    residency->defer_await = false;
+    rc = pn_tt_residency_await(residency, timeout_ms);
+    residency->defer_await = deferring;
+    return rc;
+}
+
+int pn_tt_residency_await_now(pn_tt_residency *residency, uint32_t timeout_ms)
+{
+    bool deferring;
+    int rc;
+
+    if (!residency)
+        return -1;
     deferring = residency->defer_await;
     residency->defer_await = false;
     rc = pn_tt_residency_await(residency, timeout_ms);

@@ -29,6 +29,9 @@ static double g_wall_rearm[PN_PREFILL_WALL_COUNT];
 static double g_open_rearm[PN_PREFILL_WALL_COUNT];
 static double g_total_rearm_mark;
 static double (*g_rearm_clock)(void);
+static double g_layer_seconds[2];   /* [0] SSM layers, [1] attention layers */
+static unsigned g_layer_count[2];
+static double g_attn_mixer_seconds;
 
 static double prefill_rearm_now(void)
 {
@@ -52,6 +55,9 @@ void pn_prefill_wall_begin(double accounted_seconds)
         g_wall_accounted[i] = 0.0;
         g_wall_rearm[i] = 0.0;
     }
+    g_layer_seconds[0] = g_layer_seconds[1] = 0.0;
+    g_layer_count[0] = g_layer_count[1] = 0u;
+    g_attn_mixer_seconds = 0.0;
     g_total_rearm_mark = prefill_rearm_now();
     g_total_accounted_mark = accounted_seconds;
     g_total_mark = prefill_wall_now();
@@ -71,6 +77,17 @@ void pn_prefill_wall_close(pn_prefill_wall_region region, double accounted_secon
     g_wall_rearm[region] += prefill_rearm_now() - g_open_rearm[region];
 }
 
+void pn_prefill_wall_layer(bool attention, double seconds)
+{
+    g_layer_seconds[attention ? 1 : 0] += seconds;
+    g_layer_count[attention ? 1 : 0]++;
+}
+
+void pn_prefill_wall_attn_mixer(double seconds)
+{
+    g_attn_mixer_seconds += seconds;
+}
+
 void pn_prefill_wall_report(int n_tokens, double accounted_seconds)
 {
     const double total = prefill_wall_now() - g_total_mark;
@@ -86,4 +103,11 @@ void pn_prefill_wall_report(int n_tokens, double accounted_seconds)
                             "outside %.4f, re-arms %.4f\n",
                     kPrefillWallNames[i], g_wall_seconds[i], g_wall_accounted[i],
                     g_wall_seconds[i] - g_wall_accounted[i], g_wall_rearm[i]);
+    fprintf(stderr, "qwen35_tt: prefill LAYERS by kind — SSM %.4f s over %u layer-passes "
+                    "(%.2f ms each), attention %.4f s over %u (%.2f ms each; band loop %.4f s)\n",
+            g_layer_seconds[0], g_layer_count[0],
+            g_layer_count[0] ? 1e3 * g_layer_seconds[0] / g_layer_count[0] : 0.0,
+            g_layer_seconds[1], g_layer_count[1],
+            g_layer_count[1] ? 1e3 * g_layer_seconds[1] / g_layer_count[1] : 0.0,
+            g_attn_mixer_seconds);
 }

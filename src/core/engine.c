@@ -2,15 +2,24 @@
 /* Copyright (C) 2026 David (Corey) Herrera */
 #include "engine.h"
 #include "grammar_mask_shortlist.h"
+#include "grammar_row_dump.h"
+#include "sampler_topn_tail.h"
+#include "sampler_topn_surgery.h"
+#include "sampler_margin_draw.h"
 #include "chat.h"
 #include "bpe_pretokenize.h"
+#include "load_guard.h"
 #include "../formats/gguf.h"
+#include "../formats/gguf_fttw_overlay.h"
+#include "../formats/gguf_fttw_repack.h"
 #include "../formats/gguf_dequant.h"
 #include "../models/llama.h"
 #include "../models/phi3.h"
 #include "../models/rwkvx.h"
 #include "../models/qwen35moe.h"
+#include "act_stats.h"
 #include "ngram_draft.h"
+#include "spec_sampling_chooser.h"
 #include "../models/bonsai.h"
 #include "../models/pixtral_vision.h"
 #include "../memory/arena.h"
@@ -18,8 +27,11 @@
 #include "mem/pn_kv_geometry.h"
 #include "mem/pn_memwatch.h"
 #include "mem/pn_ladder.h"
+#include "mem/pn_host_admission.h"
+#include "mem/pn_session_host_fit.h"
 #include "qweight.h"
 #include "sampling_modifiers.h"
+#include "host_stage_timer.h"
 #ifdef USE_THREADS
 #include "threadpool/threadpool.h"
 #endif
@@ -403,7 +415,7 @@ static ft_tokenizer* build_tokenizer_from_gguf(pn_gguf_file *gguf) {
  * (QWEN35_MAX_SEQ) and does not use this. */
 #define PN_SESSION_MAX_CTX_DEFAULT 40000
 
-static int pn_session_max_seq(const pn_config *cfg) {
+int pn_dense_session_max_seq(const pn_config *cfg) {
     int cap = PN_SESSION_MAX_CTX_DEFAULT;
     const char *e = getenv("PN_SESSION_MAX_CTX");
     if (e && e[0]) {
@@ -431,7 +443,7 @@ static int pn_session_max_seq(const pn_config *cfg) {
  * Arena sizing
  * ============================================================ */
 
-static size_t compute_arena_size(const pn_config *cfg) {
+size_t pn_dense_arena_bytes(const pn_config *cfg) {
     /* Arena must hold ALL per-layer buffers accumulated across layers,
      * since the arena only resets between forward calls.
      *
@@ -445,7 +457,7 @@ static size_t compute_arena_size(const pn_config *cfg) {
      *   hidden: n_embd, scores_buf: n_head*max_seq,
      *   final_normed: n_embd, logits: n_vocab
      */
-    int max_seq = pn_session_max_seq(cfg);
+    int max_seq = pn_dense_session_max_seq(cfg);
     int head_dim = pn_head_dim(cfg);
 
     size_t per_layer = (size_t)(5 * cfg->n_embd)
@@ -498,9 +510,11 @@ pn_model* pn_load(const char *path) {
  * returns FIT (no behavior change).
  * ============================================================ */
 
-/* Is q4 KV in effect? B1: default ON; mirrors pn_qwen35moe_kv_q4_on() —
- * ON unless QWEN35_KV_Q4=0. */
-static bool pn_admit_kv_q4(void) {
+/* Is q4 KV in effect? The load's own choice for a qwen35moe model
+ * (pn_qwen35moe_model_kv_q4); else B1's default: ON unless QWEN35_KV_Q4=0. */
+static bool pn_admit_kv_q4(const pn_model *model) {
+    if (model && model->config.arch == PN_ARCH_QWEN35MOE && model->weights)
+        return pn_qwen35moe_model_kv_q4(model->weights) != 0;
     const char *e = getenv("QWEN35_KV_Q4");
     return !(e && e[0] == '0');
 }
@@ -516,7 +530,7 @@ static bool pn_admit_kv_q4(void) {
  * Gating on the MoE pointer alone mislabeled Ornith path=cpu and charged it a
  * phantom host_need from the CPU-fallback LUT, tripping the ladder into
  * throttling a GPU-resident model (the 429 storm / idle-die split). */
-static bool pn_admit_gpu_resident(const pn_model *model) {
+bool pn_model_on_accelerator(const pn_model *model) {
 #ifdef USE_CUDA
     if (model && (model->forward == pn_qwen35moe_forward_cuda ||
                   model->forward == pn_bonsai_forward_cuda ||
@@ -536,6 +550,10 @@ static bool pn_admit_gpu_resident(const pn_model *model) {
     return false;
 }
 
+static bool pn_admit_gpu_resident(const pn_model *model) {
+    return pn_model_on_accelerator(model);
+}
+
 /* The per-session context window admission promises (the per-session hard cap).
  * It MUST equal the window the model's KV ring is actually sized to, or admission
  * either over-promises (admit a prompt the ring can't hold) or under-promises
@@ -545,11 +563,11 @@ static bool pn_admit_gpu_resident(const pn_model *model) {
  *   2. QWEN35_MAX_SEQ env — the hybrid ring's global override.
  *   3. else: the HYBRID (qwen35moe/bonsai) ring defaults to PN_QWEN35MOE_MAX_SEQ
  *      (the ring's own default), so admission must match it — NOT the generic
- *      pn_session_max_seq, which governs the DENSE llama KV cache only. This is
+ *      pn_dense_session_max_seq, which governs the DENSE llama KV cache only. This is
  *      what keeps saber (no ctx_cap, unset env) reporting its true 4096 window
  *      instead of a phantom 40K the ring can't hold. Always clamped to the ring
  *      ceiling + trained ctx.
- * A DENSE model short-circuits all of that and returns pn_session_max_seq()
+ * A DENSE model short-circuits all of that and returns pn_dense_session_max_seq()
  * verbatim, because on the dense path that function *is* the ring: pn_state_new
  * allocates the KV cache with the very same call. Same function, one number,
  * no drift possible. */
@@ -557,13 +575,13 @@ static int pn_admit_max_window(const pn_model *model) {
     int cap = PN_QWEN35MOE_MAX_SEQ_CAP;
     bool hybrid = model && (model->config.arch == PN_ARCH_QWEN35MOE ||
                             model->config.arch == PN_ARCH_BONSAI);
-    /* Dense arches: pn_session_max_seq IS the ring (pn_state_new sizes the KV
+    /* Dense arches: pn_dense_session_max_seq IS the ring (pn_state_new sizes the KV
      * cache with it, and it now honours ctx_cap), so derive the promise from
      * the identical call rather than re-deriving it. Re-deriving is how the
      * promise could exceed the ring — a ctx_cap above PN_SESSION_MAX_CTX_DEFAULT
      * was advertised in full while the ring stopped at 40000. */
     if (model && !hybrid)
-        return pn_session_max_seq(&model->config);
+        return pn_dense_session_max_seq(&model->config);
     int w;
     if (model && model->config.ctx_cap > 0) {
         w = model->config.ctx_cap;
@@ -574,7 +592,7 @@ static int pn_admit_max_window(const pn_model *model) {
         else if (hybrid)
             w = PN_QWEN35MOE_MAX_SEQ;   /* match the ring's own default */
         else
-            w = model ? pn_session_max_seq(&model->config)
+            w = model ? pn_dense_session_max_seq(&model->config)
                       : PN_SESSION_MAX_CTX_DEFAULT;
     }
     if (w <= 0) w = PN_SESSION_MAX_CTX_DEFAULT;
@@ -624,6 +642,19 @@ static tm_tensor *pn_prefill_tt_batched_tokens(pn_model *model, pn_state *state,
 #else
     (void)model; (void)state; (void)tokens; (void)n_tokens;
     return NULL;
+#endif
+}
+
+/* Did the batched prefill ABORT part way (not decline)? Then the session was invalidated and
+ * the per-token loop must not replay over the half-written card state: the call fails. */
+static int pn_prefill_tt_aborted(const pn_model *model)
+{
+#ifdef USE_TT
+    return model && model->forward == pn_qwen35moe_forward_tt &&
+           pn_qwen35moe_prefill_tt_aborted(model);
+#else
+    (void)model;
+    return 0;
 #endif
 }
 
@@ -687,7 +718,7 @@ int pn_effective_ctx_window(const pn_model *model) {
     pn_mem_state st;
     pn_memwatch_read(&st);
     return pn_apply_window_clamp(&st, configured, pn_admit_gpu_resident(model),
-                                 pn_admit_kv_q4(), NULL);
+                                 pn_admit_kv_q4(model), NULL);
 }
 
 int pn_model_graph_residency_read(const pn_model *model,
@@ -852,14 +883,24 @@ pn_admit_status pn_admit(pn_model *model, int n_tokens, int *fit_tokens_out) {
     if (fit_tokens_out)
         *fit_tokens_out = n_tokens;
 
-    /* Fail-open when there is no memory truth to check against. */
-    if (!pn_memwatch_running() || n_tokens <= 0)
+    if (n_tokens <= 0)
         return PN_ADMIT_FIT;
+    /* No memory truth to check against: fail open on memory, but the configured
+     * window still binds (H2d). */
+    if (!pn_memwatch_running()) {
+        int window = pn_admit_max_window(model);
+        if (window > 0 && n_tokens > window) {
+            if (fit_tokens_out)
+                *fit_tokens_out = window;
+            return PN_ADMIT_CAPPED;
+        }
+        return PN_ADMIT_FIT;
+    }
 
     pn_mem_state st;
     pn_memwatch_read(&st);
 
-    bool kv_q4 = pn_admit_kv_q4();
+    bool kv_q4 = pn_admit_kv_q4(model);
     bool gpu_resident = pn_admit_gpu_resident(model);
     int die_id = pn_admit_worst_die(&st);
     int max_window = pn_admit_max_window(model);
@@ -967,14 +1008,87 @@ static int model_primary_die(const pn_model *model)
 {
     return (model && model->n_gpu_dies > 0) ? model->gpu_dies[0] : 0;
 }
+
+/* Bind CUDA on the model's primary die. With no device the load guard
+ * refuses the load, so say why (load_guard.h). */
+static void engine_cuda_bind(const pn_model *model)
+{
+    fc_init_on(model_primary_die(model));
+    if (!fc_available())
+        pn_accel_refusal_note("no CUDA device visible on die %d (driver, "
+                              "CUDA_VISIBLE_DEVICES)", model_primary_die(model));
+}
 #endif
 
 pn_model* pn_load_ex(const char *path, const pn_load_opts *opts) {
     return pn_load_on(path, opts, NULL, 0);
 }
 
+static pn_model *pn_load_on_unfitted(const char *path, const pn_load_opts *opts,
+                                     const int *dies, int n_dies);
+
+/* Every load ends here. Where it may run (load_guard.h): a load asked to run
+ * on an accelerator lands on one or is refused with the reason, never kept on
+ * the host CPU forward; a CPU load must fit host RAM before it starts. Then the
+ * model's sessions must fit host RAM before anyone allocates one
+ * (pn_session_host_fit.h): a default window is capped to fit; an
+ * operator-chosen one that does not fit refuses the load. */
 pn_model* pn_load_on(const char *path, const pn_load_opts *opts,
                      const int *dies, int n_dies) {
+    const bool cpu_planned = pn_load_guard_cpu_planned(opts && opts->cpu_only);
+    if (cpu_planned && pn_load_guard_cpu_host_fit(path) != 0)
+        return NULL;
+    pn_accel_refusal_clear();
+    uint64_t admitted_before = pn_host_admit_thread_total();
+    pn_model *model = pn_load_on_unfitted(path, opts, dies, n_dies);
+    /* The test fake stands where the upload would, and refuses. */
+    if (model && !cpu_planned && pn_load_guard_test_fake_reason())
+        pn_accel_refusal_note("%s", pn_load_guard_test_fake_reason());
+    if (model && !cpu_planned && !pn_model_on_accelerator(model)) {
+        pn_load_guard_refuse_accel(path, dies, n_dies);
+        pn_model_free(model);   /* a failed upload already released its device memory */
+        model = NULL;
+    }
+    /* Whatever this thread admitted during the load (dequantized weight
+     * copies) belongs to the model: pn_model_free returns it. A failed load
+     * already freed those copies, so return the charge now. */
+    uint64_t admitted = pn_host_admit_thread_total() - admitted_before;
+    if (!model) {
+        pn_host_release(admitted);
+        return NULL;
+    }
+    model->host_admitted = admitted;
+    int sessions = opts && opts->host_sessions > 0 ? opts->host_sessions : 1;
+    if (pn_session_host_fit(model, sessions, NULL, 0) != 0) {
+        fprintf(stderr, "pn_load: refused - %s\n", pn_host_admit_last_refusal());
+        pn_model_free(model);
+        return NULL;
+    }
+    return model;
+}
+
+/* `PN_MIXW_BFP4=<map file>` (default off): repack the map's Bfp8
+ * artifact tensors to Bfp4 in memory before any loader reads them. Oracle only for now (the card
+ * path is plan 4.1), so it refuses without PN_FTTW_ORACLE. 0 = off or applied, -1 = refuse. */
+static int engine_apply_mixw_bfp4(pn_gguf_file *gguf, const char *oracle_fttw)
+{
+    const char *map_path = getenv("PN_MIXW_BFP4");
+
+    if (!map_path || !*map_path)
+        return 0;
+    if (!oracle_fttw || !*oracle_fttw) {
+        fprintf(stderr, "pn_load: PN_MIXW_BFP4 needs PN_FTTW_ORACLE (the CPU oracle over the artifact)\n");
+        return -1;
+    }
+    if (pn_gguf_repack_bfp4_from_map_file(gguf, map_path) < 0) {
+        fprintf(stderr, "pn_load: PN_MIXW_BFP4=%s refused\n", map_path);
+        return -1;
+    }
+    return 0;
+}
+
+static pn_model *pn_load_on_unfitted(const char *path, const pn_load_opts *opts,
+                                     const int *dies, int n_dies) {
     if (!path) {
         fprintf(stderr, "pn_load: path is NULL\n");
         return NULL;
@@ -1085,6 +1199,28 @@ pn_model* pn_load_on(const char *path, const pn_load_opts *opts,
 
     pn_gguf_file *gguf = pn_gguf_open(path);
     if (!gguf) return NULL;
+    /* The card-format oracle: the CPU forward over the FTTW
+     * artifact's own tiles instead of the GGUF's weights. Refused loudly, never skipped. */
+    const char *oracle_fttw = getenv("PN_FTTW_ORACLE");
+    if (oracle_fttw && *oracle_fttw && pn_gguf_attach_fttw(gguf, oracle_fttw) < 0) {
+        fprintf(stderr, "pn_load: PN_FTTW_ORACLE=%s could not be attached\n", oracle_fttw);
+        pn_gguf_close(gguf);
+        return NULL;
+    }
+    if (engine_apply_mixw_bfp4(gguf, oracle_fttw) != 0) {
+        pn_gguf_close(gguf);
+        return NULL;
+    }
+    /* A card metadata GGUF (Pantheon Local's p150 install of a model too big to ship as a
+     * GGUF beside its artifact) loads with the one artifact beside it, as the oracle above
+     * does by env: the loaders read its weights, the TT backend uploads it as-is. */
+    char card_artifact[1024] = "";
+    if (!(oracle_fttw && *oracle_fttw) &&
+        pn_gguf_attach_card_artifact(gguf, path, card_artifact, sizeof(card_artifact)) < 0) {
+        fprintf(stderr, "pn_load: %s: its card artifact could not be attached\n", path);
+        pn_gguf_close(gguf);
+        return NULL;
+    }
 
     pn_arch arch = detect_arch_from_gguf(gguf);
     if (arch == PN_ARCH_UNKNOWN) {
@@ -1099,8 +1235,16 @@ pn_model* pn_load_on(const char *path, const pn_load_opts *opts,
     }
 
     model->path = strdup(path);
+    if (card_artifact[0])
+        model->card_artifact = strdup(card_artifact);
     model_record_dies(model, dies, n_dies);
     model->config.arch = arch;
+    /* A `cpu` placement is the host CPU forward, whatever accelerators this build
+     * carries: no CUDA / Tenstorrent / Metal upload is attempted (Local H2g). */
+    const bool accel_ok = !(opts && opts->cpu_only);
+    if (!accel_ok)
+        fprintf(stderr, "engine: cpu placement requested; no accelerator upload\n");
+    (void)accel_ok;   /* a build with no accelerator never reads it */
     /* KV Phase 1: per-model context cap must be in the config BEFORE the arch
      * loader sizes the KV ring, so ornith can run a 40K window without moving
      * saber's. The arch loaders copy it into their own config. */
@@ -1126,27 +1270,36 @@ pn_model* pn_load_on(const char *path, const pn_load_opts *opts,
             model->weights = qw;
             model->forward = pn_qwen35moe_forward;
             fprintf(stderr, "engine: using qwen35moe weights (zero-copy mmap)\n");
+            /* The load's KV format, before the upload's die admission and any state. */
+            if (opts && opts->kv_format != PN_KV_FORMAT_DEFAULT) {
+                pn_qwen35moe_model_set_kv_format(qw, opts->kv_format);
+                fprintf(stderr, "engine: KV cache %s (the load's choice)\n",
+                        opts->kv_format == PN_KV_FORMAT_Q4 ? "Q4" : "fp32");
+            }
             /* Explicit placement (pn_load_on) must reach the GPU upload's
              * die selection — stored on the arch model before the upload. */
             if (model->n_gpu_dies > 0)
                 pn_qwen35moe_model_set_dies(qw, model->gpu_dies,
                                             model->n_gpu_dies);
+            /* The session blocks the die gate must price, before the upload. */
+            pn_qwen35moe_model_set_card_sessions(qw, opts ? opts->card_sessions : 0);
 #ifdef USE_CUDA
             /* Single-die GPU path: upload weights to persistent VRAM and select
-             * the CUDA forward when a GPU is present. Falls back to the CPU
-             * forward when there is no GPU (the Mac case) or the upload fails.
+             * the CUDA forward. No GPU or a failed upload leaves the CPU forward
+             * selected, which pn_load_on refuses (no silent CPU fallback).
              * fc_init_on() is idempotent: it dlopens libcuda + inits CUDA on the
              * ACQUIRED die (not ordinal 0); a no-op (leaving fc_available()
              * false) without a GPU. */
-            fc_init_on(model_primary_die(model));
-            if (fc_available()) {
+            if (accel_ok)
+                engine_cuda_bind(model);
+            if (accel_ok && fc_available()) {
                 if (pn_qwen35moe_gpu_upload(qw) == 0 &&
                     pn_qwen35moe_model_gpu_loaded(qw)) {
                     model->forward = pn_qwen35moe_forward_cuda;
                     fprintf(stderr, "engine: qwen35moe on GPU (single die)\n");
                 } else {
                     fprintf(stderr, "engine: qwen35moe GPU upload skipped/"
-                                    "failed; using CPU forward\n");
+                                    "failed\n");
                 }
             }
 #endif
@@ -1160,7 +1313,7 @@ pn_model* pn_load_on(const char *path, const pn_load_opts *opts,
              * PHASE 0: the selected forward has no kernels yet; it reports
              * NOT-IMPLEMENTED per token and delegates to the CPU forward, so
              * selecting it is output-neutral. */
-            if (fm_init() == 0 && fm_available() &&
+            if (accel_ok && fm_init() == 0 && fm_available() &&
                 pn_qwen35moe_metal_upload(qw) == 0) {
                 model->forward = pn_qwen35moe_forward_metal;
                 fprintf(stderr, "engine: qwen35moe Metal backend selected "
@@ -1168,6 +1321,20 @@ pn_model* pn_load_on(const char *path, const pn_load_opts *opts,
             } else {
                 fprintf(stderr, "engine: qwen35moe Metal upload skipped/"
                                 "failed; using CPU forward\n");
+            }
+#endif
+#ifdef USE_TT
+            /* Tenstorrent, the MoE checkpoint (Qwen3.6): the upload
+             * refuses it unless the census arm (PN_TT_Q36_CENSUS=1) is asked for, until the MoE
+             * block exists (Phase 5). One model, one residency: only when nothing else claimed it. */
+            if (accel_ok && model->forward == pn_qwen35moe_forward) {
+                if (pn_qwen35moe_tt_upload(model) == 0 && pn_qwen35moe_model_tt_loaded(model)) {
+                    model->forward = pn_qwen35moe_forward_tt;
+                    fprintf(stderr, "engine: qwen35moe on Tenstorrent (matmuls on card)\n");
+                } else {
+                    fprintf(stderr, "engine: qwen35moe Tenstorrent upload skipped/failed; "
+                                    "no CPU fallback\n");
+                }
             }
 #endif
         } else {
@@ -1187,22 +1354,23 @@ pn_model* pn_load_on(const char *path, const pn_load_opts *opts,
             if (model->n_gpu_dies > 0)
                 pn_bonsai_model_set_dies(bw, model->gpu_dies, model->n_gpu_dies);
 #ifdef USE_CUDA
-            fc_init_on(model_primary_die(model));
-            if (fc_available()) {
+            if (accel_ok)
+                engine_cuda_bind(model);
+            if (accel_ok && fc_available()) {
                 if (pn_bonsai_gpu_upload(bw) == 0 &&
                     pn_bonsai_model_gpu_loaded(bw)) {
                     model->forward = pn_bonsai_forward_cuda;
                     fprintf(stderr, "engine: bonsai on GPU (single die)\n");
                 } else {
                     fprintf(stderr, "engine: bonsai GPU upload skipped/"
-                                    "failed; using CPU forward\n");
+                                    "failed\n");
                 }
             }
 #endif
 #ifdef USE_TT
             /* Tenstorrent: only when no other accelerator already claimed this model —
              * one model, one residency, the same rule the llama branch below states. */
-            if (model->forward == pn_bonsai_forward) {
+            if (accel_ok && model->forward == pn_bonsai_forward) {
                 if (pn_qwen35moe_tt_upload(model) == 0 &&
                     pn_qwen35moe_model_tt_loaded(model)) {
                     model->forward = pn_qwen35moe_forward_tt;
@@ -1210,7 +1378,7 @@ pn_model* pn_load_on(const char *path, const pn_load_opts *opts,
                                     "(matmuls on card)\n");
                 } else {
                     fprintf(stderr, "engine: qwen35 Tenstorrent upload skipped/"
-                                    "failed; using CPU forward\n");
+                                    "failed\n");
                 }
             }
 #endif
@@ -1228,18 +1396,19 @@ pn_model* pn_load_on(const char *path, const pn_load_opts *opts,
             fprintf(stderr, "engine: using quantized weights (zero-copy mmap)\n");
 #ifdef USE_CUDA
             /* Plain-Llama GPU forward: upload the (non-MoE) weights to a single
-             * die and select the CUDA forward when a GPU is present. Falls back
-             * to the CPU forward (the oracle) without a GPU or on upload
-             * failure. fc_init_on() is idempotent and binds the ACQUIRED die. */
-            fc_init_on(model_primary_die(model));
-            if (fc_available()) {
+             * die and select the CUDA forward. No GPU or a failed upload is
+             * refused by pn_load_on (the CPU oracle needs cpu_only).
+             * fc_init_on() is idempotent and binds the ACQUIRED die. */
+            if (accel_ok)
+                engine_cuda_bind(model);
+            if (accel_ok && fc_available()) {
                 if (pn_llama_gpu_upload(model) == 0 &&
                     pn_llama_model_gpu_loaded(model)) {
                     model->forward = pn_llama_forward_cuda;
                     fprintf(stderr, "engine: llama on GPU (single die)\n");
                 } else {
                     fprintf(stderr, "engine: llama GPU upload skipped/"
-                                    "failed; using CPU forward\n");
+                                    "failed\n");
                 }
             }
 #endif
@@ -1248,13 +1417,13 @@ pn_model* pn_load_on(const char *path, const pn_load_opts *opts,
              * The residency handle is one slot (engine.h), and a model has one residency —
              * so a build carrying both families binds whichever family answered first
              * rather than uploading twice and leaking one. */
-            if (model->forward == pn_llama_forward) {
+            if (accel_ok && model->forward == pn_llama_forward) {
                 if (pn_llama_tt_upload(model) == 0 && pn_llama_model_tt_loaded(model)) {
                     model->forward = pn_llama_forward_tt;
                     fprintf(stderr, "engine: llama on Tenstorrent (projections on card)\n");
                 } else {
                     fprintf(stderr, "engine: llama Tenstorrent upload skipped/"
-                                    "failed; using CPU forward\n");
+                                    "failed\n");
                 }
             }
 #endif
@@ -1299,10 +1468,12 @@ pn_model* pn_load_on(const char *path, const pn_load_opts *opts,
         const char *b = strstr(chat_tmpl, "bos_token");
         const char *im = strstr(chat_tmpl, "<|im_start|>");
         model->chat_add_bos = (b && (!im || b < im)) ? 1 : 0;
+        model->chat_trim_content = pn_chat_template_trims_content(chat_tmpl) ? 1 : 0;
     }
-    fprintf(stderr, "engine: chat style: %s%s\n",
+    fprintf(stderr, "engine: chat style: %s%s%s\n",
             pn_chat_style_name(model->chat_style),
-            model->chat_add_bos ? " +bos" : "");
+            model->chat_add_bos ? " +bos" : "",
+            model->chat_trim_content ? " +trim" : "");
 
 #ifdef USE_THREADS
     {
@@ -1314,6 +1485,14 @@ pn_model* pn_load_on(const char *path, const pn_load_opts *opts,
         pn_qmv_set_pool(model->pool);
     }
 #endif
+
+    /* PN_ACT_STATS (mixw imatrix): mapped from this GGUF after every loader has taken its
+     * weight pointers; refused loudly, never skipped. The weights own the GGUF here, so
+     * pn_model_free closes it. */
+    if (pn_act_stats_begin_from_env(gguf, model) < 0) {
+        pn_model_free(model);
+        return NULL;
+    }
 
     const char *name = pn_gguf_get_str(gguf, "general.name");
     fprintf(stderr, "engine: loaded %s (%d layers, %d params roughly)\n",
@@ -1346,6 +1525,9 @@ int pn_model_warm(pn_model *model)
 
 void pn_model_free(pn_model *model) {
     if (!model) return;
+
+    /* The end of a PN_ACT_STATS run: its files are written once, here. */
+    pn_act_stats_finish(model);
 
     if (model->vision) pn_vision_free((pn_vision_model *)model->vision);
 
@@ -1408,7 +1590,9 @@ void pn_model_free(pn_model *model) {
         fw_pool_free(model->pool);
     }
 #endif
+    pn_host_release(model->host_admitted);
     free(model->path);
+    free(model->card_artifact);
     free(model);
 }
 
@@ -1475,7 +1659,18 @@ pn_state* pn_state_new(pn_model *model) {
      * and one of these exists per decode slot AND per prefix-cache session, so
      * an unbounded max_seq multiplies straight into host RSS. */
     int head_dim = pn_head_dim(&model->config);
-    int max_seq = pn_session_max_seq(&model->config);
+    int max_seq = pn_dense_session_max_seq(&model->config);
+
+    /* Host admission BEFORE the eager ring + arena: refuse with a reason
+     * instead of OOM-ing the host (pn_host_admission.h). */
+    uint64_t session_bytes = pn_session_host_bytes(&model->config);
+    char what[96];
+    snprintf(what, sizeof(what), "host KV ring + arena (%d positions)", max_seq);
+    if (pn_host_admit(session_bytes, what, NULL, 0) != 0) {
+        free(state);
+        return NULL;
+    }
+    state->host_admitted = session_bytes;
 
     pn_llama_kv_cache *cache = pn_llama_kv_cache_new(
         model->config.n_layer,
@@ -1484,16 +1679,18 @@ pn_state* pn_state_new(pn_model *model) {
         head_dim
     );
     if (!cache) {
+        pn_host_release(session_bytes);
         free(state);
         return NULL;
     }
     state->kv_cache = cache;
 
     /* Create arena for scratch memory */
-    size_t arena_size = compute_arena_size(&model->config);
+    size_t arena_size = pn_dense_arena_bytes(&model->config);
     state->arena = pn_arena_new(arena_size);
     if (!state->arena) {
         pn_llama_kv_cache_free(cache);
+        pn_host_release(session_bytes);
         free(state);
         return NULL;
     }
@@ -1525,6 +1722,7 @@ void pn_state_free(pn_state *state) {
     if (state->arena) {
         pn_arena_free(state->arena);
     }
+    pn_host_release(state->host_admitted);
     free(state);
 }
 
@@ -1569,6 +1767,10 @@ void pn_state_reset(pn_state *state) {
  * are sampling concurrently.  See sampling_modifiers.h.
  */
 static float rand_float(pn_sampling_params *params) {
+    if (params && params->carried_uniform_set) {
+        params->carried_uniform_set = 0;
+        return params->carried_uniform;
+    }
     if (params && params->rng_seeded)
         return pn_seeded_rng_next_float(&params->rng_state);
     return (float)rand() / ((float)RAND_MAX + 1.0f);
@@ -1608,10 +1810,84 @@ typedef struct {
     int    cap;
 } pn_sampler_scratch;
 
-static _Thread_local pn_sampler_scratch g_sampler_scratch = {0};
+/* ------------------------------------------------------------------
+ * Per-thread sampler buffers, freed when the thread exits (B6).
+ *
+ * The sampler scratch, the logprob snapshot and the grammar verdict/need
+ * scratch are reused across calls on one thread.  The serve runs every
+ * request on its own short-lived thread (token #1 is sampled there), so when
+ * these were bare _Thread_local pointers each request left ~2 MiB behind on
+ * the bank (two n_vocab float buffers) — still allocated, so malloc_trim could
+ * not return it.  They now live in one heap block registered as a pthread key
+ * value; the key's destructor frees the block at thread exit.  The destructor
+ * gets the block as its argument and never reads _Thread_local storage, which
+ * may already be torn down by then (macOS).
+ * ------------------------------------------------------------------ */
+typedef struct {
+    pn_sampler_scratch scratch;
+    float         *logprob_raw;     /* logprob snapshot (logprob_snapshot) */
+    int            logprob_cap;
+    unsigned char *grammar_verdict; /* grammar_verdict_scratch */
+    int            grammar_verdict_cap;
+    unsigned char *grammar_need;    /* grammar_need_scratch */
+    int            grammar_need_cap;
+} pn_sampler_thread_buffers;
+
+static _Thread_local pn_sampler_thread_buffers *t_sampler_buffers = NULL;
+static pthread_key_t  g_sampler_buffers_key;
+static pthread_once_t g_sampler_buffers_once = PTHREAD_ONCE_INIT;
+static int            g_sampler_buffers_key_ok = 0;
+
+static void sampler_buffers_free(void *block)
+{
+    pn_sampler_thread_buffers *b = (pn_sampler_thread_buffers *)block;
+    if (!b)
+        return;
+    free(b->scratch.probs);
+    free(b->scratch.work);
+    free(b->logprob_raw);
+    free(b->grammar_verdict);
+    free(b->grammar_need);
+    free(b);
+}
+
+static void sampler_buffers_key_create(void)
+{
+    g_sampler_buffers_key_ok =
+        pthread_key_create(&g_sampler_buffers_key, sampler_buffers_free) == 0;
+}
+
+/* This thread's buffer block, created (and armed for thread exit) on first
+ * use.  NULL on OOM. */
+static pn_sampler_thread_buffers *sampler_buffers(void)
+{
+    if (t_sampler_buffers)
+        return t_sampler_buffers;
+    pthread_once(&g_sampler_buffers_once, sampler_buffers_key_create);
+    pn_sampler_thread_buffers *b = calloc(1, sizeof(*b));
+    if (!b)
+        return NULL;
+    if (g_sampler_buffers_key_ok)
+        pthread_setspecific(g_sampler_buffers_key, b);
+    t_sampler_buffers = b;
+    return b;
+}
+
+void pn_sampler_thread_release(void)
+{
+    if (!t_sampler_buffers)
+        return;
+    if (g_sampler_buffers_key_ok)
+        pthread_setspecific(g_sampler_buffers_key, NULL);
+    sampler_buffers_free(t_sampler_buffers);
+    t_sampler_buffers = NULL;
+}
 
 static pn_sampler_scratch *sampler_scratch_get(int n) {
-    pn_sampler_scratch *s = &g_sampler_scratch;
+    pn_sampler_thread_buffers *b = sampler_buffers();
+    if (!b)
+        return NULL;
+    pn_sampler_scratch *s = &b->scratch;
     if (s->cap < n) {
         free(s->probs); free(s->work);
         s->probs = malloc((size_t)n * sizeof(float));
@@ -1662,20 +1938,20 @@ static float sampler_select_kth(float *a, int n, int k) {
  * them pays nothing.  The math itself is in sampling_modifiers.c.
  * ------------------------------------------------------------------ */
 
-static _Thread_local float *g_logprob_raw = NULL;
-static _Thread_local int    g_logprob_cap = 0;
-
-/* Copy the untouched logits aside.  Returns NULL on OOM (logprobs are then
- * simply not reported for this step — never a generation failure). */
+/* Copy the untouched logits aside (into this thread's buffer block).  Returns
+ * NULL on OOM (logprobs are then simply not reported for this step — never a
+ * generation failure). */
 static const float *logprob_snapshot(const float *logits, int n_vocab) {
-    if (g_logprob_cap < n_vocab) {
-        float *grown = realloc(g_logprob_raw, (size_t)n_vocab * sizeof(float));
+    pn_sampler_thread_buffers *b = sampler_buffers();
+    if (!b) return NULL;
+    if (b->logprob_cap < n_vocab) {
+        float *grown = realloc(b->logprob_raw, (size_t)n_vocab * sizeof(float));
         if (!grown) return NULL;
-        g_logprob_raw = grown;
-        g_logprob_cap = n_vocab;
+        b->logprob_raw = grown;
+        b->logprob_cap = n_vocab;
     }
-    memcpy(g_logprob_raw, logits, (size_t)n_vocab * sizeof(float));
-    return g_logprob_raw;
+    memcpy(b->logprob_raw, logits, (size_t)n_vocab * sizeof(float));
+    return b->logprob_raw;
 }
 
 /* Hand the sink the chosen token's logprob and the top alternatives. */
@@ -1772,6 +2048,58 @@ static int sampler_cmp_desc(const void *pa, const void *pb) {
 _Static_assert(sizeof(float) == sizeof(uint32_t),
                "sparse-survivor detection punnes float through uint32_t");
 
+/* ------------------------------------------------------------------
+ * SURVIVOR HINT (LAUNCH lane). A backend that built a sparse row itself (the TT forward's
+ * top-N row, `PN_TT_ROW_RESET`, default on) knows its finite entries; it hands them to the NEXT draw
+ * from that row (pn_sampler_row_hint, called by the decode loop right before sampling the
+ * tensor) and the sampler's survivor scans read the list instead of 248K floats. The list is
+ * the row's finite set by construction, ascending, so every consumer sees exactly what the
+ * scan would have found. Honoured only for the row it names, never under a live tool grammar
+ * (the mask rewrites rows), dropped by any dense refill and at the end of every draw.
+ * ------------------------------------------------------------------ */
+static _Thread_local const float *t_row_hint_row = NULL;
+static _Thread_local const uint32_t *t_row_hint_ids = NULL;
+static _Thread_local int t_row_hint_n = 0;
+static unsigned long g_row_hint_uses = 0;
+unsigned long pn_sampler_row_hint_uses(void) { return g_row_hint_uses; }
+
+void pn_sampler_row_hint(const tm_tensor *t)
+{
+    t_row_hint_row = NULL;
+    if (!t || t->is_sparse || t->dtype != TM_F32 || t->nnz <= 0 || t->nnz > PN_SURV_MAX ||
+        !t->data)
+        return;
+    t_row_hint_ids = (const uint32_t *)((const float *)t->data + t->numel);
+    t_row_hint_n = (int)t->nnz;
+    t_row_hint_row = (const float *)t->data;
+}
+
+/* The hinted survivors of `row` (ascending, finite), or -1 when `row` has no hint. */
+static int row_hint_gather(const float *row, int n_vocab, int *ids, float *vals, int cap)
+{
+    int S = 0;
+
+    if (!t_row_hint_row || row != t_row_hint_row)
+        return -1;
+    g_row_hint_uses++;
+    for (int k = 0; k < t_row_hint_n; k++) {
+        const uint32_t i = t_row_hint_ids[k];
+        uint32_t bits;
+
+        if (i >= (uint32_t)n_vocab)
+            continue;
+        memcpy(&bits, &row[i], sizeof bits);
+        if (bits == PN_NEG_INF_BITS)
+            continue;
+        if (S >= cap)
+            return -2;
+        ids[S] = (int)i;
+        vals[S] = row[i];
+        S++;
+    }
+    return S;
+}
+
 /* Runtime override for the tests (the token-identity gate flips arms in
  * process). -1 = follow the env; 0/1 = force. */
 static int g_sparse_sampler_override = -1;
@@ -1786,6 +2114,10 @@ static unsigned long g_sparse_hits = 0;
 static unsigned long g_topn_refills = 0;
 unsigned long pn_sampler_topn_refills(void) { return g_topn_refills; }
 unsigned long pn_sampler_sparse_hits(void) { return g_sparse_hits; }
+/* Dense-path draws the margin draw decided (sampler_margin_draw.h). Process-wide, unlocked:
+ * a gate counter, like the two above. */
+static unsigned long g_margin_draws = 0;
+unsigned long pn_sampler_margin_draws(void) { return g_margin_draws; }
 
 /* Per thread: the speculative-sampling chooser asks for the fast path on its own -INF rows
  * (they are sparse by construction; gated byte-identical, run_empty_env_default.sh). */
@@ -1829,6 +2161,18 @@ static int grammar_shortlist_on(void)
     return v;
 }
 
+/* PN_GRAMMAR_ROW_HINT=0: a shortlist-masked row's draw scans the vocabulary for its
+ * survivors instead of reading them from the hint (grammar_hint_kept). */
+static int grammar_row_hint_on(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *env = getenv("PN_GRAMMAR_ROW_HINT");
+        v = (env && env[0] == '0') ? 0 : 1;
+    }
+    return v;
+}
+
 typedef struct {
     const pn_tool_grammar_hook *tg;
 } grammar_allowed_ctx;
@@ -1847,15 +2191,15 @@ static bool grammar_token_allowed(void *ctx, uint32_t id)
  * the caller then asks allowed() again in pass 2). */
 static unsigned char *grammar_verdict_scratch(int n)
 {
-    static _Thread_local unsigned char *buf = NULL;
-    static _Thread_local int cap = 0;
-    if (n > cap) {
-        unsigned char *grown = realloc(buf, (size_t)n);
+    pn_sampler_thread_buffers *b = sampler_buffers();
+    if (!b) return NULL;
+    if (n > b->grammar_verdict_cap) {
+        unsigned char *grown = realloc(b->grammar_verdict, (size_t)n);
         if (!grown) return NULL;
-        buf = grown;
-        cap = n;
+        b->grammar_verdict = grown;
+        b->grammar_verdict_cap = n;
     }
-    return buf;
+    return b->grammar_verdict;
 }
 
 /* Prefix verdicts for one masked step: does the walk survive this 1- or 2-byte
@@ -1910,15 +2254,15 @@ static int grammar_token_verdict(const pn_tool_grammar_hook *tg, grammar_prefix_
 /* Per-thread chunk-need scratch (one byte per 16 ids). */
 static unsigned char *grammar_need_scratch(int n_chunks)
 {
-    static _Thread_local unsigned char *buf = NULL;
-    static _Thread_local int cap = 0;
-    if (n_chunks > cap) {
-        unsigned char *grown = realloc(buf, (size_t)n_chunks);
+    pn_sampler_thread_buffers *b = sampler_buffers();
+    if (!b) return NULL;
+    if (n_chunks > b->grammar_need_cap) {
+        unsigned char *grown = realloc(b->grammar_need, (size_t)n_chunks);
         if (!grown) return NULL;
-        buf = grown;
-        cap = n_chunks;
+        b->grammar_need = grown;
+        b->grammar_need_cap = n_chunks;
     }
-    return buf;
+    return b->grammar_need;
 }
 
 /* The full mask on a TOP-N row without the whole dense row: judge every token
@@ -1953,18 +2297,102 @@ static int grammar_mask_from_chunks(float *logits, int nv, const pn_sampling_par
     return 1;
 }
 
+/* Shortlist decisions the outside bound made (row 0 draws and verify rows alike). */
+static unsigned long g_grammar_bound_steps = 0;
+unsigned long pn_sampler_grammar_bound_steps(void)
+{
+    return __atomic_load_n(&g_grammar_bound_steps, __ATOMIC_RELAXED);
+}
+
+/* PN_GRAMMAR_EXACT_BOUND=0: the shortlist decides only when K allowed tokens clear its bound
+ * (the behaviour before the outside bound, grammar_mask_shortlist.h). */
+static int grammar_exact_bound_on(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *env = getenv("PN_GRAMMAR_EXACT_BOUND");
+        v = (env && env[0] == '0') ? 0 : 1;
+    }
+    return v;
+}
+
+/* Per thread: the verify row a draw belongs to (0 = the decode row), for the tail counts. */
+static _Thread_local int t_sample_row = 0;
+
+/* The device's tail counts of this row for the outside bound: 1 when `out` was filled. */
+static int grammar_outside_counts(const pn_sampling_params *params, float bound, int n_vocab,
+                                  tnt_tail_bins *tb, uint32_t *counts, gms_outside *out)
+{
+    if (!params->tail_counts)
+        return 0;
+    tnt_tail_bins_make(bound, bound, params->temperature, n_vocab, tb);
+    if (params->tail_counts(params->dense_ctx, t_sample_row, tb->keys, tb->bins, counts) != 0)
+        return 0;
+    out->bins = tb;
+    out->bin_counts = counts;
+    return 1;
+}
+
+/* PN_GRAMMAR_HINT_RED=1 (gates only): the hint drops the highest kept id. */
+static int grammar_hint_red(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("PN_GRAMMAR_HINT_RED");
+        v = (e && e[0] == '1') ? 1 : 0;
+    }
+    return v;
+}
+
+/* After a shortlist rewrite the row's finite entries are exactly the shortlisted ids still
+ * finite: hand them, ascending, to this draw's survivor scans as the row hint, so the gather
+ * (and a greedy argmax) reads <= GMS_MAX entries instead of the vocabulary. Nothing before
+ * the draw can change the finite set (penalties leave -inf at -inf and a finite value finite;
+ * the repeat penalty stands down under the mask). A NaN among them (never from a model) keeps
+ * the scan: the sparse argmax and the full one would order it differently. */
+static void grammar_hint_kept(const float *logits, const uint32_t *ids, int n)
+{
+    static _Thread_local uint32_t kept[GMS_MAX];
+    int k = 0;
+
+    for (int i = 0; i < n; i++) {
+        uint32_t bits;
+        memcpy(&bits, &logits[ids[i]], sizeof bits);
+        if (bits == PN_NEG_INF_BITS)
+            continue;
+        if ((bits & 0x7f800000u) == 0x7f800000u && (bits & 0x007fffffu))
+            return;
+        uint32_t id = ids[i];
+        int j = k++;
+        for (; j > 0 && kept[j - 1] > id; j--) kept[j] = kept[j - 1];
+        kept[j] = id;
+    }
+    if (grammar_hint_red() && k > 0)
+        k--;
+    t_row_hint_ids = kept;
+    t_row_hint_n = k;
+    t_row_hint_row = logits;
+}
+
 /* The shortlist decision for this row (grammar_mask_shortlist.h); true when the
- * row was rewritten to the masked survivors. */
+ * row was rewritten to the masked survivors.  The outside bound charges every token outside
+ * the shortlist at its bound first; the device's tail counts only when that cannot decide.
+ * `hint`: set this draw's row hint to the survivors (sample_token_draw only). */
 static int grammar_mask_from_shortlist(float *logits, int n_vocab,
                                        const pn_sampling_params *params,
                                        const pn_tool_grammar_hook *tg,
-                                       const uint32_t *recent, int n_recent)
+                                       const uint32_t *recent, int n_recent, int hint)
 {
-    uint32_t ids[GMS_MAX];
+    uint32_t ids[GMS_MAX], counts[TNT_TAIL_BINS + 1];
     float bound = 0.0f;
+    tnt_tail_bins tb;
     grammar_allowed_ctx ctx = { tg };
+    const char *red = getenv("PN_TT_RED");
+    gms_outside outside = { 0.0, NULL, NULL,
+                            red && strcmp(red, "grammar_bound_blind") == 0 ? 0.0 : 1.0 };
     gms_sampling s = {
-        .temperature = params->temperature, .top_k = params->top_k,
+        .temperature = params->temperature, .top_k = params->top_k, .top_p = params->top_p,
+        .outside = grammar_exact_bound_on() ? &outside : NULL,
         .repeat_penalty = params->repeat_penalty,
         .presence_penalty = params->presence_penalty,
         .frequency_penalty = params->frequency_penalty,
@@ -1975,9 +2403,24 @@ static int grammar_mask_from_shortlist(float *logits, int n_vocab,
 
     if (!grammar_shortlist_on())
         return 0;
+    uint64_t ht0 = pn_ht_now();
     int n = gms_select_shortlist(logits, nv, ids, &bound);
-    return n > 0 && gms_mask_from_shortlist(logits, n_vocab, ids, n, bound, &s,
-                                            grammar_token_allowed, &ctx);
+    ht0 = pn_ht_lap(PN_HT_S_MASK_SELECT, ht0);
+    if (n <= 0)
+        return 0;
+    outside.count = (double)(n_vocab - n);
+    int verdict = gms_mask_from_shortlist(logits, n_vocab, ids, n, bound, &s,
+                                          grammar_token_allowed, &ctx);
+    if (verdict == GMS_UNDECIDED && s.outside && params->temperature > 0.0f &&
+        grammar_outside_counts(params, bound, n_vocab, &tb, counts, &outside))
+        verdict = gms_mask_from_shortlist(logits, n_vocab, ids, n, bound, &s,
+                                          grammar_token_allowed, &ctx);
+    if (verdict == GMS_DECIDED_BOUND)
+        __atomic_fetch_add(&g_grammar_bound_steps, 1ul, __ATOMIC_RELAXED);
+    if (verdict != GMS_UNDECIDED && hint && grammar_row_hint_on())
+        grammar_hint_kept(logits, ids, n);
+    pn_ht_lap(PN_HT_S_MASK_DECIDE, ht0);
+    return verdict != GMS_UNDECIDED;
 }
 
 /* Gather the sparse row's survivors in ASCENDING id order. Returns the count,
@@ -1985,7 +2428,11 @@ static int grammar_mask_from_shortlist(float *logits, int n_vocab,
  * caller must use the full path). */
 static int sparse_gather(const float *logits, int n_vocab,
                          int *ids, float *vals) {
-    int S = 0;
+    int S = row_hint_gather(logits, n_vocab, ids, vals, PN_SURV_MAX);
+
+    if (S >= 0) return S;
+    if (S == -2) return -1;
+    S = 0;
     for (int i = 0; i < n_vocab; i++) {
         uint32_t bits;
         memcpy(&bits, &logits[i], sizeof bits);
@@ -2074,12 +2521,12 @@ static uint32_t sparse_argmax(const int *ids, const float *vals, int S)
     return (uint32_t)ids[best];
 }
 
-/* The sampler math over S survivors already in ascending-id order, with
- * temperature > 0 and the repetition penalty already applied to vals[].
+/* The sampler's final distribution over S survivors already in ascending-id order, with
+ * temperature > 0 and the repetition penalty already applied to vals[] (scaled in place by
+ * 1 / temperature): probs[i] for survivor i, zero where top-k / top-p cut it.
  * Mirrors sample_token_core's tail statement for statement. */
-static uint32_t sparse_sample(const int *ids, float *vals, int S, int n_vocab,
-                              pn_sampling_params *params) {
-    float probs[PN_SURV_MAX];
+static void sparse_final_probs(float *vals, int S, int n_vocab,
+                               const pn_sampling_params *params, float *probs) {
     float work[PN_SURV_MAX];
 
     float inv_temp = 1.0f / params->temperature;
@@ -2136,7 +2583,14 @@ static uint32_t sparse_sample(const int *ids, float *vals, int S, int n_vocab,
         inv_sum = 1.0f / sum;
         for (int i = 0; i < S; i++) probs[i] *= inv_sum;
     }
+}
 
+/* The sampled draw over S survivors (sparse_final_probs, then the cumulative scan). */
+static uint32_t sparse_sample(const int *ids, float *vals, int S, int n_vocab,
+                              pn_sampling_params *params) {
+    float probs[PN_SURV_MAX];
+
+    sparse_final_probs(vals, S, n_vocab, params, probs);
     float r = rand_float(params);
     float cum = 0.0f;
     for (int i = 0; i < S; i++) {
@@ -2151,60 +2605,97 @@ static uint32_t sparse_sample(const int *ids, float *vals, int S, int n_vocab,
     return 0;
 }
 
+/* `PN_TT_SAMPLED_TAIL=0`: a top-N row whose request top-k reaches past the N is refilled
+ * dense on every draw (the behaviour before the tail planner). */
+static int sampler_tail_enabled(void)
+{
+    static int v = -1;
+    if (v < 0) v = !(getenv("PN_TT_SAMPLED_TAIL") && atoi(getenv("PN_TT_SAMPLED_TAIL")) == 0);
+    return v;
+}
+
 /*
  * Can a TOP-N row (finite on N entries, -INFINITY elsewhere) decide this SAMPLED draw
  * exactly as the dense row would?
  *
- * The sampler's top-k set, after the penalties, must lie inside the N: every token outside
- * has a raw logit <= the smallest survivor's raw logit (v_min), and presence / frequency /
- * repetition penalties only LOWER logits, so if the k-th largest PENALISED survivor is above
- * v_min by a margin that survives temperature + expf rounding, no outside token can reach
- * the top-k threshold and the renormalised top-k distribution is the dense one's. A logit
- * bias can raise a token, so it is never exact (callers keep such requests dense).
- * Not sparse at all (a dense row) also returns true: nothing to decide.
+ * EXACT: the sampler's top-k set, after the penalties, lies inside the N: every token outside
+ * has a raw logit <= the smallest survivor's raw logit (v_min), and presence / frequency (>= 0)
+ * and repetition (>= 1) penalties only LOWER logits, so if the k-th largest PENALISED survivor
+ * is above v_min by a margin that survives temperature + expf rounding, no outside token can
+ * reach the top-k threshold and the renormalised top-k distribution is the dense one's.
+ * TAIL: top-k is off or above the N — the tail planner (sampler_topn_tail.h) decides, with
+ * *bound = v_min. REFILL: anything else (a logit bias or a penalty can RAISE a token).
+ * Not sparse at all (a dense row) is EXACT: nothing to decide.
  */
-bool pn_sampler_topn_row_exact(const float *logits, int n_vocab, const pn_sampling_params *params,
-                               const uint32_t *recent, int n_recent)
+pn_topn_verdict pn_sampler_topn_row_verdict(const float *logits, int n_vocab,
+                                            const pn_sampling_params *params,
+                                            const uint32_t *recent, int n_recent, float *bound)
 {
     enum { MAX_N = 256 };
     int ids[MAX_N];
     float adj[MAX_N];
-    float v_min = 0.0f, kth;
+    float v_min = 0.0f, kth, limit;
     int S = 0, i, j;
     uint32_t bits;
+    /* GREEDY is decided here only when client surgery can reorder across the N
+     * (sampler_topn_surgery.h); a plain greedy argmax over the top-N is the dense one. */
+    const bool greedy = params && params->temperature <= 0.0f;
 
-    if (!params || params->temperature <= 0.0f)
-        return true;
-    for (i = 0; i < n_vocab; i++) {
+    if (!params || (greedy && !pn_topn_surgery_present(params)))
+        return PN_TOPN_EXACT;
+    S = row_hint_gather(logits, n_vocab, ids, adj, MAX_N);
+    if (S == -2)
+        return PN_TOPN_EXACT;              /* not a top-N row */
+    const bool hinted = S >= 0;
+    if (hinted) {
+        for (j = 0; j < S; j++)
+            if (j == 0 || adj[j] < v_min) v_min = adj[j];
+    } else {
+        S = 0;
+    }
+    for (i = 0; !hinted && i < n_vocab; i++) {
         memcpy(&bits, &logits[i], sizeof(bits));
         if (bits == PN_NEG_INF_BITS)
             continue;
         if (S == MAX_N)
-            return true;          /* not a top-N row */
+            return PN_TOPN_EXACT;          /* not a top-N row */
         ids[S] = i;
         adj[S] = logits[i];
         if (S == 0 || logits[i] < v_min) v_min = logits[i];
         S++;
     }
     if (S == n_vocab)
-        return true;
-    if (params->logit_bias && params->n_logit_bias > 0)
-        return false;
-    if (params->top_k < 1 || params->top_k > S)
-        return false;
-    for (j = 0; j < S; j++) {
-        int count = 0;
+        return PN_TOPN_EXACT;
+    if (greedy) {
+        float best;
 
+        if (S < 1 || !pn_topn_surgery_enabled() ||
+            !pn_topn_surgery_outside_limit(ids, S, v_min, params, n_recent, &limit))
+            return PN_TOPN_REFILL;
+        pn_topn_surgery_apply(ids, adj, S, params, recent, n_recent);
+        for (best = adj[0], j = 1; j < S; j++)
+            if (adj[j] > best) best = adj[j];
+        return pn_topn_surgery_clears(best, limit) ? PN_TOPN_EXACT : PN_TOPN_REFILL;
+    }
+    if (params->logit_bias && params->n_logit_bias > 0 &&
+        (!pn_topn_surgery_enabled() || params->top_k < 1 || params->top_k > S))
+        return PN_TOPN_REFILL;
+    if (n_recent > 0 && (params->presence_penalty < 0.0f || params->frequency_penalty < 0.0f ||
+                         params->repeat_penalty < 1.0f))
+        return PN_TOPN_REFILL;
+    if (params->top_k < 1 || params->top_k > S) {
+        if (bound) *bound = v_min;
+        return S > 0 && sampler_tail_enabled() ? PN_TOPN_TAIL : PN_TOPN_REFILL;
+    }
+    /* Without a bias the limit is v_min: every outside token's raw logit is <= it. */
+    if (!pn_topn_surgery_outside_limit(ids, S, v_min, params, n_recent, &limit))
+        return PN_TOPN_REFILL;
+    pn_topn_surgery_apply(ids, adj, S, params, recent, n_recent);
+    for (j = 0; j < S && params->repeat_penalty != 1.0f; j++) {
         for (i = 0; i < n_recent; i++)
             if (recent && recent[i] == (uint32_t)ids[j])
-                count++;
-        if (count > 0) {
-            adj[j] -= params->frequency_penalty * (float)count + params->presence_penalty;
-            if (params->repeat_penalty != 1.0f)
-                for (i = 0; i < count; i++)
-                    adj[j] = adj[j] > 0.0f ? adj[j] / params->repeat_penalty
-                                           : adj[j] * params->repeat_penalty;
-        }
+                adj[j] = adj[j] > 0.0f ? adj[j] / params->repeat_penalty
+                                       : adj[j] * params->repeat_penalty;
     }
     /* k-th largest adjusted value (S <= 256: partial selection). */
     for (i = 0; i < params->top_k; i++) {
@@ -2217,7 +2708,14 @@ bool pn_sampler_topn_row_exact(const float *logits, int n_vocab, const pn_sampli
         adj[i] = kth;
     }
     kth = adj[params->top_k - 1];
-    return (kth - v_min) / params->temperature > 1e-4f;
+    return (kth - limit) / params->temperature > 1e-4f ? PN_TOPN_EXACT : PN_TOPN_REFILL;
+}
+
+bool pn_sampler_topn_row_exact(const float *logits, int n_vocab, const pn_sampling_params *params,
+                               const uint32_t *recent, int n_recent)
+{
+    return pn_sampler_topn_row_verdict(logits, n_vocab, params, recent, n_recent, NULL) ==
+           PN_TOPN_EXACT;
 }
 
 /* Distribution-test red arm only: the pre-2026-10-07 order (top-p over full-vocab mass). */
@@ -2341,6 +2839,13 @@ static float *sampler_full_probs(float *logits, int n_vocab, const pn_sampling_p
  * Red arms (`PN_SAMPLER_DIST_RED`): `old_order` (the previous top-p) and `topk0` (top-k off,
  * scored on every draw) must show a large distance.
  */
+static void sampler_apply_client_surgery(float *logits, int n_vocab,
+                                         const pn_sampling_params *params,
+                                         const uint32_t *recent_tokens, int n_recent);
+static void sampler_apply_repeat_penalty(float *logits, int n_vocab,
+                                         const pn_sampling_params *params,
+                                         const uint32_t *recent_tokens, int n_recent);
+
 static float sampler_dist_probs(const float *row, int n_vocab, const pn_sampling_params *params,
                                 const uint32_t *recent, int n_recent, float *out)
 {
@@ -2376,6 +2881,96 @@ static void sampler_dist_report(void)
                 g_dist.max_tvd, g_dist.scored ? g_dist.sum_tvd / (double)g_dist.scored : 0.0);
 }
 
+/* The tail planner's share of the test (top-k off or past the N): its plan over the top-N
+ * row and the distribution production would draw from — NUCLEUS: the survivors at top_k =
+ * the cut; MIXTURE: a * h on the survivors plus the residual max(p - a h, 0) — against the
+ * dense one. `PN_SAMPLER_DIST_RED=tail_nobound`: a planner that ignores the tail (B = 0). */
+static struct {
+    unsigned long nucleus, mixture, dense;
+    double max_tvd, sum_residual, sum_tail_mass, max_tail_mass;
+} g_dist_tail;
+
+static void sampler_dist_tail_report(void)
+{
+    if (g_dist_tail.nucleus + g_dist_tail.mixture + g_dist_tail.dense)
+        fprintf(stderr, "SAMPLER DIST TAIL — nucleus %lu, mixture %lu (residual rate mean %.3e, "
+                        "true tail mass mean %.3e max %.3e), dense %lu, TVD max %.3e\n",
+                g_dist_tail.nucleus, g_dist_tail.mixture,
+                g_dist_tail.mixture ? g_dist_tail.sum_residual / (double)g_dist_tail.mixture : 0.0,
+                g_dist_tail.mixture ? g_dist_tail.sum_tail_mass / (double)g_dist_tail.mixture : 0.0,
+                g_dist_tail.max_tail_mass, g_dist_tail.dense, g_dist_tail.max_tvd);
+}
+
+static void sampler_dist_tail(const float *logits, const float *sparse, int n_vocab,
+                              const pn_sampling_params *p, const uint32_t *recent, int n_recent,
+                              float bound, float *pd, float *ps)
+{
+    const char *red = getenv("PN_SAMPLER_DIST_RED");
+    tnt_sampling ts = { p->temperature, p->top_p, p->top_k, n_vocab, 1.0, -1.0, 0 };
+    int ids[PN_SURV_MAX], raw_ids[PN_SURV_MAX];
+    float vals[PN_SURV_MAX], raw[PN_SURV_MAX];
+    tnt_plan plan;
+    tnt_tail_bins tb;
+    uint32_t counts[TNT_TAIL_BINS + 1];
+    pn_sampling_params sub = *p;
+    double tvd = 0.0, head = 0.0, m, B, trivial;
+    float x_min;
+    int S, i, at, in_topk;
+
+    if (red && strcmp(red, "tail_nobound") == 0) ts.tail_scale = 0.0;
+    if (sparse_gather(sparse, n_vocab, raw_ids, raw) < 1) return;
+    memcpy(ps, sparse, (size_t)n_vocab * sizeof(float));
+    sampler_apply_client_surgery(ps, n_vocab, p, recent, n_recent);
+    sampler_apply_repeat_penalty(ps, n_vocab, p, recent, n_recent);
+    S = sparse_gather(ps, n_vocab, ids, vals);
+    if (S < 1 || sampler_dist_probs(logits, n_vocab, p, recent, n_recent, pd) != 0.0f) return;
+    /* Production's bound when the device counts (the counts emulated over the dense row);
+     * a plan the trivial bound decides is the same plan under the tighter one. */
+    m = vals[0];
+    x_min = vals[0];
+    for (i = 1; i < S; i++) {
+        if (vals[i] > m) m = vals[i];
+        if (vals[i] < x_min) x_min = vals[i];
+    }
+    tnt_tail_bins_make(bound, x_min, p->temperature, n_vocab, &tb);
+    tnt_tail_bins_count(&tb, logits, n_vocab, counts);
+    if (tnt_tail_from_counts(&tb, counts, raw, S, m, 1.0 / (double)p->temperature, x_min,
+                             p->top_k, &B, &in_topk) == 0) {
+        trivial = (double)(n_vocab - S) * exp(((double)bound - m) / (double)p->temperature);
+        ts.tail_mass = B < trivial ? B : trivial;
+        ts.survivors_in_topk = in_topk;
+    }
+    switch (tnt_plan_draw(vals, S, bound, &ts, &plan)) {
+    case TNT_NUCLEUS:
+        g_dist_tail.nucleus++;
+        sub.top_k = plan.nucleus_k;
+        sub.top_p = 1.0f;
+        if (sampler_dist_probs(sparse, n_vocab, &sub, recent, n_recent, ps) != 0.0f) return;
+        break;
+    case TNT_MIXTURE:
+        g_dist_tail.mixture++;
+        for (i = 0; i < n_vocab; i++) ps[i] = pd[i];
+        for (at = 0; at < S; at++) {
+            const double a_h = plan.head_mass * plan.head_prob[at];
+            const double r = (double)pd[ids[at]] - a_h;
+            ps[ids[at]] = (float)(a_h + (r > 0.0 ? r : 0.0));
+            head += (double)pd[ids[at]];
+        }
+        g_dist_tail.sum_residual += 1.0 - plan.head_mass;
+        g_dist_tail.sum_tail_mass += 1.0 - head;
+        if (1.0 - head > g_dist_tail.max_tail_mass) g_dist_tail.max_tail_mass = 1.0 - head;
+        break;
+    default:
+        g_dist_tail.dense++;
+        return;
+    }
+    for (i = 0; i < n_vocab; i++) tvd += fabs((double)pd[i] - (double)ps[i]);
+    tvd *= 0.5;
+    if (tvd > g_dist_tail.max_tvd) g_dist_tail.max_tvd = tvd;
+    if (((g_dist_tail.nucleus + g_dist_tail.mixture) & 63u) == 0u)
+        sampler_dist_tail_report();
+}
+
 static void sampler_dist_check(const float *logits, int n_vocab, const pn_sampling_params *in,
                                const uint32_t *recent, int n_recent)
 {
@@ -2388,8 +2983,13 @@ static void sampler_dist_check(const float *logits, int n_vocab, const pn_sampli
     int *top, n = 0, i, j;
     bool exact, score_all = false;
     double tvd = 0.0;
+    float bound = 0.0f;
 
-    if (!registered) { atexit(sampler_dist_report); registered = 1; }
+    if (!registered) {
+        atexit(sampler_dist_report);
+        atexit(sampler_dist_tail_report);
+        registered = 1;
+    }
     if (red && strcmp(red, "topk0") == 0) { p.top_k = 0; score_all = true; }
     /* `score_all`: score the draws the exactness check REJECTS too (run with a small
      * PN_SAMPLER_DIST_N, e.g. 8 at top_k 40, so the rejected ones carry real mass). */
@@ -2412,6 +3012,11 @@ static void sampler_dist_check(const float *logits, int n_vocab, const pn_sampli
     for (i = 0; i < n_vocab; i++) sparse[i] = -INFINITY;
     for (i = 0; i < n; i++) sparse[top[i]] = logits[top[i]];
     g_dist.draws++;
+    if (!score_all && pn_sampler_topn_row_verdict(sparse, n_vocab, &p, recent, n_recent,
+                                                  &bound) == PN_TOPN_TAIL) {
+        sampler_dist_tail(logits, sparse, n_vocab, &p, recent, n_recent, bound, pd, ps);
+        goto done;
+    }
     exact = pn_sampler_topn_row_exact(sparse, n_vocab, &p, recent, n_recent);
     if (!exact) g_dist.inexact++;
     if (!exact && !score_all) goto done;
@@ -2435,29 +3040,199 @@ done:
  * cumulative draw).  The public sample_token wraps this with the OPTIONAL
  * grammar mask; with no grammar hook the wrapper is a straight pass-through, so
  * this path is unchanged from before Phase 5. */
+/* Swap a top-N row for the dense one. Returns 1 when the row was replaced. */
+static int sampler_refill(float *logits, int n_vocab, pn_sampling_params *params)
+{
+    t_row_hint_row = NULL; /* the row turns dense: its survivor hint is void */
+    g_topn_refills++;
+    if (params->dense_row(params->dense_ctx, logits, n_vocab) == 0)
+        return 1;
+    fprintf(stderr, "sampler: dense refill failed; sampling the top-N row\n");
+    return 0;
+}
+
+/* Client-requested logit surgery (bias, presence / frequency), in OpenAI's order. */
+static void sampler_apply_client_surgery(float *logits, int n_vocab,
+                                         const pn_sampling_params *params,
+                                         const uint32_t *recent_tokens, int n_recent)
+{
+    pn_apply_logit_bias(logits, n_vocab, params->logit_bias, params->n_logit_bias);
+    pn_apply_presence_frequency_penalties(logits, n_vocab, params->presence_penalty,
+                                          params->frequency_penalty, recent_tokens, n_recent);
+}
+
+/* The repetition penalty (sampling path only), once per occurrence in the window. */
+static void sampler_apply_repeat_penalty(float *logits, int n_vocab,
+                                         const pn_sampling_params *params,
+                                         const uint32_t *recent_tokens, int n_recent)
+{
+    if (params->repeat_penalty == 1.0f || !recent_tokens || n_recent <= 0)
+        return;
+    for (int i = 0; i < n_recent; i++) {
+        uint32_t tok = recent_tokens[i];
+        if (tok < (uint32_t)n_vocab) {
+            if (logits[tok] > 0.0f)
+                logits[tok] /= params->repeat_penalty;
+            else
+                logits[tok] *= params->repeat_penalty;
+        }
+    }
+}
+
+/* Tail-planner draws: decided from the N / mixture residual / dense outright. */
+static unsigned long g_tail_from_n = 0, g_tail_residual = 0, g_tail_dense = 0;
+void pn_sampler_tail_counts(unsigned long *from_n, unsigned long *residual, unsigned long *dense)
+{
+    if (from_n) *from_n = g_tail_from_n;
+    if (residual) *residual = g_tail_residual;
+    if (dense) *dense = g_tail_dense;
+}
+
+/* Per thread: speculative sampling's rows past 0 cannot refill (the card's dense row is row
+ * 0's). A draw that needs the dense row returns PN_SPEC_CHOOSE_DEFER_TOKEN instead, leaving
+ * any uniform it drew in params->carried_uniform for the next draw at that position. */
+static _Thread_local int t_refill_forbidden = 0;
+
+static unsigned long g_tail_counted = 0;
+
+/* The device's tail counts for this row (pn_sampling_params.tail_counts), turned into the
+ * planner's tight bound: ts->tail_mass and ts->survivors_in_topk. 0 when unavailable. */
+static int sampler_tail_counts(pn_sampling_params *params, const float *raw, const float *vals,
+                               int S, float bound, int n_vocab, tnt_sampling *ts)
+{
+    tnt_tail_bins tb;
+    uint32_t counts[TNT_TAIL_BINS + 1];
+    double m = vals[0], B, trivial;
+    const double inv_t = 1.0 / (double)params->temperature;
+    float x_min = vals[0];
+    int in_topk, i;
+
+    if (!params->tail_counts)
+        return 0;
+    for (i = 1; i < S; i++) {
+        if (vals[i] > m) m = vals[i];
+        if (vals[i] < x_min) x_min = vals[i];
+    }
+    tnt_tail_bins_make(bound, x_min, params->temperature, n_vocab, &tb);
+    if (params->tail_counts(params->dense_ctx, t_sample_row, tb.keys, tb.bins, counts) != 0)
+        return 0;
+    if (tnt_tail_from_counts(&tb, counts, raw, S, m, inv_t, x_min, params->top_k, &B,
+                             &in_topk) != 0)
+        return 0;
+    trivial = (double)(n_vocab - S) * exp(((double)bound - m) * inv_t);
+    ts->tail_mass = B < trivial ? B : trivial;   /* two valid bounds: the smaller holds */
+    ts->survivors_in_topk = in_topk;
+    g_tail_counted++;
+    return 1;
+}
+
+unsigned long pn_sampler_tail_count_calls(void) { return g_tail_counted; }
+
+/* The draw from the survivors' own softmax with uniform `v` (top-k / top-p off). */
+static uint32_t sampler_tail_head(const int *ids, float *vals, int S, int n_vocab,
+                                  pn_sampling_params *params, double v)
+{
+    pn_sampling_params sub = *params;
+
+    sub.top_k = 0;
+    sub.top_p = 1.0f;
+    sub.carried_uniform_set = 1;
+    sub.carried_uniform = v < 1.0 ? (float)v : 0.99999994f;
+    if (sub.carried_uniform >= 1.0f) sub.carried_uniform = 0.99999994f;
+    return sparse_sample(ids, vals, S, n_vocab, &sub);
+}
+
+/* The tail planner's draw over the gathered PENALISED survivors (`raw`: the same survivors
+ * before the penalties). Returns 1 with *token when the N decides; 0 when the dense row is
+ * needed, with *u_drawn the mixture's uniform (residual branch) or -1 when no draw was taken.
+ * The trivial bound first; the device's counts only when it cannot decide. A mixture whose
+ * draw lands past the trivial head mass a asks for the counts' a' >= a and splits [a, a')
+ * back onto the head — a' is a function of the row alone, so the draw stays exact. */
+static int sampler_tail_draw(const int *ids, float *vals, const float *raw, int S, float bound,
+                             int n_vocab, pn_sampling_params *params, tnt_plan *plan,
+                             uint32_t *token, float *u_drawn)
+{
+    const char *red = getenv("PN_TT_RED");
+    /* RED `tail_nobound`: a planner that ignores the tail (B = 0) must measurably differ. */
+    tnt_sampling ts = { params->temperature, params->top_p, params->top_k, n_vocab,
+                        red && strcmp(red, "tail_nobound") == 0 ? 0.0 : 1.0, -1.0, 0 };
+    pn_sampling_params sub;
+    double a;
+    float u;
+    int counted = 0;
+
+    *u_drawn = -1.0f;
+    if (tnt_plan_draw(vals, S, bound, &ts, plan) == TNT_DENSE &&
+        (counted = sampler_tail_counts(params, raw, vals, S, bound, n_vocab, &ts)))
+        tnt_plan_draw(vals, S, bound, &ts, plan);
+    switch (plan->kind) {
+    case TNT_NUCLEUS:
+        sub = *params;
+        sub.top_k = plan->nucleus_k;
+        sub.top_p = 1.0f;
+        *token = sparse_sample(ids, vals, S, n_vocab, &sub);
+        params->rng_state = sub.rng_state;
+        params->carried_uniform_set = sub.carried_uniform_set;
+        return 1;
+    case TNT_MIXTURE:
+        u = rand_float(params);
+        a = plan->head_mass;
+        if ((double)u < a) {
+            *token = sampler_tail_head(ids, vals, S, n_vocab, params, (double)u / a);
+            return 1;
+        }
+        if (!counted && sampler_tail_counts(params, raw, vals, S, bound, n_vocab, &ts) &&
+            tnt_plan_draw(vals, S, bound, &ts, plan) == TNT_MIXTURE && plan->head_mass > a &&
+            (double)u < plan->head_mass) {
+            *token = sampler_tail_head(ids, vals, S, n_vocab, params,
+                                       ((double)u - a) / (plan->head_mass - a));
+            return 1;
+        }
+        if (plan->kind != TNT_MIXTURE || plan->head_mass < a)
+            tnt_plan_draw(vals, S, bound, &(tnt_sampling){ ts.temperature, ts.top_p, ts.top_k,
+                                                          n_vocab, ts.tail_scale, -1.0, 0 }, plan);
+        *u_drawn = u;
+        return 0;
+    default:
+        return 0;
+    }
+}
+
 static uint32_t sample_token_core(float *logits, int n_vocab, pn_sampling_params *params,
                                   uint32_t *recent_tokens, int n_recent) {
+    float tail_bound = 0.0f;
+    int tail = 0;
+    int tail_raw_ids[PN_SURV_MAX];
+    float tail_raw[PN_SURV_MAX];
+
     if (params->temperature > 0.0f && getenv("PN_SAMPLER_DIST_CHECK"))
         sampler_dist_check(logits, n_vocab, params, recent_tokens, n_recent);
+    uint64_t ht = pn_ht_now();
     /* A top-N row that cannot decide this draw exactly is swapped for the dense row —
-     * never one the grammar mask already rewrote (that would drop the mask). */
-    if (params->dense_row && params->temperature > 0.0f && !t_grammar_row_final &&
-        !pn_sampler_topn_row_exact(logits, n_vocab, params, recent_tokens, n_recent)) {
-        g_topn_refills++;
-        if (params->dense_row(params->dense_ctx, logits, n_vocab) != 0)
-            fprintf(stderr, "sampler: dense refill failed; sampling the top-N row\n");
+     * never one the grammar mask already rewrote (that would drop the mask). A request
+     * whose top-k reaches past the N goes to the tail planner below. */
+    if (params->dense_row && !t_grammar_row_final &&
+        (params->temperature > 0.0f || pn_topn_surgery_present(params))) {
+        const pn_topn_verdict v = pn_sampler_topn_row_verdict(logits, n_vocab, params,
+                                                              recent_tokens, n_recent,
+                                                              &tail_bound);
+        if (v == PN_TOPN_TAIL) {
+            /* The survivors' RAW values, for the device's tail counts (sampler_tail_counts). */
+            tail = sparse_gather(logits, n_vocab, tail_raw_ids, tail_raw) > 0;
+        } else if (v == PN_TOPN_REFILL) {
+            if (t_refill_forbidden)
+                return PN_SPEC_CHOOSE_DEFER_TOKEN;
+            sampler_refill(logits, n_vocab, params);
+        }
     }
     /* Client-requested logit surgery, in OpenAI's order and BEFORE the greedy
      * branch: both are explicit client intent (default 0 / empty = no-op), and
      * both are deterministic functions of the prefix, so greedy stays
      * reproducible.  See the ordering note on
      * apply_presence_frequency_penalties for why `repeat_penalty` is NOT here. */
-    pn_apply_logit_bias(logits, n_vocab, params->logit_bias,
-                        params->n_logit_bias);
-    pn_apply_presence_frequency_penalties(logits, n_vocab,
-                                          params->presence_penalty,
-                                          params->frequency_penalty,
-                                          recent_tokens, n_recent);
+    ht = pn_ht_lap(PN_HT_S_TOPN, ht);
+    sampler_apply_client_surgery(logits, n_vocab, params, recent_tokens, n_recent);
+    ht = pn_ht_lap(PN_HT_S_SURGERY, ht);
 
     /* Temperature == 0 means greedy: PURE argmax on the RAW logits, taken BEFORE
      * any repetition penalty. Greedy decoding must return the model's top token
@@ -2474,13 +3249,15 @@ static uint32_t sample_token_core(float *logits, int n_vocab, pn_sampling_params
          * Neither pn_apply_logit_bias (+=) nor the presence/frequency penalties
          * (-=) can lift a -inf non-survivor back to finite, so the survivor set
          * is the same set the full scan would have had to beat. */
-        if (sparse_sampler_enabled() && !g_grammar_masked) {
+        if ((sparse_sampler_enabled() || t_row_hint_row == logits) && !g_grammar_masked) {
             int   surv_ids[PN_SURV_MAX];
             float surv_vals[PN_SURV_MAX];
             int S = sparse_gather(logits, n_vocab, surv_ids, surv_vals);
             if (S > 0) {
                 g_sparse_hits++;
-                return sparse_argmax(surv_ids, surv_vals, S);
+                uint32_t tok = sparse_argmax(surv_ids, surv_vals, S);
+                pn_ht_lap(PN_HT_S_GREEDY, ht);
+                return tok;
             }
             /* S == 0 (nothing finite) or S == -1 (dense row): full scan. */
         }
@@ -2488,21 +3265,13 @@ static uint32_t sample_token_core(float *logits, int n_vocab, pn_sampling_params
         for (int i = 1; i < n_vocab; i++) {
             if (logits[i] > logits[best]) best = i;
         }
+        pn_ht_lap(PN_HT_S_GREEDY, ht);
         return (uint32_t)best;
     }
 
     /* Apply repetition penalty (sampling path only) */
-    if (params->repeat_penalty != 1.0f && recent_tokens && n_recent > 0) {
-        for (int i = 0; i < n_recent; i++) {
-            uint32_t tok = recent_tokens[i];
-            if (tok < (uint32_t)n_vocab) {
-                if (logits[tok] > 0.0f)
-                    logits[tok] /= params->repeat_penalty;
-                else
-                    logits[tok] *= params->repeat_penalty;
-            }
-        }
-    }
+    sampler_apply_repeat_penalty(logits, n_vocab, params, recent_tokens, n_recent);
+    ht = pn_ht_lap(PN_HT_S_SURGERY, ht);
 
     /* Sparse-survivor fast path. Placed HERE, after the repetition penalty and
      * before the temperature scale, because the penalty writes through token
@@ -2517,27 +3286,162 @@ static uint32_t sample_token_core(float *logits, int n_vocab, pn_sampling_params
         int   surv_ids[PN_SURV_MAX];
         float surv_vals[PN_SURV_MAX];
         int S = sparse_gather(logits, n_vocab, surv_ids, surv_vals);
-        if (S > 0) {
+        if (S > 0 && tail) {
+            tnt_plan plan;
+            uint32_t tok = 0;
+            float u;
+
+            if (sampler_tail_draw(surv_ids, surv_vals, tail_raw, S, tail_bound, n_vocab, params,
+                                  &plan, &tok, &u)) {
+                g_tail_from_n++;
+                g_sparse_hits++;
+                return tok;
+            }
+            if (t_refill_forbidden) {
+                /* RED `tail_nocarry`: the deferred row drops its draw (spec != plain). */
+                if (u >= 0.0f && !(getenv("PN_TT_RED") &&
+                                   strcmp(getenv("PN_TT_RED"), "tail_nocarry") == 0)) {
+                    params->carried_uniform_set = 1;
+                    params->carried_uniform = u;
+                }
+                return PN_SPEC_CHOOSE_DEFER_TOKEN;
+            }
+            if (sampler_refill(logits, n_vocab, params)) {
+                sampler_apply_client_surgery(logits, n_vocab, params, recent_tokens, n_recent);
+                sampler_apply_repeat_penalty(logits, n_vocab, params, recent_tokens, n_recent);
+            }
+            if (u >= 0.0f) {
+                float *probs = sampler_full_probs(logits, n_vocab, params);
+
+                g_tail_residual++;
+                return probs ? tnt_residual_draw(probs, n_vocab, surv_ids, &plan, S, u) : 0u;
+            }
+            g_tail_dense++;
+        } else if (S > 0) {
             g_sparse_hits++;
-            return sparse_sample(surv_ids, surv_vals, S, n_vocab, params);
+            uint32_t tok = sparse_sample(surv_ids, surv_vals, S, n_vocab, params);
+            pn_ht_lap(PN_HT_S_SPARSE, ht);
+            return tok;
         }
-        /* S == 0 (nothing finite) or S == -1 (dense row): full path below. */
+        ht = pn_ht_lap(PN_HT_S_SPARSE, ht);
+        /* S == 0 (nothing finite), S == -1 (dense row) or a tail plan that needed the dense
+         * row: full path below. */
     }
 
+    /* The dense path below, decided from the row's top candidates when every boundary is clear
+     * of rounding (sampler_margin_draw.h): the SAME uniform, so a refused draw runs the dense
+     * path with it — the same token for the same u, and the same RNG stream. The uniform is
+     * drawn first; nothing between consumes randomness (no scratch: the original returns
+     * before drawing, so this does too). */
+    pn_ht_note_row(0, 1);
+    if (!sampler_scratch_get(n_vocab)) return 0;
+    float r = rand_float(params);
+    if (pn_margin_draw_enabled() && !g_sampler_old_order) {
+        uint32_t tok;
+        const int decided = pn_margin_draw(logits, n_vocab, params->temperature, params->top_k,
+                                           params->top_p, r, &tok);
+        ht = pn_ht_lap(PN_HT_S_MARGIN, ht);
+        if (decided) {
+            g_margin_draws++;
+            return tok;
+        }
+    }
     float *probs = sampler_full_probs(logits, n_vocab, params);
+    ht = pn_ht_lap(PN_HT_S_FULL_PROBS, ht);
     if (!probs) return 0;
 
     /* Sample (identical cumulative scan and fallback as the original). */
-    float r = rand_float(params);
     float cum = 0.0f;
     for (int i = 0; i < n_vocab; i++) {
         cum += probs[i];
-        if (r < cum) return (uint32_t)i;
+        if (r < cum) { pn_ht_lap(PN_HT_S_FULL_DRAW, ht); return (uint32_t)i; }
     }
     for (int i = n_vocab - 1; i >= 0; i--) {
-        if (probs[i] > 0.0f) return (uint32_t)i;
+        if (probs[i] > 0.0f) { pn_ht_lap(PN_HT_S_FULL_DRAW, ht); return (uint32_t)i; }
     }
+    pn_ht_lap(PN_HT_S_FULL_DRAW, ht);
     return 0;
+}
+
+int pn_sampler_row_final_probs(float *row, int n_vocab, pn_sampling_params *params,
+                               const uint32_t *recent, int n_recent, bool require_exact,
+                               int *ids, float *probs, int cap)
+{
+    int   surv_ids[PN_SURV_MAX];
+    float surv_vals[PN_SURV_MAX];
+    int S;
+
+    if (!params || params->temperature <= 0.0f || params->tool_grammar || !row || cap < 1)
+        return -1;
+    /* Decide everything that can refuse BEFORE the row is penalised: a refusal hands the
+     * caller its row back as given. */
+    S = sparse_gather(row, n_vocab, surv_ids, surv_vals);
+    if (S < 1 || S > cap ||
+        (require_exact && !pn_sampler_topn_row_exact(row, n_vocab, params, recent, n_recent)))
+        return -1;
+    /* sample_token_core's order: surgery, repetition penalty, gather, the sparse tail. */
+    sampler_apply_client_surgery(row, n_vocab, params, recent, n_recent);
+    sampler_apply_repeat_penalty(row, n_vocab, params, recent, n_recent);
+    S = sparse_gather(row, n_vocab, ids, surv_vals);
+    sparse_final_probs(surv_vals, S, n_vocab, params, probs);
+    return S;
+}
+
+float pn_sampler_uniform(pn_sampling_params *params) { return rand_float(params); }
+
+static int sampler_pair_id_cmp(const void *a, const void *b)
+{
+    const int x = *(const int *)a, y = *(const int *)b;
+    return (x > y) - (x < y);
+}
+
+int pn_sampler_pairs_final_probs(const uint32_t *index, const float *value, uint32_t count,
+                                 int n_vocab, const pn_sampling_params *params,
+                                 const uint32_t *recent, int n_recent, int *ids, float *probs,
+                                 int cap)
+{
+    int order[PN_SURV_MAX * 2];
+    float vals[PN_SURV_MAX];
+    int S = 0, i, j;
+
+    if (!params || params->temperature <= 0.0f || cap < 1 || count > PN_SURV_MAX)
+        return -1;
+    /* (id, pair) packed for an ascending-id sort: the sampler's survivor order. */
+    for (i = 0; i < (int)count; i++) {
+        if (index[i] >= (uint32_t)n_vocab)
+            continue;
+        order[2 * S] = (int)index[i];
+        order[2 * S + 1] = i;
+        S++;
+    }
+    if (S < 1 || S > cap)
+        return -1;
+    qsort(order, (size_t)S, 2 * sizeof(int), sampler_pair_id_cmp);
+    for (i = 0; i < S; i++) {
+        float v = value[order[2 * i + 1]];
+        const uint32_t tok = (uint32_t)order[2 * i];
+
+        ids[i] = (int)tok;
+        /* sampler_apply_client_surgery + sampler_apply_repeat_penalty on this token alone,
+         * occurrence by occurrence in window order (no logit bias: rule requests carry none). */
+        for (j = 0; j < n_recent; j++) {
+            int k, seen = 0;
+
+            if (recent[j] != tok) continue;
+            if (params->presence_penalty != 0.0f || params->frequency_penalty != 0.0f) {
+                for (k = 0; k < j; k++) if (recent[k] == tok) { seen = 1; break; }
+                v -= params->frequency_penalty;
+                if (!seen) v -= params->presence_penalty;
+            }
+        }
+        if (params->repeat_penalty != 1.0f)
+            for (j = 0; j < n_recent; j++)
+                if (recent[j] == tok) v = v > 0.0f ? v / params->repeat_penalty
+                                                   : v * params->repeat_penalty;
+        vals[i] = v;
+    }
+    sparse_final_probs(vals, S, n_vocab, params, probs);
+    return S;
 }
 
 /*
@@ -2562,8 +3466,73 @@ static uint32_t sample_token_core(float *logits, int n_vocab, pn_sampling_params
  * small fraction of a generation.  A per-state allowed-token cache (see
  * tool_grammar.c) would drop this to a single precomputed bitmask lookup.
  */
+static uint32_t sample_token_draw(float *logits, int n_vocab, pn_sampling_params *params,
+                                  uint32_t *recent_tokens, int n_recent);
+
+/* Is the hook's mask live for THIS draw?  The same read sample_token_draw makes:
+ * the live walk when the hook can refresh itself, else the caller's `active`. */
+static int grammar_hook_live(const pn_tool_grammar_hook *tg)
+{
+    if (!tg) return 0;
+    if (tg->refresh && tg->st) return tg->refresh(tg->st);
+    return tg->active;
+}
+
+/* One draw; a survivor hint (pn_sampler_row_hint) lives for exactly this draw.
+ *
+ * NO REPETITION PENALTY UNDER A LIVE MASK.  The penalty divides a token's logit
+ * by repeat_penalty once PER OCCURRENCE in the last repeat_last_n tokens.  A tool
+ * call is structure that repeats by design — "\n" and ">" close every line of
+ * <tool_call>/<function=…>/<parameter=…> — so inside a call the penalty
+ * compounds on exactly the tokens the format needs.  Recorded on Qwen3.6
+ * (2026-10-28, logprobs replay): after "<parameter=path>" the model's own top
+ * token was "\n" (0.00) and the draw was "\n\n" (-14.27); from that blank line it
+ * wrote "</parameter", the empty-value floor masked ">", and the call shipped
+ * `{"path":"</parameter_unnamed>.teamide/…"}`.  The same penalty collapsed the
+ * newlines of an `edit`'s old_string (code repeats "\n" too).  The grammar
+ * already owns structure while its mask is live, so the penalty stands down for
+ * those draws only; prose and reasoning are sampled exactly as before. */
 static uint32_t sample_token(float *logits, int n_vocab, pn_sampling_params *params,
                              uint32_t *recent_tokens, int n_recent) {
+    uint32_t token;
+    float repeat_penalty = 1.0f;
+    int exempt = 0;
+
+    if (params && params->tool_grammar) {
+        t_row_hint_row = NULL; /* a grammar may rewrite the row: scan it */
+        exempt = params->repeat_penalty != 1.0f && grammar_hook_live(params->tool_grammar);
+        if (exempt) {
+            repeat_penalty = params->repeat_penalty;
+            params->repeat_penalty = 1.0f;
+        }
+    }
+    token = sample_token_draw(logits, n_vocab, params, recent_tokens, n_recent);
+    if (exempt) params->repeat_penalty = repeat_penalty;
+    t_row_hint_row = NULL;
+    return token;
+}
+
+/* pn_tool_grammar_hook.steer: hand the grammar the model's own top token, read
+ * off the row before any mask touches it, when the grammar refuses it.  The
+ * argmax, not a draw: it spends no randomness, so the draw that follows is the
+ * one the step would have made over the steered mask. */
+static void grammar_steer_top_token(const float *logits, int n_vocab,
+                                    const pn_tool_grammar_hook *tg, float mask)
+{
+    int nv = tg->n_vocab > 0 && tg->n_vocab < n_vocab ? tg->n_vocab : n_vocab;
+    int best = -1;
+    for (int i = 0; i < nv; i++)
+        if (logits[i] > mask && (best < 0 || logits[i] > logits[best]))
+            best = i;
+    if (best < 0)
+        return;
+    const char *txt = tg->token_text(tg->user, (uint32_t)best);
+    if (txt && *txt && !tg->allowed(tg->st, txt))
+        tg->steer(tg->st, txt);
+}
+
+static uint32_t sample_token_draw(float *logits, int n_vocab, pn_sampling_params *params,
+                                  uint32_t *recent_tokens, int n_recent) {
     const pn_tool_grammar_hook *tg = params ? params->tool_grammar : NULL;
 
     /* g_grammar_masked describes THIS step only.  Clearing it here is what
@@ -2587,11 +3556,10 @@ static uint32_t sample_token(float *logits, int n_vocab, pn_sampling_params *par
      * mask-active flag from the live grammar state here (so the batched driver,
      * which samples per-slot in its own thread and never touches `active`, gates
      * correctly).  Falls back to the caller-maintained `active` when NULL. */
-    int tg_active = tg ? tg->active : 0;
-    if (tg && tg->refresh && tg->st)
-        tg_active = tg->refresh(tg->st);
+    int tg_active = grammar_hook_live(tg);
 
     static const float TG_MASK = -1e30f;   /* finite sentinel (fast-math safe) */
+    uint64_t ht_full = 0;
     if (tg && tg_active && tg->st && tg->token_text && tg->allowed) {
         /* A top-N row (a backend handed `dense_row`) holds only N candidates.
          * First try to decide the masked draw from those N alone
@@ -2603,9 +3571,11 @@ static uint32_t sample_token(float *logits, int n_vocab, pn_sampling_params *par
          * verdicts are the same — only faster (prefix filter, one allowed()
          * per token). */
         const double mask_started = grammar_now_seconds();
+        if (tg->steer)
+            grammar_steer_top_token(logits, n_vocab, tg, TG_MASK);
         if (params->dense_row) {
             if (grammar_mask_from_shortlist(logits, n_vocab, params, tg, recent_tokens,
-                                            n_recent)) {
+                                            n_recent, 1)) {
                 g_grammar_mask_steps++;
                 g_grammar_shortlist_steps++;
                 g_grammar_mask_seconds += grammar_now_seconds() - mask_started;
@@ -2625,7 +3595,7 @@ static uint32_t sample_token(float *logits, int n_vocab, pn_sampling_params *par
                 fprintf(stderr, "sampler: dense refill for the grammar mask failed\n");
             t_grammar_row_final = 1;
             if (grammar_mask_from_shortlist(logits, n_vocab, params, tg, recent_tokens,
-                                            n_recent)) {
+                                            n_recent, 1)) {
                 g_grammar_mask_steps++;
                 g_grammar_shortlist_steps++;
                 g_grammar_mask_seconds += grammar_now_seconds() - mask_started;
@@ -2633,6 +3603,7 @@ static uint32_t sample_token(float *logits, int n_vocab, pn_sampling_params *par
             }
         }
         g_grammar_fullscan_steps++;
+        ht_full = pn_ht_now();
         int nv = tg->n_vocab > 0 && tg->n_vocab < n_vocab ? tg->n_vocab : n_vocab;
         /* Two-pass so the mask is only APPLIED when at least one token survives.
          * Pass 1 counts survivors without mutating logits; if none survive (a
@@ -2661,6 +3632,8 @@ static uint32_t sample_token(float *logits, int n_vocab, pn_sampling_params *par
             if (verdict) verdict[i] = (unsigned char)ok;
             survivors += ok;
         }
+        if (survivors > 0 && verdict && !params->dense_row && pn_grammar_row_dump_enabled())
+            pn_grammar_row_dump(logits, nv, verdict, params, recent_tokens, n_recent);
         if (survivors > 0) {
             for (int i = 0; i < nv; i++) {
                 if (logits[i] <= TG_MASK) continue;
@@ -2713,8 +3686,12 @@ static uint32_t sample_token(float *logits, int n_vocab, pn_sampling_params *par
     }
 
 masked:;
+    if (ht_full)
+        pn_ht_lap(PN_HT_S_MASK_FULL, ht_full);
+    pn_ht_note_row(tg && tg_active, 0);
     uint32_t tok = sample_token_core(logits, n_vocab, params, recent_tokens, n_recent);
     t_grammar_row_final = 0;
+    uint64_t ht_adv = pn_ht_now();
 
     /* Advance the grammar by the chosen token's text.  This must run EVERY step
      * (not only when the mask was active) so the FSM tracks the FREE reasoning
@@ -2725,6 +3702,7 @@ masked:;
         const char *txt = tg->token_text(tg->user, tok);
         if (txt) tg->advance(tg->st, txt);
     }
+    pn_ht_lap(PN_HT_S_ADVANCE, ht_adv);
     if (lp_raw) emit_logprobs(lp_sink, lp_raw, n_vocab, tok);
     return tok;
 }
@@ -2736,7 +3714,19 @@ int pn_sampler_grammar_shortlist(float *logits, int n_vocab, const pn_sampling_p
 
     if (!tg || !tg->st || !tg->token_text || !tg->allowed)
         return 0;
-    return grammar_mask_from_shortlist(logits, n_vocab, params, tg, recent_tokens, n_recent);
+    return grammar_mask_from_shortlist(logits, n_vocab, params, tg, recent_tokens, n_recent, 0);
+}
+
+uint32_t pn_sample_decided_row(float *logits, int n_vocab, pn_sampling_params *params,
+                               uint32_t *recent_tokens, int n_recent)
+{
+    uint32_t token;
+
+    t_row_hint_row = NULL;
+    t_grammar_row_final = 1;   /* decided: no top-N verdict, no refill, no tail plan */
+    token = sample_token_core(logits, n_vocab, params, recent_tokens, n_recent);
+    t_grammar_row_final = 0;
+    return token;
 }
 
 /* Public seam: reuse the internal sampler from external decode drivers (serve
@@ -2745,6 +3735,16 @@ uint32_t pn_sample_next_token(float *logits, int n_vocab,
                               pn_sampling_params *params,
                               uint32_t *recent_tokens, int n_recent) {
     return sample_token(logits, n_vocab, params, recent_tokens, n_recent);
+}
+
+uint32_t pn_sample_next_token_topn(float *logits, int n_vocab, pn_sampling_params *params,
+                                   uint32_t *recent_tokens, int n_recent) {
+    uint32_t token;
+
+    t_sparse_sampler_force = 1;
+    token = sample_token(logits, n_vocab, params, recent_tokens, n_recent);
+    t_sparse_sampler_force = 0;
+    return token;
 }
 
 /* ============================================================
@@ -2797,6 +3797,7 @@ char* pn_generate(pn_model *model, pn_state *state,
 #ifdef USE_TT
     if (pn_qwen35moe_tt_select_rows(model, params, false) > 0u) {
         params->dense_row = pn_qwen35moe_tt_dense_row;
+        params->tail_counts = pn_qwen35moe_tt_tail_counts;
         params->dense_ctx = model;
     }
 #endif
@@ -2905,6 +3906,11 @@ char* pn_generate(pn_model *model, pn_state *state,
      * per-token loop below is what runs then. `recent` is seeded from the prompt either way. */
     tm_tensor *logits = pn_prefill_tt_batched(model, state, prompt_tokens, n_prompt_tokens);
     int prefill_batched = (logits != NULL);
+    if (!logits && pn_prefill_tt_aborted(model)) {
+        free(prompt_tokens);
+        free(recent);
+        return NULL;
+    }
     /* The repeat-penalty window is PROMPT state, not forward state: seed it from the same
      * tokens whichever prefill ran, or a batched turn would sample under a different penalty
      * than a sequential one and the difference would look like a card defect. */
@@ -2949,6 +3955,7 @@ char* pn_generate(pn_model *model, pn_state *state,
         if (!logits) break;
 
         float *logit_data = (float *)logits->data;
+        pn_sampler_row_hint(logits); /* a backend's survivor list, this draw only */
         uint32_t next_token = sample_token(logit_data, model->config.n_vocab,
                                            params, recent, n_recent);
         tm_free(logits);
@@ -2991,6 +3998,7 @@ int pn_stream(pn_model *model, pn_state *state,
 #ifdef USE_TT
     if (pn_qwen35moe_tt_select_rows(model, params, false) > 0u) {
         params->dense_row = pn_qwen35moe_tt_dense_row;
+        params->tail_counts = pn_qwen35moe_tt_tail_counts;
         params->dense_ctx = model;
     }
 #endif
@@ -3082,6 +4090,11 @@ int pn_stream(pn_model *model, pn_state *state,
      * per-token loop below is what runs then. `recent` is seeded from the prompt either way. */
     tm_tensor *logits = pn_prefill_tt_batched(model, state, prompt_tokens, n_prompt_tokens);
     int prefill_batched = (logits != NULL);
+    if (!logits && pn_prefill_tt_aborted(model)) {
+        free(prompt_tokens);
+        free(recent);
+        return -1;
+    }
     /* The repeat-penalty window is PROMPT state, not forward state: seed it from the same
      * tokens whichever prefill ran, or a batched turn would sample under a different penalty
      * than a sequential one and the difference would look like a card defect. */
@@ -3122,6 +4135,7 @@ int pn_stream(pn_model *model, pn_state *state,
         if (!logits) break;
 
         float *logit_data = (float *)logits->data;
+        pn_sampler_row_hint(logits); /* a backend's survivor list, this draw only */
         uint32_t next_token = sample_token(logit_data, model->config.n_vocab,
                                            params, recent, n_recent);
         tm_free(logits);
@@ -3192,6 +4206,29 @@ pn_output* pn_infer(pn_model *model, pn_state *state, uint32_t token) {
     return out;
 }
 
+pn_output* pn_infer_prefill(pn_model *model, pn_state *state, const uint32_t *tokens,
+                            int n_tokens) {
+    tm_tensor *logits;
+    pn_output *out;
+    int n;
+
+    if (!model || !state || !tokens || n_tokens < 2) return NULL;
+    logits = pn_prefill_tt_batched_tokens(model, state, tokens, n_tokens);
+    if (!logits) return NULL;
+    out = calloc(1, sizeof(pn_output));
+    n = logits->shape[0];
+    if (!out || !(out->data = malloc((size_t)n * sizeof(float)))) {
+        free(out);
+        tm_free(logits);
+        return NULL;
+    }
+    memcpy(out->data, logits->data, (size_t)n * sizeof(float));
+    out->type = PN_OUT_LOGITS;
+    out->n = n;
+    tm_free(logits);
+    return out;
+}
+
 void pn_output_free(pn_output *out) {
     if (!out) return;
     free(out->data);
@@ -3218,10 +4255,18 @@ int pn_attach_vision(pn_model *model, const char *mmproj_path) {
     if (!model || !mmproj_path) return -1;
     pn_gguf_file *g = pn_gguf_open(mmproj_path);
     if (!g) { fprintf(stderr, "pn_attach_vision: cannot open %s\n", mmproj_path); return -1; }
+    uint64_t admitted_before = pn_host_admit_thread_total();
     pn_vision_model *v = pn_vision_load(g);
     pn_gguf_close(g);   /* vision weights are dequantized to owned F32 copies */
-    if (!v) return -1;
+    /* Those copies were admitted on this thread; they live as long as the
+     * model, so the model's free returns the charge. */
+    uint64_t admitted = pn_host_admit_thread_total() - admitted_before;
+    if (!v) {
+        pn_host_release(admitted);
+        return -1;
+    }
     model->vision = v;
+    model->host_admitted += admitted;
     return 0;
 }
 
@@ -3919,11 +4964,54 @@ float* pn_embed(pn_model *model, pn_state *state,
     return NULL;
 }
 
-#ifdef USE_TT
 /* SPECULATIVE SAMPLING's chooser (pn_spec_choose_fn): one verify row's sparse logits become the
  * row a plain sparse decode step hands the sampler (-INFINITY everywhere the card did not
  * name), and sample_token draws from it under the repeat window plain decode would have at
- * that token — the cycle's own draws appended exactly as the emit loop appends them. */
+ * that token — the cycle's own draws appended exactly as the emit loop appends them.
+ * With proposals (c->q, true speculative sampling) a draft row is decided by min(1, p/q) and
+ * the residual instead (spec_sampling_chooser.h); the plain draw stays the rule for the bonus
+ * row and for any row whose p the top-N cannot give exactly. */
+/* THE TREE PROBE's sampled half (`PN_TT_SPEC_TREE_PROBE=1`, diagnostics): per verify row the
+ * plain sampler's final distribution p (on a COPY of the row), booked as max p and the top-2
+ * mass — the old rule's acceptance with a perfect head, and with a perfect width-2 sibling. */
+static void spec_maxp_probe(const pn_spec_sample_ctx *c)
+{
+    static int on = -1;
+    static float *scratch;
+    static double sum1, sum2;
+    static unsigned long rows;
+    int ids[64], S, i;
+    float probs[64], p1 = 0.0f, p2 = 0.0f;
+
+    if (on < 0)
+        on = getenv("PN_TT_SPEC_TREE_PROBE") && atoi(getenv("PN_TT_SPEC_TREE_PROBE")) != 0;
+    if (!on || (!scratch && !(scratch = malloc((size_t)c->n_vocab * sizeof(float)))))
+        return;
+    memcpy(scratch, c->row, (size_t)c->n_vocab * sizeof(float));
+    S = pn_sampler_row_final_probs(scratch, c->n_vocab, c->params, c->recent, c->n_recent, true,
+                                   ids, probs, 64);
+    if (S < 1)
+        return;
+    for (i = 0; i < S; i++) {
+        if (probs[i] > p1) { p2 = p1; p1 = probs[i]; }
+        else if (probs[i] > p2) p2 = probs[i];
+    }
+    sum1 += p1;
+    sum2 += p1 + p2;
+    if (++rows % 128u == 0u)
+        fprintf(stderr, "SPEC MAXP PROBE — rows %lu mean max p %.4f mean top-2 mass %.4f\n", rows,
+                sum1 / (double)rows, sum2 / (double)rows);
+}
+
+static bool spec_red_window_stale(void)
+{
+    static int red = -1;
+
+    if (red < 0)
+        red = getenv("PN_TT_RED") && strcmp(getenv("PN_TT_RED"), "spec_window_stale") == 0;
+    return red != 0;
+}
+
 uint32_t pn_spec_sample_choose(void *opaque, const uint32_t *index, const float *value,
                                uint32_t count)
 {
@@ -3936,16 +5024,33 @@ uint32_t pn_spec_sample_choose(void *opaque, const uint32_t *index, const float 
     for (i = 0; i < count; i++)
         if (index[i] < (uint32_t)c->n_vocab)
             c->row[index[i]] = value[i];
+    spec_maxp_probe(c);
+    if (c->q && row < c->n_q && pn_spec_rule_choose_row(c, row, &token))
+        goto push;
     /* A row past 0 whose top-N cannot decide this draw: end the cycle there (the next
-     * cycle meets the same distribution as its row 0, which the dense refill covers). */
-    if (row > 0 && !pn_sampler_topn_row_exact(c->row, c->n_vocab, c->params, c->recent,
-                                              c->n_recent))
-        return PN_SPEC_CHOOSE_DEFER_TOKEN;
+     * cycle meets the same distribution as its row 0, which the dense refill covers). The
+     * sampler says so itself (t_refill_forbidden): before any draw for a REFILL verdict or
+     * a DENSE tail plan, after it for a mixture's residual branch — that uniform is carried
+     * in params to the next draw, which is this position's. */
+    if (row > 0 && !c->params->dense_row &&
+        !pn_sampler_topn_row_exact(c->row, c->n_vocab, c->params, c->recent, c->n_recent))
+        return PN_SPEC_CHOOSE_DEFER_TOKEN;   /* no refill at all: the pre-sampler check */
+    t_refill_forbidden = row > 0;
+    t_sample_row = row;
     /* The sampler's sparse fast path (`PN_TT_SPEC_SAMPLE_SPARSE=0`: the full-row path). */
     t_sparse_sampler_force = !(getenv("PN_TT_SPEC_SAMPLE_SPARSE") &&
                                atoi(getenv("PN_TT_SPEC_SAMPLE_SPARSE")) == 0);
     token = sample_token(c->row, c->n_vocab, c->params, c->recent, c->n_recent);
     t_sparse_sampler_force = 0;
+    t_refill_forbidden = 0;
+    t_sample_row = 0;
+    if (token == PN_SPEC_CHOOSE_DEFER_TOKEN)
+        return PN_SPEC_CHOOSE_DEFER_TOKEN;
+push:
+    /* RED `spec_window_stale` (PN_TT_RED): later verify rows draw under the cycle's STARTING
+     * window, blind to the tokens accepted before them — a penalised request MUST differ. */
+    if (spec_red_window_stale())
+        return token;
     if (c->max_recent > 0) {
         if (c->n_recent < c->max_recent) {
             c->recent[c->n_recent++] = token;
@@ -3956,7 +5061,6 @@ uint32_t pn_spec_sample_choose(void *opaque, const uint32_t *index, const float 
     }
     return token;
 }
-#endif
 
 int pn_stream_tokens(pn_model *model, pn_state *state,
                      const uint32_t *tokens, int n_tokens,
@@ -3980,6 +5084,7 @@ int pn_stream_tokens(pn_model *model, pn_state *state,
     /* Top-N rows: the sampler swaps in the dense row whenever one cannot decide a draw. */
     if (pn_qwen35moe_tt_select_rows(model, params, false) > 0u) {
         params->dense_row = pn_qwen35moe_tt_dense_row;
+        params->tail_counts = pn_qwen35moe_tt_tail_counts;
         params->dense_ctx = model;
     }
 #endif
@@ -4050,12 +5155,18 @@ int pn_stream_tokens(pn_model *model, pn_state *state,
         spec_k = getenv("PN_TT_SPEC") ? atoi(getenv("PN_TT_SPEC")) : 3;
     const bool spec_ngram = getenv("PN_TT_SPEC") != NULL && !spec_sampling;
     if (spec_k > 15) spec_k = 15;
-    pn_spec_sample_ctx spec_ctx = { params, NULL, model->config.n_vocab, NULL, 0, max_recent, 0 };
+    pn_spec_sample_ctx spec_ctx = { .params = params, .n_vocab = model->config.n_vocab,
+                                    .max_recent = max_recent };
     if (spec_sampling && spec_k > 0) {
         spec_ctx.row = malloc((size_t)model->config.n_vocab * sizeof(float));
         spec_ctx.recent = malloc((size_t)(max_recent > 0 ? max_recent : 1) * sizeof(uint32_t));
         if (!spec_ctx.row || !spec_ctx.recent)
             spec_k = 0;
+        /* TRUE SPECULATIVE SAMPLING (opt-in, `PN_TT_SPEC_SAMPLE_RULE=1`/`2`; off = the
+         * shared-randomness rule): drafts drawn from the MTP head's q, rows decided by min(1, p/q). */
+        if (spec_k > 0 && pn_spec_rule_applies(params) && pn_spec_sample_rule_arm(&spec_ctx) == 0 &&
+            eos_id >= 0)
+            spec_ctx.no_draft[spec_ctx.n_no_draft++] = (uint32_t)eos_id;
     }
 #else
     int spec_k = 0;
@@ -4126,6 +5237,7 @@ int pn_stream_tokens(pn_model *model, pn_state *state,
                     logit_data[a] - logit_data[b]);
             free(pa); free(pb); free(pc);
         }
+        pn_sampler_row_hint(logits); /* a backend's survivor list, this draw only */
         next_token = sample_token(logit_data, model->config.n_vocab,
                                   params, recent, n_recent);
         tm_free(logits);
@@ -4170,15 +5282,24 @@ spec_emit:
 #ifdef USE_TT
         if (spec_k > 0) {
             uint32_t drafts[16];
-            int nd = pn_qwen35moe_tt_mtp_draft(model, state, next_token, spec_k, drafts);
-            if (nd < 1)
-                nd = spec_ngram ? pn_ngram_draft(hist, n_hist, 4, 1, spec_k, drafts) : 0;
-            /* No draft: a one-row verify costs more than the plain decode step. */
-            int ne = 0;
-            if (nd > 0 && spec_ctx.row) {
+            int nd;
+            if (spec_ctx.row) {
+                /* The window the cycle's draws (sampled drafts included) start from. */
                 memcpy(spec_ctx.recent, recent, (size_t)n_recent * sizeof(uint32_t));
                 spec_ctx.n_recent = n_recent;
                 spec_ctx.row_index = 0;
+                pn_spec_sample_begin_drafts(&spec_ctx);
+            }
+            nd = spec_ctx.q ? pn_qwen35moe_tt_mtp_draft_ex(model, state, next_token, spec_k,
+                                                           drafts, pn_spec_sample_draft,
+                                                           &spec_ctx)
+                            : pn_qwen35moe_tt_mtp_draft(model, state, next_token, spec_k, drafts);
+            if (nd < 1)
+                nd = spec_ngram ? pn_ngram_draft(hist, n_hist, 4, 1, spec_k, drafts) : 0;
+            pn_spec_sample_cut_drafts(&spec_ctx, nd);
+            /* No draft: a one-row verify costs more than the plain decode step. */
+            int ne = 0;
+            if (nd > 0 && spec_ctx.row) {
                 ne = pn_qwen35moe_tt_spec_step_ex(model, state, next_token, drafts, nd,
                                                   spec_pending, pn_spec_sample_choose, &spec_ctx);
             } else if (nd > 0) {
@@ -4207,9 +5328,12 @@ spec_emit:
     free(recent);
     free(hist);
 #ifdef USE_TT
+    pn_spec_rule_report(&spec_ctx, "cli");
+    pn_spec_sample_rule_free(&spec_ctx);
     free(spec_ctx.row);
     free(spec_ctx.recent);
     params->dense_row = NULL;
+    params->tail_counts = NULL;
     params->dense_ctx = NULL;
 #endif
 

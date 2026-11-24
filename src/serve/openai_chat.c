@@ -69,6 +69,7 @@
 
 #include "batch_sched.h"
 #include "http_server.h"
+#include "field_patterns_request.h"
 #include "json_reader.h"
 #include "session_key.h"
 #include "attn_residency_json.h"
@@ -77,22 +78,26 @@
 #include "model_registry.h"
 #include "request_profile.h"
 #include "model_session.h"
+#include "replica_affinity.h"
+#include "replica_pin.h"
 #include "serve_generation.h"
+#include "serve_request_dump.h"
 #include "serve_shutdown.h"
 #include "tool_call_stream.h"
 #include "tool_calling.h"
+#include "tool_raw_excerpt.h"
 #include "base64.h"
+#include "sampling_defaults.h"
 #include "../accel/backend_identity.h"
 #include "../core/engine.h"
+#include "../core/mem/pn_host_admission.h"
 #include "../core/mem/pn_mem_state.h"
 #include "../core/mem/pn_memwatch.h"
 #include "../core/prefix_cache.h"
 #include "../core/session_snapshot.h"
+#include "../core/think_history.h"
 #include "../models/qwen35moe.h"
 
-#define OAI_DEFAULT_TEMPERATURE 0.7f
-#define OAI_DEFAULT_TOP_P       0.95f
-#define OAI_DEFAULT_TOP_K       40
 #define OAI_DEFAULT_MAX_TOKENS  1024
 
 /* Ceiling on OpenAI `n`.  Every extra completion is another full decode on a
@@ -156,6 +161,9 @@ typedef struct {
     pn_logit_bias_entry *logit_bias; /* OWNED parsed `logit_bias` map; gen.logit_bias
                                      * borrows it, so it must outlive the completion
                                      * (freed in chat_request_free). */
+    pn_model_sampling sampling;   /* the sampling fields this request CARRIED;
+                                     * re-resolved against the routed model's
+                                     * defaults (sampling_defaults.h). */
 } chat_request;
 
 /* Take ownership of `s` for later free and return it as a borrowed pointer.
@@ -354,8 +362,6 @@ static void parse_openai_sampling_fields(chat_request *req, const jr_value *root
         req->gen.seed = (uint64_t)(int64_t)sv;
     }
 
-    req->gen.presence_penalty = (float)clamp_number(
-        jr_as_number(jr_object_get(root, "presence_penalty"), 0.0), -2.0, 2.0);
     req->gen.frequency_penalty = (float)clamp_number(
         jr_as_number(jr_object_get(root, "frequency_penalty"), 0.0), -2.0, 2.0);
 
@@ -404,29 +410,67 @@ static const char *wire_response_format_status(const chat_request *req,
     return "not_enforced";
 }
 
-/* Concatenate an assistant message's text content and the XML render of its
- * tool_calls into one owned string, registered on the request. Returns the
- * combined borrowed string (falls back to `content` on OOM). */
+/* An assistant message's trimmed text content and the render of its tool_calls
+ * as one owned string (tc_join_assistant_history), registered on the request.
+ * Returns the combined borrowed string (falls back to `content` on OOM). */
 static const char *combine_assistant_tool_calls(chat_request *req,
                                                 const char *content,
                                                 const jr_value *tool_calls,
                                                 tc_dialect dialect)
 {
-    bool content_empty = !content || !*content;
-    char *rendered = tc_render_assistant_tool_calls(tool_calls, content_empty,
-                                                    dialect);
-    if (!rendered) return content ? content : "";
-    size_t clen = content ? strlen(content) : 0;
-    size_t xlen = strlen(rendered);
-    char *combined = malloc(clen + xlen + 1);
-    if (combined) {
-        if (clen) memcpy(combined, content, clen);
-        memcpy(combined + clen, rendered, xlen);
-        combined[clen + xlen] = '\0';
-    }
-    free(rendered);
+    char *combined = tc_join_assistant_history(content, tool_calls, dialect);
+    if (!combined) return content ? content : "";
     const char *owned = req_own(req, combined);
     return owned ? owned : (content ? content : "");
+}
+
+/* A message's text as the chat template renders it: a string as is; an array's
+ * text parts concatenated in order (image/video parts skipped: no vision);
+ * else NULL. */
+static const char *message_text(chat_request *req, const jr_value *content)
+{
+    jr_type k = jr_kind(content);
+    if (k == JR_STRING)
+        return jr_as_string(content);
+    if (k == JR_ARRAY) {
+        int n = jr_array_len(content);
+        char *buf = NULL;
+        size_t len = 0, cap = 0;
+        for (int i = 0; i < n; i++) {
+            const jr_value *item = jr_array_get(content, i);
+            if (jr_kind(item) != JR_OBJECT)
+                continue;
+            const char *type = jr_as_string(jr_object_get(item, "type"));
+            if (type && (strcmp(type, "image") == 0 || strcmp(type, "video") == 0))
+                continue;
+            if (jr_object_get(item, "image") ||
+                jr_object_get(item, "image_url") ||
+                jr_object_get(item, "video"))
+                continue;
+            const char *txt = jr_as_string(jr_object_get(item, "text"));
+            if (!txt)
+                continue;
+            size_t tlen = strlen(txt);
+            if (len + tlen > cap) {
+                size_t new_cap = cap ? cap * 2 : 256;
+                while (new_cap < len + tlen)
+                    new_cap *= 2;
+                char *tmp = realloc(buf, new_cap);
+                if (!tmp) { free(buf); return NULL; }
+                buf = tmp;
+                cap = new_cap;
+            }
+            memcpy(buf + len, txt, tlen);
+            len += tlen;
+        }
+        if (!buf) {
+            buf = malloc(1);
+            if (!buf) return NULL;
+            buf[0] = '\0';
+        }
+        return req_own(req, buf);
+    }
+    return NULL;
 }
 
 /* Build the sg_message[] the generator consumes. When `tools` is present the
@@ -451,7 +495,7 @@ static int build_messages(const jr_value *msgs, chat_request *req,
     req->raw_messages = msgs;
     if (req->tools) {
         const char *sys = first_is_system
-            ? jr_as_string(jr_object_get(first, "content")) : NULL;
+            ? message_text(req, jr_object_get(first, "content")) : NULL;
         /* Render the DEFAULT (Qwen/N2) preamble here; a post-route fixup
          * (chat_apply_tool_dialect) swaps it for the model's native dialect
          * once the resident model is known (e.g. MiniCPM5). Record the slot +
@@ -469,7 +513,7 @@ static int build_messages(const jr_value *msgs, chat_request *req,
     for (int i = start; i < n; i++) {
         const jr_value *m = jr_array_get(msgs, i);
         const char *role = jr_as_string(jr_object_get(m, "role"));
-        const char *content = jr_as_string(jr_object_get(m, "content"));
+        const char *content = message_text(req, jr_object_get(m, "content"));
         const jr_value *tool_calls = jr_object_get(m, "tool_calls");
         if (!role) role = "user";
         req->messages[out].role = role;
@@ -500,6 +544,22 @@ static int build_messages(const jr_value *msgs, chat_request *req,
 /* Defined with its streaming sibling below; declared here because the default
  * arming happens during the parse. */
 static int oai_shutdown_requested(void *ud);
+
+/* `think_history` (core/think_history.h): what the session's KV must hold of
+ * earlier think blocks. Absent → KEEP (today's ladder). A value this serve does
+ * not know is ignored the same way, so a newer client still gets an answer, and
+ * logged once per process so the mismatch is visible without flooding. */
+static void parse_think_history(const jr_value *value, sg_gen_params *gen)
+{
+    static int unknown_logged;
+    if (!value || pn_think_history_parse(jr_as_string(value),
+                                         &gen->think_history))
+        return;
+    if (__atomic_exchange_n(&unknown_logged, 1, __ATOMIC_RELAXED) == 0)
+        fprintf(stderr, "[serve] think_history: unknown value %s ignored "
+                "(known: as_sent, drop_last); logged once\n",
+                jr_as_string(value) ? jr_as_string(value) : "(not a string)");
+}
 
 /* Parse the request DOM into a chat_request. Returns 0 on success, -1 with a
  * human message in *err on failure. */
@@ -557,6 +617,22 @@ static int parse_chat_request(const jr_value *root, chat_request *req,
     /* Borrow the tools DOM for grammar-constrained decoding (consumed when the
      * grammar arms — sg_tool_grammar_arms; otherwise ignored). */
     req->gen.tools = req->tools;
+    /* Keys required only on the first call of a reply that reasoned (borrowed
+     * like `tools`; read by the grammar build, never rendered into the prompt). */
+    req->gen.required_if_reasoned =
+        req->tools ? jr_object_get(root, "required_if_reasoned") : NULL;
+    /* Whole-value patterns on tool string fields (borrowed the same way; read by
+     * the grammar build, never rendered).  A malformed field or a pattern that
+     * does not compile is refused here, with its reason, rather than dropped. */
+    const jr_value *field_patterns = jr_object_get(root, "field_patterns");
+    char fp_err[256];
+    if (field_patterns_validate(field_patterns, fp_err, sizeof(fp_err)) != 0) {
+        *err = req_own(req, strdup(fp_err));
+        if (!*err) *err = "'field_patterns' is malformed";
+        return -1;
+    }
+    req->gen.field_patterns =
+        (req->tools && jr_kind(field_patterns) == JR_OBJECT) ? field_patterns : NULL;
     /* Thread the resolved choice down to Phase-5 forced-call decoding.  With no
      * tools present, forcing is meaningless → fall back to AUTO.  forced_name
      * (when set) is request-OWNED (strdup'd above), so it stays valid for the
@@ -574,12 +650,10 @@ static int parse_chat_request(const jr_value *root, chat_request *req,
 
     if (build_messages(messages, req, err) != 0) return -1;
 
-    req->gen.temperature = (float)jr_as_number(jr_object_get(root, "temperature"),
-                                               OAI_DEFAULT_TEMPERATURE);
-    req->gen.top_p = (float)jr_as_number(jr_object_get(root, "top_p"),
-                                         OAI_DEFAULT_TOP_P);
-    req->gen.top_k = (int)jr_as_number(jr_object_get(root, "top_k"),
-                                       OAI_DEFAULT_TOP_K);
+    /* temperature / top_p / top_k / presence_penalty: request value, else the
+     * serve fallback here; re-resolved against the model's defaults once routed. */
+    pn_model_sampling_from_json(root, &req->sampling);
+    pn_model_sampling_apply(&req->sampling, NULL, &req->gen);
     /* Accept both max_tokens and the newer max_completion_tokens. */
     double mt = jr_as_number(jr_object_get(root, "max_tokens"),
               jr_as_number(jr_object_get(root, "max_completion_tokens"),
@@ -615,6 +689,7 @@ static int parse_chat_request(const jr_value *root, chat_request *req,
     if (jr_kind(et) == JR_BOOL)
         req->gen.thinking = jr_as_bool(et, true) ? SG_THINKING_ON
                                                  : SG_THINKING_OFF;
+    parse_think_history(jr_object_get(root, "think_history"), &req->gen);
     req->stream = jr_as_bool(jr_object_get(root, "stream"), false);
     /* OpenAI stream_options.include_usage: when set, the stream ends with an
      * extra chunk carrying `usage` (and empty `choices`), so a proxy can meter
@@ -820,11 +895,16 @@ static void collect_tool_calls(const chat_request *req, const sg_result *res,
             err->message = strdup("a tool-call frame was emitted but no call "
                                   "could be parsed out of it");
         }
-        if (err && err->kind != TC_PARSE_OK)
-            fprintf(stderr, "[tool_call_dropped] code=%s %s raw_len=%zu raw=<<<%.600s%s>>>\n",
+        if (err && err->kind != TC_PARSE_OK) {
+            flockfile(stderr);   /* one line, even with other requests logging */
+            fprintf(stderr, "[tool_call_dropped] code=%s %s ",
                     tc_parse_failure_code(err->kind),
-                    err->message ? err->message : "(no message)",
-                    rawlen, res->tool_raw, rawlen > 600 ? "…[truncated]" : "");
+                    err->message ? err->message : "(no message)");
+            tool_raw_excerpt_print(stderr, res->tool_raw, TOOL_RAW_EXCERPT_HEAD,
+                                   TOOL_RAW_EXCERPT_TAIL);
+            fputc('\n', stderr);
+            funlockfile(stderr);
+        }
         for (int i = 0; i < *n; i++) {
             if (!tc_args_degenerate((*calls)[i].arguments))
                 continue;
@@ -853,7 +933,7 @@ static void rerender_assistant_history(chat_request *req, tc_dialect dialect)
         if (!role || strcmp(role, "assistant") != 0) continue;
         if (jr_kind(tool_calls) != JR_ARRAY || jr_array_len(tool_calls) == 0)
             continue;
-        const char *content = jr_as_string(jr_object_get(m, "content"));
+        const char *content = message_text(req, jr_object_get(m, "content"));
         req->messages[out].content =
             combine_assistant_tool_calls(req, content, tool_calls, dialect);
     }
@@ -898,6 +978,21 @@ static void chat_apply_tool_dialect(chat_request *req, const pn_model *model,
 /* ============================================================
  * GET /v1/models
  * ============================================================ */
+
+/* `think_history` — the request values this model honours
+ * (core/think_history.h). as_sent on every path: the batched ladder resumes at
+ * the system prefix, the single-user cache and the TT card checkpoint stop at
+ * the first think block, and a request without a session is always cold.
+ * drop_last where a turn-start state is kept: the batched scheduler's turn
+ * checkpoints (CUDA), the single-user turn snapshot, or the TT card's band
+ * checkpoint. Always present, so a client
+ * never has to guess from absence. */
+static void write_think_history_props(json_writer *jw, const mr_info *info)
+{
+    jw_raw(jw, info->think_history_drop_last
+                   ? ",\"think_history\":[\"as_sent\",\"drop_last\"]"
+                   : ",\"think_history\":[\"as_sent\"]");
+}
 
 void oai_handle_models(int client_fd, mr_registry *reg)
 {
@@ -961,6 +1056,7 @@ void oai_handle_models(int client_fd, mr_registry *reg)
             tc_dialect_for_model(info[i].name, info[i].minicpm_tool_dialect);
         jw_printf(&jw, ",\"tool_choice_required_with_thinking\":%s",
                   sg_tool_choice_required_with_thinking(dialect) ? "true" : "false");
+        write_think_history_props(&jw, &info[i]);
         /* `graphs` — CUDA-graph residency, same additive/omit-when-absent rule.
          * A lost graph costs speed only (output stays correct), so this is the
          * one place a client or a poller can see that a model is running
@@ -1199,14 +1295,19 @@ static void send_completion_json(int client_fd, const char *id, long created,
      * reported no reuse from one that does not report reuse at all, so an absent
      * field forces it back to prompt_tokens/TTFT — a prefill rate that rises
      * with every cache hit. Absent and zero are different answers. */
+    /* `resume` + `prefill_tokens`: the rung this turn resumed on and what it
+     * prefilled, so a client metering a think_history request (or any turn)
+     * does not need the serve log. Unconditional, like cached_tokens. */
     jw_printf(&jw, ",\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":%d,"
                    "\"total_tokens\":%d,"
                    "\"prompt_tokens_details\":{\"cached_tokens\":%d},"
-                   "\"kv_used\":%d,\"kv_cap\":%d%s}",
+                   "\"kv_used\":%d,\"kv_cap\":%d,"
+                   "\"resume\":\"%s\",\"prefill_tokens\":%d%s}",
               first->prompt_tokens, completion_total,
               first->prompt_tokens + completion_total,
               first->cached_prompt_tokens,
               first->kv_used_tokens, first->kv_cap_tokens,
+              pn_resume_kind_name(first->resume_kind), first->prefill_tokens,
               first->session_conflict ? ",\"session_conflict\":true" : "");
     /* Tell the client when admission clamped its context (MemoryAware §6.2
      * rung 3): the oldest prompt tokens were dropped to the fitting window, so
@@ -1274,6 +1375,9 @@ typedef struct {
     double      last_write_s;     /* monotonic time of the last SSE write */
     double      keepalive_s;      /* silence that earns a keepalive comment while
                                    * a tool call is being written; 0 = default */
+    bool        client_gone;      /* a write to the stream failed (closed, reset,
+                                   * or not read within the send timeout): the
+                                   * turn's should_abort stops it */
 } stream_ctx;
 
 /* Longest silence on the wire while the model writes a tool call.  Whatever
@@ -1334,7 +1438,8 @@ static void send_chunk(stream_ctx *sc, const char *delta_json,
         jw_string(&jw, sc->response_format_status);
     }
     jw_raw(&jw, "}");
-    hs_send_sse(sc->client_fd, jw.data);
+    if (hs_send_sse(sc->client_fd, jw.data) != 0)
+        sc->client_gone = true;
     sc->last_write_s = oai_now_s();
     jw_free(&jw);
 }
@@ -1350,9 +1455,7 @@ static void send_chunk(stream_ctx *sc, const char *delta_json,
  * `cached_tokens` rides here too, and this is the emission that matters for it:
  * benchmarks stream, so a fix to the non-streaming body alone would leave every
  * measured prefill rate inflated. */
-static void send_usage_chunk(stream_ctx *sc, int prompt_tokens,
-                             int completion_tokens, int cached_tokens,
-                             int kv_used, int kv_cap, int session_conflict)
+static void send_usage_chunk(stream_ctx *sc, const sg_result *res)
 {
     json_writer jw;
     if (!jw_init(&jw)) return;
@@ -1364,15 +1467,20 @@ static void send_usage_chunk(stream_ctx *sc, int prompt_tokens,
     jw_printf(&jw, ",\"choices\":[],\"usage\":{\"prompt_tokens\":%d,"
                    "\"completion_tokens\":%d,\"total_tokens\":%d,"
                    "\"prompt_tokens_details\":{\"cached_tokens\":%d},"
-                   "\"kv_used\":%d,\"kv_cap\":%d%s}}",
-              prompt_tokens, completion_tokens,
-              prompt_tokens + completion_tokens, cached_tokens, kv_used, kv_cap,
+                   "\"kv_used\":%d,\"kv_cap\":%d,"
+                   "\"resume\":\"%s\",\"prefill_tokens\":%d%s}}",
+              res->prompt_tokens, res->completion_tokens,
+              res->prompt_tokens + res->completion_tokens,
+              res->cached_prompt_tokens, res->kv_used_tokens,
+              res->kv_cap_tokens, pn_resume_kind_name(res->resume_kind),
+              res->prefill_tokens,
               /* Same signal as the non-streaming body's "session_conflict":
                * two conversations are sharing one session id, so neither can
                * resume. Rides `usage` because that is the object a streaming
                * client already reads for kv_used/kv_cap. */
-              session_conflict ? ",\"session_conflict\":true" : "");
-    hs_send_sse(sc->client_fd, jw.data);
+              res->session_conflict ? ",\"session_conflict\":true" : "");
+    if (hs_send_sse(sc->client_fd, jw.data) != 0)
+        sc->client_gone = true;
     jw_free(&jw);
 }
 
@@ -1406,6 +1514,21 @@ static void send_context_over_budget_sse(int client_fd, int kv_used, int kv_cap)
              kv_used, kv_cap);
     hs_send_sse(client_fd, json);
     hs_end_sse(client_fd);
+}
+
+/* A turn refused to protect host memory, on an open SSE stream: an OpenAI
+ * error event carrying the refusal (the caller ends the stream). */
+static void send_memory_constrained_sse(int client_fd, const char *reason)
+{
+    json_writer jw;
+    if (!jw_init(&jw))
+        return;
+    jw_raw(&jw, "{\"error\":{\"message\":");
+    jw_string(&jw, reason && reason[0] ? reason
+                                       : "server memory-constrained; retry shortly");
+    jw_raw(&jw, ",\"type\":\"server_memory_constrained\",\"code\":null}}");
+    hs_send_sse(client_fd, jw.data);
+    jw_free(&jw);
 }
 
 static void ensure_role_sent(stream_ctx *sc)
@@ -1475,7 +1598,8 @@ static void stream_tool_call_progress(void *ud)
     double interval = sc->keepalive_s > 0 ? sc->keepalive_s : OAI_TOOL_KEEPALIVE_S;
     double now = oai_now_s();
     if (now - sc->last_write_s < interval) return;
-    hs_send_sse_comment(sc->client_fd, "keepalive");
+    if (hs_send_sse_comment(sc->client_fd, "keepalive") != 0)
+        sc->client_gone = true;
     sc->last_write_s = now;
 }
 
@@ -1523,18 +1647,79 @@ static sg_gen_params gen_params_for_choice(const chat_request *req, int index)
     return g;
 }
 
-/* should_abort for a streaming turn: true once the client has disconnected, OR
- * once the process has been asked to stop. ud is a pointer to the client fd
- * (valid for the whole synchronous completion).
+/* What a routed turn's should_abort looks at: the client fd (streaming only —
+ * NULL where a disconnect is not acted on) and the model entry it runs on. Both
+ * outlive the synchronous completion. */
+typedef struct {
+    const int      *client_fd;
+    const mr_entry *entry;
+    const bool     *client_gone;   /* the stream's failed-write flag, or NULL */
+} oai_turn_abort_ctx;
+
+/* should_abort for a routed turn: true once the process has been asked to stop,
+ * once an unload of this model has cancelled its live turns
+ * (mr_turn_cancel_requested), or — streaming — once the client disconnected.
  *
  * The shutdown arm is what makes SIGTERM able to retire the card residencies:
  * the accept loop cannot tear the accelerator down while a turn is still
  * submitting descriptors against it, so the turn has to stop being asked to
- * finish first. The generation loop polls this between prefill chunks and every
- * 8 decode tokens, which bounds how long a stop waits. */
-static int oai_client_gone(void *ud)
+ * finish first. The unload arm is the same idea for one model: an unload that
+ * outwaited its finish budget asks the turn to stop so it can free the card
+ * instead of refusing. The generation loop polls this between prefill chunks
+ * and every 8 decode tokens, which bounds how long a stop waits. */
+static int oai_turn_should_abort(void *ud)
 {
-    return pn_serve_shutdown_requested() || !hs_client_alive(*(const int *)ud);
+    const oai_turn_abort_ctx *a = ud;
+
+    if (pn_serve_shutdown_requested())
+        return 1;
+    if (a && mr_turn_cancel_requested(a->entry))
+        return 1;
+    if (a && a->client_gone && *a->client_gone)
+        return 1;   /* a write already failed: the slot goes back now */
+    return a && a->client_fd && !hs_client_alive(*a->client_fd);
+}
+
+/* The streaming arming of a routed turn's abort: same entry, plus the client
+ * fd. `out` must outlive the completion (the caller's stack frame). */
+static void arm_streaming_abort(sg_gen_params *g, oai_turn_abort_ctx *out,
+                                const int *client_fd, const bool *client_gone)
+{
+    const oai_turn_abort_ctx *routed = g->should_abort == oai_turn_should_abort
+                                     ? g->abort_ud : NULL;
+
+    out->client_fd = client_fd;
+    out->client_gone = client_gone;
+    out->entry = routed ? routed->entry : NULL;
+    g->should_abort = oai_turn_should_abort;
+    g->abort_ud = out;
+}
+
+/* Was this aborted turn stopped by an unload of its model (not a disconnect)? */
+static bool turn_cancelled_by_unload(const sg_gen_params *g)
+{
+    const oai_turn_abort_ctx *a = g->should_abort == oai_turn_should_abort
+                                ? g->abort_ud : NULL;
+
+    return a && mr_turn_cancel_requested(a->entry);
+}
+
+/* The terminal SSE error a streaming turn gets when an unload cancels it. */
+static void send_model_unloaded_sse(int client_fd)
+{
+    hs_send_sse(client_fd, "{\"error\":{\"message\":\"the model was unloaded; "
+                "this turn was cancelled\",\"type\":\"model_unloaded\","
+                "\"code\":\"model_unloaded\"}}");
+}
+
+/* The terminal SSE error of a turn the decode watchdog stopped: no token came
+ * for bs_decode_stall_ms(), the slot is released, and the stream ends here
+ * instead of staying open with nothing on it. */
+static void send_generation_stalled_sse(int client_fd)
+{
+    hs_send_sse(client_fd, "{\"error\":{\"message\":\"generation stalled: no token "
+                "for too long; the turn was stopped, retry it\",\"type\":"
+                "\"generation_stalled\",\"code\":\"generation_stalled\"}}");
 }
 
 /* should_abort for a turn with no client-liveness check (the non-streaming
@@ -1607,29 +1792,35 @@ static int run_streaming(int client_fd, pn_model *model, pn_state *state,
                          stream_ctx *sc, const sg_prefix_ctx *pc)
 {
     sg_gen_params g = *gen;
+    oai_turn_abort_ctx abort_ctx;
     /* Free the model slot the instant the client disconnects (e.g. Esc) instead
      * of finishing a cold prefill nobody will read — that lingering slot is what
      * made the next turn hit a "busy" empty response. */
-    g.should_abort = oai_client_gone;
-    g.abort_ud = (void *)&client_fd;
+    arm_streaming_abort(&g, &abort_ctx, &client_fd, &sc->client_gone);
     tcs_streamer ts;
     bool tool_stream = stream_tool_calls_begin(sc, &ts, req, &g);
     sg_result res = {0};
     int rc = sg_run_completion(model, state, req->messages, req->n_messages,
                                &g, stream_delta_cb, sc, &res, pc);
-    if (rc == SG_ABORTED) {
+    if (turn_cancelled_by_unload(&g)) {
+        /* Checked before rc: a cancel landing mid-decode ends the loop like a
+         * clean "stop" (rc 0), and closing it as one would pass a cut-off answer
+         * off as complete. */
+        fprintf(stderr, "[serve] model unloading — turn cancelled\n");
+        send_model_unloaded_sse(client_fd);
+        rc = SG_ABORTED;
+    } else if (rc == SG_ABORTED) {
         /* Client is gone and the slot is released; nothing to send. */
         fprintf(stderr, "[serve] client disconnected — turn aborted, slot released\n");
+    } else if (rc == SG_ADMIT_DENIED) {
+        send_memory_constrained_sse(client_fd, res.admit_reason);
     } else if (rc == SG_CONTEXT_OVER_BUDGET) {
         send_context_over_budget_sse(client_fd, res.kv_used_tokens,
                                      res.kv_cap_tokens);
     } else {
         stream_finish_choice(sc, req, &res, rc);
         if (req->include_usage)
-            send_usage_chunk(sc, res.prompt_tokens, res.completion_tokens,
-                             res.cached_prompt_tokens,
-                             res.kv_used_tokens, res.kv_cap_tokens,
-                             res.session_conflict);
+            send_usage_chunk(sc, &res);
     }
     if (tool_stream) stream_tool_calls_end(sc, &ts);
     sg_result_free(&res);
@@ -1653,28 +1844,34 @@ static int run_streaming_batched(int client_fd, pn_model *model,
      * whole cold prefill (~205 s at 8k) holding a decode slot.  A foreign client
      * with a fixed timeout would retry into a second slot and repeat it; the
      * server, not the client, has to be the one that stops. */
-    g.should_abort = oai_client_gone;
-    g.abort_ud = (void *)&client_fd;
+    oai_turn_abort_ctx abort_ctx;
+    arm_streaming_abort(&g, &abort_ctx, &client_fd, &sc->client_gone);
     tcs_streamer ts;
     bool tool_stream = stream_tool_calls_begin(sc, &ts, req, &g);
     sg_result res = {0};
     int rc = sg_run_completion_batched(model, sched, slot, req->messages,
                                        req->n_messages, &g,
                                        stream_delta_cb, sc, &res, sid);
-    if (rc == SG_ABORTED) {
+    if (turn_cancelled_by_unload(&g)) {
+        /* Before rc, for the reason run_streaming gives. */
+        fprintf(stderr, "[serve] model unloading — batched turn cancelled\n");
+        send_model_unloaded_sse(client_fd);
+        rc = SG_ABORTED;
+    } else if (rc == SG_ABORTED) {
         /* Client is gone and the slot is released; nothing to send. */
         fprintf(stderr, "[serve] client disconnected — batched turn aborted, "
                 "slot released\n");
+    } else if (rc == SG_STALLED) {
+        send_generation_stalled_sse(client_fd);
+    } else if (rc == SG_ADMIT_DENIED) {
+        send_memory_constrained_sse(client_fd, res.admit_reason);
     } else if (rc == SG_CONTEXT_OVER_BUDGET) {
         send_context_over_budget_sse(client_fd, res.kv_used_tokens,
                                      res.kv_cap_tokens);
     } else {
         stream_finish_choice(sc, req, &res, rc);
         if (req->include_usage)
-            send_usage_chunk(sc, res.prompt_tokens, res.completion_tokens,
-                             res.cached_prompt_tokens,
-                             res.kv_used_tokens, res.kv_cap_tokens,
-                             res.session_conflict);
+            send_usage_chunk(sc, &res);
     }
     if (tool_stream) stream_tool_calls_end(sc, &ts);
     sg_result_free(&res);
@@ -1686,12 +1883,25 @@ static int run_streaming_batched(int client_fd, pn_model *model,
  * request routes to it regardless of the field (the single-model server's
  * behavior, so existing clients keep working); with several, an exact name
  * match is required (a missing field falls back to the default model) and an
- * unknown name is a clean 404. Returns NULL after answering the client. */
+ * unknown name is a clean 404. A requested copy (route->replica) binds a new
+ * session to exactly that copy (replica_pin.h). Every response after routing
+ * carries X-Pantheon-Replica. Returns NULL after answering the client. */
 static mr_entry *route_model(int client_fd, mr_registry *reg,
-                             const char *name)
+                             const char *name, const char *sid, mr_route *route)
 {
-    mr_entry *entry = (mr_count(reg) <= 1) ? mr_acquire(reg, NULL)
-                                           : mr_acquire(reg, name);
+    mr_entry *entry = NULL;
+
+    /* Replicas of one name: the session's own replica, else the requested one,
+     * else the least busy. */
+    if (route->replica == 0 && mr_count(reg) <= 1) {
+        entry = mr_acquire(reg, NULL);
+        pn_replica_pin_announce(entry);
+    } else {
+        entry = pn_replica_pin_acquire(client_fd, reg, mr_count(reg) <= 1 ? NULL : name,
+                                       sid, route);
+        if (!entry && route->status == MR_ROUTE_NO_REPLICA)
+            return NULL;   /* answered: the copy is not loaded */
+    }
     if (entry)
         return entry;
     if (mr_count(reg) == 0)
@@ -1703,21 +1913,37 @@ static mr_entry *route_model(int client_fd, mr_registry *reg,
     return NULL;
 }
 
-/*
- * Acquire one decode slot on the batched path, waiting in the scheduler's
- * bounded FIFO when every slot is busy and gating new prefills on host memory
- * pressure (D3 backpressure).  429 only when the queue is full; 503 when the
- * queue is full AND memory is CRITICAL.
- *
- * `answer_client` sends the OpenAI error body on failure.  It is false for the
- * second and later completions of an `n` > 1 request: a response is already in
- * flight (SSE) or already has usable choices, so an error body would corrupt it
- * — the caller reports the shortfall in `n_status` instead.
- */
-static bs_acquire_result acquire_decode_slot(int client_fd,
-                                             pn_batch_sched *sched,
-                                             const char *sid, int *slot_out,
-                                             bool answer_client)
+/* Log a session-capacity 429 with who holds the seats, so a refusal while
+ * sessions_used reads below max_sessions (a family holding several slots) is
+ * visible in the serve log. */
+static void log_session_capacity_refuse(const mr_entry *entry, const char *sid)
+{
+    ms_occupancy o;
+
+    ms_session_occupancy(entry, &o);
+    fprintf(stderr, "[admission] 429 session capacity: sid=%s model=%s replica=%d "
+            "sessions=%d/%d slots_held=%d slots_free=%d seat_free=%d\n",
+            sid && sid[0] ? sid : "-", entry->name, entry->replica,
+            o.sessions_used, o.max_sessions, o.slots_held, o.slots_free,
+            (int)o.seat_free);
+}
+
+/* Send the Phase-5 "model at session capacity" 429 with a Retry-After and a
+ * re-prefill restart estimate. `restart_tokens` is the committed length the
+ * refused (returning/expired) session would re-prefill; 0 for a truly new sid. */
+static void send_session_capacity_refuse(int client_fd, const mr_route *route,
+                                         const mr_entry *entry, const char *sid,
+                                         int restart_tokens)
+{
+    int restart_s = (int)((double)restart_tokens
+                          / oai_prefill_tok_per_s() + 0.5);
+    log_session_capacity_refuse(entry, sid);
+    pn_replica_pin_send_full(client_fd, route, entry, restart_s);
+}
+
+/* Take a decode slot (see acquire_decode_slot) without answering the client. */
+static bs_acquire_result acquire_decode_slot_quiet(pn_batch_sched *sched, const char *sid,
+                                                   int *slot_out, int *retry_after)
 {
     /* Refresh the pressure snapshot so the scheduler sees the current host state
      * at decision time (memwatch polls every 250 ms; this forces an immediate
@@ -1728,12 +1954,20 @@ static bs_acquire_result acquire_decode_slot(int client_fd,
         bs_notify_pressure(sched, (int)ms.level);
     }
     static const int SLOT_WAIT_MS = 30000;  /* 30 s max queue wait */
-    int retry_after = 0;
+    *retry_after = 0;
     *slot_out = -1;
-    bs_acquire_result ar = bs_slot_acquire_or_wait(sched, SLOT_WAIT_MS, slot_out,
-                                                   &retry_after, sid);
-    if (ar == BS_ACQUIRE_OK || !answer_client)
-        return ar;
+    return bs_slot_acquire_or_wait(sched, SLOT_WAIT_MS, slot_out, retry_after, sid);
+}
+
+/* The OpenAI error body for a failed slot acquire. */
+static void send_acquire_refusal(int client_fd, bs_acquire_result ar, int retry_after,
+                                 const mr_route *route, const mr_entry *entry,
+                                 const char *sid)
+{
+    if (ar == BS_ACQUIRE_AT_CAPACITY) {
+        send_session_capacity_refuse(client_fd, route, entry, sid, 0);
+        return;
+    }
 
     int http_code;
     const char *err_code, *err_msg;
@@ -1766,31 +2000,78 @@ static bs_acquire_result acquire_decode_slot(int client_fd,
     } else {
         hs_send_error(client_fd, http_code, err_code, err_msg);
     }
+}
+
+/*
+ * Acquire one decode slot on the batched path, waiting in the scheduler's
+ * bounded FIFO when every slot is busy and gating new prefills on host memory
+ * pressure (D3 backpressure).  429 only when the queue is full; 503 when the
+ * queue is full AND memory is CRITICAL.  The scheduler also admits the
+ * session (max_sessions): a new session with no seat gets the immediate
+ * 429 model_at_session_capacity, never a wait or another session's slot.
+ *
+ * `answer_client` sends the OpenAI error body on failure.  It is false for the
+ * second and later completions of an `n` > 1 request: a response is already in
+ * flight (SSE) or already has usable choices, so an error body would corrupt it
+ * — the caller reports the shortfall in `n_status` instead.
+ */
+static bs_acquire_result acquire_decode_slot(int client_fd,
+                                             pn_batch_sched *sched,
+                                             const mr_route *route,
+                                             const mr_entry *entry,
+                                             const char *sid, int *slot_out,
+                                             bool answer_client)
+{
+    int retry_after = 0;
+    bs_acquire_result ar = acquire_decode_slot_quiet(sched, sid, slot_out, &retry_after);
+    if (ar != BS_ACQUIRE_OK && answer_client)
+        send_acquire_refusal(client_fd, ar, retry_after, route, entry, sid);
     return ar;
 }
 
-/* Send the Phase-5 "model at session capacity" 429 with a Retry-After and a
- * re-prefill restart estimate. `restart_tokens` is the committed length the
- * refused (returning/expired) session would re-prefill; 0 for a truly new sid. */
-static void send_session_capacity_refuse(int client_fd, const mr_entry *entry,
-                                         int restart_tokens)
+/*
+ * The first completion's slot, failing over between copies: when this copy
+ * refuses (no seat, queue full, no slot in time) a session that holds no seat
+ * here and named no copy, the least busy other copy with a free seat is tried
+ * before the client hears a 429 — a full replica never refuses a session a free
+ * one could seat.  On a move *entry (and the scheduler, model and abort target
+ * derived from it) switch to the new copy; the old reference is released.
+ * Answers the client on failure, like acquire_decode_slot.
+ */
+static bs_acquire_result acquire_with_failover(int client_fd, mr_registry *reg,
+                                               mr_route *route, mr_entry **entry,
+                                               oai_turn_abort_ctx *turn_abort,
+                                               const char *sid, int *slot_out)
 {
-    int restart_s = (int)((double)restart_tokens
-                          / oai_prefill_tok_per_s() + 0.5);
-    char ra_hdr[64];
-    snprintf(ra_hdr, sizeof(ra_hdr), "Retry-After: %d\r\n", 30);
-    char msg[192];
-    snprintf(msg, sizeof(msg),
-             "model at session capacity (%d live sessions); retry "
-             "shortly. A fresh session re-prefills in ~%ds.",
-             entry->max_sessions, restart_s);
-    hs_send_error_ex(client_fd, 429, "model_at_session_capacity", msg, ra_hdr);
+    int retry_after = 0;
+    mr_entry *at = *entry;
+    bs_acquire_result ar = acquire_decode_slot_quiet(at->sched, sid, slot_out, &retry_after);
+
+    while (ar != BS_ACQUIRE_OK && ar != BS_ACQUIRE_SHUTDOWN && route->replica <= 0 &&
+           !ms_session_holds_seat(at, sid)) {
+        mr_entry *next = mr_failover_session(reg, at, sid, route);
+        if (!next || !next->sched) {
+            if (next)
+                mr_release(reg, next);
+            break;
+        }
+        mr_release(reg, at);
+        at = next;
+        *entry = at;
+        turn_abort->entry = at;
+        pn_replica_pin_announce(at);
+        ar = acquire_decode_slot_quiet(at->sched, sid, slot_out, &retry_after);
+    }
+    if (ar != BS_ACQUIRE_OK)
+        send_acquire_refusal(client_fd, ar, retry_after, route, at, sid);
+    return ar;
 }
 
 void oai_handle_chat(int client_fd, mr_registry *reg, const char *body,
-                     const char *session_id)
+                     const char *session_id, const char *replica_header)
 {
     if (!body) { hs_send_error(client_fd, 400, "invalid_request_error", "empty request body"); return; }
+    sg_request_dump_body(body);
 
     pn_reqprof_phase_start(PN_REQ_JSON_PARSE);
     jr_value *root = jr_parse(body);
@@ -1811,12 +2092,39 @@ void oai_handle_chat(int client_fd, mr_registry *reg, const char *body,
         return;
     }
 
+    /* The copy the client asks for (body "replica" wins over the header). A
+     * turn may re-place a bound session that holds no seat on its copy. */
+    mr_route route = { .place_unseated = true };
+    char pin_err[96];
+    if (pn_replica_pin_parse(root, replica_header, &route.replica, pin_err,
+                             sizeof(pin_err)) != 0) {
+        hs_send_error(client_fd, 400, "invalid_request_error", pin_err);
+        chat_request_free(&req);
+        jr_free(root);
+        return;
+    }
+
     /* Route to the resident model. The held reference keeps mr_unload from
      * freeing the model mid-generation. */
     pn_reqprof_phase_start(PN_REQ_ROUTE);
-    mr_entry *entry = route_model(client_fd, reg, req.model);
+    mr_entry *entry = route_model(client_fd, reg, req.model,
+                                  (req.session_id && req.session_id[0]) ? req.session_id
+                                                                        : session_id,
+                                  &route);
     if (!entry) {
         pn_reqprof_phase_end(PN_REQ_ROUTE);
+        chat_request_free(&req);
+        jr_free(root);
+        return;
+    }
+    /* Pantheon Local: a session belongs to the person who first used it (§4.8). */
+    if (ms_session_principal_check(entry, (req.session_id && req.session_id[0]) ? req.session_id
+                                                                                 : session_id,
+                                   hs_thread_principal(), hs_thread_principal_admin(),
+                                   MS_PRINCIPAL_BIND) != MS_OK) {
+        pn_reqprof_phase_end(PN_REQ_ROUTE);
+        hs_send_error(client_fd, 403, "session_not_yours", MS_NOT_YOURS_MESSAGE);
+        mr_release(reg, entry);
         chat_request_free(&req);
         jr_free(root);
         return;
@@ -1825,6 +2133,12 @@ void oai_handle_chat(int client_fd, mr_registry *reg, const char *body,
     pn_model        *model    = entry->model;
     const char      *model_id = entry->name;
     pn_batch_sched  *sched    = entry->sched;   /* non-NULL when C3 is active */
+
+    /* Every turn on this entry is now cancellable by an unload of it (plus the
+     * shutdown check parse armed); the streaming paths add client liveness. */
+    oai_turn_abort_ctx turn_abort = { .client_fd = NULL, .entry = entry };
+    req.gen.should_abort = oai_turn_should_abort;
+    req.gen.abort_ud = &turn_abort;
 
     /* Now that the resident model is known, resolve its tool-call dialect and
      * swap the tools preamble / re-render history into it (e.g. MiniCPM5's
@@ -1838,6 +2152,9 @@ void oai_handle_chat(int client_fd, mr_registry *reg, const char *body,
      * (from --reasoning-budget) ELSE 0 (disabled). */
     if (!req.reasoning_budget_set)
         req.gen.reasoning_budget = entry->reasoning_budget;
+    req.gen.reasoning_reserve = entry->reasoning_reserve;
+    /* Absent sampling fields take the model's defaults (A4). */
+    pn_model_sampling_apply(&req.sampling, &entry->sampling, &req.gen);
     /* Name the model on the params purely so an abnormal-event log (the
      * reasoning force-close) can say WHICH model it happened to.  Borrowed from
      * the registry entry, which outlives this request (it is ref-held). */
@@ -1855,41 +2172,13 @@ void oai_handle_chat(int client_fd, mr_registry *reg, const char *body,
     long created = (long)time(NULL);
 
     /* ── Phase 5: session admission — REFUSE at capacity + idle TTL ──
-     * A "session" is a live prefix-cache slot. Before touching the model, gate a
-     * genuinely-NEW session id against the model's per-model max_sessions cap:
-     * if every slot holds a live, non-idle session, refuse with a clean 429
-     * (never queue, never LRU-evict a live session — an existing sid always
-     * resumes). The reaper inside admit first frees any slot idle past the TTL.
-     * On refuse the serve reports a re-prefill restart estimate for the client
-     * UX. Only engaged when the client sent a session id AND the model has a
-     * prefix cache; the uncached path is byte-identical to before.
-     *
-     * The BATCHED path admits here under pc_lock (its cache ops — admit/touch —
-     * are all pc_lock-guarded and it never runs the cache's own generation).
-     * The SINGLE-USER path admits LATER, under gen_lock (see below): its
-     * generation mutates the same per-session cache states with pc_lock==NULL
-     * (serialized only by gen_lock), so running the idle reaper here under
-     * pc_lock could free a slot a concurrent single-user generation is still
-     * using (use-after-free). Admitting it under gen_lock serializes the reaper
-     * with that generation. */
-    if (sched && entry->prefix_cache && sid) {
-        int restart_tokens = 0;
-        pn_reqprof_phase_start(PN_REQ_SESSION_ADMIT);
-        pthread_mutex_lock(&entry->pc_lock);
-        pn_session_admit v = pn_prefix_cache_admit(entry->prefix_cache, sid,
-                                                   ms_now_ms(),
-                                                   ms_session_idle_ttl_ms(),
-                                                   &restart_tokens);
-        pthread_mutex_unlock(&entry->pc_lock);
-        pn_reqprof_phase_end(PN_REQ_SESSION_ADMIT);
-        if (v == PN_SESSION_ADMIT_AT_CAPACITY) {
-            send_session_capacity_refuse(client_fd, entry, restart_tokens);
-            mr_release(reg, entry);
-            chat_request_free(&req);
-            jr_free(root);
-            return;
-        }
-    }
+     * A new session past the model's max_sessions gets a clean 429 (never
+     * queued, never seated on a live session's state — an existing session
+     * always resumes); idle unwatched sessions are reaped first.  The BATCHED
+     * path admits inside the scheduler, atomically with the slot claim
+     * (acquire_decode_slot): its slots hold the sessions.  The SINGLE-USER
+     * path admits below, under gen_lock: its generation mutates the same
+     * per-session cache states the reaper frees. */
 
     /* ── C3 batched path (QWEN35_BATCH_SLOTS=1 and model is GPU-placed) ── */
     if (sched) {
@@ -1915,16 +2204,30 @@ void oai_handle_chat(int client_fd, mr_registry *reg, const char *body,
             /* D1+D3: acquire a slot BEFORE opening SSE so a 429/503 can be sent
              * cleanly without an in-progress SSE stream to abort. */
             int slot = -1;
-            bs_acquire_result ar =
-                acquire_decode_slot(client_fd, sched, sid, &slot,
-                                    /* answer_client = */ ci == 0);
+            bs_acquire_result ar;
+            if (ci == 0) {
+                ar = acquire_with_failover(client_fd, reg, &route, &entry, &turn_abort,
+                                           sid, &slot);
+                /* A failover moved the turn: everything below runs on the new copy
+                 * (same model file, same name). */
+                sched = entry->sched;
+                model = entry->model;
+                model_id = entry->name;
+                sc.model_id = model_id;
+                req.gen.model_name = entry->name;
+            } else {
+                ar = acquire_decode_slot(client_fd, sched, &route, entry, sid, &slot, false);
+            }
             if (ar != BS_ACQUIRE_OK) {
                 /* The FIRST choice failing is the whole request failing, and
                  * acquire_decode_slot already answered.  A LATER choice failing
                  * cannot inject an error into a response already in flight — the
                  * client gets the completions that did land, and n_status says
                  * the rest did not. */
-                if (ci == 0) goto batched_done;
+                if (ci == 0) {
+                    pn_replica_pin_undo(&route, entry, sid);
+                    goto batched_done;
+                }
                 n_status = "partial_slot_unavailable";
                 break;
             }
@@ -1937,7 +2240,10 @@ void oai_handle_chat(int client_fd, mr_registry *reg, const char *body,
             sg_gen_params gen = gen_params_for_choice(&req, ci);
 
             if (req.stream) {
-                if (!sse_open) { hs_begin_sse(client_fd); sse_open = true; }
+                if (!sse_open) {
+                    sc.client_gone = hs_begin_sse(client_fd) != 0;
+                    sse_open = true;
+                }
                 sc.choice_index = ci;
                 sc.role_sent    = false;
                 int rc = run_streaming_batched(client_fd, model, sched, &req,
@@ -1950,6 +2256,8 @@ void oai_handle_chat(int client_fd, mr_registry *reg, const char *body,
                                                    req.messages, req.n_messages,
                                                    &gen, NULL, NULL, &ch->res,
                                                    choice_sid);
+                if (turn_cancelled_by_unload(&gen))
+                    rc = SG_ABORTED;   /* a mid-decode cancel returns 0 */
                 if (rc != 0) {
                     if (n_delivered > 0) {
                         /* Some completions already succeeded — return them
@@ -1962,11 +2270,21 @@ void oai_handle_chat(int client_fd, mr_registry *reg, const char *body,
                     }
                     if (rc == SG_ADMIT_DENIED)
                         hs_send_error(client_fd, 503, "server_memory_constrained",
-                                      "server memory-constrained; retry shortly");
+                                      ch->res.admit_reason[0]
+                                          ? ch->res.admit_reason
+                                          : "server memory-constrained; retry shortly");
                     else if (rc == SG_CONTEXT_OVER_BUDGET)
                         send_context_over_budget_http(client_fd,
                                                       ch->res.kv_used_tokens,
                                                       ch->res.kv_cap_tokens);
+                    else if (turn_cancelled_by_unload(&gen))
+                        hs_send_error(client_fd, 503, "model_unloaded",
+                                      "the model was unloaded; this turn was "
+                                      "cancelled");
+                    else if (rc == SG_STALLED)
+                        hs_send_error(client_fd, 503, "generation_stalled",
+                                      "generation stalled: no token for too long; "
+                                      "the turn was stopped, retry it");
                     else
                         hs_send_error(client_fd, 500, "server_error",
                                       "generation failed");
@@ -1997,13 +2315,6 @@ void oai_handle_chat(int client_fd, mr_registry *reg, const char *body,
         for (int ci = 0; choices && ci < n_delivered; ci++)
             chat_choice_free(&choices[ci]);
         free(choices);
-        /* Phase 5: mark the session active for the idle-TTL reaper. The batched
-         * path has concurrent slots, so guard the cache op with pc_lock. */
-        if (entry->prefix_cache && sid) {
-            pthread_mutex_lock(&entry->pc_lock);
-            pn_prefix_cache_touch(entry->prefix_cache, sid, ms_now_ms());
-            pthread_mutex_unlock(&entry->pc_lock);
-        }
         /* No gen_lock to release — the slot scheduler manages concurrency. */
         mr_release(reg, entry);
         chat_request_free(&req);
@@ -2019,6 +2330,7 @@ void oai_handle_chat(int client_fd, mr_registry *reg, const char *body,
         hs_send_error(client_fd, 429, "server_busy",
                       "a generation is already in progress on this model; "
                       "retry shortly");
+        pn_replica_pin_undo(&route, entry, sid);
         mr_release(reg, entry);
         chat_request_free(&req);
         jr_free(root);
@@ -2040,7 +2352,8 @@ void oai_handle_chat(int client_fd, mr_registry *reg, const char *body,
                                                    &restart_tokens);
         if (v == PN_SESSION_ADMIT_AT_CAPACITY) {
             pthread_mutex_unlock(&entry->gen_lock);
-            send_session_capacity_refuse(client_fd, entry, restart_tokens);
+            send_session_capacity_refuse(client_fd, &route, entry, sid, restart_tokens);
+            pn_replica_pin_undo(&route, entry, sid);
             mr_release(reg, entry);
             chat_request_free(&req);
             jr_free(root);
@@ -2075,7 +2388,10 @@ void oai_handle_chat(int client_fd, mr_registry *reg, const char *body,
             sg_gen_params gen = gen_params_for_choice(&req, ci);
 
             if (req.stream) {
-                if (!sse_open) { hs_begin_sse(client_fd); sse_open = true; }
+                if (!sse_open) {
+                    sc.client_gone = hs_begin_sse(client_fd) != 0;
+                    sse_open = true;
+                }
                 sc.choice_index = ci;
                 sc.role_sent    = false;
                 int rc = run_streaming(client_fd, model, state, &req, &gen, &sc,
@@ -2087,6 +2403,8 @@ void oai_handle_chat(int client_fd, mr_registry *reg, const char *body,
                 int rc = sg_run_completion(model, state, req.messages,
                                            req.n_messages, &gen, NULL, NULL,
                                            &ch->res, choice_pc);
+                if (turn_cancelled_by_unload(&gen))
+                    rc = SG_ABORTED;   /* a mid-decode cancel returns 0 */
                 if (rc != 0) {
                     if (n_delivered > 0) {
                         n_status = "partial_generation_failed";
@@ -2096,11 +2414,17 @@ void oai_handle_chat(int client_fd, mr_registry *reg, const char *body,
                     }
                     if (rc == SG_ADMIT_DENIED)
                         hs_send_error(client_fd, 503, "server_memory_constrained",
-                                      "server memory-constrained; retry shortly");
+                                      ch->res.admit_reason[0]
+                                          ? ch->res.admit_reason
+                                          : "server memory-constrained; retry shortly");
                     else if (rc == SG_CONTEXT_OVER_BUDGET)
                         send_context_over_budget_http(client_fd,
                                                       ch->res.kv_used_tokens,
                                                       ch->res.kv_cap_tokens);
+                    else if (turn_cancelled_by_unload(&gen))
+                        hs_send_error(client_fd, 503, "model_unloaded",
+                                      "the model was unloaded; this turn was "
+                                      "cancelled");
                     else
                         hs_send_error(client_fd, 500, "server_error",
                                       "generation failed");
@@ -2173,7 +2497,8 @@ static uint32_t *parse_token_array(const jr_value *arr, int *n)
  * length must equal the blob's snapshot pos. On a weights_version mismatch or a
  * bad blob, answer a clean error so the client falls back to message-replay. */
 void oai_handle_session_restore(int client_fd, mr_registry *reg,
-                                const char *body, const char *session_id)
+                                const char *body, const char *session_id,
+                                const char *replica_header)
 {
     if (!body) { hs_send_error(client_fd, 400, "invalid_request_error", "empty request body"); return; }
     jr_value *root = jr_parse(body);
@@ -2202,11 +2527,22 @@ void oai_handle_session_restore(int client_fd, mr_registry *reg,
         return;
     }
 
-    mr_entry *entry = mr_acquire(reg, name);
+    /* A restore binds the session like its first turn: honour a requested copy. */
+    mr_route route = {0};
+    char pin_err[96];
+    if (pn_replica_pin_parse(root, replica_header, &route.replica, pin_err,
+                             sizeof(pin_err)) != 0) {
+        free(tokens);
+        hs_send_error(client_fd, 400, "invalid_request_error", pin_err);
+        jr_free(root);
+        return;
+    }
+    mr_entry *entry = pn_replica_pin_acquire(client_fd, reg, name, sid, &route);
     if (!entry) {
         free(tokens);
-        hs_send_error(client_fd, 404, "model_not_found",
-                      "the requested model is not loaded (see GET /v1/models)");
+        if (route.status != MR_ROUTE_NO_REPLICA)
+            hs_send_error(client_fd, 404, "model_not_found",
+                          "the requested model is not loaded (see GET /v1/models)");
         jr_free(root);
         return;
     }
@@ -2220,6 +2556,13 @@ void oai_handle_session_restore(int client_fd, mr_registry *reg,
         jr_free(root);
         return;
     }
+    if (ms_session_principal_check(entry, sid, hs_thread_principal(),
+                                   hs_thread_principal_admin(), MS_PRINCIPAL_BIND) != MS_OK) {
+        mr_release(reg, entry); free(tokens);
+        hs_send_error(client_fd, 403, "session_not_yours", MS_NOT_YOURS_MESSAGE);
+        jr_free(root);
+        return;
+    }
 
     /* Decode + deserialize the blob, then validate its weights_version — all
      * BEFORE handing it to the facade, so the (potentially large) untrusted
@@ -2227,6 +2570,18 @@ void oai_handle_session_restore(int client_fd, mr_registry *reg,
      * happen on BOTH paths and before any state is touched: a blob captured
      * under a different model build must never be written into a live slot. */
     size_t blob_len = 0;
+    char admit_reason[PN_HOST_ADMIT_REASON_LEN];
+    /* Decoded blob (3/4 of the text) + the snapshot it parses into (~the blob
+     * again) are both live at once. */
+    if (pn_host_admit_check((uint64_t)strlen(blob_b64) / 4 * 3 * 2,
+                            "session import", "shorten the session or free "
+                            "host memory", admit_reason,
+                            sizeof(admit_reason)) != 0) {
+        mr_release(reg, entry); free(tokens);
+        hs_send_error(client_fd, 503, "server_memory_constrained", admit_reason);
+        jr_free(root);
+        return;
+    }
     unsigned char *blob = pn_base64_decode(blob_b64, &blob_len);
     if (!blob) {
         mr_release(reg, entry); free(tokens);
@@ -2270,20 +2625,28 @@ void oai_handle_session_restore(int client_fd, mr_registry *reg,
     pn_session_snapshot_free(arch, snap);
 
     if (msr != MS_OK) {
-        mr_release(reg, entry); free(tokens);
         if (msr == MS_BUSY)
+            log_session_capacity_refuse(entry, sid);
+        if (msr == MS_BUSY && route.replica > 0) {
+            pn_replica_pin_send_full(client_fd, &route, entry,
+                                     (int)((double)n_tok / oai_prefill_tok_per_s() + 0.5));
+            pn_replica_pin_undo(&route, entry, sid);
+        } else if (msr == MS_BUSY) {
             hs_send_error(client_fd, 429, "model_at_session_capacity",
                           "model at session capacity; retry shortly");
-        else if (msr == MS_NO_CACHE)
+            pn_replica_pin_undo(&route, entry, sid);
+        } else if (msr == MS_NO_CACHE) {
             hs_send_error(client_fd, 400, "session_caching_disabled",
                           "this model has no session cache to restore into");
-        else if (msr == MS_BAD_SNAPSHOT)
+        } else if (msr == MS_BAD_SNAPSHOT) {
             hs_send_error(client_fd, 400, "bad_session_blob",
                           "snapshot did not fit this model (dim/pos mismatch); "
                           "replay instead");
-        else
+        } else {
             hs_send_error(client_fd, 500, "server_error",
                           "session restore failed");
+        }
+        mr_release(reg, entry); free(tokens);
         jr_free(root);
         return;
     }
@@ -2329,16 +2692,25 @@ void oai_handle_session_release(int client_fd, mr_registry *reg,
         return;
     }
 
-    mr_entry *entry = mr_acquire(reg, name);
+    mr_entry *entry = mr_acquire_session(reg, name, sid);
     if (!entry) {
         hs_send_error(client_fd, 404, "model_not_found",
                       "the requested model is not loaded (see GET /v1/models)");
         jr_free(root);
         return;
     }
+    pn_replica_pin_announce(entry);
+    if (ms_session_principal_check(entry, sid, hs_thread_principal(),
+                                   hs_thread_principal_admin(), MS_PRINCIPAL_CHECK) != MS_OK) {
+        mr_release(reg, entry);
+        hs_send_error(client_fd, 403, "session_not_yours", MS_NOT_YOURS_MESSAGE);
+        jr_free(root);
+        return;
+    }
     /* Nothing to free → the release still "succeeds" (the client's intent —
      * the slot is gone — is satisfied). */
     ms_session_release(entry, sid);
+    pn_replica_affinity_forget(sid);
 
     json_writer jw;
     if (!jw_init(&jw)) { mr_release(reg, entry); hs_send_error(client_fd, 500, "server_error", "oom"); jr_free(root); return; }

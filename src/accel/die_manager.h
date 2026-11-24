@@ -54,7 +54,8 @@ typedef struct {
     char     model_name[PN_DM_NAME_MAX]; /* first bound model, "" if free   */
     int      n_models;                   /* bindings touching this die      */
     uint64_t vram_budget;                /* usable bytes (total - reserve)  */
-    uint64_t vram_used;                  /* bytes reserved by bindings      */
+    uint64_t vram_used;                  /* bindings + other processes' use */
+    uint64_t vram_bound;                 /* bytes reserved by bindings only  */
 } pn_dm_die;
 
 /* Start the manager with n_dies LOGICAL dies of budget_bytes each — the
@@ -130,6 +131,12 @@ int pn_dm_init_tt(int n_devices);
 bool pn_dm_tt_driver_explicit(void);
 #endif
 
+/* True while the manager tracks real dies (pn_dm_init_cuda / pn_dm_init_tt), false
+ * for logical dies or when stopped.
+ *
+ * Thread-safe: yes */
+bool pn_dm_is_hardware(void);
+
 /* Stop tracking and forget all dies/bindings. Safe to call if never started. */
 void pn_dm_shutdown(void);
 
@@ -141,6 +148,13 @@ int pn_dm_get(int die_id, pn_dm_die *out);
 
 /* The card index a die sits on (K80 pairing: die/2). Pure. */
 static inline int pn_dm_card_of(int die_id) { return die_id / PN_DM_DIES_PER_CARD; }
+
+/* Record what other processes hold on die_id right now (a live device read):
+ * vram_used becomes the die's bindings plus `external`, capped at the budget, so
+ * pn_dm_place / pn_dm_bind see the same occupancy the hardware report shows.
+ * Returns 0, or -1 if the die is unknown or the manager is not running.
+ * Thread-safe: yes */
+int pn_dm_note_external(int die_id, uint64_t external);
 
 /* Pick a die-set for a model needing need_bytes across n_dies_wanted dies
  * (bytes split evenly). Topology-aware: n=2 → a same-card pair, preferring a
@@ -162,9 +176,41 @@ int pn_dm_place(uint64_t need_bytes, int n_dies_wanted, int *dies_out);
 int pn_dm_bind(const int *dies, int n, const char *model_name,
                uint64_t total_bytes);
 
-/* Release model_name's binding, returning its bytes to each die. Returns 0,
- * or -1 if the name is unknown. */
+/* Names ONE binding exactly. A model name does not: replicas of one model
+ * share it, and a by-name release frees whichever binding comes first. */
+typedef struct {
+    int      slot;     /* binding table index, -1 = none */
+    uint64_t serial;   /* that binding's serial, so a reused slot never matches */
+} pn_dm_binding_ref;
+
+#define PN_DM_BINDING_NONE ((pn_dm_binding_ref){ .slot = -1, .serial = 0 })
+
+/* pn_dm_bind, and on success *out (may be NULL) names the new binding for
+ * pn_dm_release_ref. *out is PN_DM_BINDING_NONE on refusal.
+ *
+ * Thread-safe: yes */
+int pn_dm_bind_ref(const int *dies, int n, const char *model_name,
+                   uint64_t total_bytes, pn_dm_binding_ref *out);
+
+/* Release exactly the binding `*ref` names, returning its bytes to each die,
+ * and reset *ref to PN_DM_BINDING_NONE. Returns 0, or -1 when *ref names no
+ * live binding (never bound, already released, or the manager restarted) — in
+ * which case nothing is released.
+ *
+ * Thread-safe: yes */
+int pn_dm_release_ref(pn_dm_binding_ref *ref);
+
+/* Release model_name's FIRST binding, returning its bytes to each die. With
+ * replicas of one name this may be another replica's: release a binding you
+ * took by its ref. Returns 0, or -1 if the name is unknown. */
 int pn_dm_release(const char *model_name);
+
+/* Release the binding of model_name whose die-set starts at first_die (one
+ * replica of a name placed on several die-sets); first_die < 0 = the first
+ * binding of that name, as pn_dm_release. Returns 0, or -1 if none matches.
+ *
+ * Thread-safe: yes */
+int pn_dm_release_on(const char *model_name, int first_die);
 
 #ifdef __cplusplus
 }

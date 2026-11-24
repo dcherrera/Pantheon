@@ -1,0 +1,22 @@
+{
+ "model": "qwen",
+ "messages": [
+  {
+   "role": "system",
+   "content": "You are a coding agent working in potluck/.\nBe precise.\n"
+  },
+  {
+   "role": "user",
+   "content": "What seeds pl_rng?"
+  },
+  {
+   "role": "assistant",
+   "content": "time(NULL), in pl_seed.c.",
+   "reasoning_content": "pl_seed.c line 12 seeds from time()."
+  },
+  {
+   "role": "user",
+   "content": "Is that deterministic?"
+  }
+ ]
+}

@@ -1,0 +1,11 @@
+{"endpoint":"GET /local/sessions[?rev=<n>]","class":"device",
+ "request":null,
+ "status":200,
+ "response":{"rev":482,"sessions":[
+   {"key":"c-0123456789ab","kind":"session","owner":{"id":"p1a2b3c4d","handle":"david","name":"David"},
+    "origin_device":{"id":"d0123456789abcdef","name":"mac-studio"},"title":"Fix the relay",
+    "model":"qwen3.6-35b-a3b-q8","instance":2,"state":"idle","role":"owner",
+    "shares":[{"person":"p55aa66bb","handle":"bob","role":"view"}],
+    "registered_at":1793000000,"last_beat":1793000420}]},
+ "response_unchanged":{"rev":482,"unchanged":true},
+ "errors":[{"when":"rev is not a non-negative integer","status":400,"type":"invalid_request_error"}]}

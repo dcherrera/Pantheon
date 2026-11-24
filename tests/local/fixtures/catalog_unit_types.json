@@ -1,0 +1,300 @@
+{
+ "schema": 1,
+ "version": 1,
+ "published": "2026-10-26",
+ "models": [
+  {
+   "id": "orn-mini-q8",
+   "name": "Ornith mini (TEST ONLY unit_types fixture)",
+   "family": "qwen3",
+   "description": "TEST ONLY: placeholder files; the .fttw extras are p150-only",
+   "licence": {
+    "id": "apache-2.0",
+    "url": "https://huggingface.co/Qwen/Qwen3-0.6B"
+   },
+   "capabilities": [
+    "chat"
+   ],
+   "files": [
+    {
+     "role": "weights",
+     "hf_repo": "teamide/test-fixtures",
+     "revision": "0123456789abcdef0123456789abcdef01234567",
+     "filename": "orn-mini-Q8_0.gguf",
+     "size": 4096,
+     "sha256": "d41d438c379110c7f7b2c561b1f04f26c1b4549110791f8e022f48974280c13e"
+    },
+    {
+     "role": "extra",
+     "hf_repo": "teamide/test-fixtures",
+     "revision": "0123456789abcdef0123456789abcdef01234567",
+     "filename": "orn-mini-Q8_0.bfp8.fttw",
+     "size": 8192,
+     "sha256": "e5b95fc917901d624e42e597d2a8b7e70a73021945f39bdfcad33c6feafab1d8",
+     "unit_types": [
+      "p150"
+     ]
+    },
+    {
+     "role": "extra",
+     "hf_repo": "teamide/test-fixtures",
+     "revision": "0123456789abcdef0123456789abcdef01234567",
+     "filename": "orn-mini-Q8_0.bfp8.mtp.fttw",
+     "size": 1024,
+     "sha256": "2b9280e5076ba8143b1678ac42279cfd52a37bd56c9a2487c3e56b0b75a1a09e",
+     "unit_types": [
+      "p150"
+     ]
+    }
+   ],
+   "profiles": [
+    {
+     "id": "k80-one",
+     "rank": 1,
+     "hardware": {
+      "unit_type": "k80-gpu",
+      "count": 1,
+      "same_card": false,
+      "min_mem_per_unit": 2000000000,
+      "min_host_ram": 2000000000
+     },
+     "load": {
+      "ctx_cap": 4096,
+      "max_sessions": 2,
+      "max_concurrent": 1,
+      "reasoning_budget": 0,
+      "mtp": false
+     },
+     "sampling": {
+      "temperature": 0.6,
+      "top_p": 0.95,
+      "top_k": 20,
+      "min_p": 0,
+      "presence_penalty": 0
+     },
+     "measured": {
+      "decode_tok_s": {
+       "8k": 1.0,
+       "14k": 0,
+       "32k": 0
+      },
+      "ttft": {
+       "prompt_tokens": 100,
+       "seconds": 1.0
+      },
+      "context_window": 4096
+     }
+    },
+    {
+     "id": "p150-one",
+     "rank": 1,
+     "hardware": {
+      "unit_type": "p150",
+      "count": 1,
+      "same_card": false,
+      "min_mem_per_unit": 0,
+      "min_host_ram": 2000000000
+     },
+     "load": {
+      "ctx_cap": 4096,
+      "max_sessions": 2,
+      "max_concurrent": 1,
+      "reasoning_budget": 0,
+      "mtp": false
+     },
+     "sampling": {
+      "temperature": 0.6,
+      "top_p": 0.95,
+      "top_k": 20,
+      "min_p": 0,
+      "presence_penalty": 0
+     },
+     "measured": {
+      "decode_tok_s": {
+       "8k": 1.0,
+       "14k": 0,
+       "32k": 0
+      },
+      "ttft": {
+       "prompt_tokens": 100,
+       "seconds": 1.0
+      },
+      "context_window": 4096
+     }
+    },
+    {
+     "id": "cpu",
+     "rank": 2,
+     "hardware": {
+      "unit_type": "cpu",
+      "count": 1,
+      "same_card": false,
+      "min_mem_per_unit": 0,
+      "min_host_ram": 2000000000
+     },
+     "load": {
+      "ctx_cap": 4096,
+      "max_sessions": 2,
+      "max_concurrent": 1,
+      "reasoning_budget": 0,
+      "mtp": false
+     },
+     "sampling": {
+      "temperature": 0.6,
+      "top_p": 0.95,
+      "top_k": 20,
+      "min_p": 0,
+      "presence_penalty": 0
+     },
+     "measured": {
+      "decode_tok_s": {
+       "8k": 1.0,
+       "14k": 0,
+       "32k": 0
+      },
+      "ttft": {
+       "prompt_tokens": 100,
+       "seconds": 1.0
+      },
+      "context_window": 4096
+     }
+    }
+   ]
+  },
+  {
+   "id": "q36-mini-q8",
+   "name": "Qwen3.6 mini (TEST ONLY per-unit weights fixture)",
+   "family": "qwen3.6",
+   "description": "TEST ONLY: placeholder files; a K80 GGUF and a p150 metadata GGUF + .fttw, each its unit type's weights",
+   "licence": {
+    "id": "apache-2.0",
+    "url": "https://huggingface.co/Qwen/Qwen3.6-35B-A3B/blob/main/LICENSE"
+   },
+   "capabilities": [
+    "chat"
+   ],
+   "files": [
+    {
+     "role": "weights",
+     "hf_repo": "teamide/test-fixtures",
+     "revision": "0123456789abcdef0123456789abcdef01234567",
+     "filename": "q36-mini-Q8_0.gguf",
+     "size": 4096,
+     "sha256": "0873bfbcb03f54b15a961a94098d27195d10b7261d046a5dbe4107518479f104",
+     "unit_types": [
+      "k80-gpu"
+     ]
+    },
+    {
+     "role": "weights",
+     "hf_repo": "teamide/test-fixtures",
+     "revision": "0123456789abcdef0123456789abcdef01234567",
+     "filename": "q36-mini-Q8_0.meta.gguf",
+     "size": 512,
+     "sha256": "f281617c99c52addd7ad345e35efc72ce838725de3e9f947f2d31115647830d3",
+     "unit_types": [
+      "p150"
+     ]
+    },
+    {
+     "role": "extra",
+     "hf_repo": "teamide/test-fixtures",
+     "revision": "0123456789abcdef0123456789abcdef01234567",
+     "filename": "q36-mini-Q8_0.meta.moe_bfp6.fttw",
+     "size": 2048,
+     "sha256": "8a5fc9b31669528e56c3e4c535d64f3b1615a13acfef018bb7da70e49fe7754d",
+     "unit_types": [
+      "p150"
+     ]
+    },
+    {
+     "role": "extra",
+     "hf_repo": "teamide/test-fixtures",
+     "revision": "0123456789abcdef0123456789abcdef01234567",
+     "filename": "q36-mini-Q8_0.meta.moe_bfp6.mtp.fttw",
+     "size": 256,
+     "sha256": "20d0a2125f1cc86b4c77d5992860f140b0bca5bf72139834f9c8ba1becbb070f",
+     "unit_types": [
+      "p150"
+     ]
+    }
+   ],
+   "profiles": [
+    {
+     "id": "k80-one",
+     "rank": 1,
+     "hardware": {
+      "unit_type": "k80-gpu",
+      "count": 1,
+      "same_card": false,
+      "min_mem_per_unit": 2000000000,
+      "min_host_ram": 2000000000
+     },
+     "load": {
+      "ctx_cap": 4096,
+      "max_sessions": 2,
+      "max_concurrent": 1,
+      "reasoning_budget": 0,
+      "mtp": false
+     },
+     "sampling": {
+      "temperature": 0.6,
+      "top_p": 0.95,
+      "top_k": 20,
+      "min_p": 0,
+      "presence_penalty": 0
+     },
+     "measured": {
+      "decode_tok_s": {
+       "8k": 1.0,
+       "14k": 0,
+       "32k": 0
+      },
+      "ttft": {
+       "prompt_tokens": 100,
+       "seconds": 1.0
+      },
+      "context_window": 4096
+     }
+    },
+    {
+     "id": "p150-one",
+     "rank": 1,
+     "hardware": {
+      "unit_type": "p150",
+      "count": 1,
+      "same_card": false,
+      "min_mem_per_unit": 0,
+      "min_host_ram": 2000000000
+     },
+     "load": {
+      "ctx_cap": 4096,
+      "max_sessions": 2,
+      "max_concurrent": 1,
+      "reasoning_budget": 0,
+      "mtp": false
+     },
+     "sampling": {
+      "temperature": 0.6,
+      "top_p": 0.95,
+      "top_k": 20,
+      "min_p": 0,
+      "presence_penalty": 0
+     },
+     "measured": {
+      "decode_tok_s": {
+       "8k": 1.0,
+       "14k": 0,
+       "32k": 0
+      },
+      "ttft": {
+       "prompt_tokens": 100,
+       "seconds": 1.0
+      },
+      "context_window": 4096
+     }
+    }
+   ]
+  }
+ ]
+}

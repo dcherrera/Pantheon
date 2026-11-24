@@ -1,0 +1,6 @@
+{"endpoint":"GET /local/keys[?all=1]","class":"device",
+ "request":null,
+ "status":200,
+ "response":{"keys":[{"id":"k1a2b3c4d","kind":"device","role":"admin","person":{"id":"p1a2b3c4d","handle":"david","name":"David"},
+                      "label":"argus","device_id":"d0123456789abcdef","device_name":"mac-studio","created":1793000000}]},
+ "errors":[{"when":"all=1 from a non-admin","status":403,"type":"forbidden"}]}

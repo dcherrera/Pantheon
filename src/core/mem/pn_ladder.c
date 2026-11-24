@@ -16,12 +16,46 @@
 
 #include "pn_ladder.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 
 bool pn_ladder_disabled(void)
 {
     const char *v = getenv("PN_LADDER_DISABLE");
     return v && v[0] && v[0] != '0';
+}
+
+bool pn_ladder_kv_q4_allowed(void)
+{
+    const char *v = getenv("PN_LADDER_KV_Q4");
+    return !(v && v[0] == '0');
+}
+
+pn_ladder_kv_action pn_ladder_kv_action_for(pn_mem_level level, bool explicit_fp32)
+{
+    pn_ladder_plan plan;
+
+    pn_ladder_plan_for(level, 1, 0, false, &plan);
+    if (!plan.force_kv_q4)
+        return PN_LADDER_KV_KEEP;
+    return explicit_fp32 ? PN_LADDER_KV_REFUSE : PN_LADDER_KV_TO_Q4;
+}
+
+static __thread char g_kv_refusal[192];
+
+void pn_ladder_kv_refusal_set(const char *why)
+{
+    snprintf(g_kv_refusal, sizeof(g_kv_refusal), "%s", why ? why : "");
+}
+
+void pn_ladder_kv_refusal_clear(void)
+{
+    g_kv_refusal[0] = '\0';
+}
+
+const char *pn_ladder_kv_refusal(void)
+{
+    return g_kv_refusal[0] ? g_kv_refusal : NULL;
 }
 
 /* Rung 2: the effective slot ceiling for a level. Reduce-only, floor of 1. */
@@ -75,7 +109,8 @@ void pn_ladder_plan_for(pn_mem_level level, int cfg_max_slots,
 
     out->level          = level;
     out->max_slots      = slots_for(level, cfg_slots);
-    out->force_kv_q4    = cfg_kv_q4 || (level >= PN_LADDER_FORCE_Q4_LEVEL);
+    out->force_kv_q4    = cfg_kv_q4 || (level >= PN_LADDER_FORCE_Q4_LEVEL &&
+                                         pn_ladder_kv_q4_allowed());
     out->kv_evict       = (level >= PN_LADDER_EVICT_LEVEL);
     out->prefill_window = window_for(level, cfg_prefill_window);
 

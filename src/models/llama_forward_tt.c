@@ -950,6 +950,15 @@ static int llama_tt_upload_norms(pn_llama_tt *g, pn_llama_qweights *qw, const pn
                                        cfg->rms_norm_eps, &g->output_norm);
 }
 
+/** Does layer 0 carry a host-side step between the projections and RoPE — the Qwen2
+ *  biases or the Qwen3 per-head Q/K norm (pn_llama_qkv_finish)? The card does neither. */
+static bool llama_tt_needs_qkv_finish(const pn_model *model)
+{
+    const pn_llama_qlayer *l = &((const pn_llama_qweights *)model->weights)->layers[0];
+
+    return l->bq || l->bk || l->bv || l->attn_q_norm || l->attn_k_norm;
+}
+
 /**
  * Arm the three attention residencies and the card-resident KV cache, once, on the first
  * forward.
@@ -986,6 +995,19 @@ static int llama_tt_ensure_attention(pn_llama_tt *g, pn_model *model, int max_se
                         "(slot p carries pair half-1-p). The on-card RoPE table is built in "
                         "SLOT order, so the card would apply every frequency to the wrong "
                         "feature. It is an instrument: run it with host attention.\n");
+        g->attn_refused = true;
+        return -1;
+    }
+    if (pn_tt_device_kv_type(g->device).rotate) {
+        fprintf(stderr, "llama_tt: REFUSED — KV type k4h rotates Q and K after RoPE, which only "
+                        "the Qwen3.5-family forward does. Use bfp4 here.\n");
+        g->attn_refused = true;
+        return -1;
+    }
+    if (llama_tt_needs_qkv_finish(model)) {
+        fprintf(stderr, "llama_tt: REFUSED — on-card attention keeps q/k on the card, and this "
+                        "model needs its q/k bias or per-head Q/K norm applied before RoPE, "
+                        "which only the host arm does. Run it with host attention.\n");
         g->attn_refused = true;
         return -1;
     }
@@ -1150,6 +1172,15 @@ static int llama_tt_resolve_artifact(const pn_model *model, char *out, size_t ou
                         "against the checkpoint)\n", out, PN_TT_ARTIFACT_ENV);
         return 0;
     }
+    if (model->card_artifact && *model->card_artifact) {
+        /* A card metadata GGUF's own artifact (pn_load attached it): nothing to convert. */
+        if (snprintf(out, out_bytes, "%s", model->card_artifact) >= (int)out_bytes) {
+            fprintf(stderr, "llama_tt: REFUSED — the card artifact's path does not fit\n");
+            return -1;
+        }
+        fprintf(stderr, "llama_tt: artifact %s (prebuilt, beside the metadata GGUF)\n", out);
+        return 0;
+    }
 
     if (!model->path || !*model->path) {
         fprintf(stderr, "llama_tt: REFUSED — the model has no checkpoint path to convert "
@@ -1282,6 +1313,15 @@ int pn_llama_tt_upload(pn_model *model)
         goto fail;
     if (pn_tt_device_load_artifact(g->device, artifact) != 0)
         goto fail;
+    /* The host arm applies the q/k bias and per-head norm in the GGUF's feature order. A
+     * permuted artifact (split-half, or a reflected instrument) moves q/k features away from
+     * their bias and gamma entries: a smoothly wrong answer, so refuse it. */
+    if ((pn_tt_device_rope_is_split_half(g->device) ||
+         pn_tt_device_rope_pairs_reversed(g->device)) && llama_tt_needs_qkv_finish(model)) {
+        fprintf(stderr, "llama_tt: REFUSED — this artifact permutes q/k, and the model's q/k "
+                        "bias / per-head norm are in the checkpoint's order\n");
+        goto fail;
+    }
 
     g->layers = calloc((size_t)cfg->n_layer, sizeof(*g->layers));
     if (!g->layers)
@@ -1381,6 +1421,12 @@ static int llama_tt_attend_one(pn_llama_tt *g, pn_model *model, pn_state *state,
     int n_kv_groups = cfg->n_head / cfg->n_kv_head;
     int q_width = cfg->n_head * head_dim;
     int kv_width = cfg->n_kv_head * head_dim;
+
+    /* Biases (Qwen2) + per-head Q/K RMSNorm (Qwen3) BEFORE RoPE, the CPU oracle's own code.
+     * The card's projections do neither; skipping this ran Qwen3 attention on un-normed q/k
+     * (garbage text). It assumes the artifact keeps the GGUF's q/k feature order, which
+     * llama_tt_ensure_attention() and pn_llama_tt_upload() check. */
+    pn_llama_qkv_finish(&((pn_llama_qweights *)model->weights)->layers[layer], cfg, q, k, v);
 
     /* THE PAIRING COMES FROM THE ARTIFACT, NOT THE ARCHITECTURE. A `--rope-pairing
      * split-half` artifact holds wq/wk with llama.cpp's HF->GGUF permutation undone, so

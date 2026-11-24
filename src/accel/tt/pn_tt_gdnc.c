@@ -56,6 +56,7 @@
 
 #include "pn_tt_device_internal.h"
 #include "pn_tt_gdn.h"
+#include "pn_tt_gdn_layout.h"
 
 #include "tt/ft_tt_op_gdnc.h"
 #include "tt/ft_tt_tilize.h"
@@ -63,6 +64,7 @@
 /* See the file header: the L1 pointer attribute is the SFPI fork's, not the contract's. */
 #define FTQ_L1_PTR
 #include "tt/kernels/ftgc_compact.h"
+#include "tt/kernels/ftgc_table.h"
 #include "tt/kernels/resident_gdnc_protocol.h"
 
 /**
@@ -288,6 +290,8 @@ static ft_tt_op_operand gdnc_operand(const pn_tt_device *device,
     return operand;
 }
 
+static void gdnc_table_release(pn_tt_device *device);
+
 /** Carve one DRAM buffer. `PN_TT_GDNC_ANY_BANK` round-robins; anything else PINS. */
 #define PN_TT_GDNC_ANY_BANK UINT32_MAX
 
@@ -298,10 +302,9 @@ static int gdnc_alloc_in(pn_tt_device *device, uint32_t bank, size_t bytes, bool
 
     if (bytes == 0u)
         return -1;
-    if (bank == PN_TT_GDNC_ANY_BANK)
-        bank = device->strip_bank_cursor++ % device->dram_bank_count;
-    if (ft_tt_buffer_alloc(&device->allocator, FT_TT_MEM_SPACE_DRAM, bank, bytes, &buffer) !=
-        FT_TT_OK) {
+    if (bank == PN_TT_GDNC_ANY_BANK ? pn_tt_dram_alloc_any(device, bytes, &buffer) != 0
+                                    : ft_tt_buffer_alloc(&device->allocator, FT_TT_MEM_SPACE_DRAM,
+                                                         bank, bytes, &buffer) != FT_TT_OK) {
         fprintf(stderr, "pn_tt: DRAM full allocating a %zu-byte GDNC buffer\n", bytes);
         return -1;
     }
@@ -363,8 +366,12 @@ static int gdnc_upload_delta_constants(pn_tt_device *device)
 static int gdnc_alloc_constant_replicas(pn_tt_device *device, size_t constant)
 {
     /* DEFAULT 8 (run_pm8_conv_replicas.sh: serve warm 1,630 TTFT 2,547/2,537 ->
-     * 2,472/2,458 ms, CLI sequential 1.026 -> 0.967 s, IDENTICAL). `=1` off. */
-    uint32_t replicas = pn_tt_env_u32(PN_TT_GDNC_CONST_REPLICAS_ENV, 8u);
+     * 2,472/2,458 ms, CLI sequential 1.026 -> 0.967 s, IDENTICAL). `=1` off. A model's fit
+     * may ask fewer (pn_tt_gdnc_request_replicas: lever E when a bank is short). */
+    uint32_t replicas = pn_tt_env_u32(PN_TT_GDNC_CONST_REPLICAS_ENV,
+                                      device->gdnc_constant_replicas_requested
+                                          ? device->gdnc_constant_replicas_requested
+                                          : 8u);
     const uint32_t layers = device->gdn_shape.layer_count;
     uint32_t layer;
     uint32_t copy;
@@ -394,6 +401,12 @@ static int gdnc_alloc_constant_replicas(pn_tt_device *device, size_t constant)
             (double)constant * layers * (device->gdnc_constant_replicas - 1u) /
                 (1024.0 * 1024.0));
     return 0;
+}
+
+void pn_tt_gdnc_request_replicas(pn_tt_device *device, uint32_t replicas)
+{
+    if (device)
+        device->gdnc_constant_replicas_requested = replicas;
 }
 
 /** Copy `copy` of `layer`'s conv constant (0 = the original). */
@@ -467,6 +480,20 @@ static int gdnc_alloc_regions(pn_tt_device *device, const ft_tt_op_gdnc_request 
                 (double)(ft_tt_op_gdnc_delta_constant_bytes(delta) +
                          ft_tt_op_gdnc_gate_bytes(delta)) / 1024.0);
     return 0;
+}
+
+int pn_tt_gdnc_place_regions(pn_tt_device *device)
+{
+    ft_tt_op_gdnc_request conv;
+    ft_tt_op_gdnc_request delta;
+
+    if (!device || device->gdn_shape.layer_count == 0u)
+        return -1;
+    conv = gdnc_request(device, FT_TT_OP_GDNC_PHASE_CONV, PN_TT_GDNC_TILE_DIM);
+    delta = gdnc_request(device, FT_TT_OP_GDNC_PHASE_DELTA, PN_TT_GDNC_TILE_DIM);
+    conv.activation_in.tile_bytes = PN_TT_GDNC_TILE_BYTES;
+    conv.activation_out.tile_bytes = PN_TT_GDNC_TILE_BYTES;
+    return gdnc_alloc_regions(device, &conv, &delta);
 }
 
 /**
@@ -721,7 +748,7 @@ int pn_tt_device_arm_gdnc(pn_tt_device *device)
         pn_tt_residency_release(&device->gdnc);
         return 0;
     }
-    if (gdnc_alloc_regions(device, &conv, &delta) != 0) {
+    if (pn_tt_gdnc_place_regions(device) != 0) {
         fprintf(stderr, "pn_tt: the gdnc family could not be staged in card DRAM\n");
         pn_tt_residency_release(&device->gdnc);
         /* A HALF-ALLOCATED table is worse than none: a later reader would find addresses for
@@ -847,6 +874,7 @@ void pn_tt_gdnc_release(pn_tt_device *device)
 {
     if (!device)
         return;
+    gdnc_table_release(device);
     /* WHAT THE TWO PHASES COST, PER DESCRIPTOR, measured directly rather than subtracted
      * between two runs. `oncard_seconds` is a sum over every family and a subtraction cannot
      * tell CONV from DELTA — which are the two things a re-pricing has to separate, because
@@ -901,6 +929,11 @@ void pn_tt_gdnc_release(pn_tt_device *device)
     if (device->gdnc.running)
         pn_tt_residency_stop(&device->gdnc);
     pn_tt_residency_release(&device->gdnc);
+    free(device->gdnc_state_split);
+    free(device->gdnc_state_split_live);
+    device->gdnc_state_split = NULL;
+    device->gdnc_state_split_live = NULL;
+    device->gdnc_state_split_members = 0u;
     free(device->gdnc_constant);
     free(device->gdnc_constant_replica);
     device->gdnc_constant_replica = NULL;
@@ -956,25 +989,14 @@ int pn_tt_gdnc_conv_weight_upload(pn_tt_device *device, uint32_t layer, const fl
         uint32_t column;
 
         for (column = 0; column < cols; column++) {
-            uint32_t row;
-            uint32_t lane;
-
-            memset(plane, 0, sizeof(plane));
-            /* THE ROW REPLICATION, and the whole of it: `w[c][tap]` at EVERY row, because the
-             * tap coefficient is constant across the chunk's positions and the broadcast
-             * surface is BROADCAST_COL only — there is no row broadcast.
+            /* THE ROW REPLICATION (pn_tt_gdn_layout.h). Row 0 is the decode plane byte for
+             * byte, which is what lets the decode CONV share this constant.
              * RED PROOF: `gdnc_weight_row0` writes row 0 alone, which is the DECODE family's
              * plane. It is right at row 0 of every chunk and zero at rows 1..C-1, so it is a
              * mutation a single-POSITION comparison cannot see. */
-            for (row = 0; row < (row0 ? 1u : PN_TT_GDNC_TILE_DIM); row++)
-                for (lane = 0; lane < PN_TT_GDNC_TILE_DIM; lane++)
-                    plane[row * PN_TT_GDNC_TILE_DIM + lane] =
-                        weight[((size_t)column * PN_TT_GDNC_TILE_DIM + lane) * taps + tap];
-            if (ft_tt_tilize_strip(plane, sizeof(float), PN_TT_GDNC_TILE_DIM,
-                                   PN_TT_GDNC_TILE_DIM,
-                                   (size_t)PN_TT_GDNC_TILE_DIM * sizeof(float),
-                                   tiles + (size_t)column * PN_TT_GDNC_TILE_BYTES) !=
-                FT_TT_TILIZE_OK) {
+            if (pn_tt_gdnc_stage_weight_column(weight, taps, tap, column, row0, plane,
+                                               tiles + (size_t)column *
+                                                           PN_TT_GDNC_TILE_BYTES) != 0) {
                 rc = -1;
                 break;
             }
@@ -1202,6 +1224,273 @@ void pn_tt_gdnc_set_overlap_aux(pn_tt_device *device, int (*fn)(void *context), 
     device->gdnc_overlap_aux_context = context;
 }
 
+/* ================================================================
+ * Prefill lane: PER-MEMBER STATE BANKS (`PN_TT_GDNC_STATE_BANKS`) — see pn_tt_gdnc.h
+ * ================================================================ */
+
+bool pn_tt_gdnc_state_split_enabled(void)
+{
+    static int cached = -1;
+
+    if (cached < 0) {
+        const char *env = getenv("PN_TT_GDNC_STATE_BANKS");
+
+        /* DEFAULT ON (prefill lane run_pg_statebank.sh, 2026-10-22: CLI 1,630 lines 2.118 ->
+         * 2.031 s, gdnc member-0 wait 123 -> 108 us, IDENTICAL pf8/pf64, red DIFFERS). `=0` off. */
+        cached = (env && *env) ? atoi(env) != 0 : 1;
+    }
+    return cached == 1;
+}
+
+/** One v-head's carried state, in bytes (`ftgc_state_tile()`: head-major, contiguous). */
+static uint32_t gdnc_state_head_bytes(const pn_tt_device *device)
+{
+    const uint32_t st = device->gdn_shape.state_size / PN_TT_GDNC_TILE_DIM;
+
+    return st * st * PN_TT_GDNC_TILE_BYTES;
+}
+
+static bool gdnc_state_split_usable(const pn_tt_device *device, uint32_t layer)
+{
+    return pn_tt_gdnc_state_split_enabled() && pn_tt_gdnc_is_armed(device) &&
+           device->gdnc_members > 1u && layer < device->gdn_shape.layer_count &&
+           (device->gdn_shape.v_heads % device->gdnc_members) == 0u;
+}
+
+static int gdnc_state_split_alloc(pn_tt_device *device)
+{
+    const uint32_t layers = device->gdn_shape.layer_count;
+    const uint32_t members = device->gdnc_members;
+    const size_t bytes = (size_t)(device->gdn_shape.v_heads / members) *
+                         gdnc_state_head_bytes(device);
+    uint32_t layer, m;
+
+    if (device->gdnc_state_split && device->gdnc_state_split_members == members)
+        return 0;
+    if (device->gdnc_state_split)
+        return -1; /* the member count changed under it: refuse rather than re-carve */
+    device->gdnc_state_split = calloc((size_t)layers * members, sizeof(pn_tt_gdn_buffer));
+    device->gdnc_state_split_live = calloc(layers, sizeof(bool));
+    if (!device->gdnc_state_split || !device->gdnc_state_split_live)
+        return -1;
+    for (layer = 0; layer < layers; layer++)
+        for (m = 0; m < members; m++)
+            if (gdnc_alloc_in(device,
+                              (device->gdn_region[layer].state.bank + 1u + m) %
+                                  device->dram_bank_count,
+                              (bytes + 63u) & ~(size_t)63u, false,
+                              &device->gdnc_state_split[(size_t)layer * members + m]) != 0)
+                return -1;
+    device->gdnc_state_split_members = members;
+    fprintf(stderr, "pn_tt: gdnc STATE BANKS — each of %u DELTA members keeps its %u heads of "
+                    "a layer's state in its own bank during the band loop (%.1f MiB)\n",
+            members, device->gdn_shape.v_heads / members,
+            (double)bytes * members * layers / (1024.0 * 1024.0));
+    return 0;
+}
+
+/** Copy member slices <-> the live region, `in` choosing the direction. */
+static int gdnc_state_split_copy(pn_tt_device *device, uint32_t layer, bool in)
+{
+    const uint32_t members = device->gdnc_state_split_members;
+    const uint32_t bytes = (device->gdn_shape.v_heads / members) * gdnc_state_head_bytes(device);
+    const pn_tt_gdn_buffer *region = &device->gdn_region[layer].state;
+    uint32_t m;
+
+    for (m = 0; m < members; m++) {
+        const pn_tt_gdn_buffer *slice = &device->gdnc_state_split[(size_t)layer * members + m];
+        const uint32_t at = region->address + m * bytes;
+
+        if (in ? pn_tt_copy_dram_oncard(device, region->bank, at, slice->bank, slice->address,
+                                        bytes)
+               : pn_tt_copy_dram_oncard(device, slice->bank, slice->address, region->bank, at,
+                                        bytes))
+            return -1;
+    }
+    return 0;
+}
+
+int pn_tt_gdnc_state_split_enter(pn_tt_device *device, uint32_t layer, uint32_t bands)
+{
+    if (!device || !gdnc_state_split_usable(device, layer) ||
+        bands < pn_tt_env_u32("PN_TT_GDNC_STATE_BANKS_MIN_BANDS", 4u))
+        return 0;
+    if (gdnc_state_split_alloc(device) != 0 || gdnc_state_split_copy(device, layer, true) != 0) {
+        if (device->gdnc_state_split_live)
+            device->gdnc_state_split_live[layer] = false;
+        return -1;
+    }
+    device->gdnc_state_split_live[layer] = true;
+    return 0;
+}
+
+int pn_tt_gdnc_state_split_sync(pn_tt_device *device, uint32_t layer)
+{
+    if (!device || !device->gdnc_state_split_live || layer >= device->gdn_shape.layer_count ||
+        !device->gdnc_state_split_live[layer])
+        return 0;
+    /* RED `gdnc_state_split_nosync`: the slices never go back — the tail forward, decode and the
+     * checkpoint read the state the layer had BEFORE its band loop. Must DIFFER. */
+    if (pn_tt_red("gdnc_state_split_nosync"))
+        return 0;
+    return gdnc_state_split_copy(device, layer, false);
+}
+
+int pn_tt_gdnc_state_split_exit(pn_tt_device *device, uint32_t layer)
+{
+    int rc;
+
+    if (!device || !device->gdnc_state_split_live || layer >= device->gdn_shape.layer_count ||
+        !device->gdnc_state_split_live[layer])
+        return 0;
+    rc = pn_tt_gdnc_state_split_sync(device, layer);
+    device->gdnc_state_split_live[layer] = false;
+    return rc;
+}
+
+/* ================================================================
+ * Prefill lane PIPE 2 helpers — see pn_tt_gdnc.h
+ * ================================================================ */
+
+static void gdnc_swap_buffer(pn_tt_gdn_buffer *a, pn_tt_gdn_buffer *b)
+{
+    const pn_tt_gdn_buffer t = *a;
+
+    *a = *b;
+    *b = t;
+}
+
+/* PIPE 2's alternate streams. ONE bank for all three: CONV's (stream_in, stream_out) and
+ * DELTA's (stream_out, y) each share one packed coordinate word. A different bank from the
+ * primaries. `need` non-NULL: count them instead of allocating. */
+static int gdnc_alt_streams(pn_tt_device *device, pn_tt_bank_need *need)
+{
+    const uint32_t bank = (device->gdn_stream_in.bank + device->dram_bank_count / 2u) %
+                          device->dram_bank_count;
+    const size_t stream = (size_t)(device->gdn_shape.conv_dim / PN_TT_GDNC_TILE_DIM) *
+                          PN_TT_GDNC_TILE_BYTES;
+    const size_t y = (size_t)device->gdn_shape.v_heads *
+                     (device->gdn_shape.state_size / PN_TT_GDNC_TILE_DIM) *
+                     PN_TT_GDNC_TILE_BYTES;
+
+    if (device->gdnc_alt_ready)
+        return 0;
+    if (need) {
+        pn_tt_bank_need_pin(need, bank, stream);
+        pn_tt_bank_need_pin(need, bank, stream);
+        pn_tt_bank_need_pin(need, bank, y);
+        return 0;
+    }
+    if (gdnc_alloc_in(device, bank, stream, true, &device->gdnc_alt_stream_in) != 0 ||
+        gdnc_alloc_in(device, bank, stream, true, &device->gdnc_alt_stream_out) != 0 ||
+        gdnc_alloc_in(device, bank, y, true, &device->gdnc_alt_y) != 0)
+        return -1;
+    device->gdnc_alt_ready = true;
+    return 0;
+}
+
+/* The state-split slices (gdnc_state_split_alloc), counted. */
+static void gdnc_state_split_need(const pn_tt_device *device, pn_tt_bank_need *need)
+{
+    const uint32_t layers = device->gdn_shape.layer_count;
+    uint32_t *banks;
+
+    if (device->gdnc_state_split || !gdnc_state_split_usable(device, 0u))
+        return;
+    banks = calloc(layers, sizeof(*banks));
+    if (!banks) {
+        pn_tt_bank_need_pin(need, 0u, UINT64_MAX / 4u); /* cannot count -> cannot fit */
+        return;
+    }
+    for (uint32_t layer = 0; layer < layers; layer++)
+        banks[layer] = device->gdn_region[layer].state.bank;
+    pn_tt_bank_need_state_split(need, banks, layers, device->gdnc_members,
+                                (uint64_t)(device->gdn_shape.v_heads / device->gdnc_members) *
+                                    gdnc_state_head_bytes(device));
+    free(banks);
+}
+
+void pn_tt_gdnc_prefill_need(const pn_tt_device *device, pn_tt_bank_need *need)
+{
+    if (!device || !need || !pn_tt_gdnc_is_armed(device))
+        return;
+    gdnc_state_split_need(device, need);
+    (void)gdnc_alt_streams((pn_tt_device *)device, need);
+}
+
+int pn_tt_gdnc_reserve_prefill(pn_tt_device *device)
+{
+    if (!device || !pn_tt_gdnc_is_armed(device))
+        return 0;
+    if (gdnc_state_split_usable(device, 0u) && gdnc_state_split_alloc(device) != 0)
+        return -1;
+    return gdnc_alt_streams(device, NULL);
+}
+
+int pn_tt_gdnc_set_parity(pn_tt_device *device, uint32_t parity)
+{
+    if (!device || parity > 1u)
+        return -1;
+    if (device->gdnc_parity == parity)
+        return 0;
+    if (gdnc_alt_streams(device, NULL) != 0)
+        return -1;
+    gdnc_swap_buffer(&device->gdn_stream_in, &device->gdnc_alt_stream_in);
+    gdnc_swap_buffer(&device->gdn_stream_out, &device->gdnc_alt_stream_out);
+    gdnc_swap_buffer(&device->gdn_y, &device->gdnc_alt_y);
+    device->gdnc_parity = parity;
+    return 0;
+}
+
+void pn_tt_gdnc_defer(pn_tt_device *device, bool on)
+{
+    uint32_t index;
+
+    if (!device)
+        return;
+    device->gdnc.defer_await = on;
+    for (index = 0; index + 1u < device->gdnc_members; index++)
+        device->gdnc_member[index].defer_await = on;
+}
+
+int pn_tt_gdnc_settle(pn_tt_device *device)
+{
+    uint32_t index;
+    int rc = 0;
+
+    if (!device)
+        return -1;
+    if (pn_tt_residency_settle(&device->gdnc, PN_TT_OP_TIMEOUT_MS) != 0)
+        rc = -1;
+    for (index = 0; index + 1u < device->gdnc_members; index++)
+        if (pn_tt_residency_settle(&device->gdnc_member[index], PN_TT_OP_TIMEOUT_MS) != 0)
+            rc = -1;
+    return rc;
+}
+
+void pn_tt_gdnc_serialize_next(pn_tt_device *device, bool on)
+{
+    if (device)
+        device->gdnc_serialize = on;
+}
+
+/** Member `m`'s state operand for a DELTA of `layer`: its slice, addressed by ABSOLUTE head. */
+static bool gdnc_state_split_operand(const pn_tt_device *device, uint32_t layer, uint32_t m,
+                                     uint32_t first_head, ft_tt_op_operand *out)
+{
+    const pn_tt_gdn_buffer *slice;
+
+    if (!device->gdnc_state_split_live || layer >= device->gdn_shape.layer_count ||
+        !device->gdnc_state_split_live[layer] || m >= device->gdnc_state_split_members ||
+        device->gdnc_state_split_members != device->gdnc_members)
+        return false;
+    slice = &device->gdnc_state_split[(size_t)layer * device->gdnc_state_split_members + m];
+    *out = gdnc_operand(device, slice);
+    /* The kernels index the state by ABSOLUTE head (`ftgc_state_tile()`); uint32 wraps back. */
+    out->address = slice->address - first_head * gdnc_state_head_bytes(device);
+    return true;
+}
+
 static int gdnc_submit_split(pn_tt_device *device, const ft_tt_op_gdnc_request *request)
 {
     const uint32_t members = device->gdnc_members;
@@ -1226,6 +1515,9 @@ static int gdnc_submit_split(pn_tt_device *device, const ft_tt_op_gdnc_request *
             sliced.constant = gdnc_operand(
                 device, gdnc_constant_copy(device, device->gdnc_conv_layer,
                                            index % device->gdnc_constant_replicas));
+        if (request->phase == FT_TT_OP_GDNC_PHASE_DELTA)
+            (void)gdnc_state_split_operand(device, device->gdnc_delta_layer, index,
+                                           sliced.first_col, &sliced.state_conv);
         if (ft_tt_op_gdnc_parameters(&sliced, words[index]) != FT_TT_OK) {
             fprintf(stderr, "pn_tt: the gdnc phase-%u slice [%u, %u) is one the family "
                             "refuses\n", sliced.phase, sliced.first_col,
@@ -2062,6 +2354,7 @@ int pn_tt_gdnc_delta_oncard_at(pn_tt_device *device, uint32_t layer, uint32_t fi
             return -1;
     }
 
+    device->gdnc_delta_layer = layer;
     request = gdnc_request(device, FT_TT_OP_GDNC_PHASE_DELTA, chunk_rows);
     request.first_row = first_row;
     request.activation_in = gdnc_operand(device, &device->gdn_stream_out);
@@ -2085,6 +2378,281 @@ int pn_tt_gdnc_delta_oncard_at(pn_tt_device *device, uint32_t layer, uint32_t fi
     return gdnc_submit(device, &request);
 }
 
+/* ================================================================
+ * The exact card gates (kGdncDeltaFlagTable, foundry tt/kernels/ftgc_table.h)
+ * ================================================================ */
+
+/** What the table arm placed. Layer l's decay tables are striped over `stripes` banks (head h
+ *  in stripe h % S at slot h / S, each layer at its own slot, 64 B aligned), every bank holding
+ *  a stripe holds one beta copy, and the table blocks (one per layer, kFtgtBlockStride apart)
+ *  live in DELTA constant slot 0's bank, whose packed NoC word the descriptor carries. `shadow`
+ *  is each block as the card holds it. */
+struct pn_tt_gdnc_table_state {
+    uint32_t layers, heads, stripes;
+    pn_tt_gdn_buffer *decay; /* [layers * PN_TT_GDNC_TABLE_STRIPES] */
+    uint32_t *slot_bytes;    /* [layers] */
+    pn_tt_gdn_buffer beta[FT_TT_MAX_DRAM_BANKS];
+    bool beta_in[FT_TT_MAX_DRAM_BANKS];
+    uint32_t beta_bytes;
+    pn_tt_gdn_buffer blocks;
+    uint32_t (*shadow)[kFtgtBlockWords];
+    bool *shadow_valid;
+    uint64_t table_bytes;
+    uint64_t ops;
+    /* DECODE: blocks naming the decode strips as they stand, per layer and address pair,
+     * written once and never rewritten (a queued DELTA may still read one). */
+    struct {
+        uint32_t alpha, beta;
+        pn_tt_gdn_buffer block;
+    } (*decode)[PN_TT_GDNC_TABLE_DECODE_BLOCKS];
+    uint32_t *decode_count;
+};
+
+_Static_assert(kFtgtBlockWords == 48 && PN_TT_GDNC_TABLE_STRIPES == kFtgtMaxStripes,
+               "pn_tt_gdnc.h's table block and stripe count are ftgc_table.h's");
+
+static uint32_t gdnc_table_xy(const pn_tt_device *device, uint32_t bank)
+{
+    return (uint32_t)device->dram[bank].x | ((uint32_t)device->dram[bank].y << 16);
+}
+
+static void gdnc_table_free(struct pn_tt_gdnc_table_state *t)
+{
+    if (!t)
+        return;
+    free(t->decay);
+    free(t->slot_bytes);
+    free(t->shadow);
+    free(t->shadow_valid);
+    free(t->decode);
+    free(t->decode_count);
+    free(t);
+}
+
+static void gdnc_table_release(pn_tt_device *device)
+{
+    if (!device->gdnc_table)
+        return;
+    fprintf(stderr, "pn_tt: exact card gates — %llu DELTA descriptors looked their gates up\n",
+            (unsigned long long)device->gdnc_table->ops);
+    gdnc_table_free(device->gdnc_table);
+    device->gdnc_table = NULL;
+}
+
+int pn_tt_gdnc_table_arm(pn_tt_device *device, uint32_t layers, uint32_t heads,
+                         const uint32_t *decay, size_t head_stride_words,
+                         const uint32_t *layer_words, const uint32_t *beta, uint32_t beta_words,
+                         uint32_t stripes, const uint32_t *stripe_bank)
+{
+    struct pn_tt_gdnc_table_state *t;
+    uint32_t *pack = NULL;
+    uint32_t per;
+    int rc = -1;
+
+    if (!device || !decay || !layer_words || !beta || !stripe_bank || device->gdnc_table ||
+        !pn_tt_gdnc_is_armed(device) || layers != device->gdn_shape.layer_count ||
+        heads != device->gdn_shape.v_heads || heads == 0u || heads > 64u || beta_words == 0u ||
+        stripes == 0u || stripes > PN_TT_GDNC_TABLE_STRIPES)
+        return -1;
+    per = (heads + stripes - 1u) / stripes;
+    t = calloc(1u, sizeof(*t));
+    if (!t)
+        return -1;
+    t->layers = layers;
+    t->heads = heads;
+    t->stripes = stripes;
+    t->decay = calloc((size_t)layers * PN_TT_GDNC_TABLE_STRIPES, sizeof(*t->decay));
+    t->slot_bytes = calloc(layers, sizeof(*t->slot_bytes));
+    t->shadow = calloc(layers, sizeof(*t->shadow));
+    t->shadow_valid = calloc(layers, sizeof(*t->shadow_valid));
+    t->decode = calloc(layers, sizeof(*t->decode));
+    t->decode_count = calloc(layers, sizeof(*t->decode_count));
+    pack = malloc((size_t)per * head_stride_words * sizeof(uint32_t) + 64u);
+    if (!t->decay || !t->slot_bytes || !t->shadow || !t->shadow_valid || !t->decode ||
+        !t->decode_count || !pack)
+        goto done;
+    t->beta_bytes = (beta_words * 4u + 63u) & ~63u;
+    if (t->beta_bytes > per * head_stride_words * 4u)
+        goto done;
+    for (uint32_t l = 0; l < layers; l++) {
+        const uint32_t slot = (layer_words[l] * 4u + 63u) & ~63u;
+        const size_t bytes = (size_t)per * slot;
+
+        if (layer_words[l] == 0u || layer_words[l] > head_stride_words)
+            goto done;
+        for (uint32_t s = 0; s < stripes; s++) {
+            const uint32_t bank = stripe_bank[l * PN_TT_GDNC_TABLE_STRIPES + s];
+            pn_tt_gdn_buffer *buffer = &t->decay[l * PN_TT_GDNC_TABLE_STRIPES + s];
+
+            if (bank >= device->dram_bank_count)
+                goto done;
+            for (uint32_t i = 0; i < s; i++)
+                if (stripe_bank[l * PN_TT_GDNC_TABLE_STRIPES + i] == bank)
+                    goto done; /* a layer's stripes are distinct banks */
+            memset(pack, 0, bytes);
+            for (uint32_t h = s; h < heads; h += stripes)
+                memcpy((unsigned char *)pack + (size_t)(h / stripes) * slot,
+                       decay + ((size_t)l * heads + h) * head_stride_words, layer_words[l] * 4u);
+            if (gdnc_alloc_in(device, bank, bytes, false, buffer) != 0 ||
+                pn_tt_write_dram(device, buffer->bank, buffer->address, pack, bytes) != 0)
+                goto done;
+            t->table_bytes += bytes;
+            if (!t->beta_in[bank]) {
+                memset(pack, 0, t->beta_bytes);
+                memcpy(pack, beta, (size_t)beta_words * 4u);
+                if (gdnc_alloc_in(device, bank, t->beta_bytes, false, &t->beta[bank]) != 0 ||
+                    pn_tt_write_dram(device, bank, t->beta[bank].address, pack,
+                                     t->beta_bytes) != 0)
+                    goto done;
+                t->beta_in[bank] = true;
+                t->table_bytes += t->beta_bytes;
+            }
+        }
+        t->slot_bytes[l] = slot;
+    }
+    if (gdnc_alloc_in(device, device->gdnc_delta_constant[0].bank,
+                      (size_t)layers * kFtgtBlockStride, true, &t->blocks) != 0)
+        goto done;
+    device->gdnc_table = t;
+    fprintf(stderr, "pn_tt: exact card gates armed — %u layers x %u heads of lookup tables, "
+                    "%.1f MiB striped over %u banks a layer (a beta copy in each)\n",
+            layers, heads, (double)t->table_bytes / 1048576.0, stripes);
+    rc = 0;
+done:
+    free(pack);
+    if (rc != 0)
+        gdnc_table_free(t); /* the DRAM stays carved: the allocator only bumps */
+    return rc;
+}
+
+bool pn_tt_gdnc_table_ready(const pn_tt_device *device)
+{
+    return device && device->gdnc_table && pn_tt_gdnc_is_armed(device);
+}
+
+int pn_tt_gdnc_table_block(const pn_tt_device *device, uint32_t layer,
+                           const pn_tt_activation *alpha, const pn_tt_activation *beta,
+                           uint32_t out[kFtgtBlockWords])
+{
+    const struct pn_tt_gdnc_table_state *t = device ? device->gdnc_table : NULL;
+    const uint32_t band_bytes = alpha ? alpha->tile_count * PN_TT_TILE_BF16 : 0u;
+    uint32_t alpha0, beta0;
+
+    if (!t || !alpha || !beta || layer >= t->layers || alpha->tile_count != beta->tile_count ||
+        alpha->tile_count * 32u < t->heads)
+        return -1;
+    alpha0 = alpha->address - alpha->row_offset * band_bytes;
+    beta0 = beta->address - beta->row_offset * band_bytes;
+    if ((alpha0 % 64u) != 0u || (beta0 % 64u) != 0u)
+        return -1;
+    memset(out, 0, kFtgtBlockWords * sizeof(uint32_t));
+    out[kFtgtBlockScale] = gdnc_compact_scale_bits(device);
+    out[kFtgtBlockAlphaXy] = gdnc_table_xy(device, alpha->bank);
+    out[kFtgtBlockAlphaBase] = alpha0;
+    out[kFtgtBlockBetaXy] = gdnc_table_xy(device, beta->bank);
+    out[kFtgtBlockBetaBase] = beta0;
+    out[kFtgtBlockBandBytes] = band_bytes;
+    out[kFtgtBlockStripes] = t->stripes;
+    out[kFtgtBlockDecaySlot] = t->slot_bytes[layer];
+    out[kFtgtBlockBetaBytes] = t->beta_bytes;
+    for (uint32_t s = 0; s < t->stripes; s++) {
+        const pn_tt_gdn_buffer *d = &t->decay[layer * PN_TT_GDNC_TABLE_STRIPES + s];
+        uint32_t *w = out + kFtgtBlockStripe + 4u * s;
+
+        w[kFtgtStripeDecayXy] = gdnc_table_xy(device, d->bank);
+        w[kFtgtStripeDecayBase] = d->address;
+        w[kFtgtStripeBetaXy] = gdnc_table_xy(device, d->bank);
+        w[kFtgtStripeBetaBase] = t->beta[d->bank].address;
+    }
+    return 0;
+}
+
+int pn_tt_gdnc_table_bind(pn_tt_device *device, uint32_t layer, const pn_tt_activation *alpha,
+                          const pn_tt_activation *beta)
+{
+    struct pn_tt_gdnc_table_state *t = device ? device->gdnc_table : NULL;
+    uint32_t block[kFtgtBlockWords];
+
+    if (!t || pn_tt_gdnc_table_block(device, layer, alpha, beta, block) != 0)
+        return -1;
+    if (t->shadow_valid[layer] && memcmp(t->shadow[layer], block, sizeof(block)) == 0)
+        return 0;
+    /* Only before the layer's band loop opens its stream: nothing queued reads this block. */
+    if (pn_tt_write_dram(device, t->blocks.bank, t->blocks.address + layer * kFtgtBlockStride,
+                         block, sizeof(block)) != 0) {
+        t->shadow_valid[layer] = false;
+        return -1;
+    }
+    memcpy(t->shadow[layer], block, sizeof(block));
+    t->shadow_valid[layer] = true;
+    return 0;
+}
+
+int pn_tt_gdnc_table_decode_block(pn_tt_device *device, uint32_t layer,
+                                  const pn_tt_activation *alpha, const pn_tt_activation *beta,
+                                  uint32_t *bank, uint32_t *address)
+{
+    struct pn_tt_gdnc_table_state *t = device ? device->gdnc_table : NULL;
+    uint32_t block[kFtgtBlockWords], n;
+
+    if (!t || !alpha || !beta || !bank || !address || layer >= t->layers ||
+        (alpha->address % 64u) != 0u || (beta->address % 64u) != 0u)
+        return -1;
+    for (n = 0; n < t->decode_count[layer]; n++)
+        if (t->decode[layer][n].alpha == alpha->address &&
+            t->decode[layer][n].beta == beta->address)
+            break;
+    if (n == t->decode_count[layer]) {
+        if (n == PN_TT_GDNC_TABLE_DECODE_BLOCKS ||
+            pn_tt_gdnc_table_block(device, layer, alpha, beta, block) != 0)
+            return -1;
+        /* The strips as they stand: the decode rows are rows of THIS band. RED
+         * `gdn_table_decode_tile`: the alpha strip one tile on — must DIFFER. */
+        block[kFtgtBlockAlphaBase] = alpha->address +
+                                     (pn_tt_red("gdn_table_decode_tile") ? PN_TT_TILE_BF16 : 0u);
+        block[kFtgtBlockBetaBase] = beta->address;
+        block[kFtgtBlockBandBytes] = 0u;
+        if (gdnc_alloc_in(device, t->blocks.bank, kFtgtBlockStride, true,
+                          &t->decode[layer][n].block) != 0 ||
+            pn_tt_write_dram(device, t->decode[layer][n].block.bank,
+                             t->decode[layer][n].block.address, block, sizeof(block)) != 0)
+            return -1;
+        t->decode[layer][n].alpha = alpha->address;
+        t->decode[layer][n].beta = beta->address;
+        t->decode_count[layer]++;
+    }
+    *bank = t->decode[layer][n].block.bank;
+    *address = t->decode[layer][n].block.address;
+    return 0;
+}
+
+int pn_tt_gdnc_delta_oncard_table(pn_tt_device *device, uint32_t layer, uint32_t first_row,
+                                  uint32_t chunk_rows, uint32_t band)
+{
+    struct pn_tt_gdnc_table_state *t = device ? device->gdnc_table : NULL;
+    ft_tt_op_gdnc_request request;
+
+    if (!t || !pn_tt_gdnc_is_armed(device) || chunk_rows == 0u ||
+        chunk_rows > PN_TT_GDNC_TILE_DIM || layer >= t->layers || !t->shadow_valid[layer] ||
+        (first_row % FT_TT_OP_GDNC_SUB_CHUNK_ALIGN) != 0u ||
+        first_row + chunk_rows > PN_TT_GDNC_TILE_DIM)
+        return -1;
+    device->gdnc_prestaged[gdnc_stage_slot(first_row)].valid = false;
+    device->gdnc_delta_layer = layer;
+    request = gdnc_request(device, FT_TT_OP_GDNC_PHASE_DELTA, chunk_rows);
+    request.first_row = first_row;
+    request.activation_in = gdnc_operand(device, &device->gdn_stream_out);
+    request.activation_out = gdnc_operand(device, &device->gdn_y);
+    request.constant = gdnc_operand(device, &device->gdnc_delta_constant[0]);
+    request.gate_address = t->blocks.address + layer * kFtgtBlockStride;
+    request.gate_band = band;
+    request.delta_flags = FT_TT_OP_GDNC_DELTA_FLAG_TABLE | FT_TT_OP_GDNC_DELTA_FLAG_COMPACT;
+    request.serialize = device->gdnc_serialize;
+    request.state_conv = gdnc_operand(device, &device->gdn_region[layer].state);
+    t->ops++;
+    return gdnc_submit(device, &request);
+}
+
 uint32_t pn_tt_gdnc_compact_scale_bits(const pn_tt_device *device)
 {
     return device ? gdnc_compact_scale_bits(device) : 0u;
@@ -2105,6 +2673,7 @@ int pn_tt_gdnc_delta_oncard_card_gate(pn_tt_device *device, uint32_t layer, uint
         first_row + chunk_rows > PN_TT_GDNC_TILE_DIM)
         return -1;
     device->gdnc_prestaged[gdnc_stage_slot(first_row)].valid = false;
+    device->gdnc_delta_layer = layer;
     request = gdnc_request(device, FT_TT_OP_GDNC_PHASE_DELTA, chunk_rows);
     request.first_row = first_row;
     request.activation_in = gdnc_operand(device, &device->gdn_stream_out);
@@ -2112,6 +2681,7 @@ int pn_tt_gdnc_delta_oncard_card_gate(pn_tt_device *device, uint32_t layer, uint
     request.constant = gdnc_operand(device, &device->gdnc_delta_constant[slot]);
     request.gate_address = gate_address;
     request.delta_flags = FT_TT_OP_GDNC_DELTA_FLAG_COMPACT;
+    request.serialize = device->gdnc_serialize;
     request.state_conv = gdnc_operand(device, &device->gdn_region[layer].state);
     return gdnc_submit(device, &request);
 }

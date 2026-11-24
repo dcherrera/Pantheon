@@ -15,8 +15,8 @@
  *         prefill (byte-identical to before).  PC3: the batched path
  *         (sg_run_completion_batched) also delta-prefills when a session id is
  *         sent — session→slot affinity + bs_prefill_resume delta-prefill +
- *         bs_slot_finalize snapshots the slot's warm SSM/KV back into its
- *         pn_state (via pn_qwen35moe_decode_slot_ssm_to_host).  No session id →
+ *         the slot's warm SSM/KV stay in its block on the card between
+ *         turns (bs_slot_finalize just confirms them).  No session id →
  *         full prefill (byte-identical to the pre-PC batched path).  SYS1:
  *         the single-user path additionally caches the SYSTEM-PREFIX boundary
  *         state per session (two-stage prefill + snapshot), so a turn whose
@@ -64,6 +64,12 @@
  * cache session (if any) is reset so the next turn full-prefills cleanly.
  * Nothing failed; the HTTP layer just drops the already-gone connection. */
 #define SG_ABORTED (-3)
+
+/* Returned by the batched path when the decode watchdog fired: no token reached
+ * this turn for bs_decode_stall_ms() (batch_sched_watchdog.h). The slot is
+ * released without committing the turn; the HTTP layer ends the response with
+ * a `generation_stalled` error instead of leaving the stream open. */
+#define SG_STALLED (-5)
 
 /* finish_reason for a turn ended by the repetition-loop detector
  * (repetition_loop_detector.h): the model stopped producing new text and was
@@ -168,6 +174,16 @@ typedef struct {
                            * Only consulted for Phase-5 grammar-constrained
                            * decoding, and only when PANTHEON_TOOL_GRAMMAR=1;
                            * unset/NULL → the sampler is byte-identical. */
+    const void *required_if_reasoned; /* borrowed request `required_if_reasoned`
+                           * (jr_value* array of property names), or NULL.  Each
+                           * listed key is required on the reply's first call when
+                           * the reply reasoned (tg_require_if_reasoned); consulted
+                           * only where `tools` is.  Never rendered into the prompt. */
+    const void *field_patterns; /* borrowed request `field_patterns` (jr_value*
+                           * object: tool -> property -> pattern), or NULL.  Each
+                           * pattern binds that string value whole
+                           * (tg_apply_field_patterns); validated at request parse,
+                           * consulted only where `tools` is, never rendered. */
     sg_tool_choice_kind tool_choice;  /* resolved `tool_choice` (default AUTO).
                            * Phase-5 forced-call mode: REQUIRED/FUNCTION compel a
                            * call (grammar's FREE state forced to the opener);
@@ -197,7 +213,13 @@ typedef struct {
                            * default ELSE 0.  0 (or absent) = DISABLED — today's
                            * unbounded behavior, byte-identical.  Independent of the
                            * tool-forcing grammar (that only fires on tool_choice
-                           * REQUIRED/FUNCTION; this fires on the plain AUTO turn). */
+                           * REQUIRED/FUNCTION; this fires on the plain AUTO turn).
+                           * The cap actually run is pn_reasoning_plan_for_turn's:
+                           * lowered to keep reasoning_reserve of max_tokens for
+                           * the answer, and closed at a line end near the cap. */
+    int   reasoning_reserve; /* tokens of max_tokens kept for the answer/tool call
+                           * after a forced close (the per-model default); 0 =
+                           * PN_REASONING_RESERVE_DEFAULT.  See reasoning_budget.h. */
 
     sg_thinking_mode thinking; /* request `enable_thinking` (default 0 = the env
                            * decides).  Unlike reasoning_budget — which lets the
@@ -205,6 +227,11 @@ typedef struct {
                            * mid-sentence — this decides BEFORE generation whether
                            * the block is opened at all, so nothing is ever cut
                            * off mid-word.  See sg_thinking_mode. */
+
+    pn_think_history think_history; /* request `think_history`
+                           * (core/think_history.h): what the session's KV must
+                           * hold of earlier think blocks.  KEEP (0, absent) =
+                           * today's resume ladder. */
 
     /* ── OpenAI sampling/decoding fields (all default to "off", so a request
      * that sends none of them behaves byte-identically to before) ── */
@@ -373,6 +400,15 @@ typedef struct {
                                     * token, owned (freed by sg_result_free).
                                     * NULL unless the request asked for them. */
     int         n_logprobs;
+    char        admit_reason[320]; /* SG_ADMIT_DENIED from host-RAM admission:
+                                    * the refusal text (pn_host_admission.h);
+                                    * "" for a memory-pressure denial */
+    pn_resume_kind resume_kind;    /* the rung this turn resumed on (usage
+                                    * `resume`); COLD on a full prefill */
+    int         prefill_tokens;    /* prompt tokens this turn prefilled (usage
+                                    * `prefill_tokens`): n_prompt minus the
+                                    * resume point, in the request's own index
+                                    * space */
 } sg_result;
 
 /**

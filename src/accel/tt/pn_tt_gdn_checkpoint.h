@@ -25,6 +25,7 @@
 #ifdef USE_TT
 
 #include "pn_tt_device.h"
+#include "pn_tt_prefill_reserve.h"
 
 /**
  * Copy SSM layer `layer`'s live window + state into its checkpoint twin (the set is allocated
@@ -59,6 +60,14 @@ long long pn_tt_gdn_checkpoint_verify_layer(pn_tt_device *device, uint32_t layer
 
 /** Is `PN_TT_CKPT_VERIFY` set? */
 bool pn_tt_gdn_checkpoint_verify_wanted(void);
+
+/** Add the checkpoint twins (every layer's window + state, each pinned to its live region's
+ *  bank) to `need`, unless the set is already allocated. Nothing when the GDN is not armed. */
+void pn_tt_gdn_checkpoint_need(const pn_tt_device *device, pn_tt_bank_need *need);
+
+/** Add the verify's GDN snapshot slots up to `slots` (each one twin set, as the checkpoint's;
+ *  pn_tt_gdn_snapshot_reserve) to `need`, less the slots already allocated. */
+void pn_tt_gdn_snapshot_need(const pn_tt_device *device, uint32_t slots, pn_tt_bank_need *need);
 
 #endif /* USE_TT */
 #endif /* PN_TT_GDN_CHECKPOINT_H */

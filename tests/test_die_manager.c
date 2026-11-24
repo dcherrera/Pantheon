@@ -148,6 +148,28 @@ static void test_bind_release_accounting(void)
     pn_dm_shutdown();
 }
 
+/* L4: two replicas of one name on two cards; unloading the one on dies 2,3
+ * must give back dies 2,3, not the first binding's (by-name first-match
+ * released dies 0,1 while their model was still on them). */
+static void test_release_one_replica(void)
+{
+    printf("release_one_replica:\n");
+    CHECK(pn_dm_init_logical(4, GIB(11)) == 0, "init 4 dies");
+    int a[2] = { 0, 1 }, b[2] = { 2, 3 };
+    pn_dm_die d;
+
+    CHECK(pn_dm_bind(a, 2, "qwen", GIB(16)) == 0 && pn_dm_bind(b, 2, "qwen", GIB(16)) == 0,
+          "one name on two die pairs");
+    CHECK(pn_dm_release_on("qwen", 2) == 0, "release the replica on dies 2,3");
+    CHECK(pn_dm_get(2, &d) == 0 && d.vram_used == 0 && d.n_models == 0, "die 2 is free");
+    CHECK(pn_dm_get(0, &d) == 0 && d.vram_used == GIB(8) && d.n_models == 1,
+          "die 0 still carries the other replica");
+    CHECK(pn_dm_release_on("qwen", 2) == -1, "no second binding starts at die 2");
+    CHECK(pn_dm_release_on("qwen", -1) == 0, "first_die -1 = the first binding");
+    CHECK(pn_dm_get(0, &d) == 0 && d.vram_used == 0, "die 0 free");
+    pn_dm_shutdown();
+}
+
 int main(void)
 {
     printf("test_die_manager\n");
@@ -155,6 +177,7 @@ int main(void)
     test_pair_placement();
     test_single_die_packing();
     test_bind_release_accounting();
+    test_release_one_replica();
 
     if (g_failed) {
         printf("FAILED: %d check(s)\n", g_failed);

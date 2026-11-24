@@ -79,9 +79,11 @@ static void tb_push_text(token_builder *tb, ft_tokenizer *tok, const char *text)
  * the rendered STRING into the four ordinary ids "<","tool","_call",">".  Both
  * are legal tokenizations of the same characters, so the ONLY thing that matters
  * is that the prompt builder and the re-render projection pick the same one —
- * which they do by both going through sg_encode_assistant_content.  Only
- * assistant turns: a user/tool message that happens to contain the literal text
- * stays ordinary text. */
+ * which they do by both going through sg_encode_assistant_content.  Assistant
+ * and system turns only: the system turn carries the tools preamble, whose
+ * format instructions spell <tool_call> out, and the chat template tokenizes
+ * those as the special ids.  A user/tool message that happens to contain the
+ * literal text stays ordinary text. */
 static const char *const TOOL_WRAPPER_MARKERS[] = { "<tool_call>", "</tool_call>" };
 #define TOOL_WRAPPER_MARKER_COUNT \
     (sizeof(TOOL_WRAPPER_MARKERS) / sizeof(TOOL_WRAPPER_MARKERS[0]))
@@ -130,7 +132,9 @@ static void tb_push_assistant_content(token_builder *tb, ft_tokenizer *tok,
 
 /* Emit one "<|im_start|>{role}\n{content}<|im_end|>\n" block.  An assistant
  * turn's content goes through tb_push_assistant_content so a rendered tool call
- * reproduces the ids the projection recorded (see TOOL_WRAPPER_MARKERS). */
+ * reproduces the ids the projection recorded; a system turn does too, so the
+ * tools preamble's <tool_call> example is the special id the template gives
+ * (see TOOL_WRAPPER_MARKERS). */
 static void tb_push_turn(token_builder *tb, ft_tokenizer *tok,
                          const char *role, const char *content)
 {
@@ -138,7 +142,7 @@ static void tb_push_turn(token_builder *tb, ft_tokenizer *tok,
     snprintf(header, sizeof(header), "%s\n", role);
     tb_push_special(tb, tok, "<|im_start|>");
     tb_push_text(tb, tok, header);
-    if (strcmp(role, "assistant") == 0)
+    if (strcmp(role, "assistant") == 0 || strcmp(role, "system") == 0)
         tb_push_assistant_content(tb, tok, content);
     else
         tb_push_text(tb, tok, content);
@@ -146,18 +150,25 @@ static void tb_push_turn(token_builder *tb, ft_tokenizer *tok,
     tb_push_text(tb, tok, "\n");
 }
 
-/* Whitespace the streaming emitter left-trims off the head of each channel and
- * that a resent think block therefore cannot recover from the text alone (see
- * serve_emitter.c's em_emit).  These are the canonical Qwen/N2 separators the
- * model itself emits: "\n" right after the forced <think>, "\n\n" after the
- * "</think>" close. */
-static const char THINK_LEAD_WS[] = "\n";
+/* The separator after "</think>" in a history think block, as the chat
+ * template writes it. */
 static const char THINK_TAIL_WS[] = "\n\n";
 
-/* Emit the think block of a HISTORY assistant turn — "<think>{reasoning}</think>"
- * plus the separators the emitter trimmed — for a client that resent the
- * reasoning verbatim.  <think> and </think> go in as SPECIAL ids: tb_push_text
- * would byte-encode them as ordinary text and never reach id 248068.
+/* Whitespace Jinja's |trim strips from both ends of a string. */
+static int is_jinja_trim_whitespace(char c)
+{
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' ||
+           c == '\f';
+}
+
+/* Emit the think block of a HISTORY assistant turn for a client that resent
+ * the reasoning: "<think>\n" + trim(reasoning) + "\n</think>\n\n", as the
+ * template writes it, so a client that echoes reasoning_content verbatim and
+ * one that strips it render the same bytes.  <think> and </think> go in as
+ * SPECIAL ids: tb_push_text would byte-encode them as ordinary text and never
+ * reach id 248068.  The middle is ONE text push: Qwen's pre-tokenizer joins
+ * punctuation with a following newline, so pushing it in pieces can tokenize
+ * differently.
  *
  * This is the ONE definition of that span.  Both the prompt builder (below) and
  * the reasoning-bearing resume projection (sg_encode_history_think_block) go
@@ -167,9 +178,25 @@ static const char THINK_TAIL_WS[] = "\n\n";
 static void tb_push_history_think_block(token_builder *tb, ft_tokenizer *tok,
                                         const char *reasoning)
 {
+    size_t begin = 0, end = strlen(reasoning);
+    while (begin < end && is_jinja_trim_whitespace(reasoning[begin])) begin++;
+    while (end > begin && is_jinja_trim_whitespace(reasoning[end - 1])) end--;
+
+    size_t trimmed_len = end - begin;
+    char *middle = malloc(trimmed_len + 3); /* "\n" + trimmed + "\n" + NUL */
     tb_push_special(tb, tok, "<think>");
-    tb_push_text(tb, tok, THINK_LEAD_WS);
-    tb_push_text(tb, tok, reasoning);
+    if (!middle) {
+        fprintf(stderr, "serve: think block alloc failed; reasoning sent untrimmed\n");
+        tb_push_text(tb, tok, "\n");
+        tb_push_text(tb, tok, reasoning);
+    } else {
+        middle[0] = '\n';
+        memcpy(middle + 1, reasoning + begin, trimmed_len);
+        middle[trimmed_len + 1] = '\n';
+        middle[trimmed_len + 2] = '\0';
+        tb_push_text(tb, tok, middle);
+        free(middle);
+    }
     tb_push_special(tb, tok, "</think>");
     tb_push_text(tb, tok, THINK_TAIL_WS);
 }
@@ -188,18 +215,91 @@ static void tb_push_assistant_think_turn(token_builder *tb, ft_tokenizer *tok,
     tb_push_text(tb, tok, "\n");
 }
 
-/* Emit a tool-result turn per the model's chat_template: a tool message is fed
- * back inside a <tool_response> wrapper on a user turn, so multi-step tool loops
- * reconstruct the prompt shape the model was trained on. */
-static void tb_push_tool_response(token_builder *tb, ft_tokenizer *tok,
-                                  const char *content)
+/* Encode head + body + tail as ONE text push.  Qwen's pre-tokenizer joins
+ * punctuation with a following newline, so pushing the pieces separately can
+ * tokenize differently from the template's single string. */
+static void tb_push_text_joined(token_builder *tb, ft_tokenizer *tok,
+                                const char *head, const char *body,
+                                const char *tail)
 {
-    tb_push_special(tb, tok, "<|im_start|>");
-    tb_push_text(tb, tok, "user\n<tool_response>\n");
-    tb_push_text(tb, tok, content);
-    tb_push_text(tb, tok, "\n</tool_response>");
-    tb_push_special(tb, tok, "<|im_end|>");
-    tb_push_text(tb, tok, "\n");
+    size_t head_len = strlen(head), body_len = strlen(body), tail_len = strlen(tail);
+    char *joined = malloc(head_len + body_len + tail_len + 1);
+    if (!joined) {
+        fprintf(stderr, "serve: prompt text alloc failed; pushed in pieces\n");
+        tb_push_text(tb, tok, head);
+        tb_push_text(tb, tok, body);
+        tb_push_text(tb, tok, tail);
+        return;
+    }
+    memcpy(joined, head, head_len);
+    memcpy(joined + head_len, body, body_len);
+    memcpy(joined + head_len + body_len, tail, tail_len + 1);
+    tb_push_text(tb, tok, joined);
+    free(joined);
+}
+
+/* Emit one tool result per the model's chat_template: a tool message is fed
+ * back inside a <tool_response> wrapper on a user turn, and CONSECUTIVE tool
+ * messages share that one turn:
+ *   "<|im_start|>user" + ("\n<tool_response>\n" + content + "\n</tool_response>")...
+ *   + "<|im_end|>\n"
+ * `opens_turn` / `closes_turn` say whether this result is the first / last of
+ * its run.  <tool_response> and </tool_response> are added tokens in the Qwen
+ * vocabs (248066 / 248067) that an HF tokenizer splits out of any text, so they
+ * go in as their ids when the vocab has both; a vocab without them gets the
+ * same characters as one text run. */
+static void tb_push_tool_response(token_builder *tb, ft_tokenizer *tok,
+                                  const char *content, bool opens_turn,
+                                  bool closes_turn)
+{
+    int open_id = ft_token_to_id(tok, "<tool_response>");
+    int close_id = ft_token_to_id(tok, "</tool_response>");
+    const char *lead = opens_turn ? "user\n" : "\n";
+    if (opens_turn) tb_push_special(tb, tok, "<|im_start|>");
+    if (open_id >= 0 && close_id >= 0) {
+        tb_push_text(tb, tok, lead);
+        tb_push(tb, (uint32_t)open_id);
+        tb_push_text_joined(tb, tok, "\n", content, "\n");
+        tb_push(tb, (uint32_t)close_id);
+    } else {
+        char head[32];
+        snprintf(head, sizeof(head), "%s<tool_response>\n", lead);
+        tb_push_text_joined(tb, tok, head, content, "\n</tool_response>");
+    }
+    if (closes_turn) {
+        tb_push_special(tb, tok, "<|im_end|>");
+        tb_push_text(tb, tok, "\n");
+    }
+}
+
+/* A copy of `text` with Jinja |trim applied (the whitespace
+ * is_jinja_trim_whitespace names, from both ends).  Owned; NULL on OOM. */
+static char *dup_jinja_trimmed(const char *text)
+{
+    size_t begin = 0, end = strlen(text);
+    while (begin < end && is_jinja_trim_whitespace(text[begin])) begin++;
+    while (end > begin && is_jinja_trim_whitespace(text[end - 1])) end--;
+    char *trimmed = malloc(end - begin + 1);
+    if (!trimmed) return NULL;
+    memcpy(trimmed, text + begin, end - begin);
+    trimmed[end - begin] = '\0';
+    return trimmed;
+}
+
+/* A message's content as the model's template renders it: |trim'd when the
+ * template trims (model->chat_trim_content), else as sent.  Returns an owned
+ * copy in *owned (free it) when it trimmed, NULL otherwise. */
+static const char *template_content(const struct pn_model *model,
+                                    const char *content, char **owned)
+{
+    *owned = NULL;
+    if (!model->chat_trim_content || !content) return content;
+    *owned = dup_jinja_trimmed(content);
+    if (!*owned) {
+        fprintf(stderr, "serve: content trim alloc failed; sent untrimmed\n");
+        return content;
+    }
+    return *owned;
 }
 
 bool sg_no_think_enabled(void)
@@ -263,10 +363,31 @@ uint32_t *sg_build_prompt_tokens(struct pn_model *model,
                                  int *n_out, int *sys_len_out,
                                  int *think_prefill_out)
 {
+    sg_prompt_bounds bounds;
+    uint32_t *tokens = sg_build_prompt_tokens_bounded(model, messages,
+                                                      n_messages, thinking,
+                                                      n_out, &bounds);
+    if (sys_len_out) *sys_len_out = tokens ? bounds.sys_len : 0;
+    if (think_prefill_out) *think_prefill_out = tokens ? bounds.think_prefill : 0;
+    return tokens;
+}
+
+/* Is messages[index] a tool result?  False outside [0, n_messages). */
+static bool message_is_tool(const sg_message *messages, int n_messages, int index)
+{
+    if (index < 0 || index >= n_messages) return false;
+    return messages[index].role && strcmp(messages[index].role, "tool") == 0;
+}
+
+uint32_t *sg_build_prompt_tokens_bounded(struct pn_model *model,
+                                         const sg_message *messages,
+                                         int n_messages,
+                                         sg_thinking_mode thinking, int *n_out,
+                                         sg_prompt_bounds *bounds)
+{
     ft_tokenizer *tok = model->tokenizer;
     token_builder tb;
-    if (sys_len_out) *sys_len_out = 0;
-    if (think_prefill_out) *think_prefill_out = 0;
+    memset(bounds, 0, sizeof(*bounds));
     if (!tb_init(&tb)) return NULL;
 
     /* Templates that lead with {{ bos_token }} (e.g. MiniCPM5) need BOS at
@@ -279,24 +400,30 @@ uint32_t *sg_build_prompt_tokens(struct pn_model *model,
 
     for (int i = 0; i < n_messages; i++) {
         const char *role = messages[i].role ? messages[i].role : "user";
-        const char *content = messages[i].content ? messages[i].content : "";
+        char *trimmed = NULL;
+        const char *content = template_content(
+            model, messages[i].content ? messages[i].content : "", &trimmed);
         const char *reasoning = messages[i].reasoning;
         if (strcmp(role, "tool") == 0)
-            tb_push_tool_response(&tb, tok, content);
+            tb_push_tool_response(&tb, tok, content,
+                                  !message_is_tool(messages, n_messages, i - 1),
+                                  !message_is_tool(messages, n_messages, i + 1));
         else if (reasoning && *reasoning && strcmp(role, "assistant") == 0 &&
                  sg_chat_style_is_think(model->chat_style))
             tb_push_assistant_think_turn(&tb, tok, reasoning, content);
         else
             tb_push_turn(&tb, tok, role, content);
-        if (i == 0 && sys_len_out && strcmp(role, "system") == 0)
-            *sys_len_out = tb.len;
+        free(trimmed);
+        if (i == 0 && strcmp(role, "system") == 0)
+            bounds->sys_len = tb.len;
     }
 
+    bounds->turn_start = tb.len;
     tb_push_special(&tb, tok, "<|im_start|>");
     tb_push_text(&tb, tok, "assistant\n");
-    int prefill_n = tb_push_generation_prefill(&tb, tok, model->chat_style,
-                                               thinking);
-    if (think_prefill_out) *think_prefill_out = prefill_n;
+    bounds->think_prefill = tb_push_generation_prefill(&tb, tok,
+                                                       model->chat_style,
+                                                       thinking);
     *n_out = tb.len;
     return tb.tokens;
 }
@@ -341,17 +468,20 @@ uint32_t *sg_encode_assistant_content(struct pn_model *model, const char *text,
  * Client-re-render projection
  * ============================================================ */
 
-/* Re-render the serve's OWN parsed calls into assistant-history syntax, through
- * the very function the next request's `tool_calls` array will go through.
+/* Re-render the serve's OWN parsed calls, with this turn's content, into
+ * assistant-history syntax through the very function the next request's
+ * `tool_calls` array will go through (tc_join_assistant_history, reached from
+ * combine_assistant_tool_calls in openai_chat.c).
  *
  * The detour via JSON is deliberate and is the whole point: the calls are put
  * back into the exact OpenAI wire shape the reply is about to carry, then handed
- * to tc_render_assistant_tool_calls.  Rendering them any other way would be a
- * SECOND implementation of the history syntax, free to drift from the one that
+ * to the shared join.  Rendering them any other way would be a SECOND
+ * implementation of the history syntax, free to drift from the one that
  * actually runs next turn — and a one-token drift costs a full re-prefill.
  * Returns an owned string, or NULL on OOM / no calls. */
-static char *render_own_calls_as_history(const tc_tool_call *calls, int n,
-                                         bool content_empty, tc_dialect dialect)
+static char *render_own_turn_as_history(const char *content,
+                                        const tc_tool_call *calls, int n,
+                                        tc_dialect dialect)
 {
     if (!calls || n <= 0) return NULL;
     json_writer jw;
@@ -371,26 +501,11 @@ static char *render_own_calls_as_history(const tc_tool_call *calls, int n,
     char *rendered = NULL;
     if (!jw.oom) {
         jr_value *dom = jr_parse(jw.data);
-        rendered = tc_render_assistant_tool_calls(dom, content_empty, dialect);
+        rendered = tc_join_assistant_history(content, dom, dialect);
         jr_free(dom);
     }
     jw_free(&jw);
     return rendered;
-}
-
-/* Concatenate the turn's content and its rendered calls exactly as
- * combine_assistant_tool_calls (openai_chat.c) will next turn.  Returns an owned
- * string, or NULL on OOM. */
-static char *join_content_and_calls(const char *content, const char *calls_xml)
-{
-    size_t clen = content ? strlen(content) : 0;
-    size_t xlen = calls_xml ? strlen(calls_xml) : 0;
-    char *joined = malloc(clen + xlen + 1);
-    if (!joined) return NULL;
-    if (clen) memcpy(joined, content, clen);
-    if (xlen) memcpy(joined + clen, calls_xml, xlen);
-    joined[clen + xlen] = '\0';
-    return joined;
 }
 
 uint32_t *sg_project_client_rerender(struct pn_model *model,
@@ -402,24 +517,25 @@ uint32_t *sg_project_client_rerender(struct pn_model *model,
     if (!model) return NULL;
     if (!content) content = "";
 
-    char *calls_xml = NULL;
+    char *joined = NULL;
     if (tool_raw && tool_raw[0]) {
         tc_tool_call *calls = NULL;
         int n_calls = 0;
         if (tc_parse_tool_calls(tool_raw, (const jr_value *)tools, dialect,
                                 &calls, &n_calls) == 0 && n_calls > 0)
-            calls_xml = render_own_calls_as_history(calls, n_calls,
-                                                    content[0] == '\0', dialect);
+            joined = render_own_turn_as_history(content, calls, n_calls, dialect);
         tc_tool_calls_free(calls, n_calls);
         /* A diverted block that will not parse back is a turn whose re-render we
          * cannot predict — disable the rung rather than record a guess. */
-        if (!calls_xml) return NULL;
+        if (!joined) return NULL;
     }
 
-    char *joined = join_content_and_calls(content, calls_xml);
-    free(calls_xml);
-    if (!joined) return NULL;
-    uint32_t *ids = sg_encode_assistant_content(model, joined, n_out);
+    /* The prompt builder then applies the template's content |trim to the
+     * whole message (template_content); do the same here. */
+    char *trimmed = NULL;
+    const char *text = template_content(model, joined ? joined : content, &trimmed);
+    uint32_t *ids = sg_encode_assistant_content(model, text, n_out);
+    free(trimmed);
     free(joined);
     return ids;
 }

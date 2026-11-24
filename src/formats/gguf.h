@@ -57,6 +57,17 @@ typedef enum {
     GGUF_QUANT_BF16  = 30,  /* 1|8|7. The format the checkpoints actually ship in: same 2 bytes/weight as F16 but the fp32 exponent range, so widening is the top-16-bits reinterpret and no weight is re-rounded. */
     GGUF_QUANT_Q2_0_G128 = 142,  /* PrismML Bonsai native ternary (g128 release): 128-elem blocks, fp16 group scale + 2-bit codes. NOTE: the shipped Q2_0_g128 pack tags tensors type 142 / general.file_type 141; the older g64 pack used id 42. The 34-byte block layout ([fp16 d][32 codes], 128 elems) is identical — only the type id differs. */
     PN_QUANT_TERNARY = 100,  /* Packed 2-bit ternary with per-group float32 scales */
+    /* Foundry FTTW tiles, read through an attached artifact (gguf_fttw_overlay.h): the
+     * card-format CPU oracle. NOT GGML ids: 2000 + the
+     * artifact's ft_tt_tensor_format. 32x32 tiles; a "block" is 32 elements of
+     * tile_bytes/32 bytes, so numel/32 * bpb is the exact size of whole tiles and a 32-row
+     * group starts at data + r0 * row_stride. gguf_tiled.h has the layout. */
+    PN_QUANT_TILED_FP32 = 2000,      /* N-major, fp32 face-ordered tiles (the exact-values arm) */
+    PN_QUANT_TILED_BFP8 = 2002,      /* N-major: K x N tiles, column-major grid (matmul weights) */
+    PN_QUANT_TILED_BFP4 = 2003,
+    PN_QUANT_TILED_BFP6 = 2004,
+    PN_QUANT_TILED_ROWS_FP32 = 2100, /* source layout, fp32 face-ordered tiles */
+    PN_QUANT_TILED_ROWS_BFP8 = 2102, /* source layout: row-major tile grid (the embedding) */
 } pn_gguf_quant;
 
 /* GGUF string (length-prefixed) */
@@ -105,6 +116,8 @@ typedef struct {
     size_t data_size;
     void *mmap_base;                /* mmap base pointer (for munmap) */
     size_t mmap_size;               /* mmap size */
+    void *overlay_base;             /* an attached FTTW artifact's mapping, or NULL */
+    size_t overlay_size;
     int fd;                         /* File descriptor */
 } pn_gguf_file;
 

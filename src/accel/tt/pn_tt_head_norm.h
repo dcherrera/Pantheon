@@ -270,9 +270,10 @@ int pn_tt_head_norm_bf16(pn_tt_device *device, ft_tt_op_reduce_function function
  *
  * **INPUT AND OUTPUT MAY BE THE SAME BUFFER.** The GDN q/k norm runs IN PLACE over the first
  * `2*k_heads*state_tiles` tiles of the conv output, and that is safe by pipeline order rather
- * than by luck: the reader prefetches ONE row block, so block `b` has been read before the
- * writer can write block `b`. Nothing here enforces it — it is stated so that an in-place
- * caller is a decision rather than an accident.
+ * than by luck: block `b` has been read before the writer can write block `b`, and the reader
+ * only ever reads AHEAD — under P3 up to four blocks ahead (pn_tt_norm_schedule.h), all of
+ * them not yet written. Nothing here enforces it — it is stated so that an in-place caller is
+ * a decision rather than an accident.
  */
 int pn_tt_head_norm_operands(pn_tt_device *device, ft_tt_op_reduce_function function,
                              const pn_tt_norm_constants *constants, uint32_t heads,

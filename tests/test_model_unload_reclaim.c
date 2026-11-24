@@ -184,13 +184,15 @@ static void test_pinned_unload_refuses(const char *path, uint64_t budget)
                   err, sizeof(err)) == 0, "load 'alpha'");
     uint64_t held = die0_used();
 
-    /* A reference that does NOT go away on its own — what an open
-     * /session/watch holds for the lifetime of its connection. */
+    /* A reference that does NOT go away on its own — a live turn that never
+     * polls the unload's cancel (an open /session/watch no longer counts: it
+     * holds a watch pin, see test_unload_closes_watch). */
     mr_entry *pin = mr_acquire(&reg, "alpha");
     CHECK(pin != NULL, "acquire pins alpha");
 
     /* Refuse as soon as anything is in flight, so the arm is fast and exact. */
     setenv("PN_UNLOAD_DRAIN_MS", "0", 1);
+    setenv("PN_UNLOAD_CANCEL_MS", "0", 1);
 
     unload_call u = { .reg = &reg, .done = 0, .rc = 0, .err = "" };
     pthread_t tid;
@@ -206,10 +208,12 @@ static void test_pinned_unload_refuses(const char *path, uint64_t budget)
         CHECK(die0_used() == 0, "die budget released by the stuck unload");
         pthread_detach(tid);
         unsetenv("PN_UNLOAD_DRAIN_MS");
+        unsetenv("PN_UNLOAD_CANCEL_MS");
         return;
     }
     pthread_join(tid, NULL);
     unsetenv("PN_UNLOAD_DRAIN_MS");
+    unsetenv("PN_UNLOAD_CANCEL_MS");
 
     CHECK(u.rc != 0, "pinned unload REFUSES rather than reporting success");
     CHECK(strstr(u.err, "busy") != NULL, "the refusal says the model is busy");

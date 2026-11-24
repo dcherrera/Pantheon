@@ -1,0 +1,75 @@
+<|im_start|>system
+# Tools
+
+You have access to the following functions:
+
+<tools>
+{"type": "function", "function": {"name": "read", "description": "Read a file — returns numbered lines.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "File path"}, "offset": {"type": "integer"}}, "required": ["path"]}}}
+{"type": "function", "function": {"name": "bash", "description": "Run a shell command.", "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}}
+{"type": "function", "function": {"name": "todo", "description": "Replace the todo list.", "parameters": {"type": "object", "properties": {"items": {"type": "array", "items": {"type": "string"}}}, "required": ["items"]}}}
+</tools>
+
+If you choose to call a function ONLY reply in the following format with NO suffix:
+
+<tool_call>
+<function=example_function_name>
+<parameter=example_parameter_1>
+value_1
+</parameter>
+<parameter=example_parameter_2>
+This is the value for the second parameter
+that can span
+multiple lines
+</parameter>
+</function>
+</tool_call>
+
+<IMPORTANT>
+Reminder:
+- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags
+- Required parameters MUST be specified
+- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after
+- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls
+</IMPORTANT>
+
+You are a coding agent working in potluck/.
+Be precise.<|im_end|>
+<|im_start|>user
+Find EVERY root cause of the RNG test failure in potluck.<|im_end|>
+<|im_start|>assistant
+Reading the test.
+
+<tool_call>
+<function=read>
+<parameter=path>
+potluck/tests/test_pl_rng.c
+</parameter>
+</function>
+</tool_call><|im_end|>
+<|im_start|>user
+<tool_response>
+54	pl_rng_fill(A1, rank * din);
+</tool_response><|im_end|>
+<|im_start|>user
+[context checkpoint] Your earlier reasoning was cleared to make room. Every tool call above (with its concl and keep) and every tool result is still here: do not redo work they show.
+Task: find every root cause of the RNG failure
+Last conclusion: A1[4] overflow @ potluck/tests/test_pl_rng.c:54
+Continue with: look for a second cause<|im_end|>
+<|im_start|>assistant
+<think>
+Run it.
+</think>
+
+<tool_call>
+<function=bash>
+<parameter=command>
+make -C potluck test
+</parameter>
+</function>
+</tool_call><|im_end|>
+<|im_start|>user
+<tool_response>
+FAIL test_pl_rng
+</tool_response><|im_end|>
+<|im_start|>assistant
+<think>

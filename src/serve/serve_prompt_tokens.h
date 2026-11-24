@@ -21,7 +21,7 @@
  * client-visible projection is a token-exact prefix of the next request's
  * context — so the projection must not GUESS what the client will send.  It
  * renders the assistant turn through the very same functions the next request
- * will go through (tc_render_assistant_tool_calls → sg_encode_assistant_content),
+ * will go through (tc_join_assistant_history → sg_encode_assistant_content),
  * which makes agreement structural rather than lucky.
  *
  * Why that matters, concretely: a model's own sampled ids for a piece of text
@@ -130,6 +130,31 @@ uint32_t *sg_build_prompt_tokens(struct pn_model *model,
                                  int *n_out, int *sys_len_out,
                                  int *think_prefill_out);
 
+/** Where a built prompt's parts start, in prompt-token positions. */
+typedef struct {
+    int sys_len;        /* system-prefix boundary (see sg_build_prompt_tokens) */
+    int think_prefill;  /* forced generation prefill length after the opener */
+    int turn_start;     /* where the assistant opener "<|im_start|>assistant\n"
+                         * begins: the end of the client's own messages.  A next
+                         * request that drops or rewrites this turn's reply still
+                         * starts with prompt[0, turn_start). */
+} sg_prompt_bounds;
+
+/**
+ * sg_build_prompt_tokens that also reports `turn_start` (sg_prompt_bounds).
+ * Same tokens, same sys_len and think_prefill as sg_build_prompt_tokens.
+ *
+ * @param bounds  receives the boundaries (required)
+ * @return  Owned token array (caller frees), or NULL on failure.
+ *
+ * Thread-safe: yes
+ */
+uint32_t *sg_build_prompt_tokens_bounded(struct pn_model *model,
+                                         const sg_message *messages,
+                                         int n_messages,
+                                         sg_thinking_mode thinking, int *n_out,
+                                         sg_prompt_bounds *bounds);
+
 /**
  * Encode the think block of a HISTORY assistant turn as the prompt builder will
  * render it next turn when the client resends this turn's `reasoning_content`:
@@ -181,10 +206,12 @@ uint32_t *sg_encode_assistant_content(struct pn_model *model, const char *text,
  * the same path the next request will take.
  *
  * The turn's reply is `content` plus, when the model emitted a tool call, the
- * calls parsed out of `tool_raw`.  Those calls are re-rendered with
- * tc_render_assistant_tool_calls — the exact function build_messages() will call
- * on the client's `tool_calls` array next turn — and the result is tokenized
- * with sg_encode_assistant_content, the exact function build_prompt() will use.
+ * calls parsed out of `tool_raw`.  Content and calls are joined with
+ * tc_join_assistant_history — the exact function build_messages() will call on
+ * the client's message next turn — the template's content |trim is applied as
+ * the builder applies it (model->chat_trim_content), and the result is
+ * tokenized with sg_encode_assistant_content, the exact function the builder
+ * uses.
  * So the projection is not a prediction of the client so much as a replay of the
  * deterministic pipeline the client's message is about to enter.
  *

@@ -22,6 +22,7 @@
 #include "../src/accel/die_layer_split.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 
 static int g_failed = 0;
 
@@ -210,8 +211,36 @@ static void test_single_range_matches_the_full_plan(void)
     CHECK(lo == -1 && hi == -1, "and a refusal writes nothing");
 }
 
+/* PN_DIE_SPLIT_LAYERS: an explicit N-1 boundary list (head die lighter). */
+static void test_env_boundaries(void)
+{
+    pn_die_layer_split p;
+    int lo = -1, hi = -1;
+
+    setenv("PN_DIE_SPLIT_LAYERS", "11,22,32", 1);
+    CHECK(pn_plan_die_layer_split(40, 4, 0, &p) == 0, "env split plans");
+    CHECK(p.layer_hi[0] == 11 && p.layer_hi[1] == 22 && p.layer_hi[2] == 32 &&
+          p.layer_hi[3] == 40, "env boundaries 11,22,32 are used");
+    check_plan_is_a_partition(&p, 40, "env split is a partition");
+    CHECK(pn_die_layer_range(40, 4, 3, &lo, &hi) == 0 && lo == 32 && hi == 40,
+          "pn_die_layer_range honours the env too");
+    CHECK(pn_plan_die_layer_split(40, 3, 0, &p) == 0 && p.layer_hi[0] == 13,
+          "a wrong-width list is ignored (flat 3-way split)");
+    setenv("PN_DIE_SPLIT_LAYERS", "11,11,32", 1);
+    CHECK(pn_plan_die_layer_split(40, 4, 0, &p) == 0 && p.layer_hi[0] == 10,
+          "a non-increasing list is ignored");
+    setenv("PN_DIE_SPLIT_LAYERS", "11,22,40", 1);
+    CHECK(pn_plan_die_layer_split(40, 4, 0, &p) == 0 && p.layer_hi[2] == 30,
+          "a boundary at n_layer is ignored");
+    setenv("PN_DIE_SPLIT_LAYERS", "11,22,32x", 1);
+    CHECK(pn_plan_die_layer_split(40, 4, 0, &p) == 0 && p.layer_hi[0] == 10,
+          "trailing junk is ignored");
+    unsetenv("PN_DIE_SPLIT_LAYERS");
+}
+
 int main(void)
 {
+    test_env_boundaries();
     test_two_die_matches_the_hardcoded_split();
     test_one_die_is_the_whole_model();
     test_wide_splits_are_flat_and_contiguous();

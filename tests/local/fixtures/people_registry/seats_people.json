@@ -1,0 +1,8 @@
+{"endpoint":"GET /local/seats/people","class":"admin",
+ "request":null,
+ "status":200,
+ "response":{"people":[{"id":"p1a2b3c4d","handle":"david","name":"David",
+  "sessions":{"registered":4,"thinking":1,"needs_you":1,"idle":2,"disconnected":0},
+  "seats":[{"model":"qwen3.6-35b-a3b-q8","instance":2,"held":3}]}]},
+ "errors":[{"when":"a device key of a non-admin person","status":403,"type":"forbidden"},
+           {"when":"an inference key","status":403,"type":"forbidden"}]}

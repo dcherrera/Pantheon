@@ -4,7 +4,7 @@
  * @file   qweight.h
  * @brief  Quantized weight handle and its matvec / matmul / dot kernels.
  *
- * Written from a behaviour specification (plans/cleanroom_r2_qweight_spec.md); no ggml or
+ * Written from a behaviour specification (cleanroom_r2_qweight_spec.md, recorded in docs/cleanroom/README.md); no ggml or
  * llama.cpp source was consulted.
  *
  * @status None
@@ -64,6 +64,14 @@ typedef enum {
 /** Observer called once per reported dispatch, on the dispatching thread. */
 typedef void (*pn_qweight_dispatch_observer_fn)(const pn_qweight *w,
                                                 pn_qweight_op op, void *user);
+
+/**
+ * Activation observer: called once per pn_qmv / pn_qmv_group entry / pn_qmm / pn_qmm_prefill
+ * dispatch, on the dispatching thread, BEFORE the product, with the B input rows ([B, w->cols]
+ * row-major) exactly as the caller passed them. Internal per-row fallbacks never re-report.
+ */
+typedef void (*pn_qweight_activation_observer_fn)(const pn_qweight *w, const float *acts,
+                                                  int B, void *user);
 
 struct fw_pool;
 
@@ -162,6 +170,19 @@ void pn_qweight_set_dispatch_observer(pn_qweight_dispatch_observer_fn fn, void *
  * Signal-safe: no
  */
 void pn_qweight_note_dispatch(const pn_qweight *w, pn_qweight_op op);
+
+/**
+ * Install (or clear, fn = NULL) the process-wide activation observer (PN_ACT_STATS uses it).
+ * Unset, each entry point pays one untaken branch.
+ *
+ * @param fn    Observer, or NULL to disable
+ * @param user  Passed back to fn on every call
+ *
+ * Thread-safe: no (call before the forward)
+ * Reentrant:   no
+ * Signal-safe: no
+ */
+void pn_qweight_set_activation_observer(pn_qweight_activation_observer_fn fn, void *user);
 
 /**
  * Register the thread pool the matvec / matmul entry points split rows over.

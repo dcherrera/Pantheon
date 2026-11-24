@@ -19,6 +19,9 @@
  *      users' max gap.  With L3 (default) a stalled owner must NOT stall
  *      the batch: fast max gap ≪ SLOW_MS stall; hard-FAIL if the fast gap
  *      exceeds SLOW_GATE_MS (generous; lockstep would exceed it hugely).
+ *      The gated gap is the STEADY one, after all 4 users emitted a delta:
+ *      before that, a gap can hold a later user's prefill, which pauses
+ *      every decoder by design (on 4 dies, Q8_0, those reach 1.3 s).
  *
  * Build (CUDA host): make USE_CUDA=1 tests/test_serve_sched_qwen35
  * Run:  QWEN35_GPU_SPLIT_LAYER=20 QWEN35_GPU_DIE_A=0 QWEN35_GPU_DIE_B=1 \
@@ -80,22 +83,37 @@ typedef struct {
     double          t_start;    /* first-delta reference */
     double          t_last;     /* last delta time */
     double          max_gap_ms; /* max inter-delta gap */
+    int            *started;    /* phase 3: users that emitted a delta (shared) */
+    int             n_users;    /* phase 3: users in the batch */
+    int             prev_all;   /* every user had started at the previous delta */
+    double          max_gap_steady_ms; /* max gap once every user had started */
     int             n_deltas;
     sg_result       res;
     int             rc;
 } req_ctx;
 
-static void delta_cb(const char *text, int is_reasoning, void *ud)
+static void delta_cb(const char *text, int is_reasoning,
+                     const sg_token_logprob *const *logprobs, int n_logprobs,
+                     void *ud)
 {
-    (void)text; (void)is_reasoning;
+    (void)text; (void)is_reasoning; (void)logprobs; (void)n_logprobs;
     req_ctx *rc = ud;
     double t = now_ms();
     if (rc->n_deltas > 0) {
         double gap = t - rc->t_last;
         if (gap > rc->max_gap_ms) rc->max_gap_ms = gap;
+        /* Steady state only: a gap that began before every user had joined
+         * can hold another user's PREFILL, which pauses every decoder by
+         * design and is not the stalled client. */
+        if (rc->prev_all && gap > rc->max_gap_steady_ms)
+            rc->max_gap_steady_ms = gap;
     } else {
         rc->t_start = t;
+        if (rc->started)
+            __atomic_add_fetch(rc->started, 1, __ATOMIC_SEQ_CST);
     }
+    rc->prev_all = !rc->started ||
+                   __atomic_load_n(rc->started, __ATOMIC_SEQ_CST) >= rc->n_users;
     rc->t_last = t;
     rc->n_deltas++;
     if (rc->stall_ms > 0) {
@@ -176,7 +194,7 @@ int main(int argc, char **argv)
 
     int failed = 0;
 
-    pn_batch_sched *sched = bs_create(model, MAX_USERS);
+    pn_batch_sched *sched = bs_create(model, MAX_USERS, NULL);
     if (!sched) { fprintf(stderr, "bs_create failed\n"); return 1; }
     fprintf(stderr, "serve-sched gate: K=%d max_tokens=%d driver_sample=%d "
             "chunk=%s\n", K, max_tokens, bs_driver_sampling(sched) ? 1 : 0,
@@ -268,20 +286,26 @@ int main(int argc, char **argv)
                 (int)SLOW_MS);
         pthread_t th[4];
         req_ctx rq[4];
+        int started = 0;
         memset(rq, 0, sizeof(rq));
         for (int u = 0; u < 4; u++) {
             rq[u].model = model; rq[u].sched = sched;
             rq[u].text = user_text(u);
             rq[u].max_tokens = max_tokens < 24 ? max_tokens : 24;
+            rq[u].started = &started;
+            rq[u].n_users = 4;
             if (u == 0) rq[u].stall_ms = SLOW_MS;
             pthread_create(&th[u], NULL, req_thread, &rq[u]);
         }
         for (int u = 0; u < 4; u++) pthread_join(th[u], NULL);
-        double worst = 0.0;
-        for (int u = 1; u < 4; u++)
-            if (rq[u].max_gap_ms > worst) worst = rq[u].max_gap_ms;
-        fprintf(stderr, "slow: fast users' max inter-token gap %.0f ms "
-                "(stalled user emitted %d deltas)\n", worst, rq[0].n_deltas);
+        double worst = 0.0, worst_all = 0.0;
+        for (int u = 1; u < 4; u++) {
+            if (rq[u].max_gap_steady_ms > worst) worst = rq[u].max_gap_steady_ms;
+            if (rq[u].max_gap_ms > worst_all) worst_all = rq[u].max_gap_ms;
+        }
+        fprintf(stderr, "slow: fast users' max inter-token gap %.0f ms once all "
+                "4 had joined (%.0f ms including the joins' prefills; stalled "
+                "user emitted %d deltas)\n", worst, worst_all, rq[0].n_deltas);
         for (int u = 0; u < 4; u++) {
             sg_result ref_slow;
             memset(&ref_slow, 0, sizeof(ref_slow));

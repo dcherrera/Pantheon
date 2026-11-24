@@ -33,6 +33,12 @@ int pn_qwen35moe_tt_card_holds(const pn_model *model, const pn_state *state)
     (void)model; (void)state;
     return 0;
 }
+
+int pn_qwen35moe_tt_checkpoint_available(const pn_model *model)
+{
+    (void)model;
+    return 0;
+}
 #else
 typedef int pn_tt_prefix_cache_link_stubs_unused;
 #endif

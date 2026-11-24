@@ -145,7 +145,8 @@ void pn_state_free(pn_state *state)
 void pn_state_reset(pn_state *state) { if (state) state->pos = 0; }
 
 /* ---- Tiny registry stubs (avoid linking model_registry.c's heavy deps). The
- * watch manager only calls mr_acquire/mr_release; we hand-build the entry. ---- */
+ * watch manager only calls mr_acquire/mr_release, mr_acquire_replicas,
+ * mr_watch_pin/unpin and mr_set_unload_hook; we hand-build the entry. ---- */
 
 mr_entry *mr_acquire(mr_registry *reg, const char *name)
 {
@@ -164,6 +165,38 @@ void mr_release(mr_registry *reg, mr_entry *entry)
 {
     (void)reg;
     if (entry && entry->refs > 0) entry->refs--;
+}
+int mr_acquire_replicas(mr_registry *reg, const char *name, mr_entry **out, int max)
+{
+    int n = 0;
+    if (!reg || !name) return 0;
+    for (int i = 0; i < MR_MAX_MODELS && n < max; i++) {
+        mr_entry *e = &reg->entries[i];
+        if (e->used && e->model && !e->unloading &&
+            strncmp(e->name, name, MR_MAX_NAME) == 0) {
+            e->refs++;
+            out[n++] = e;
+        }
+    }
+    return n;
+}
+int mr_watch_pin(mr_registry *reg, mr_entry *entry)
+{
+    (void)reg;
+    if (!entry || !entry->used || !entry->model || entry->unloading) return -1;
+    entry->watch_refs++;
+    return 0;
+}
+void mr_watch_unpin(mr_registry *reg, mr_entry *entry)
+{
+    (void)reg;
+    if (entry && entry->watch_refs > 0) entry->watch_refs--;
+}
+void mr_set_unload_hook(mr_registry *reg, mr_unload_hook_fn fn, void *ctx)
+{
+    if (!reg) return;
+    reg->unload_hook = fn;
+    reg->unload_hook_ctx = ctx;
 }
 
 /* ---- Fixtures ---- */

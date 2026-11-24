@@ -31,8 +31,11 @@ typedef enum {
     PN_REQ_HTTP_READ = 0,   /* accept -> request line + headers + body read     */
     PN_REQ_JSON_PARSE,      /* jr_parse + parse_chat_request                    */
     PN_REQ_ROUTE,           /* route_model + tool-dialect swap                  */
-    PN_REQ_SESSION_ADMIT,   /* pn_prefix_cache_admit (capacity + idle reap)     */
-    PN_REQ_SLOT_WAIT,       /* bs_slot_acquire_or_wait (queue for a decode slot)*/
+    PN_REQ_SESSION_ADMIT,   /* always 0 now: batched admission runs inside the
+                             * slot claim (SLOT_WAIT); kept so the "admit"
+                             * column of existing profiles keeps its place     */
+    PN_REQ_SLOT_WAIT,       /* bs_slot_acquire_or_wait: session admission +
+                             * queue for a decode slot                         */
     PN_REQ_TOKENIZE,        /* build_prompt: chat template render + tokenize    */
     PN_REQ_CACHE_LOOKUP,    /* bs_prefill_resume_sys / bs_prefill_begin         */
     PN_REQ_PREFILL,         /* sg_prefill_range_sched over the delta            */

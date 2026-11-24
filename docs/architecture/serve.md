@@ -287,7 +287,15 @@ After each chunk (except the last) `bs_prefill_yield` (`batch_sched.c:1040`)
 makes the slot's host mirror authoritative via `gpu_state_to_host`, releases
 the GPU turn, and re-acquires it FIFO — giving the driver one decode step
 between chunks. This bounds a joiner's stall on concurrent decoders to one
-chunk instead of one full prompt.
+chunk instead of one full prompt. It also yields when a finished slot is queued
+in `bs_slot_finalize` (`n_finalize_waiting`): that owner sends its reply only
+after finalize, so it waits one chunk, not the rest of the other prompt. A
+queued prefill alone does not trigger a yield.
+
+Every batched request ends with one `[req]` line in the serve log
+(`request_timing_line.h`): wall time, prompt / prefilled tokens, TTFT from
+request arrival, decode tok/s over the request's own decode time, the
+active-slot range it decoded in, whether MTP ran, and the finalize wait.
 
 ### Single-user fallback
 

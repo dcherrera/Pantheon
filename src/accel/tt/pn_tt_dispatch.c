@@ -38,9 +38,15 @@
 #include <string.h>
 
 #include "pn_tt_device_internal.h"
+#include "pn_tt_dispatch_hoist.h"
+#include "pn_tt_host_gap.h"
+#include "pn_tt_precondition.h"
 #include "../../core/bench.h"
+#include "../../core/sample_profiler.h"
 
 #include "tt/ft_tt_op_l1_layout.h"
+#include "tt/kernels/resident_precondition_protocol.h"
+#include "tt/kernels/resident_puller_abi.h"
 
 enum {
     TD_ACC_NOC = 0,
@@ -128,6 +134,10 @@ typedef struct {
     uint64_t first_forward;
     uint64_t sequence_first; /* the forward a sequence began at (1 = the process's first) */
     bool sequence_reset;     /* pn_tt_dispatch_sequence_reset() was called */
+    uint32_t relearns;       /* windows slid this sequence (two model tokens not one shape) */
+    uint64_t shape_key;      /* the coming token's shape key (pn_tt_dispatch_shape_key) */
+    uint64_t anchor_key;     /* the key the model is learned under */
+    uint64_t reanchors;      /* learning re-anchored at a key change */
     /* shadow tallies */
     uint64_t checked_tokens, shape_failures;
     uint64_t compared[TD_CLASSES], mismatched[TD_CLASSES];
@@ -153,11 +163,14 @@ static uint8_t td_classify(uint8_t acc, uint64_t addr, bool write)
     if (write) {
         if (offset == 8u)
             return TD_Q_HEAD;
-        if (offset >= TD_QUEUE_RING_OFFSET && offset < 0x9000u)
+        /* The ring is at most 64 slots (0x100..0x900); the parameter cache's overflow
+         * region is 0x2000..0x9000 (ft_tt_queue.h), its primary region 0xA000..0xF000. */
+        if (offset >= TD_QUEUE_RING_OFFSET && offset < TD_QUEUE_RING_OFFSET + 64u * 32u)
             return TD_Q_RING;
         if (offset >= 0x9000u && offset < 0xA000u)
             return TD_Q_PARAM_ROT;
-        if (offset >= 0xA000u && offset < 0xF000u)
+        if ((offset >= 0xA000u && offset < 0xF000u) ||
+            (offset >= FT_TT_QUEUE_PARAM_CACHE_OVERFLOW_OFFSET && offset < 0x9000u))
             return TD_Q_PARAM_CACHE;
         return TD_Q_OTHER_W;
     }
@@ -433,7 +446,7 @@ static uint32_t td_queue_capacity_mask(const td_queue *queue)
     return words[1] - 1u;
 }
 
-static bool td_learn_queues(void)
+static bool td_learn_queues_at(size_t *failed_at)
 {
     uint32_t q;
     unsigned m;
@@ -459,8 +472,10 @@ static bool td_learn_queues(void)
                 queue->nonce_known = true;
             }
             for (d = 0; d < e->bytes / 32u; d++)
-                if (t->pool[e->data_at + d * 8u + 1u] != td_token_at(queue->nonce, e->index + d))
+                if (t->pool[e->data_at + d * 8u + 1u] != td_token_at(queue->nonce, e->index + d)) {
+                    *failed_at = i + (size_t)m * 1000000000u;
                     return false;
+                }
             slot = (e->addr - FT_TT_OP_QUEUE_BASE - TD_QUEUE_RING_OFFSET) / 32u;
             /* THE CAPACITY IS READ, NOT INFERRED. "The smallest power of two every recorded
              * slot agrees with" is underdetermined for a queue with one descriptor a token:
@@ -471,8 +486,10 @@ static bool td_learn_queues(void)
             if (queue->mask == 0u && !pn_tt_red("dispatch_mask_infer"))
                 queue->mask = td_queue_capacity_mask(queue);
             if ((e->index & queue->mask) != slot && queue->mask != 0u &&
-                !pn_tt_red("dispatch_mask_infer"))
+                !pn_tt_red("dispatch_mask_infer")) {
+                *failed_at = i + (size_t)m * 1000000000u + 500000000u;
                 return false;
+            }
             while ((e->index & queue->mask) != slot) {
                 queue->mask = queue->mask * 2u + 1u;
                 if (queue->mask > 0xFFFFu)
@@ -879,11 +896,601 @@ static bool td_plan_merges(void)
     return true;
 }
 
+/* ---------------------------------------------------------------------------------------
+ * L10: HOISTING (pn_tt_dispatch_hoist.h). Each emitted entry is noted with what it writes or
+ * waits for; the planner reorders the entries so a descriptor's parameter block and ring slot
+ * go out while the puller awaits the core before it, behind a FLUSH of the queued heads.
+ * `PN_TT_DISPATCH_HOIST` (0 = the host's order).
+ * --------------------------------------------------------------------------------------- */
+
+typedef struct {
+    pn_tt_hoist_item *items;
+    pn_tt_pre_item *pre; /* S2: the same entry as the precondition planner sees it */
+    size_t *word_at;   /* first program word of each item's entry */
+    size_t count, capacity;
+    pn_tt_hoist_stats stats;
+    bool planned;
+} td_hoist_state;
+
+static td_hoist_state g_hoist;
+
+static long td_hoist_on(void)
+{
+    const char *value = getenv("PN_TT_DISPATCH_HOIST");
+
+    /* DEFAULT 1 (run_l10_hoist.sh: plain 20.13 -> 20.22 tok/s twice, IDENTICAL, reds green) */
+    return (value && *value) ? strtol(value, NULL, 10) : 1;
+}
+
+/* ---------------------------------------------------------------------------------------
+ * S2: ON-CARD COMPLETION (pn_tt_precondition.h). The replay program and the decode / verify
+ * streams turn an AWAIT followed by heads into wait sidecar entries on those heads'
+ * descriptors plus the same AWAIT a window later. `PN_TT_ONCARD_COMPLETION` (default 1, David 2026-11-17; 0 = the pre-S2
+ * programs, byte for byte), `PN_TT_ONCARD_LOOKAHEAD` (windows ahead, default 1), RED
+ * `PN_TT_RED=precondition_early` (every entry one count short: must DIFFER).
+ * --------------------------------------------------------------------------------------- */
+
+static bool td_oncard_on(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *value = getenv("PN_TT_ONCARD_COMPLETION");
+
+        on = value && *value ? atoi(value) != 0 : 1;
+    }
+    return on == 1;
+}
+
+static uint32_t td_oncard_lookahead(void)
+{
+    static uint32_t lookahead;
+
+    if (lookahead == 0u) {
+        const char *value = getenv("PN_TT_ONCARD_LOOKAHEAD");
+        const long parsed = value && *value ? strtol(value, NULL, 10) : 1;
+
+        lookahead = parsed < 1 ? 1u
+                               : parsed > (long)PN_TT_PRE_MAX_LOOKAHEAD ? PN_TT_PRE_MAX_LOOKAHEAD
+                                                                        : (uint32_t)parsed;
+    }
+    return lookahead;
+}
+
+/** A plan's actions, as the planner hands them out (the replay keeps its program's; a stream
+ *  under `PN_TT_ONCARD_VERIFY=1` its own, for the check at its end). */
+typedef struct {
+    pn_tt_pre_action *a;
+    size_t n, cap;
+    bool oom;
+} td_oncard_actions;
+
+static void td_oncard_append(td_oncard_actions *list, const pn_tt_pre_action *action)
+{
+    if (list->n == list->cap) {
+        const size_t grow = list->cap ? list->cap * 2u : 8192u;
+        pn_tt_pre_action *more = realloc(list->a, grow * sizeof(*more));
+
+        if (!more) {
+            list->oom = true;
+            return;
+        }
+        list->a = more;
+        list->cap = grow;
+    }
+    list->a[list->n++] = *action;
+}
+
+static struct {
+    td_oncard_actions plan; /* the replay program's, in program order */
+    pn_tt_pre_stats stats;
+    pn_tt_pre_report report;
+    bool planned;           /* the uploaded replay program is the S2 one */
+} g_oncard;
+
+static void td_oncard_record(void *user, const pn_tt_pre_action *action)
+{
+    (void)user;
+    td_oncard_append(&g_oncard.plan, action);
+}
+
+/** `PN_TT_DISPATCH_LAZY_HEADS`: the puller skips the write barrier after a head flush inside a
+ *  segment (resident_puller.c args[4] bit 6; one barrier at the segment end). */
+static uint32_t td_lazy_heads_bit(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *value = getenv("PN_TT_DISPATCH_LAZY_HEADS");
+
+        on = (value && *value) ? atoi(value) != 0 : 0;
+    }
+    return on ? 64u : 0u;
+}
+
+/** The descriptor index a rotating parameter block at event `i` belongs to: the next ring
+ *  write on the same queue. UINT32_MAX when there is none. */
+static uint32_t td_param_descriptor(size_t i)
+{
+    const td_token *a = &g_td.model[0];
+    size_t j;
+
+    for (j = i + 1u; j < a->count; j++)
+        if (a->events[j].cls == TD_Q_RING && a->events[j].queue == a->events[i].queue)
+            return a->events[j].index;
+    return UINT32_MAX;
+}
+
+/** Note the entry the builder just emitted for event `i` (at word `entry_at`). `kind` forces
+ *  a kind (segment end); 0 classifies the event. `pre`: the entry as S2's planner sees it. */
+static void td_hoist_note(size_t i, size_t entry_at, uint8_t kind, const pn_tt_pre_item *pre)
+{
+    const td_token *a = &g_td.model[0];
+    pn_tt_hoist_item *it;
+
+    if (g_hoist.count == g_hoist.capacity) {
+        const size_t grow = g_hoist.capacity ? g_hoist.capacity * 2u : 8192u;
+        pn_tt_hoist_item *items = realloc(g_hoist.items, grow * sizeof(*items));
+        pn_tt_pre_item *pres = items ? realloc(g_hoist.pre, grow * sizeof(*pres)) : NULL;
+        size_t *word_at = pres ? realloc(g_hoist.word_at, grow * sizeof(*word_at)) : NULL;
+
+        if (items)
+            g_hoist.items = items;
+        if (pres)
+            g_hoist.pre = pres;
+        if (!items || !pres || !word_at) {
+            g_prog.ok = false;
+            return;
+        }
+        g_hoist.word_at = word_at;
+        g_hoist.capacity = grow;
+    }
+    g_hoist.pre[g_hoist.count] = *pre;
+    it = &g_hoist.items[g_hoist.count];
+    g_hoist.word_at[g_hoist.count++] = entry_at;
+    memset(it, 0, sizeof(*it));
+    it->group = -1;
+    it->kind = kind ? kind : PN_TT_HOIST_FIXED;
+    if (kind)
+        return;
+    {
+        const td_event *e = &a->events[i];
+        const uint32_t *w = &a->pool[e->data_at];
+
+        it->queue = (uint16_t)e->queue;
+        if ((e->cls == TD_Q_RING || e->cls == TD_Q_HEAD) && g_merge[i] >= 0) {
+            it->group = (int16_t)g_merge[i];
+            it->queue = (uint16_t)g_groups[g_merge[i]].queues[0];
+        }
+        switch (e->cls) {
+        case TD_Q_RING: {
+            const uint32_t last = (e->bytes / 32u - 1u) * 8u;
+
+            it->kind = PN_TT_HOIST_RING;
+            it->index = e->index;
+            it->slots = e->bytes / 32u;
+            /* a3 > 1: member 0 pulls that many members up to sequence a4; a5: this core's
+             * group sequence (resident_matmul_writer.c) */
+            if ((w[last + 5u] & 0x7FFFFFFFu) > 1u)
+                it->pull_sequence = w[last + 6u];
+            it->group_sequence = w[last + 7u];
+            break;
+        }
+        case TD_Q_HEAD:
+            it->kind = PN_TT_HOIST_HEAD;
+            break;
+        case TD_Q_POLL: {
+            const uint32_t offset = e->addr - FT_TT_OP_QUEUE_BASE;
+
+            it->kind = PN_TT_HOIST_AWAIT;
+            it->index = w[(0x14u - offset) / 4u];
+            break;
+        }
+        case TD_Q_PARAM_ROT:
+            it->index = td_param_descriptor(i);
+            if (it->index != UINT32_MAX) {
+                it->kind = PN_TT_HOIST_WRITE;
+                it->address = e->addr;
+            }
+            break;
+        default:
+            break;
+        }
+    }
+}
+
+/** The queue index of core (x, y) in `count` queues found by `queue_of`, or -1. */
+static int32_t td_find_queue(uint16_t x, uint16_t y, uint32_t count,
+                             uint16_t (*xy_of)(uint32_t q, int which))
+{
+    uint32_t q;
+
+    for (q = 0; q < count; q++)
+        if (xy_of(q, 0) == x && xy_of(q, 1) == y)
+            return (int32_t)q;
+    return -1;
+}
+
+/** S1: the members of one split vector family's planted pull table (pn_tt_group_pull.h) get
+ *  its member 0's queue as their leader. Nothing when the table is not live. */
+static void td_hoist_pull_leaders(const pn_tt_group_pull *pull, uint32_t count,
+                                  uint16_t (*xy_of)(uint32_t, int), int32_t *leader_of)
+{
+    int32_t leader;
+    uint32_t m;
+
+    if (!pn_tt_group_pull_covers(pull, pull->members))
+        return;
+    leader = td_find_queue(pull->core_x[0], pull->core_y[0], count, xy_of);
+    if (leader < 0)
+        return;
+    for (m = 1; m < pull->members; m++) {
+        const int32_t q = td_find_queue(pull->core_x[m], pull->core_y[m], count, xy_of);
+
+        if (q >= 0)
+            leader_of[q] = leader;
+    }
+}
+
+/** Members whose completion member 0's PULL implies: the decode matmul group's
+ *  (resident_matmul_writer.c pull_group) and every split vector family's (S1). Each gets its
+ *  member 0's queue as its leader. Nothing for a pull that is not armed or that a red arm
+ *  skips or shortens. */
+static void td_hoist_leaders(pn_tt_device *device, uint32_t count, uint16_t (*xy_of)(uint32_t, int),
+                      int32_t *leader_of)
+{
+    const pn_tt_matmul_group *group = &device->group;
+    int32_t leader;
+    uint32_t m;
+
+    for (m = 0; m < count; m++)
+        leader_of[m] = -1;
+    if (!pn_tt_red("group_pull_short")) {
+        td_hoist_pull_leaders(&device->eltwise_pull, count, xy_of, leader_of);
+        td_hoist_pull_leaders(&device->reduce_pull, count, xy_of, leader_of);
+        td_hoist_pull_leaders(&device->attention_pull, count, xy_of, leader_of);
+        td_hoist_pull_leaders(&device->gdn_pull, count, xy_of, leader_of);
+        td_hoist_pull_leaders(&device->memory_pull, count, xy_of, leader_of);
+        for (m = 0; m < (uint32_t)PN_TT_RENDER_DIRECTIONS; m++)
+            td_hoist_pull_leaders(&device->render[m].pull, count, xy_of, leader_of);
+        for (m = 0; m < PN_TT_HEAD_NORM_MAX_WIDTHS; m++)
+            td_hoist_pull_leaders(&device->head_norm[m].pull, count, xy_of, leader_of);
+    }
+    if (group->member_count < 2u || !group->pull || !group->pull_table_ok ||
+        group->red_pull_skip)
+        return;
+    leader = td_find_queue(group->member[0].core_x, group->member[0].core_y, count, xy_of);
+    if (leader < 0)
+        return;
+    for (m = 1; m < group->member_count; m++) {
+        const int32_t q = td_find_queue(group->member[m].core_x, group->member[m].core_y,
+                                        count, xy_of);
+
+        if (q >= 0)
+            leader_of[q] = leader;
+    }
+}
+
+static uint16_t td_queue_xy(uint32_t q, int which)
+{
+    return which ? g_td.queues[q].y : g_td.queues[q].x;
+}
+
+/** Per queue: capacity, per-token step, pull leader. */
+static void td_hoist_queues(pn_tt_hoist_queue *queues)
+{
+    const td_token *a = &g_td.model[0], *b = &g_td.model[1];
+    int32_t leader_of[TD_MAX_QUEUES];
+    uint32_t q;
+    size_t i;
+
+    td_hoist_leaders(g_td.device, g_td.queue_count, td_queue_xy, leader_of);
+    for (q = 0; q < g_td.queue_count; q++) {
+        queues[q].capacity = g_td.queues[q].mask + 1u;
+        queues[q].step = 0u;
+        queues[q].leader = leader_of[q];
+    }
+    for (i = 0; i < a->count; i++)
+        if (a->events[i].cls == TD_Q_RING && queues[a->events[i].queue].step == 0u)
+            queues[a->events[i].queue].step = b->events[i].index - a->events[i].index;
+}
+
+/** Where an assembly of the reordered program stands. */
+typedef struct {
+    uint32_t *words;
+    size_t at, entries_from;
+    uint32_t offsets[256], segments;
+    bool open, ok;
+} td_assembly;
+
+/** Append an entry's words, opening a segment first when none is open. */
+static void td_assemble_words(td_assembly *as, const uint32_t *w, size_t n)
+{
+    if (!as->open) {
+        as->ok = as->segments < 256u;
+        if (!as->ok)
+            return;
+        as->offsets[as->segments++] = (uint32_t)((as->entries_from + as->at) * 4u);
+        as->open = true;
+    }
+    memcpy(&as->words[as->at], w, n * sizeof(*w));
+    as->at += n;
+}
+
+/** Append noted entry `origin` as the builder emitted it, or a FLUSH for the mark. */
+static void td_assemble_item(td_assembly *as, uint32_t origin)
+{
+    size_t from, to;
+
+    if (origin == PN_TT_HOIST_FLUSH_MARK) {
+        as->words[as->at++] = FT_TT_PULLER_ENTRY_FLUSH;
+        return;
+    }
+    from = g_hoist.word_at[origin];
+    to = origin + 1u < g_hoist.count ? g_hoist.word_at[origin + 1u] : g_prog.count;
+    td_assemble_words(as, &g_prog.words[from], to - from);
+    if (g_hoist.items[origin].kind == PN_TT_HOIST_SEGMENT)
+        as->open = false;
+}
+
+/** S2: one action of the precondition plan; an item is `order[item]`. */
+static void td_assemble_action(td_assembly *as, const pn_tt_pre_action *a, const uint32_t *order)
+{
+    uint32_t w[FT_TT_PULLER_PRECOND_WORDS];
+
+    switch (a->kind) {
+    case PN_TT_PRE_OUT_ITEM:
+        td_assemble_item(as, order[a->item]);
+        break;
+    case PN_TT_PRE_OUT_AWAIT:
+        w[0] = 4u;
+        w[1] = a->queue;
+        w[2] = a->count;
+        w[3] = a->count_step;
+        td_assemble_words(as, w, 4u);
+        break;
+    default:
+        w[0] = FT_TT_PULLER_ENTRY_PRECOND;
+        w[1] = a->group >= 0 ? 0x80000000u | (uint32_t)a->group : a->queue;
+        w[2] = a->index;
+        w[3] = a->index_step;
+        w[4] = a->producer;
+        w[5] = a->count;
+        w[6] = a->count_step;
+        td_assemble_words(as, w, FT_TT_PULLER_PRECOND_WORDS);
+        break;
+    }
+}
+
+/** `PN_TT_ONCARD_DUMP=<file>`: the replay's planning problem (queues, groups, the items as the
+ *  planner sees them, after the hoist) and its plan, for an off-card re-plan and re-check
+ *  (tests/test_tt_precondition --replay <file>). Rewritten at every program build. */
+static void td_oncard_dump(const pn_tt_pre_config *config, const pn_tt_hoist_queue *queues,
+                           const pn_tt_hoist_group *groups, const pn_tt_pre_item *in, size_t n)
+{
+    const char *path = getenv("PN_TT_ONCARD_DUMP");
+    uint32_t capacity[TD_MAX_QUEUES], step[TD_MAX_QUEUES];
+    int32_t leader[TD_MAX_QUEUES];
+    bool honours[TD_MAX_QUEUES];
+    pn_tt_pre_dump d;
+    uint32_t q;
+    FILE *f;
+
+    if (!path || !*path)
+        return;
+    for (q = 0; q < g_td.queue_count; q++) {
+        capacity[q] = queues[q].capacity;
+        step[q] = queues[q].step;
+        leader[q] = queues[q].leader;
+        honours[q] = true;
+    }
+    memset(&d, 0, sizeof(d));
+    d.config = *config;
+    d.queue_count = g_td.queue_count;
+    d.capacity = capacity;
+    d.step = step;
+    d.leader = leader;
+    d.honours = honours;
+    d.group_count = g_group_count;
+    d.groups = (pn_tt_hoist_group *)(uintptr_t)groups;
+    d.items = (pn_tt_pre_item *)(uintptr_t)in;
+    d.n_items = n;
+    d.actions = g_oncard.plan.a;
+    d.n_actions = g_oncard.plan.n;
+    f = fopen(path, "w");
+    if (!f || pn_tt_precondition_dump_write(f, &d) != 0)
+        fprintf(stderr, "pn_tt: DISPATCH — ONCARD dump to %s failed\n", path);
+    else
+        fprintf(stderr, "pn_tt: DISPATCH — ONCARD dump: %zu items, %zu actions -> %s\n", n,
+                d.n_actions, path);
+    if (f)
+        fclose(f);
+}
+
+/** S2: plan the (hoisted) order into g_oncard.plan and check it. Carried from the previous
+ *  token like the hoist; refused (false, the order stands) when the check fails — except
+ *  under RED `precondition_early`, whose refused plan is the point. */
+static bool td_oncard_plan(const uint32_t *order, size_t planned, const pn_tt_hoist_queue *queues,
+                           const pn_tt_hoist_group *groups)
+{
+    const pn_tt_pre_config config = { td_oncard_lookahead(), pn_tt_red("precondition_early") };
+    pn_tt_pre_queue_info info[TD_MAX_QUEUES];
+    pn_tt_pre_item *in = malloc((planned ? planned : 1u) * sizeof(*in));
+    pn_tt_pre_planner *p =
+        in ? pn_tt_precondition_create(g_td.queue_count, &config, td_oncard_record, NULL) : NULL;
+    bool ok = p != NULL;
+    size_t k;
+    uint32_t q;
+
+    g_oncard.plan.n = 0u;
+    g_oncard.plan.oom = false;
+    for (q = 0; ok && q < g_td.queue_count; q++) {
+        info[q].capacity = queues[q].capacity;
+        info[q].honours = true; /* every resident reader waits (foundry check_precondition_wait.sh) */
+        pn_tt_precondition_queue(p, q, queues[q].capacity, queues[q].step, queues[q].leader, true);
+    }
+    if (ok)
+        pn_tt_precondition_groups(p, groups, g_group_count);
+    for (k = 0; ok && k < planned; k++) {
+        static const pn_tt_pre_item flush = { .kind = PN_TT_PRE_NEUTRAL, .group = -1 };
+
+        in[k] = order[k] == PN_TT_HOIST_FLUSH_MARK ? flush : g_hoist.pre[order[k]];
+    }
+    if (ok)
+        pn_tt_precondition_carry(p, in, planned);
+    for (k = 0; ok && k < planned; k++)
+        ok = pn_tt_precondition_push(p, (uint32_t)k, &in[k]) == 0;
+    if (p)
+        g_oncard.stats = *pn_tt_precondition_stats(p);
+    pn_tt_precondition_destroy(p);
+    ok = ok && !g_oncard.plan.oom;
+    if (ok)
+        td_oncard_dump(&config, queues, groups, in, planned);
+    if (ok && !pn_tt_precondition_verify(in, planned, g_oncard.plan.a, g_oncard.plan.n, info,
+                                         g_td.queue_count, groups, g_group_count,
+                                         &g_oncard.report)) {
+        fprintf(stderr, "pn_tt: DISPATCH — ONCARD plan refused by its check (%zu failures; "
+                        "first: %s; held %zu, publish %zu)%s\n", g_oncard.report.failures,
+                g_oncard.report.first, g_oncard.stats.by_held, g_oncard.stats.by_publish,
+                config.red_early ? " — RED precondition_early runs it anyway" : "; the order "
+                                                                               "stands");
+        ok = config.red_early;
+    }
+    if (!ok)
+        g_oncard.plan.n = 0u;
+    free(in);
+    return ok;
+}
+
+/** Reorder the entries from word `entries_from` to the end by the plan (the hoist, then S2's
+ *  preconditions). Any refusal leaves the host's order (and its segment table) as emitted. */
+static bool td_hoist_program(size_t entries_from)
+{
+    pn_tt_hoist_queue queues[TD_MAX_QUEUES];
+    pn_tt_hoist_group groups[TD_MAX_GROUPS];
+    const bool hoist = td_hoist_on() > 0, oncard = td_oncard_on();
+    uint32_t *order = NULL;
+    size_t planned = 0u, k;
+    bool preconditioned = false;
+    td_assembly as;
+
+    g_hoist.planned = false;
+    g_oncard.planned = false;
+    /* The DRY run checks the hoisted program too: hoisting keeps each stream (writes, heads,
+     * awaits) in the host's order, which is all the dry comparison reads. */
+    if (!hoist && !oncard)
+        return true;
+    for (k = 0; k < g_group_count; k++) {
+        memcpy(groups[k].queues, g_groups[k].queues, sizeof(groups[k].queues));
+        groups[k].count = g_groups[k].count;
+    }
+    td_hoist_queues(queues);
+    memset(&as, 0, sizeof(as));
+    as.entries_from = entries_from;
+    order = malloc(2u * (g_hoist.count + 1u) * sizeof(*order));
+    /* room for a FLUSH and, under S2, an entry beside every noted item */
+    as.words = malloc((g_prog.count - entries_from +
+                       (1u + (oncard ? FT_TT_PULLER_PRECOND_WORDS : 0u)) * g_hoist.count + 1u) *
+                      sizeof(*as.words));
+    if (order && as.words) {
+        if (hoist)
+            planned = pn_tt_hoist_plan(g_hoist.items, g_hoist.count, queues, g_td.queue_count,
+                                       groups, g_group_count, order, &g_hoist.stats);
+        else
+            for (planned = 0u; planned < g_hoist.count; planned++)
+                order[planned] = (uint32_t)planned;
+    }
+    as.ok = planned != 0u;
+    preconditioned = as.ok && oncard && td_oncard_plan(order, planned, queues, groups);
+    for (k = 0; preconditioned && as.ok && k < g_oncard.plan.n; k++)
+        td_assemble_action(&as, &g_oncard.plan.a[k], order);
+    for (k = 0; !preconditioned && as.ok && k < planned; k++)
+        td_assemble_item(&as, order[k]);
+    if (as.ok && as.segments == g_prog.segments) {
+        g_prog.count = entries_from;
+        for (k = 0; k < as.at; k++)
+            td_emit(as.words[k]);
+        memcpy(g_prog.segment_offset, as.offsets, as.segments * sizeof(*as.offsets));
+        g_hoist.planned = g_prog.ok && hoist;
+        g_oncard.planned = g_prog.ok && preconditioned;
+    } else {
+        fprintf(stderr, "pn_tt: DISPATCH — HOIST plan refused (%zu entries, %u of %u segments); "
+                        "the host's order stands\n", planned, as.segments, g_prog.segments);
+    }
+    free(order);
+    free(as.words);
+    return g_prog.ok;
+}
+
+/** S2: event `i` as the precondition planner sees it. `first` / `first_step` hold, per queue
+ *  and then per multicast group, the first ring index staged since its last head (a head's
+ *  first descriptor) and that index's per-token step. */
+static pn_tt_pre_item td_pre_item(size_t i, uint32_t *first, uint32_t *first_step)
+{
+    const td_token *a = &g_td.model[0], *b = &g_td.model[1];
+    const td_event *ea = &a->events[i], *eb = &b->events[i];
+    const uint32_t *wa = &a->pool[ea->data_at], *wb = &b->pool[eb->data_at];
+    const bool grouped = (ea->cls == TD_Q_RING || ea->cls == TD_Q_HEAD) && g_merge[i] >= 0;
+    const uint32_t target = grouped ? TD_MAX_QUEUES + (uint32_t)g_merge[i] : ea->queue;
+    pn_tt_pre_item it;
+
+    memset(&it, 0, sizeof(it));
+    it.kind = PN_TT_PRE_BARRIER; /* parameter cache, any other queue word: untracked */
+    it.group = grouped ? (int16_t)g_merge[i] : -1;
+    it.queue = grouped ? (uint16_t)g_groups[g_merge[i]].queues[0] : (uint16_t)ea->queue;
+    switch (ea->cls) {
+    case TD_Q_RING: {
+        const uint32_t last = (ea->bytes / 32u - 1u) * 8u;
+
+        it.kind = PN_TT_PRE_RING;
+        it.index = ea->index;
+        it.slots = ea->bytes / 32u;
+        it.step = eb->index - ea->index;
+        if ((wa[last + 5u] & 0x7FFFFFFFu) > 1u)
+            it.pull_sequence = wa[last + 6u];
+        it.group_sequence = wa[last + 7u];
+        if (first[target] == UINT32_MAX) {
+            first[target] = ea->index;
+            first_step[target] = it.step;
+        }
+        break;
+    }
+    case TD_Q_HEAD:
+        it.kind = PN_TT_PRE_HEAD;
+        it.index = first[target];
+        it.slots = first[target] == UINT32_MAX ? 0u : wa[0] - first[target];
+        it.step = first_step[target];
+        first[target] = UINT32_MAX;
+        break;
+    case TD_Q_POLL: {
+        const uint32_t word = (0x14u - (ea->addr - FT_TT_OP_QUEUE_BASE)) / 4u;
+
+        it.kind = PN_TT_PRE_AWAIT;
+        it.index = wa[word];
+        it.step = wb[word] - wa[word];
+        break;
+    }
+    case TD_Q_PARAM_ROT:
+        it.index = td_param_descriptor(i);
+        if (it.index != UINT32_MAX) {
+            it.kind = PN_TT_PRE_WRITE;
+            it.address = ea->addr;
+        }
+        break;
+    default:
+        break;
+    }
+    return it;
+}
+
 /** Build the puller program from the two model tokens. @return false = refuse replay */
 static bool td_build_program(void)
 {
     const td_token *a = &g_td.model[0], *b = &g_td.model[1];
-    size_t queue_table, segment_table, group_table, i;
+    static uint32_t first[TD_MAX_QUEUES + TD_MAX_GROUPS], first_step[TD_MAX_QUEUES + TD_MAX_GROUPS];
+    static const pn_tt_pre_item segment_end = { .kind = PN_TT_PRE_SEGMENT, .group = -1 };
+    pn_tt_pre_item pre;
+    size_t queue_table, segment_table, group_table, entries_from, i;
     bool in_segment = false;
     uint32_t q;
 
@@ -915,13 +1522,19 @@ static bool td_build_program(void)
         td_emit(0u);
         td_emit(0u);
     }
+    entries_from = g_prog.count;
+    g_hoist.count = 0u;
+    memset(first, 0xFF, sizeof(first));
     for (i = 0; i < a->count && g_prog.ok; i++) {
         const td_event *ea = &a->events[i], *eb = &b->events[i];
         const uint32_t *wa = &a->pool[ea->data_at], *wb = &b->pool[eb->data_at];
+        const size_t entry_at = g_prog.count;
 
         if (td_is_boundary(ea->cls)) {
-            if (in_segment)
+            if (in_segment) {
                 td_emit(5u); /* segment end */
+                td_hoist_note(i, entry_at, PN_TT_HOIST_SEGMENT, &segment_end);
+            }
             in_segment = false;
             continue;
         }
@@ -984,9 +1597,18 @@ static bool td_build_program(void)
             break;
         }
         }
+        pre = td_pre_item(i, first, first_step);
+        if (g_prog.count != entry_at)
+            td_hoist_note(i, entry_at, 0u, &pre);
     }
-    if (in_segment)
+    if (in_segment) {
+        const size_t entry_at = g_prog.count;
+
         td_emit(5u);
+        td_hoist_note(a->count, entry_at, PN_TT_HOIST_SEGMENT, &segment_end);
+    }
+    if (g_prog.ok && !td_hoist_program(entries_from))
+        return false;
     td_emit(6u);
     if (!g_prog.ok)
         return false;
@@ -1027,10 +1649,13 @@ static bool td_puller_arm(pn_tt_device *device)
     return true;
 }
 
+static void ts_table_forget(void);
+
 static bool td_upload_program(pn_tt_device *device)
 {
     const ft_tt_noc_access *bulk = &device->runtime.bulk_l1;
 
+    ts_table_forget(); /* the recorded program may run over the shared queue table */
     if (bulk->write(bulk->user, device->puller.core_x, device->puller.core_y, TD_PROGRAM_BASE,
                     g_prog.words, g_prog.count * 4u) != FT_TT_OK) {
         fprintf(stderr, "pn_tt: DISPATCH — the program did not upload\n");
@@ -1058,10 +1683,94 @@ static bool td_upload_program(pn_tt_device *device)
                     "(%u B)\n",
             g_prog.count * 4u, g_td.queue_count, g_prog.segments, g_prog.words[6],
             g_prog.words[7]);
+    if (g_hoist.planned)
+        fprintf(stderr, "pn_tt: DISPATCH — HOIST: %zu writes moved under an await, %zu left in "
+                        "place, %zu flushes\n",
+                g_hoist.stats.moved, g_hoist.stats.blocked, g_hoist.stats.flushes);
+    if (g_oncard.planned)
+        fprintf(stderr, "pn_tt: DISPATCH — ONCARD (lookahead %u): %zu awaits a token, %zu "
+                        "converted to %zu sidecar entries and realized a window late, %zu kept "
+                        "in place (realized by write %zu, barrier %zu, segment %zu, run %zu, "
+                        "chain %zu, publish %zu, held %zu); check: %zu heads, %zu writes, "
+                        "%zu segments, %zu failures%s\n",
+                td_oncard_lookahead(), g_oncard.stats.awaits_in, g_oncard.stats.windows,
+                g_oncard.stats.preconds,
+                g_oncard.stats.awaits_in - g_oncard.stats.merged - g_oncard.stats.windows,
+                g_oncard.stats.by_write, g_oncard.stats.by_barrier, g_oncard.stats.by_segment,
+                g_oncard.stats.by_run, g_oncard.stats.by_chain, g_oncard.stats.by_publish,
+                g_oncard.stats.by_held,
+                g_oncard.report.heads,
+                g_oncard.report.writes, g_oncard.report.segments, g_oncard.report.failures,
+                pn_tt_red("precondition_early") ? " [RED precondition_early]" : "");
     return true;
 }
 
 static uint64_t g_dry_checked, g_dry_failed, g_dry_words;
+
+/** S2 dry run: the log's AWAIT (4) and PRECOND records, in program order, against the plan's
+ *  realized AWAITs and sidecar entries at token offset k. (The host's polls themselves are the
+ *  shadow's to check: td_shadow_check compares each against the model.) */
+static bool td_dry_check_oncard(const uint32_t *log, size_t log_words, uint32_t k,
+                                uint64_t forward)
+{
+    size_t at = 0u, j = 0u;
+
+    for (; at + 4u <= log_words; at += 4u + log[at + 3u]) {
+        const uint32_t type = log[at];
+        const pn_tt_pre_action *a;
+        uint32_t want[4], xy, addr = 0u, n = 1u, w;
+
+        if (type != 4u && type != FT_TT_PULLER_ENTRY_PRECOND)
+            continue;
+        while (j < g_oncard.plan.n && g_oncard.plan.a[j].kind == PN_TT_PRE_OUT_ITEM)
+            j++;
+        a = j < g_oncard.plan.n ? &g_oncard.plan.a[j++] : NULL;
+        if (!a || (type == 4u) != (a->kind == PN_TT_PRE_OUT_AWAIT)) {
+            fprintf(stderr, "pn_tt: DISPATCH DRY forward %llu: log record type %u at word %zu is "
+                            "not the plan's next await / entry\n", (unsigned long long)forward,
+                    type, at);
+            return false;
+        }
+        xy = (uint32_t)g_td.queues[a->queue].x | ((uint32_t)g_td.queues[a->queue].y << 16);
+        want[0] = a->count + a->count_step * k;
+        if (type != 4u) {
+            const td_queue *target = &g_td.queues[a->group >= 0 ? g_groups[a->group].queues[0]
+                                                                : a->queue];
+            const td_queue *producer = &g_td.queues[a->producer];
+
+            want[0] = a->index + a->index_step * k;
+            want[1] = ftq_pre_xy_word(producer->x, producer->y);
+            want[2] = a->count + a->count_step * k;
+            want[3] = producer->nonce;
+            addr = FT_TT_OP_QUEUE_BASE + ftq_pre_entry_offset(want[0], target->mask);
+            xy = a->group >= 0 ? 0x80000000u | (uint32_t)a->group : xy;
+            n = 4u;
+        }
+        if (log[at + 1u] != xy || log[at + 3u] != n || (type != 4u && log[at + 2u] != addr)) {
+            fprintf(stderr, "pn_tt: DISPATCH DRY forward %llu: %s record at word %zu names xy 0x%x "
+                            "addr 0x%x n %u, the plan xy 0x%x addr 0x%x n %u\n",
+                    (unsigned long long)forward, type == 4u ? "await" : "entry", at, log[at + 1u],
+                    log[at + 2u], log[at + 3u], xy, addr, n);
+            return false;
+        }
+        for (w = 0; w < n; w++)
+            if (log[at + 4u + w] != want[w]) {
+                fprintf(stderr, "pn_tt: DISPATCH DRY forward %llu: %s record at word %zu word %u: "
+                                "the puller 0x%08x, the plan 0x%08x\n",
+                        (unsigned long long)forward, type == 4u ? "await" : "entry", at, w,
+                        log[at + 4u + w], want[w]);
+                return false;
+            }
+    }
+    while (j < g_oncard.plan.n && g_oncard.plan.a[j].kind == PN_TT_PRE_OUT_ITEM)
+        j++;
+    if (j != g_oncard.plan.n) {
+        fprintf(stderr, "pn_tt: DISPATCH DRY forward %llu: the log ran out before the plan's "
+                        "await / entry %zu\n", (unsigned long long)forward, j);
+        return false;
+    }
+    return true;
+}
 
 /** Run the whole token k on the puller in DRY-RUN mode and compare its log, stream for
  *  stream (non-head writes, heads, awaits), with what the host really did this token. */
@@ -1116,6 +1825,16 @@ static void td_dry_check(pn_tt_device *device, uint64_t forward)
 
         if (td_is_boundary(e->cls) || e->cls == TD_Q_GROUP_R || e->cls == TD_Q_OTHER_R)
             continue;
+        if (e->cls == TD_Q_POLL && g_oncard.planned)
+            continue; /* S2 moved the awaits: td_dry_check_oncard() reads them */
+        /* STEP 3 B: a multicast group's ring slot / head is ONE log record naming the group
+         * (bit 31 | group); the members' own events were merged into the leader's. */
+        if (g_merge && (e->cls == TD_Q_RING || e->cls == TD_Q_HEAD)) {
+            if (g_merge[i] == -2)
+                continue;
+            if (g_merge[i] >= 0)
+                xy = 0x80000000u | (uint32_t)g_merge[i];
+        }
         if (e->cls == TD_Q_POLL) {
             const uint32_t offset = e->addr - FT_TT_OP_QUEUE_BASE;
 
@@ -1170,6 +1889,8 @@ static void td_dry_check(pn_tt_device *device, uint64_t forward)
             }
         *cursor += 4u + n;
     }
+    if (!bad && g_oncard.planned)
+        bad = !td_dry_check_oncard(log, log_words, k, forward);
     free(log);
     if (bad)
         g_dry_failed++;
@@ -1212,8 +1933,12 @@ void pn_tt_move_stats(uint64_t *rows, double *row_ms)
  * PULL descriptor that ran it has completed. */
 #define TS_REGIONS 12u
 #define TS_INFLIGHT 6u
-#define TS_REGION_WORDS (((TD_PROGRAM_LIMIT - TD_PROGRAM_BASE) / 4u / TS_REGIONS) & ~3u)
 #define TS_MAX_QUEUES 256u
+/* LAUNCH lane: the SHARED queue table (`PN_TT_STREAM_SHARED_TABLE`) sits above the regions, one
+ * 4-word row a queue. */
+#define TS_TABLE_BYTES (TS_MAX_QUEUES * 16u)
+#define TS_TABLE_BASE (TD_PROGRAM_LIMIT - TS_TABLE_BYTES)
+#define TS_REGION_WORDS (((TS_TABLE_BASE - TD_PROGRAM_BASE) / 4u / TS_REGIONS) & ~3u)
 #define TS_ENTRY_BASE (16u + 4u * TS_MAX_QUEUES + 4u)
 #define TS_MAX_WORDS TS_REGION_WORDS
 /* A chunk launches early (`PN_TT_STREAM_CHUNK` words, default 512: run_s2d_chunk.sh) so the card starts while
@@ -1235,6 +1960,8 @@ static uint32_t ts_chunk_words(void)
 /* After a boundary the card is idle: launch the FIRST chunk sooner (`PN_TT_STREAM_FIRST`
  * words, default = the chunk size). */
 static bool g_ts_fresh;
+/* HOST GAP: why the next full flush leaves the card idle (pn_tt_host_gap.h). */
+static const char *g_ts_gap_why = "flush";
 static uint32_t ts_first_words(void)
 {
     static uint32_t first;
@@ -1257,6 +1984,12 @@ typedef struct {
     uint32_t ring_token; /* the token word of the last ring slot written since the head */
     bool ring_pending;
     uint32_t heartbeat;
+    /* L10 B2 (hoisting in the stream): a head captured in THIS stream makes `issued` exact;
+     * slots staged since it give a write's descriptor index; the ring capacity, read once a
+     * nonce (a re-arm is a new nonce). */
+    bool fresh;
+    uint32_t staged;
+    uint32_t capacity, capacity_nonce;
 } ts_queue;
 
 static struct {
@@ -1291,6 +2024,37 @@ static struct {
     uint32_t census0[2u * TS_MAX_QUEUES];
     double census_ms[TS_MAX_QUEUES];
     uint64_t census_awaits[TS_MAX_QUEUES];
+    /* L10 B2: the hoist in the stream (`PN_TT_STREAM_HOIST`) */
+    pn_tt_hoist_tracker *hoist;
+    int64_t await_at;          /* the chunk's last AWAIT entry (word offset), -1 none */
+    bool after_await;          /* a non-HEAD entry follows it: nothing may move above it */
+    bool flushed;              /* a FLUSH already stands before it */
+    size_t await_undo_from, await_undo_to;
+    uint64_t hoisted, hoist_blocked, hoist_flushes;
+    int32_t leader_of[TS_MAX_QUEUES];
+    uint32_t leader_queues;    /* queue_count leader_of was computed for */
+    /* LAUNCH lane: the shared queue table — rows on the puller (0 = none since the stream
+     * began), the nonce each row carries, and the rows written / table drains a run. */
+    uint32_t table_rows;
+    uint32_t table_nonce[TS_MAX_QUEUES];
+    uint64_t table_writes, table_drains, table_words_saved;
+    /* S2 (pn_tt_precondition.h) in a decode-time stream: the planner, each queue's ring slots
+     * captured since its last head, the queues it was told about, the last AWAIT pushed (a
+     * poll loop is one AWAIT), and under `PN_TT_ONCARD_VERIFY=1` the stream's items and
+     * actions for the check at its end. */
+    pn_tt_pre_planner *pre;
+    uint32_t pre_items;
+    uint32_t pre_staged[TS_MAX_QUEUES];
+    bool pre_set[TS_MAX_QUEUES];
+    pn_tt_pre_queue_info pre_info[TS_MAX_QUEUES];
+    bool pre_last_await;
+    uint32_t pre_last_q, pre_last_count;
+    uint64_t n_precond;
+    bool pre_verify;
+    pn_tt_pre_item *vlog;
+    size_t vlog_n, vlog_cap;
+    td_oncard_actions vplan;
+    uint64_t verified, verify_failed;
 } g_ts;
 
 /* The puller kernel's PULL_AWAIT_TABLE (resident_puller.c). */
@@ -1331,7 +2095,13 @@ static void ts_census_accumulate(void)
     }
 }
 
-/** Print the census by family (the core's label), totals over the run. */
+void pn_tt_dispatch_census_restart(void)
+{
+    memset(g_ts.census_ms, 0, sizeof(g_ts.census_ms));
+    memset(g_ts.census_awaits, 0, sizeof(g_ts.census_awaits));
+}
+
+/** Print the census by family (the core's label), totals since the last restart. */
 static void ts_census_report(void)
 {
     double total = 0.0;
@@ -1353,10 +2123,30 @@ static void ts_census_report(void)
                     g_ts.census_ms[q] * 1000.0 / (double)g_ts.census_awaits[q]);
 }
 
+void pn_tt_dispatch_census_print(void)
+{
+    ts_census_report();
+}
+
+/* LAUNCH lane: (x, y) -> queue index + 1 (0 = none yet), so a captured write finds its
+ * queue in one load instead of a scan of ~140 (three lookups an issued descriptor). Valid
+ * while `g_ts_queue_at_count` == g_ts.queue_count; a reset of the queue list empties it. */
+static uint16_t g_ts_queue_at[64][64];
+static uint32_t g_ts_queue_at_count;
+
 static uint32_t ts_queue_of(uint16_t x, uint16_t y)
 {
     uint32_t i;
 
+    if (g_ts_queue_at_count != g_ts.queue_count) {
+        memset(g_ts_queue_at, 0, sizeof(g_ts_queue_at));
+        for (i = 0; i < g_ts.queue_count; i++)
+            if (g_ts.queues[i].x < 64u && g_ts.queues[i].y < 64u)
+                g_ts_queue_at[g_ts.queues[i].x][g_ts.queues[i].y] = (uint16_t)(i + 1u);
+        g_ts_queue_at_count = g_ts.queue_count;
+    }
+    if (x < 64u && y < 64u && g_ts_queue_at[x][y] != 0u)
+        return g_ts_queue_at[x][y] - 1u;
     for (i = 0; i < g_ts.queue_count; i++)
         if (g_ts.queues[i].x == x && g_ts.queues[i].y == y)
             return i;
@@ -1365,7 +2155,10 @@ static uint32_t ts_queue_of(uint16_t x, uint16_t y)
     memset(&g_ts.queues[i], 0, sizeof(g_ts.queues[i]));
     g_ts.queues[i].x = x;
     g_ts.queues[i].y = y;
-    return g_ts.queue_count++;
+    if (x < 64u && y < 64u)
+        g_ts_queue_at[x][y] = (uint16_t)(i + 1u);
+    g_ts_queue_at_count = ++g_ts.queue_count;
+    return i;
 }
 
 static bool ts_room(size_t words)
@@ -1375,6 +2168,7 @@ static bool ts_room(size_t words)
 
 static bool ts_flush(void);
 static bool ts_launch(bool wait);
+static bool ts_pre_push_kind(uint8_t kind);
 
 static bool ts_emit(const uint32_t *w, size_t n)
 {
@@ -1415,6 +2209,126 @@ static bool ts_wait_puller(uint32_t target)
     return true;
 }
 
+/** HOST GAP (`PN_TT_HOST_GAP_STARVE=N`, timing only): every Nth launch reads the puller's
+ *  completed count first; equal to every PULL launched = the puller had run out of program
+ *  and was waiting on the host's capture (a STARVED launch). A starved puller is spinning in
+ *  its idle loop: its idle-spin word (control word 10, reset when work arrives) says how long
+ *  it has waited, in spins; `ts_starve_calibrate` prices a spin once, on an idle puller. */
+static uint64_t g_starve_sampled, g_starve_empty, g_starve_spins;
+/* by launches since the last full flush (0 = the first chunk after a boundary .. 4 = 4+) */
+static uint64_t g_starve_at_sampled[5], g_starve_at_empty[5];
+static uint32_t g_ts_since_flush;
+static double g_starve_spins_per_us;
+static uint32_t ts_starve_every(void)
+{
+    static uint32_t every = 0xFFFFFFFFu;
+
+    if (every == 0xFFFFFFFFu)
+        every = getenv("PN_TT_HOST_GAP_STARVE") ? (uint32_t)atoi(getenv("PN_TT_HOST_GAP_STARVE"))
+                                                : 0u;
+    return every;
+}
+
+static void ts_starve_sample(pn_tt_residency *puller)
+{
+    static uint32_t n;
+    const ft_tt_noc_access *noc = &g_td.original[TD_ACC_NOC];
+    const uint32_t every = ts_starve_every();
+    uint32_t fields[8];
+
+    if (every == 0u || ++n % every != 0u)
+        return;
+    if (noc->read(noc->user, puller->core_x, puller->core_y, FT_TT_OP_QUEUE_BASE + 0x10u, fields,
+                  32u) != FT_TT_OK)
+        return;
+    g_starve_sampled++;
+    g_starve_at_sampled[g_ts_since_flush < 4u ? g_ts_since_flush : 4u]++;
+    if (fields[1] == g_ts.launched) {
+        g_starve_empty++;
+        g_starve_at_empty[g_ts_since_flush < 4u ? g_ts_since_flush : 4u]++;
+        g_starve_spins += fields[6];
+    }
+}
+
+/** Once, on a puller the host knows is idle (every PULL awaited): idle spins per us. */
+static void ts_starve_calibrate(pn_tt_residency *puller)
+{
+    const ft_tt_noc_access *noc = &g_td.original[TD_ACC_NOC];
+    uint32_t a, b;
+    double t0, t1;
+
+    if (ts_starve_every() == 0u || g_starve_spins_per_us > 0.0)
+        return;
+    t0 = pn_time_ms();
+    if (noc->read(noc->user, puller->core_x, puller->core_y, FT_TT_OP_QUEUE_BASE + 40u, &a, 4u) !=
+        FT_TT_OK)
+        return;
+    while (pn_time_ms() - t0 < 2.0)
+        ;
+    t1 = pn_time_ms();
+    if (noc->read(noc->user, puller->core_x, puller->core_y, FT_TT_OP_QUEUE_BASE + 40u, &b, 4u) !=
+            FT_TT_OK ||
+        b <= a)
+        return;
+    g_starve_spins_per_us = (double)(b - a) / ((t1 - t0) * 1000.0);
+}
+
+static void ts_table_forget(void)
+{
+    g_ts.table_rows = 0u;
+}
+
+/** `PN_TT_STREAM_SHARED_TABLE` (default 1; 0 = every launch carries its own queue table). */
+static bool ts_shared_table_on(void)
+{
+    static int on = -1;
+
+    if (on < 0)
+        on = !getenv("PN_TT_STREAM_SHARED_TABLE") || atoi(getenv("PN_TT_STREAM_SHARED_TABLE")) != 0;
+    return on != 0;
+}
+
+/** THE SHARED QUEUE TABLE: one copy on the puller at TS_TABLE_BASE instead of ~130 queue rows
+ *  (~520 words) in every launch's program. A row only ever GROWS the table in place (a launch
+ *  in flight indexes only the queues it knew); a row whose nonce changed (a re-armed queue)
+ *  would change what an in-flight launch reads, so the puller is drained first. Forgotten at
+ *  every stream begin (a replay program may have overwritten the arena). */
+static bool ts_table_sync(const ft_tt_noc_access *bulk, pn_tt_residency *puller)
+{
+    uint32_t rows[4u * TS_MAX_QUEUES];
+    uint32_t q, first = g_ts.table_rows;
+
+    for (q = 0; q < g_ts.table_rows; q++)
+        if (g_ts.table_nonce[q] != g_ts.queues[q].nonce)
+            break;
+    if (q < g_ts.table_rows) {
+        if (!ts_wait_puller(g_ts.launched))
+            return false;
+        g_ts.table_drains++;
+        first = 0u;
+    }
+    if (first == g_ts.queue_count)
+        return true;
+    for (q = first; q < g_ts.queue_count; q++) {
+        rows[4u * (q - first)] = (uint32_t)g_ts.queues[q].x | ((uint32_t)g_ts.queues[q].y << 16);
+        rows[4u * (q - first) + 1u] = g_ts.queues[q].nonce;
+        rows[4u * (q - first) + 2u] = 0xFFFFu;
+        rows[4u * (q - first) + 3u] = 0u;
+        g_ts.table_nonce[q] = g_ts.queues[q].nonce;
+    }
+    /* RED `stream_table_nonce`: the shared rows carry wrong nonces; the puller's await token
+     * check must refuse (proves the launches read THIS table). */
+    if (pn_tt_red("stream_table_nonce"))
+        for (q = first; q < g_ts.queue_count; q++)
+            rows[4u * (q - first) + 1u] ^= 1u;
+    if (bulk->write(bulk->user, puller->core_x, puller->core_y, TS_TABLE_BASE + first * 16u, rows,
+                    (size_t)(g_ts.queue_count - first) * 16u) != FT_TT_OK)
+        return false;
+    g_ts.table_rows = g_ts.queue_count;
+    g_ts.table_writes++;
+    return true;
+}
+
 /** Upload the captured chunk into the next region and launch it; `wait`: and wait for every
  *  launched chunk (the puller's own await, so its completion bookkeeping stays exact). */
 static bool ts_launch(bool wait)
@@ -1449,23 +2363,29 @@ static bool ts_launch(bool wait)
         w[TS_ENTRY_BASE + g_ts.count++] = 6u; /* program end */
         {
             /* COMPACT: header, the queues actually known, the segment table, the entries —
-             * a fixed 256-queue table was 1,044 words a launch. */
-            const uint32_t table = 16u, seg = table + 4u * g_ts.queue_count;
+             * a fixed 256-queue table was 1,044 words a launch. SHARED: no table here, the
+             * header points at the puller's one copy (an offset from this header). */
+            const bool shared = ok && ts_shared_table_on() && ts_table_sync(bulk, puller);
+            const uint32_t table = 16u, seg = table + (shared ? 0u : 4u * g_ts.queue_count);
             const uint32_t entries = (seg + 1u + 3u) & ~3u;
             uint32_t *o = g_ts.out;
 
+            if (ok && ts_shared_table_on() && !shared)
+                ok = false;
             memset(o, 0, (size_t)entries * 4u);
             o[0] = TD_PULL_MAGIC;
             o[1] = 1u;
             o[2] = g_ts.queue_count;
-            o[3] = table * 4u;
+            o[3] = shared ? TS_TABLE_BASE - base : table * 4u;
             o[4] = 1u;
             o[5] = seg * 4u;
-            for (q = 0; q < g_ts.queue_count; q++) {
+            for (q = 0; !shared && q < g_ts.queue_count; q++) {
                 o[table + 4u * q] = (uint32_t)g_ts.queues[q].x | ((uint32_t)g_ts.queues[q].y << 16);
                 o[table + 4u * q + 1u] = g_ts.queues[q].nonce;
                 o[table + 4u * q + 2u] = 0xFFFFu;
             }
+            if (shared)
+                g_ts.table_words_saved += 4u * g_ts.queue_count;
             o[seg] = entries * 4u;
             memcpy(&o[entries], &w[TS_ENTRY_BASE], g_ts.count * 4u);
             total = entries + g_ts.count;
@@ -1481,8 +2401,10 @@ static bool ts_launch(bool wait)
                 ok = false;
             g_ts.upload_ms += pn_time_ms() - up;
         }
+        ts_starve_sample(puller);
         memset(params, 0, sizeof(params));
         params[0] = base;
+        params[4] = td_lazy_heads_bit();
         /* Each queued PULL keeps ITS OWN parameter block: with one slot, a launch queued
          * behind another rewrote the base the earlier one had not read yet (chunked launches
          * skipped regions — error 4 at an await). */
@@ -1492,13 +2414,16 @@ static bool ts_launch(bool wait)
         puller->param_slot = 0u;
         g_ts_fresh = false;
         if (ok) {
+            pn_tt_host_gap_card_busy();
             g_ts.launched++;
             g_ts.region_done_at[r] = g_ts.launched;
             g_ts.region = (r + 1u) % TS_REGIONS;
             g_ts.async_launches++;
+            g_ts_since_flush++;
         }
         g_ts.launched_words += total;
         g_ts.count = 0u;
+        g_ts.await_at = -1;
         g_ts.segments++;
     }
     if (ok && wait && g_ts.launched != g_ts.completed) {
@@ -1517,20 +2442,25 @@ static bool ts_launch(bool wait)
             g_ts.completed = g_ts.launched;
         }
     }
+    if (ok && wait)
+        pn_tt_host_gap_card_idle(g_ts_gap_why);
     g_td.internal = false;
     g_ts.flush_ms += pn_time_ms() - started;
     if (wait) {
         g_ts.last_flush_end = pn_time_ms();
         g_ts_fresh = true;
+        g_ts_since_flush = 0u;
     }
     if (!ok)
         g_ts.failed = true;
     return ok;
 }
 
-/** Everything captured runs on the card and is done. */
+/** Everything captured runs on the card and is done (S2: every converted AWAIT first). */
 static bool ts_flush(void)
 {
+    if (!ts_pre_push_kind(PN_TT_PRE_SEGMENT))
+        return false;
     return ts_launch(true);
 }
 
@@ -1584,6 +2514,18 @@ static bool ts_write_entry(uint16_t x, uint16_t y, uint64_t addr, const void *sr
     return true;
 }
 
+/** `PN_TT_STREAM_CENSUS=1`: the S2e duplicate-write census (a byte hash of every ring slot
+ *  and parameter block the host captures, ~0.5 MB a cycle). Off by default since the LAUNCH
+ *  lane: it is host time in the capture path, which starves the puller mid-stream. */
+static bool ts_dup_census_on(void)
+{
+    static int on = -1;
+
+    if (on < 0)
+        on = getenv("PN_TT_STREAM_CENSUS") && atoi(getenv("PN_TT_STREAM_CENSUS")) != 0;
+    return on != 0;
+}
+
 static void ts_census(uint8_t cls, uint16_t x, uint16_t y, uint64_t addr, const void *src,
                       size_t bytes)
 {
@@ -1599,6 +2541,8 @@ static void ts_census(uint8_t cls, uint16_t x, uint16_t y, uint64_t addr, const 
     case TD_B_DRAM_W: g_ts.n_dram++; g_ts.w_dram += bytes / 4u; return;
     default: g_ts.n_l1++; g_ts.w_l1 += bytes / 4u; return;
     }
+    if (!ts_dup_census_on())
+        return;
     for (b = 0; b < bytes; b++)
         hash = (hash ^ p[b]) * 1099511628211ull;
     for (i = 0; i < 32u; i++) {
@@ -1620,6 +2564,338 @@ static void ts_census(uint8_t cls, uint16_t x, uint16_t y, uint64_t addr, const 
     g_ts.recent[g_ts.recent_at % 32u].bytes = (uint32_t)bytes;
     g_ts.recent[g_ts.recent_at % 32u].hash = hash;
     g_ts.recent_at++;
+}
+
+/* ---------------------------------------------------------------------------------------
+ * L10 B2: HOISTING IN THE STREAM. The rule is the replay's (pn_tt_dispatch_hoist.h), driven
+ * one captured entry at a time: a rotating parameter block or a ring slot of a queue whose
+ * head this stream has seen goes in front of the chunk's last AWAIT (only HEADs after it),
+ * behind a FLUSH, when what it overwrites is proven finished there. `PN_TT_STREAM_HOIST`.
+ * --------------------------------------------------------------------------------------- */
+
+static bool ts_hoist_on(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *env = getenv("PN_TT_STREAM_HOIST");
+
+        on = env && *env ? atoi(env) != 0 : 0;
+    }
+    return on == 1;
+}
+
+/** The stream hoist, unless S2 plans this stream (its lagged AWAITs already put a window
+ *  between a write and the await before it). */
+static bool ts_hoist_active(void)
+{
+    return ts_hoist_on() && !g_ts.pre;
+}
+
+static uint16_t ts_queue_xy(uint32_t q, int which)
+{
+    return which ? g_ts.queues[q].y : g_ts.queues[q].x;
+}
+
+/** The queue's ring capacity (control word 1), read once a nonce; 0 unknown. */
+static uint32_t ts_queue_capacity(ts_queue *queue)
+{
+    td_queue probe;
+
+    if (queue->capacity != 0u && queue->capacity_nonce == queue->nonce)
+        return queue->capacity;
+    memset(&probe, 0, sizeof(probe));
+    probe.x = queue->x;
+    probe.y = queue->y;
+    queue->capacity = td_queue_capacity_mask(&probe) + 1u;
+    if (queue->capacity == 1u)
+        queue->capacity = 0u;
+    queue->capacity_nonce = queue->nonce;
+    return queue->capacity;
+}
+
+/** A stream begins: every bound unknown (a host-issued gap or a re-arm may lie behind it). */
+static void ts_hoist_begin(void)
+{
+    uint32_t q;
+
+    g_ts.await_at = -1;
+    g_ts.leader_queues = UINT32_MAX;
+    for (q = 0; q < g_ts.queue_count; q++)
+        g_ts.queues[q].fresh = false;
+    if (!ts_hoist_active())
+        return;
+    if (!g_ts.hoist)
+        g_ts.hoist = pn_tt_hoist_tracker_create(TS_MAX_QUEUES);
+    if (g_ts.hoist)
+        pn_tt_hoist_tracker_forget(g_ts.hoist);
+}
+
+/** The tracker item for a queue write, or kind FIXED. */
+static pn_tt_hoist_item ts_hoist_item(uint8_t cls, uint32_t q, uint64_t addr, const void *src,
+                                      size_t bytes)
+{
+    pn_tt_hoist_item it;
+    const ts_queue *queue = &g_ts.queues[q];
+
+    memset(&it, 0, sizeof(it));
+    it.kind = PN_TT_HOIST_FIXED;
+    it.group = -1;
+    it.queue = (uint16_t)q;
+    if (!queue->fresh)
+        return it;
+    if (cls == TD_Q_PARAM_ROT) {
+        it.kind = PN_TT_HOIST_WRITE;
+        it.index = queue->issued + queue->staged;
+        it.address = (uint32_t)addr;
+    } else if (cls == TD_Q_RING && bytes % 32u == 0u && bytes > 0u) {
+        uint32_t w[8];
+
+        memcpy(w, (const uint8_t *)src + bytes - 32u, sizeof(w));
+        it.kind = PN_TT_HOIST_RING;
+        it.index = queue->issued + queue->staged;
+        it.slots = (uint32_t)(bytes / 32u);
+        if ((w[5] & 0x7FFFFFFFu) > 1u)
+            it.pull_sequence = w[6];
+        it.group_sequence = w[7];
+    }
+    return it;
+}
+
+/** Put one WRITE DIRECT in front of the chunk's last AWAIT (FLUSH first, once). */
+static bool ts_hoist_insert(uint16_t x, uint16_t y, uint64_t addr, const void *src, size_t bytes)
+{
+    const size_t at = (size_t)g_ts.await_at + (g_ts.flushed ? 0u : 1u);
+    const uint32_t pad = (uint32_t)((4u - (at + 3u) % 4u) % 4u);
+    const size_t words = 3u + pad + bytes / 4u + (g_ts.flushed ? 0u : 1u);
+    uint32_t *base = &g_ts.words[TS_ENTRY_BASE];
+    const size_t tail = g_ts.count - (size_t)g_ts.await_at;
+
+    if (!ts_direct() || bytes > 4000u * 4u || !ts_room(words + 4u))
+        return false;
+    memmove(&base[(size_t)g_ts.await_at + words], &base[g_ts.await_at], tail * 4u);
+    if (!g_ts.flushed) {
+        base[g_ts.await_at] = FT_TT_PULLER_ENTRY_FLUSH;
+        g_ts.hoist_flushes++;
+    }
+    base[at] = 8u | ((uint32_t)(bytes / 4u) << 8) | (pad << 20);
+    base[at + 1u] = (uint32_t)x | ((uint32_t)y << 16);
+    base[at + 2u] = (uint32_t)addr;
+    memset(&base[at + 3u], 0, pad * 4u);
+    memcpy(&base[at + 3u + pad], src, bytes);
+    g_ts.count += words;
+    g_ts.await_at += (int64_t)words;
+    g_ts.flushed = true;
+    g_ts.entries++;
+    return true;
+}
+
+/** Capture a queue write, in front of the last await when the rule allows. */
+static bool ts_hoist_write(uint8_t cls, uint32_t q, uint16_t x, uint16_t y, uint64_t addr,
+                           const void *src, size_t bytes)
+{
+    pn_tt_hoist_item it;
+    pn_tt_hoist_need need[4];
+    uint32_t needs;
+    bool moved = false;
+
+    if (!ts_hoist_active() || !g_ts.hoist)
+        return ts_write_entry(x, y, addr, src, bytes);
+    it = ts_hoist_item(cls, q, addr, src, bytes);
+    if (it.kind == PN_TT_HOIST_RING || it.kind == PN_TT_HOIST_WRITE) {
+        const uint32_t capacity = ts_queue_capacity(&g_ts.queues[q]);
+        const int32_t *leader_of = g_ts.leader_of;
+
+        if (g_ts.leader_queues != g_ts.queue_count) {
+            td_hoist_leaders(g_ts.device, g_ts.queue_count, ts_queue_xy, g_ts.leader_of);
+            g_ts.leader_queues = g_ts.queue_count;
+        }
+        pn_tt_hoist_tracker_queue(g_ts.hoist, q, capacity, 0u, leader_of[q]);
+        if (it.kind == PN_TT_HOIST_RING && leader_of[q] >= 0)
+            pn_tt_hoist_tracker_queue(g_ts.hoist, (uint32_t)leader_of[q],
+                                      ts_queue_capacity(&g_ts.queues[leader_of[q]]), 0u, -1);
+        needs = pn_tt_hoist_tracker_needs(g_ts.hoist, &it, need);
+        if (g_ts.await_at >= 0 && !g_ts.after_await &&
+            pn_tt_hoist_tracker_met(g_ts.hoist, need, needs, g_ts.await_undo_from,
+                                    g_ts.await_undo_to))
+            moved = ts_hoist_insert(x, y, addr, src, bytes);
+        if (moved)
+            g_ts.hoisted++;
+        else
+            g_ts.hoist_blocked++;
+    }
+    if (!moved) {
+        const uint32_t launched = g_ts.launched;
+
+        if (!ts_write_entry(x, y, addr, src, bytes))
+            return false;
+        g_ts.after_await = g_ts.launched == launched ? true : g_ts.after_await;
+    }
+    (void)pn_tt_hoist_tracker_apply(g_ts.hoist, &it);
+    if (it.kind == PN_TT_HOIST_RING || (cls == TD_Q_RING && g_ts.queues[q].fresh))
+        g_ts.queues[q].staged += (uint32_t)(bytes / 32u);
+    return true;
+}
+
+/** A HEAD captured: the queue's count is exact from here (its writes may move). */
+static void ts_hoist_head(uint32_t q, uint32_t value)
+{
+    g_ts.queues[q].fresh = true;
+    g_ts.queues[q].staged = 0u;
+    (void)value;
+}
+
+/** An AWAIT appended at word `at` of the chunk. */
+static void ts_hoist_await(uint32_t q, uint32_t wanted, size_t at)
+{
+    pn_tt_hoist_item it;
+
+    g_ts.await_at = -1;
+    if (!ts_hoist_active() || !g_ts.hoist || !g_ts.queues[q].fresh)
+        return;
+    memset(&it, 0, sizeof(it));
+    it.kind = PN_TT_HOIST_AWAIT;
+    it.group = -1;
+    it.queue = (uint16_t)q;
+    it.index = wanted;
+    pn_tt_hoist_tracker_drop_undo(g_ts.hoist);
+    g_ts.await_undo_from = pn_tt_hoist_tracker_apply(g_ts.hoist, &it);
+    g_ts.await_undo_to = pn_tt_hoist_tracker_undo_mark(g_ts.hoist);
+    g_ts.await_at = (int64_t)at;
+    g_ts.after_await = false;
+    g_ts.flushed = false;
+}
+
+/* ---------------------------------------------------------------------------------------
+ * S2 IN THE STREAM: each captured queue access is an item for the precondition planner, fed
+ * before the access's own entry, so the realized AWAITs and the sidecar entries it hands out
+ * land in front of it. Entries are WRITE DIRECTs of the 16-byte sidecar slot (the stream's
+ * values are literal; the replay uses the puller's PRECOND entry for its per-token patches).
+ * --------------------------------------------------------------------------------------- */
+
+static void ts_pre_emit(void *user, const pn_tt_pre_action *a)
+{
+    (void)user;
+    if (g_ts.pre_verify)
+        td_oncard_append(&g_ts.vplan, a);
+    if (g_ts.failed)
+        return;
+    if (a->kind == PN_TT_PRE_OUT_AWAIT) {
+        const uint32_t entry[4] = { 4u, a->queue, a->count, 0u };
+
+        g_ts.n_await++;
+        if (!ts_emit(entry, 4u))
+            g_ts.failed = true;
+    } else if (a->kind == PN_TT_PRE_OUT_PRECOND) {
+        const ts_queue *target = &g_ts.queues[a->queue], *producer = &g_ts.queues[a->producer];
+        const uint32_t words[4] = { a->index, ftq_pre_xy_word(producer->x, producer->y), a->count,
+                                    producer->nonce };
+
+        g_ts.n_precond++;
+        /* A coordinate past six bits would leave the slot untagged — no wait at all. */
+        if (words[1] == 0u || target->capacity == 0u ||
+            !ts_write_entry(target->x, target->y,
+                            FT_TT_OP_QUEUE_BASE + ftq_pre_entry_offset(a->index,
+                                                                       target->capacity - 1u),
+                            words, sizeof(words)))
+            g_ts.failed = true;
+    }
+}
+
+/** Tell the planner about queue `q` the first time this stream names it: its ring capacity
+ *  (read once a nonce), its pull leader, and whether an entry can be addressed to it. */
+static void ts_pre_setup(uint32_t q)
+{
+    uint32_t capacity;
+
+    if (q >= TS_MAX_QUEUES || g_ts.pre_set[q])
+        return;
+    capacity = ts_queue_capacity(&g_ts.queues[q]);
+    if (g_ts.leader_queues != g_ts.queue_count) {
+        td_hoist_leaders(g_ts.device, g_ts.queue_count, ts_queue_xy, g_ts.leader_of);
+        g_ts.leader_queues = g_ts.queue_count;
+    }
+    g_ts.pre_info[q].capacity = capacity;
+    g_ts.pre_info[q].honours = capacity != 0u;
+    pn_tt_precondition_queue(g_ts.pre, q, capacity, 0u, g_ts.leader_of[q],
+                             g_ts.pre_info[q].honours);
+    g_ts.pre_set[q] = true;
+}
+
+/** Feed one item. @return false (the stream failed) when the planner refused it. */
+static bool ts_pre_push(const pn_tt_pre_item *it)
+{
+    if (g_ts.failed)
+        return false;
+    if (it->kind == PN_TT_PRE_HEAD || it->kind == PN_TT_PRE_RING ||
+        it->kind == PN_TT_PRE_WRITE || it->kind == PN_TT_PRE_AWAIT)
+        ts_pre_setup(it->queue);
+    if (g_ts.pre_verify) {
+        if (g_ts.vlog_n == g_ts.vlog_cap) {
+            const size_t grow = g_ts.vlog_cap ? g_ts.vlog_cap * 2u : 16384u;
+            pn_tt_pre_item *more = realloc(g_ts.vlog, grow * sizeof(*more));
+
+            if (more) {
+                g_ts.vlog = more;
+                g_ts.vlog_cap = grow;
+            } else {
+                g_ts.pre_verify = false; /* the check is off for this stream, not the plan */
+            }
+        }
+        if (g_ts.pre_verify)
+            g_ts.vlog[g_ts.vlog_n++] = *it;
+    }
+    g_ts.pre_last_await = it->kind == PN_TT_PRE_AWAIT;
+    g_ts.pre_last_q = it->queue;
+    g_ts.pre_last_count = it->index;
+    if (pn_tt_precondition_push(g_ts.pre, g_ts.pre_items++, it) != 0)
+        g_ts.failed = true;
+    return !g_ts.failed;
+}
+
+/** The planner's item for a captured queue write (`cls` RING / PARAM_ROT / PARAM_CACHE). A
+ *  ring slot or parameter block of a queue whose head this stream has not seen has no known
+ *  index: an untracked write (everything realized first). */
+static pn_tt_pre_item ts_pre_write_item(uint8_t cls, uint32_t q, uint64_t addr, const void *src,
+                                        size_t bytes)
+{
+    const ts_queue *queue = &g_ts.queues[q];
+    pn_tt_pre_item it;
+
+    memset(&it, 0, sizeof(it));
+    it.kind = PN_TT_PRE_BARRIER;
+    it.group = -1;
+    it.queue = (uint16_t)q;
+    if (!queue->fresh)
+        return it;
+    it.index = queue->issued + g_ts.pre_staged[q];
+    if (cls == TD_Q_RING && bytes % 32u == 0u && bytes > 0u) {
+        uint32_t w[8];
+
+        memcpy(w, (const uint8_t *)src + bytes - 32u, sizeof(w));
+        it.kind = PN_TT_PRE_RING;
+        it.slots = (uint32_t)(bytes / 32u);
+        if ((w[5] & 0x7FFFFFFFu) > 1u)
+            it.pull_sequence = w[6];
+        it.group_sequence = w[7];
+    } else if (cls == TD_Q_PARAM_ROT) {
+        it.kind = PN_TT_PRE_WRITE;
+        it.address = (uint32_t)addr;
+    }
+    return it;
+}
+
+/** An item of one kind and nothing else (a data write, a row copy, a stream's segment end). */
+static bool ts_pre_push_kind(uint8_t kind)
+{
+    pn_tt_pre_item it;
+
+    if (!g_ts.pre)
+        return true;
+    memset(&it, 0, sizeof(it));
+    it.kind = kind;
+    it.group = -1;
+    return ts_pre_push(&it);
 }
 
 static bool td_stream_write(uint8_t acc, uint16_t x, uint16_t y, uint64_t addr,
@@ -1646,7 +2922,15 @@ static bool td_stream_write(uint8_t acc, uint16_t x, uint16_t y, uint64_t addr,
             memcpy(&g_ts.queues[q].ring_token, (const uint8_t *)src + bytes - 32u + 4u, 4u);
             g_ts.queues[q].ring_pending = true;
         }
-        return ts_write_entry(x, y, addr, src, bytes);
+        if (g_ts.pre) {
+            const pn_tt_pre_item it = ts_pre_write_item(cls, q, addr, src, bytes);
+
+            if (!ts_pre_push(&it))
+                return false;
+            if (cls == TD_Q_RING)
+                g_ts.pre_staged[q] += (uint32_t)(bytes / 32u);
+        }
+        return ts_hoist_write(cls, q, x, y, addr, src, bytes);
     }
     case TD_Q_HEAD: {
         const uint32_t q = ts_queue_of(x, y);
@@ -1662,6 +2946,22 @@ static bool td_stream_write(uint8_t acc, uint16_t x, uint16_t y, uint64_t addr,
         }
         g_ts.queues[q].issued = value;
         g_ts.queues[q].issued_known = true;
+        ts_hoist_head(q, value);
+        if (g_ts.pre) {
+            /* The batch's ring slots were captured just before (an enqueue writes slots, then
+             * the head, in one call), so its first descriptor is the head less them. */
+            pn_tt_pre_item it;
+
+            memset(&it, 0, sizeof(it));
+            it.kind = PN_TT_PRE_HEAD;
+            it.group = -1;
+            it.queue = (uint16_t)q;
+            it.slots = g_ts.pre_staged[q];
+            it.index = it.slots ? value - it.slots : UINT32_MAX;
+            g_ts.pre_staged[q] = 0u;
+            if (!ts_pre_push(&it))
+                return false;
+        }
         entry[0] = 3u;
         entry[1] = q;
         entry[2] = value;
@@ -1673,6 +2973,9 @@ static bool td_stream_write(uint8_t acc, uint16_t x, uint16_t y, uint64_t addr,
     case TD_B_L1_W:
         if (!aligned)
             break;
+        g_ts.after_await = true;
+        if (!ts_pre_push_kind(PN_TT_PRE_BARRIER))
+            return false;
         return ts_write_entry(x, y, addr, src, bytes);
     default:
         break;
@@ -1689,6 +2992,39 @@ static bool td_stream_write(uint8_t acc, uint16_t x, uint16_t y, uint64_t addr,
     return false;
 }
 
+/** The puller AWAITs queue `q` reaching `count` — once a run (S2: the planner places it). */
+static bool ts_emit_await(uint32_t q, uint32_t count)
+{
+    const size_t last = g_ts.count;
+    uint32_t entry[4];
+
+    if (g_ts.pre) {
+        pn_tt_pre_item it;
+
+        memset(&it, 0, sizeof(it));
+        it.kind = PN_TT_PRE_AWAIT;
+        it.group = -1;
+        it.queue = (uint16_t)q;
+        it.index = count;
+        if (g_ts.pre_last_await && g_ts.pre_last_q == q && g_ts.pre_last_count == count)
+            return true;
+        return ts_pre_push(&it);
+    }
+    if (last >= 4u && g_ts.words[TS_ENTRY_BASE + last - 4u] == 4u &&
+        g_ts.words[TS_ENTRY_BASE + last - 3u] == q &&
+        g_ts.words[TS_ENTRY_BASE + last - 2u] == count)
+        return true;
+    entry[0] = 4u;
+    entry[1] = q;
+    entry[2] = count;
+    entry[3] = 0u;
+    g_ts.n_await++;
+    if (!ts_emit(entry, 4u))
+        return false;
+    ts_hoist_await(q, count, g_ts.count - 4u);
+    return true;
+}
+
 static bool td_stream_read(uint8_t acc, uint16_t x, uint16_t y, uint64_t addr, void *dst,
                            size_t bytes)
 {
@@ -1699,29 +3035,18 @@ static bool td_stream_read(uint8_t acc, uint16_t x, uint16_t y, uint64_t addr, v
         ts_queue *queue = q < TS_MAX_QUEUES ? &g_ts.queues[q] : NULL;
 
         if (queue && queue->nonce_known && queue->issued_known && queue->issued > 0u) {
-            uint32_t window[16], entry[4];
+            uint32_t window[16];
             const uint32_t first = (uint32_t)((addr - FT_TT_OP_QUEUE_BASE) / 4u);
-            const size_t last = g_ts.count;
             uint32_t token = queue->nonce ^ (queue->issued * TD_TOKEN_MULTIPLIER);
 
             if (token == 0u || token == (uint32_t)FT_TT_QUEUE_STATE_HOST_POISON)
                 token = queue->nonce ^ 0xA5A5A5A5u;
-            /* The puller waits for the same count (once a run of polls). */
-            if (!(last >= 4u && g_ts.words[TS_ENTRY_BASE + last - 4u] == 4u &&
-                  g_ts.words[TS_ENTRY_BASE + last - 3u] == q &&
-                  g_ts.words[TS_ENTRY_BASE + last - 2u] == queue->issued)) {
-                entry[0] = 4u;
-                entry[1] = q;
-                /* RED `stream_await_early`: the puller waits for one descriptor LESS than the
-                 * host was told is done — the next family starts on a producer's unfinished
-                 * output; must DIFFER (never more than one behind, so no ring overrun). */
-                entry[2] = queue->issued - (pn_tt_red("stream_await_early") && queue->issued > 1u
-                                                ? 1u : 0u);
-                entry[3] = 0u;
-                g_ts.n_await++;
-                if (!ts_emit(entry, 4u))
-                    return false;
-            }
+            /* RED `stream_await_early`: the puller waits for one descriptor LESS than the host
+             * was told is done — the next family starts on a producer's unfinished output; must
+             * DIFFER (never more than one behind, so no ring overrun). */
+            if (!ts_emit_await(q, queue->issued - (pn_tt_red("stream_await_early") &&
+                                                           queue->issued > 1u ? 1u : 0u)))
+                return false;
             memset(window, 0, sizeof(window));
             window[FT_TT_QUEUE_FIELD_COMPLETED_COUNT] = queue->issued;
             window[FT_TT_QUEUE_FIELD_COMPLETED_TOKEN] = token;
@@ -1741,8 +3066,11 @@ static bool td_stream_read(uint8_t acc, uint16_t x, uint16_t y, uint64_t addr, v
     g_ts.bound_by_class[cls]++;
     {
         const double t = pn_time_ms();
-        const bool flushed = ts_flush();
+        bool flushed;
 
+        g_ts_gap_why = td_class_name[cls];
+        flushed = ts_flush();
+        g_ts_gap_why = "flush";
         g_ts.bound_drain_ms += pn_time_ms() - t;
         if (!flushed)
             return false;
@@ -1812,6 +3140,9 @@ static bool td_stream_rowcopy(const uint32_t *params)
 {
     uint32_t entry[10];
 
+    g_ts.after_await = true;
+    if (!ts_pre_push_kind(PN_TT_PRE_BARRIER))
+        return false;
     entry[0] = 7u;
     memcpy(&entry[1], params, 9u * 4u);
     g_ts.n_rowcopy++;
@@ -1819,6 +3150,75 @@ static bool td_stream_rowcopy(const uint32_t *params)
 }
 
 static void ts_puller_clocks(uint32_t *busy, uint32_t *await);
+
+/** pn_tt_dispatch_stream_begin_decode() is the caller: S2 may plan this stream. */
+static bool g_ts_decode;
+
+/** `PN_TT_ONCARD_VERIFY=1`: every S2 stream is checked at its end (pn_tt_precondition_verify). */
+static bool ts_pre_verify_on(void)
+{
+    static int on = -1;
+
+    if (on < 0)
+        on = getenv("PN_TT_ONCARD_VERIFY") && atoi(getenv("PN_TT_ONCARD_VERIFY")) != 0;
+    return on == 1;
+}
+
+/** S2 for a decode-time stream: a fresh planner (every bound unknown, as the hoist's). */
+static void ts_pre_begin(void)
+{
+    const pn_tt_pre_config config = { td_oncard_lookahead(), pn_tt_red("precondition_early") };
+
+    g_ts.pre = NULL;
+    if (!g_ts_decode || !td_oncard_on())
+        return;
+    g_ts.pre = pn_tt_precondition_create(TS_MAX_QUEUES, &config, ts_pre_emit, NULL);
+    if (!g_ts.pre) {
+        fprintf(stderr, "pn_tt: STREAM — ONCARD planner not created; this stream awaits as "
+                        "today\n");
+        return;
+    }
+    g_ts.pre_items = 0u;
+    g_ts.pre_last_await = false;
+    memset(g_ts.pre_staged, 0, sizeof(g_ts.pre_staged));
+    memset(g_ts.pre_set, 0, sizeof(g_ts.pre_set));
+    memset(g_ts.pre_info, 0, sizeof(g_ts.pre_info));
+    g_ts.pre_verify = ts_pre_verify_on();
+    g_ts.vlog_n = 0u;
+    g_ts.vplan.n = 0u;
+    g_ts.vplan.oom = false;
+}
+
+/** The stream ended (everything realized by its last flush): check it if asked, drop the
+ *  planner. A failed check is reported; the stream already ran, so it is also counted. */
+static void ts_pre_end(void)
+{
+    pn_tt_pre_report report;
+
+    if (!g_ts.pre)
+        return;
+    if (g_ts.pre_verify && !g_ts.vplan.oom) {
+        g_ts.verified++;
+        if (!pn_tt_precondition_verify(g_ts.vlog, g_ts.vlog_n, g_ts.vplan.a, g_ts.vplan.n,
+                                       g_ts.pre_info, TS_MAX_QUEUES, NULL, 0u, &report) &&
+            g_ts.verify_failed++ < 8u)
+            fprintf(stderr, "pn_tt: STREAM — ONCARD check FAILED on stream %llu (%zu failures; "
+                            "first: %s)\n", (unsigned long long)g_ts.verified, report.failures,
+                    report.first);
+    }
+    pn_tt_precondition_destroy(g_ts.pre);
+    g_ts.pre = NULL;
+}
+
+bool pn_tt_dispatch_stream_begin_decode(pn_tt_device *device)
+{
+    bool ok;
+
+    g_ts_decode = true;
+    ok = pn_tt_dispatch_stream_begin(device);
+    g_ts_decode = false;
+    return ok;
+}
 
 bool pn_tt_dispatch_stream_begin(pn_tt_device *device)
 {
@@ -1840,6 +3240,9 @@ bool pn_tt_dispatch_stream_begin(pn_tt_device *device)
     memset(g_ts.region_done_at, 0, sizeof(g_ts.region_done_at));
     g_ts.launched = g_ts.completed = device->puller.queue.issued;
     g_ts.last_flush_end = pn_time_ms();
+    ts_pre_begin(); /* before the hoist: an S2 stream does not hoist */
+    ts_hoist_begin();
+    ts_table_forget();
     /* The streamed program overwrites the puller's recorded decode program: re-learn it. */
     g_td.sequence_reset = true;
     td_wrap(device);
@@ -1847,6 +3250,9 @@ bool pn_tt_dispatch_stream_begin(pn_tt_device *device)
     if (ts_census_enabled())
         ts_census_read(g_ts.census0);
     g_streaming = true;
+    /* `PN_TT_STREAM_PROFILE=1` (with `PN_PROFILE`): sample the host only inside streams. */
+    if (getenv("PN_TT_STREAM_PROFILE"))
+        pn_sample_profiler_window(1);
     return true;
 }
 
@@ -1868,7 +3274,12 @@ bool pn_tt_dispatch_stream_end(void)
 
     if (!g_streaming)
         return true;
+    g_ts_gap_why = "end";
     ok = ts_flush() && !g_ts.failed;
+    g_ts_gap_why = "flush";
+    ts_pre_end();
+    if (ok)
+        ts_starve_calibrate(&g_ts.device->puller);
     {
         uint32_t busy, wait;
 
@@ -1879,11 +3290,30 @@ bool pn_tt_dispatch_stream_end(void)
             ts_census_accumulate();
     }
     g_streaming = false;
+    if (getenv("PN_TT_STREAM_PROFILE"))
+        pn_sample_profiler_window(0);
     td_unwrap();
     /* What the host thinks it issued stays what it issued; a failure leaves no trust. */
     if (!ok)
         g_ts.queue_count = 0u;
     return ok;
+}
+
+int pn_tt_dispatch_stream_await(uint16_t x, uint16_t y, uint32_t count)
+{
+    uint32_t q;
+
+    if (!g_streaming)
+        return 0;
+    if (g_ts.failed)
+        return -1;
+    q = ts_queue_of(x, y);
+    if (q >= TS_MAX_QUEUES || !g_ts.queues[q].nonce_known || !g_ts.queues[q].issued_known ||
+        count > g_ts.queues[q].issued)
+        return -1;
+    if (count == 0u)
+        return 1;
+    return ts_emit_await(q, count) ? 1 : -1;
 }
 
 bool pn_tt_dispatch_stream_kick(void)
@@ -1914,6 +3344,11 @@ void pn_tt_dispatch_stream_report(double cycles)
             g_ts.n_l1 / cycles, g_ts.w_l1 / cycles, g_ts.n_head / cycles, g_ts.n_await / cycles,
             g_ts.n_rowcopy / cycles, g_ts.dup_writes / cycles, g_ts.dup_words / cycles,
             g_ts.dup_same_row / cycles);
+    if (g_ts.table_writes)
+        fprintf(stderr, "pn_tt: STREAM shared queue table: %.0f words a cycle not uploaded, "
+                        "%.1f table writes and %.2f drains a cycle\n",
+                (double)g_ts.table_words_saved / cycles, (double)g_ts.table_writes / cycles,
+                (double)g_ts.table_drains / cycles);
     {
         unsigned c;
 
@@ -1932,9 +3367,39 @@ void pn_tt_dispatch_stream_report(double cycles)
                     g_ts.l1r[c].ms / cycles);
         fprintf(stderr, "\n");
     }
+    if (g_starve_sampled) {
+        const double share = (double)g_starve_empty / (double)g_starve_sampled;
+        const double idle_us = g_starve_empty && g_starve_spins_per_us > 0.0
+                                   ? (double)g_starve_spins / (double)g_starve_empty /
+                                         g_starve_spins_per_us
+                                   : 0.0;
+
+        fprintf(stderr, "pn_tt: STREAM STARVED launches: %llu of %llu sampled found the puller "
+                        "with nothing left to run; idle at the launch %.1f us each (%.1f spins/us)"
+                        " -> ~%.2f ms a cycle\n", (unsigned long long)g_starve_empty,
+                (unsigned long long)g_starve_sampled, idle_us, g_starve_spins_per_us,
+                share * ((double)g_ts.async_launches / cycles) * idle_us / 1000.0);
+        fprintf(stderr, "pn_tt: STREAM STARVED by launches since a flush: 0 %llu/%llu, 1 %llu/%llu, "
+                        "2 %llu/%llu, 3 %llu/%llu, 4+ %llu/%llu\n",
+                (unsigned long long)g_starve_at_empty[0], (unsigned long long)g_starve_at_sampled[0],
+                (unsigned long long)g_starve_at_empty[1], (unsigned long long)g_starve_at_sampled[1],
+                (unsigned long long)g_starve_at_empty[2], (unsigned long long)g_starve_at_sampled[2],
+                (unsigned long long)g_starve_at_empty[3], (unsigned long long)g_starve_at_sampled[3],
+                (unsigned long long)g_starve_at_empty[4], (unsigned long long)g_starve_at_sampled[4]);
+    }
     fprintf(stderr, "pn_tt: STREAM puller a cycle: %.1f ms inside PULLs, %.1f of them in AWAIT "
                     "polls (%.1f issuing)\n", g_ts.puller_busy_ms / cycles,
             g_ts.puller_await_ms / cycles, (g_ts.puller_busy_ms - g_ts.puller_await_ms) / cycles);
+    if (ts_hoist_on())
+        fprintf(stderr, "pn_tt: STREAM HOIST a cycle: %.0f writes moved under an await, %.0f "
+                        "left in place, %.0f flushes\n", g_ts.hoisted / cycles,
+                g_ts.hoist_blocked / cycles, g_ts.hoist_flushes / cycles);
+    if (g_ts.n_precond)
+        fprintf(stderr, "pn_tt: STREAM ONCARD a cycle: %.0f sidecar entries, %.0f real awaits "
+                        "(lookahead %u); %llu streams checked, %llu FAILED%s\n",
+                g_ts.n_precond / cycles, g_ts.n_await / cycles, td_oncard_lookahead(),
+                (unsigned long long)g_ts.verified, (unsigned long long)g_ts.verify_failed,
+                pn_tt_red("precondition_early") ? " [RED precondition_early]" : "");
 }
 
 /**
@@ -1950,8 +3415,11 @@ static int td_puller_submit(pn_tt_device *device, uint32_t opcode, const uint32_
 {
     if (!td_puller_arm(device))
         return -1;
-    if (pn_tt_residency_submit(&device->puller, opcode, params, 5000u) == 0)
+    pn_tt_host_gap_card_busy();
+    if (pn_tt_residency_submit(&device->puller, opcode, params, 5000u) == 0) {
+        pn_tt_host_gap_card_idle("puller-op");
         return 0;
+    }
     if (pn_tt_red("puller_no_rearm") || device->puller.running || !td_puller_arm(device) ||
         (g_prog.count > 0u && !td_upload_program(device)))
         return -1;
@@ -2198,7 +3666,7 @@ static bool td_launch_segment(uint32_t segment)
     params[4] = (pn_tt_red("dispatch_skip_patch") ? 2u : 0u) |
                 (pn_tt_red("dispatch_bad_token") ? 4u : 0u) |
                 (pn_tt_red("dispatch_no_wait") ? 8u : 0u) |
-                (pn_tt_red("dispatch_mcast_short") ? 32u : 0u);
+                (pn_tt_red("dispatch_mcast_short") ? 32u : 0u) | td_lazy_heads_bit();
     if (ok && pn_tt_residency_enqueue(puller, TD_PULL_OPCODE, params, 1u) != 0) {
         /* AN IDLE PULLER IS RETIRED BY THE ENQUEUE (residency_idle_retire): a prefill longer
          * than the idle limit (~5 s: the serve's 1,630-token prompt is 7 s) between two
@@ -2211,6 +3679,7 @@ static bool td_launch_segment(uint32_t segment)
     }
     g_td.internal = false;
     if (ok) {
+        pn_tt_host_gap_card_busy();
         g_td.next_segment = segment + 1u;
         g_td.launched_segments++;
     }
@@ -2287,6 +3756,8 @@ static bool td_await_puller(void)
     }
     g_td.internal = false;
     g_td.awaited_segment = g_td.next_segment;
+    if (ok)
+        pn_tt_host_gap_card_idle("segment");
     return ok;
 }
 
@@ -2303,6 +3774,10 @@ static bool td_replay_access(uint8_t acc, uint16_t x, uint16_t y, uint64_t addr,
         return false;
     }
     e = &a->events[g_td.cursor];
+    /* HOST GAP: before the token's first launch the card is idle — book the host time up to
+     * each event under the class it reached (timing only; a no-op with the clock off). */
+    if (g_td.next_segment == 0u)
+        pn_tt_host_gap_split(td_class_name[cls]);
     if (cls != e->cls || x != e->x || y != e->y || bytes != e->bytes ||
         (cls != TD_Q_RING && addr != e->addr)) {
         if (g_td.divergences < 8u)
@@ -2402,6 +3877,28 @@ static void td_replay_end(void)
     td_unwrap();
 }
 
+/** Why the two model tokens gave no model: the reason and the first events around it (both
+ *  tokens), so a refused token names its own cause (qwen36 plan S2). */
+static void td_explain_no_model(const char *why, size_t at)
+{
+    const size_t index = at % 500000000u;
+
+    fprintf(stderr, "pn_tt: DISPATCH SHADOW — no model: %s (at %s%zu)\n", why,
+            at >= 1000000000u ? "model 1 event " : "event ", index);
+    for (unsigned m = 0; m < 2u; m++) {
+        const td_token *t = &g_td.model[m];
+
+        for (size_t i = index > 2u ? index - 2u : 0u; i < t->count && i <= index + 2u; i++) {
+            const td_event *e = &t->events[i];
+
+            fprintf(stderr, "pn_tt:   model %u event %zu: %s acc %u core (%u,%u) addr 0x%x bytes %u "
+                            "queue %u index %u%s\n", m, i, td_class_name[e->cls], (unsigned)e->acc,
+                    (unsigned)e->x, (unsigned)e->y, (unsigned)e->addr, (unsigned)e->bytes,
+                    (unsigned)e->queue, (unsigned)e->index, i == index ? "   <--" : "");
+        }
+    }
+}
+
 /* ---------------------------------------------------------------------------------------
  * Token hooks
  * --------------------------------------------------------------------------------------- */
@@ -2417,6 +3914,19 @@ void pn_tt_dispatch_token_begin(pn_tt_device *device, uint64_t forward)
 
     if (!device)
         return;
+    /* A SHAPE-KEY CHANGE re-anchors the model exactly as a new sequence does: the token's
+     * descriptors are not the linear continuation of the model's (split-K's plan at the new
+     * depth), and the puller writes a prediction BEFORE the host's write can be compared, so
+     * a replayed token across the change puts the wrong descriptors on the card. That token
+     * and the learning pair after it are host-issued (exact either way). */
+    if (g_td.shape_key != g_td.anchor_key) {
+        if (g_td.reanchors++ < 8u && live > 0)
+            fprintf(stderr, "pn_tt: DISPATCH — the token's shape key changed at forward %llu "
+                            "(the attention plan): replay re-learns from here\n",
+                    (unsigned long long)forward);
+        g_td.anchor_key = g_td.shape_key;
+        g_td.sequence_reset = true;
+    }
     /* A NEW SEQUENCE re-anchors the model: positions restart, so every position patch would
      * be wrong. The model is re-learned on the sequence's own forwards `shadow`, `shadow+1`
      * (counted from its first forward) and replay resumes after them. */
@@ -2425,6 +3935,7 @@ void pn_tt_dispatch_token_begin(pn_tt_device *device, uint64_t forward)
         g_td.sequence_first = forward;
         g_td.model_ok = false;
         g_td.puller_ready = false;
+        g_td.relearns = 0u;
     }
     if (g_td.sequence_first == 0u)
         g_td.sequence_first = 1u;
@@ -2456,6 +3967,29 @@ void pn_tt_dispatch_token_begin(pn_tt_device *device, uint64_t forward)
     g_td.recording = true;
 }
 
+/**
+ * H: two model tokens that are not one shape (the first decode forward still carries the
+ * prefill's tail) slide the window one forward instead of ending replay for the sequence:
+ * the second token becomes the first of the next pair, and learning retries on the next
+ * forward. `PN_TT_DISPATCH_RELEARN` slides at most (default 8, 0 = never, the old behaviour).
+ */
+static void td_slide_window(void)
+{
+    const long limit = getenv("PN_TT_DISPATCH_RELEARN") ? td_env_long("PN_TT_DISPATCH_RELEARN")
+                                                         : 8;
+    td_token keep;
+
+    if (limit <= 0 || g_td.relearns >= (uint32_t)limit)
+        return;
+    keep = g_td.model[0];
+    g_td.model[0] = g_td.model[1];
+    g_td.model[1] = keep;
+    g_td.sequence_first++;
+    g_td.relearns++;
+    fprintf(stderr, "pn_tt: DISPATCH SHADOW — window slid (%u of %ld): learning retries on "
+                    "the next forward\n", g_td.relearns, limit);
+}
+
 void pn_tt_dispatch_token_end(pn_tt_device *device, uint64_t forward)
 {
     const long observe = td_env_long("PN_TT_DISPATCH_RECORD");
@@ -2475,18 +4009,29 @@ void pn_tt_dispatch_token_end(pn_tt_device *device, uint64_t forward)
     if (shadow <= 0)
         return;
     if (g_td.into == &g_td.model[1]) {
-        g_td.model_ok = g_td.model[0].count == g_td.model[1].count &&
-                        td_resolve(&g_td.model[0]) && td_resolve(&g_td.model[1]) &&
-                        td_learn_queues();
+        const char *why = NULL;
+        size_t at = 0u;
+
+        if (g_td.model[0].count != g_td.model[1].count)
+            why = "event counts differ";
+        else if (!td_resolve(&g_td.model[0]) || !td_resolve(&g_td.model[1]))
+            why = "a queue write did not resolve (queue table full or a ring write not 32 B)";
+        else if (!td_learn_queues_at(&at))
+            why = "a ring token or slot did not decode (learn queues)";
+        g_td.model_ok = why == NULL;
         if (g_td.model_ok) {
             size_t i;
 
             for (i = 0; i < g_td.model[0].count; i++)
                 if (!td_same_shape(&g_td.model[0].events[i], &g_td.model[1].events[i])) {
                     g_td.model_ok = false;
+                    why = "an event changed shape";
+                    at = i;
                     break;
                 }
         }
+        if (why)
+            td_explain_no_model(why, at);
         if (g_td.model_ok && (td_env_long("PN_TT_DISPATCH_DRY") > 0 || live > 0)) {
             g_td.puller_ready = td_build_program() && td_puller_arm(device) &&
                                 td_upload_program(device);
@@ -2497,10 +4042,12 @@ void pn_tt_dispatch_token_end(pn_tt_device *device, uint64_t forward)
             if (!g_event_segment_ready)
                 g_td.puller_ready = false;
         }
-        if (!g_td.model_ok)
+        if (!g_td.model_ok) {
             fprintf(stderr, "pn_tt: DISPATCH SHADOW — the two model tokens are not one shape "
                             "(%zu vs %zu events) or a token word did not decode; no model\n",
                     g_td.model[0].count, g_td.model[1].count);
+            td_slide_window();
+        }
     } else if (g_td.into == &g_td.current && g_td.model_ok) {
         if (td_resolve(&g_td.current)) {
             td_shadow_check(forward);
@@ -2516,6 +4063,11 @@ void pn_tt_dispatch_token_end(pn_tt_device *device, uint64_t forward)
 void pn_tt_dispatch_sequence_reset(void)
 {
     g_td.sequence_reset = true;
+}
+
+void pn_tt_dispatch_shape_key(uint64_t key)
+{
+    g_td.shape_key = key;
 }
 
 bool pn_tt_dispatch_quiet(void)
@@ -2547,6 +4099,10 @@ void pn_tt_dispatch_report(void)
                 (unsigned long long)g_td.divergences,
                 g_td.replay_dead ? " — replay OFF" : "",
                 getenv("PN_TT_RED") ? " [RED armed]" : "");
+    if (td_dispatch_live() > 0 && g_td.reanchors)
+        fprintf(stderr, "pn_tt: DISPATCH REPLAY — %llu re-anchor(s) at a shape-key change "
+                        "(the attention plan); learning restarted there\n",
+                (unsigned long long)g_td.reanchors);
     if (td_env_long("PN_TT_DISPATCH_DRY") > 0)
         fprintf(stderr, "pn_tt: DISPATCH DRY — %llu tokens replayed on the puller in dry-run, "
                         "%llu FAILED, %llu log words compared; program %zu B, %u segments%s\n",

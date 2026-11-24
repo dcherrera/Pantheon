@@ -50,6 +50,50 @@ static int ckpt_reserve(pn_tt_device *device)
     return 0;
 }
 
+/** Add `sets` twin sets (every layer's window + state, each pinned to its live region's bank,
+ *  the placement pn_tt_gdn_alloc_twin takes) to `need`. */
+static void gdn_twin_sets_need(const pn_tt_device *device, uint32_t sets, pn_tt_bank_need *need)
+{
+    const uint32_t layers = device->gdn_shape.layer_count;
+    uint32_t *banks;
+    size_t window, state;
+
+    if (sets == 0u)
+        return;
+    banks = calloc((size_t)layers * 2u, sizeof(*banks));
+    if (!banks) {
+        pn_tt_bank_need_pin(need, 0u, UINT64_MAX / 4u); /* cannot count -> cannot fit */
+        return;
+    }
+    for (uint32_t layer = 0; layer < layers; layer++) {
+        banks[layer] = device->gdn_region[layer].window.bank;
+        banks[layers + layer] = device->gdn_region[layer].state.bank;
+    }
+    pn_tt_gdn_carried_bytes(device, &window, &state);
+    for (uint32_t set = 0; set < sets; set++)
+        pn_tt_bank_need_twins(need, banks, banks + layers, layers, window, state);
+    free(banks);
+}
+
+void pn_tt_gdn_checkpoint_need(const pn_tt_device *device, pn_tt_bank_need *need)
+{
+    if (!need || !pn_tt_gdn_is_armed(device) || device->gdn_checkpoint)
+        return;
+    gdn_twin_sets_need(device, 1u, need);
+}
+
+void pn_tt_gdn_snapshot_need(const pn_tt_device *device, uint32_t slots, pn_tt_bank_need *need)
+{
+    if (!need || !pn_tt_gdn_is_armed(device) || slots <= device->gdn_snapshot_slots)
+        return;
+    gdn_twin_sets_need(device, slots - device->gdn_snapshot_slots, need);
+}
+
+int pn_tt_gdn_checkpoint_reserve(pn_tt_device *device)
+{
+    return device && pn_tt_gdn_is_armed(device) ? ckpt_reserve(device) : -1;
+}
+
 /** Copy one buffer card side. Both ends are exactly `bytes` long and 64 B aligned. */
 static int ckpt_copy(pn_tt_device *device, const pn_tt_gdn_buffer *from,
                      const pn_tt_gdn_buffer *to, size_t bytes)

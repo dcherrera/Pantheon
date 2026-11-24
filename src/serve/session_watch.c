@@ -15,6 +15,11 @@
  *        every matching mode slot, and while alive it holds them off the 12 h
  *        backstop (via a watch-hook installed on each model's prefix cache).
  *
+ *        A watch PINS its model (mr_watch_pin), it does not hold an in-flight
+ *        reference: an unload never waits on it. The manager is the registry's
+ *        unload hook — when a model is unloaded every watch on it (live or in
+ *        grace) gets a terminal `event: model_unloaded` and is closed.
+ *
  * @status Built; poll loop + grace reaper CPU-tested, CUDA compile-checked.
  * @issues None
  * @todo None
@@ -34,8 +39,10 @@
 #include <unistd.h>
 
 #include "../core/prefix_cache.h"
+#include "batch_sched.h"
 #include "http_server.h"
 #include "model_session.h"
+#include "replica_affinity.h"
 
 #define PN_WATCH_SID_MAX  64
 #define PN_WATCH_NAME_MAX MR_MAX_NAME
@@ -48,7 +55,8 @@ typedef struct {
     int       fd;                       /* held client fd, or -1 when closed */
     char      name[PN_WATCH_NAME_MAX];  /* model id (routing + logging) */
     char      sid[PN_WATCH_SID_MAX];    /* prefix-cache session key */
-    mr_entry *entry;                    /* the manager holds an mr_acquire ref */
+    char      principal[MS_PRINCIPAL_MAX]; /* who opened it ("" = plain serve) */
+    mr_entry *entry;                    /* the manager holds an mr_watch_pin */
     uint64_t  closed_at_ms;             /* wall-clock ms the watch closed; 0 =
                                          * still held (alive). Nonzero starts
                                          * the grace timer. */
@@ -144,15 +152,37 @@ uint64_t pn_session_watch_backstop_ms(void)
  * mode-suffixed sids `<base>-orch`/`-act`/`-chat` — so release the whole
  * `<base>-*` prefix, not just an exact-match base entry (which usually does not
  * even exist). Also release any exact-match base entry, for a client that keyed
- * its live slot on the bare base. */
-static void release_session(mr_entry *entry, const char *sid)
+ * its live slot on the bare base.
+ *
+ * `principal` is who opened the watch ("" = plain serve). Pantheon Local (§4.8):
+ * a session bound to another person since the watch opened is not released. */
+static void release_session(mr_registry *reg, mr_entry *entry, const char *sid,
+                            const char *principal)
 {
     if (!entry || !sid || !sid[0])
         return;
+    if (ms_session_principal_check(entry, sid, principal, false, MS_PRINCIPAL_CHECK) != MS_OK) {
+        fprintf(stderr, "[session_watch] not releasing sid=%s model=%s: it belongs to "
+                "another person\n", sid, entry->name);
+        return;
+    }
     char base_prefix[PN_WATCH_SID_MAX + 1];
     snprintf(base_prefix, sizeof(base_prefix), "%s-", sid);
-    ms_session_release_by_prefix(entry, base_prefix);
-    ms_session_release(entry, sid);
+    /* Every copy of the model, not just the watched one: a turn may have placed
+     * the session on another copy than the one its watch pinned (a seatless
+     * binding is re-placed, a refused session fails over). */
+    mr_entry *copies[MR_MAX_MODELS];
+    int n = mr_acquire_replicas(reg, entry->name, copies, MR_MAX_MODELS);
+    if (n == 0) {
+        copies[0] = entry;   /* our pin keeps it valid; not counted as a ref */
+    }
+    for (int i = 0; i < (n ? n : 1); i++) {
+        ms_session_release_by_prefix(copies[i], base_prefix);
+        ms_session_release(copies[i], sid);
+    }
+    pn_replica_affinity_forget(sid);   /* the base and every "<base>-*" binding */
+    for (int i = 0; i < n; i++)
+        mr_release(reg, copies[i]);
 }
 
 /* Wake the poll thread (the table changed). Best-effort one byte on the
@@ -228,7 +258,7 @@ void pn_session_watch_install_backstop_hooks(pn_session_watch_mgr *m)
     pthread_mutex_lock(&m->reg->lock);
     for (int i = 0; i < MR_MAX_MODELS; i++) {
         mr_entry *e = &m->reg->entries[i];
-        if (!e->used || !e->prefix_cache)
+        if (!e->used || (!e->prefix_cache && !e->sched))
             continue;
         if (m->n_hook_bindings >= MR_MAX_MODELS)
             break;
@@ -237,32 +267,36 @@ void pn_session_watch_install_backstop_hooks(pn_session_watch_mgr *m)
             continue;   /* OOM: this cache just keeps the default (no hook) */
         b->mgr = m;
         snprintf(b->name, sizeof(b->name), "%s", e->name);
+        /* Both arms: the cache's backstop on the single-user path, the
+         * scheduler's idle-slot reaper on the batched one. */
         pn_prefix_cache_set_watch_hook(e->prefix_cache, watch_hook_adapter, b);
+        bs_set_watch_hook(e->sched, watch_hook_adapter, b);
         m->hook_bindings[m->n_hook_bindings++] = b;
     }
     pthread_mutex_unlock(&m->reg->lock);
 }
 
-/* Drop a watch row entirely: close its fd if still open, release the manager's
- * registry reference, clear the row. Caller holds mu. Does NOT release the
+/* Drop a watch row entirely: close its fd if still open, drop the manager's
+ * watch pin, clear the row. Caller holds mu. Does NOT release the
  * session (that is the sweep's decision) unless `release` is set. */
 static void watch_drop(pn_session_watch_mgr *m, pn_watch *w, int release)
 {
     if (!w->used)
         return;
     if (release)
-        release_session(w->entry, w->sid);
+        release_session(m->reg, w->entry, w->sid, w->principal);
     if (w->fd >= 0) {
         close(w->fd);
         w->fd = -1;
     }
     if (w->entry)
-        mr_release(m->reg, w->entry);
+        mr_watch_unpin(m->reg, w->entry);
     w->entry = NULL;
     w->used = 0;
     w->closed_at_ms = 0;
     w->sid[0] = '\0';
     w->name[0] = '\0';
+    w->principal[0] = '\0';
 }
 
 /* Mark a watch's connection closed (peer hung up): close the fd, start the
@@ -278,6 +312,58 @@ static void watch_mark_closed(pn_watch *w, uint64_t now_ms)
         w->closed_at_ms = now_ms ? now_ms : 1;   /* nonzero = grace running */
 }
 
+/* Send a watch its terminal event before the serve closes it for an unload:
+ *   event: model_unloaded
+ *   data: {"event":"model_unloaded","model":"<name>"}
+ * Non-blocking and best-effort — a peer that is not reading just gets the
+ * close. The name is JSON-escaped by dropping the few characters that would
+ * need escaping (model ids never carry them). */
+static void watch_send_model_unloaded(int fd, const char *name)
+{
+    char safe[PN_WATCH_NAME_MAX], msg[256];
+    size_t n = 0;
+
+    for (const char *p = name; *p && n + 1 < sizeof(safe); p++)
+        if (*p != '"' && *p != '\\' && (unsigned char)*p >= 0x20)
+            safe[n++] = *p;
+    safe[n] = '\0';
+    int len = snprintf(msg, sizeof(msg), "event: model_unloaded\ndata: "
+                       "{\"event\":\"model_unloaded\",\"model\":\"%s\"}\n\n", safe);
+    if (len > 0 && (size_t)len < sizeof(msg)) {
+        ssize_t w = send(fd, msg, (size_t)len, MSG_DONTWAIT);
+        (void)w;
+    }
+}
+
+/* The registry's unload hook (mr_set_unload_hook): the entry's live turns are
+ * gone and it is about to be freed, so close every watch on it — live ones get
+ * the terminal `model_unloaded` event first, in-grace ones (fd already closed)
+ * just go — and drop their pins. The sessions themselves are not released one
+ * by one: the unload frees the whole prefix cache and scheduler right after.
+ * Called WITHOUT the registry lock (mr_watch_unpin takes it under mu, the same
+ * order watch_drop uses). */
+static void watch_close_for_unload(void *ctx, mr_entry *entry)
+{
+    pn_session_watch_mgr *m = ctx;
+    int closed = 0;
+
+    pthread_mutex_lock(&m->mu);
+    for (int i = 0; i < PN_WATCH_MAX; i++) {
+        pn_watch *w = &m->watches[i];
+        if (!w->used || w->entry != entry)
+            continue;
+        if (w->fd >= 0)
+            watch_send_model_unloaded(w->fd, w->name);
+        fprintf(stderr, "[session_watch] closing watch sid=%s model=%s "
+                "(model unloaded)\n", w->sid, w->name);
+        watch_drop(m, w, 0);
+        closed++;
+    }
+    pthread_mutex_unlock(&m->mu);
+    if (closed)
+        watch_wake(m);
+}
+
 /* Grace sweep: release any watch closed longer than the grace ago (no
  * reconnect cancelled it). Runs under mu for the table scan; the actual
  * pn_prefix_cache_release_session happens on a snapshot AFTER dropping mu so
@@ -286,8 +372,8 @@ static void watch_sweep(pn_session_watch_mgr *m, uint64_t now_ms)
 {
     /* Collect the (entry,sid) to release + rows to clear under mu, then act
      * without mu held (release_session takes a model lock). */
-    struct { mr_entry *entry; char sid[PN_WATCH_SID_MAX]; int idx; }
-        due[PN_WATCH_MAX];
+    struct { mr_entry *entry; char sid[PN_WATCH_SID_MAX];
+             char principal[MS_PRINCIPAL_MAX]; int idx; } due[PN_WATCH_MAX];
     int n_due = 0;
 
     pthread_mutex_lock(&m->mu);
@@ -299,6 +385,8 @@ static void watch_sweep(pn_session_watch_mgr *m, uint64_t now_ms)
             now_ms - w->closed_at_ms >= m->grace_ms) {
             due[n_due].entry = w->entry;
             snprintf(due[n_due].sid, sizeof(due[n_due].sid), "%s", w->sid);
+            snprintf(due[n_due].principal, sizeof(due[n_due].principal), "%s",
+                     w->principal);
             due[n_due].idx = i;
             n_due++;
             /* Detach the row from the manager's reference bookkeeping here but
@@ -319,14 +407,15 @@ static void watch_sweep(pn_session_watch_mgr *m, uint64_t now_ms)
             w->entry = NULL;   /* ownership of the ref moves to `due` */
             w->sid[0] = '\0';
             w->name[0] = '\0';
+            w->principal[0] = '\0';
         }
     }
     pthread_mutex_unlock(&m->mu);
 
     for (int i = 0; i < n_due; i++) {
-        release_session(due[i].entry, due[i].sid);
+        release_session(m->reg, due[i].entry, due[i].sid, due[i].principal);
         if (due[i].entry)
-            mr_release(m->reg, due[i].entry);
+            mr_watch_unpin(m->reg, due[i].entry);
     }
 }
 
@@ -479,6 +568,7 @@ static pn_session_watch_mgr *watch_new(mr_registry *reg, int start_thread)
         }
         m->thread_started = 1;
     }
+    mr_set_unload_hook(reg, watch_close_for_unload, m);
     return m;
 }
 
@@ -497,6 +587,9 @@ void pn_session_watch_stop(pn_session_watch_mgr *m)
 {
     if (!m)
         return;
+    /* First, so no unload calls into a manager that is going away (waits out a
+     * hook call already in progress). */
+    mr_set_unload_hook(m->reg, NULL, NULL);
     pthread_mutex_lock(&m->mu);
     m->stop = 1;
     pthread_mutex_unlock(&m->mu);
@@ -504,7 +597,7 @@ void pn_session_watch_stop(pn_session_watch_mgr *m)
     if (m->thread_started)
         pthread_join(m->thread, NULL);
 
-    /* Close every held/in-grace watch and release the manager's refs. Does NOT
+    /* Close every held/in-grace watch and drop the manager's pins. Does NOT
      * release the sessions — shutdown reclaims VRAM via the model teardown. */
     for (int i = 0; i < PN_WATCH_MAX; i++)
         watch_drop(m, &m->watches[i], 0);
@@ -513,10 +606,13 @@ void pn_session_watch_stop(pn_session_watch_mgr *m)
      * freed) and free them. Best-effort under the registry lock. */
     if (m->reg) {
         pthread_mutex_lock(&m->reg->lock);
-        for (int i = 0; i < MR_MAX_MODELS; i++)
-            if (m->reg->entries[i].used && m->reg->entries[i].prefix_cache)
-                pn_prefix_cache_set_watch_hook(m->reg->entries[i].prefix_cache,
-                                               NULL, NULL);
+        for (int i = 0; i < MR_MAX_MODELS; i++) {
+            if (!m->reg->entries[i].used)
+                continue;
+            pn_prefix_cache_set_watch_hook(m->reg->entries[i].prefix_cache,
+                                           NULL, NULL);
+            bs_set_watch_hook(m->reg->entries[i].sched, NULL, NULL);
+        }
         pthread_mutex_unlock(&m->reg->lock);
     }
     for (int i = 0; i < m->n_hook_bindings; i++)
@@ -531,17 +627,22 @@ void pn_session_watch_stop(pn_session_watch_mgr *m)
 
 /* The keepalive header a watch connection gets on establish: a 200 with an
  * event-stream content type and a single comment line, then held open. No body
- * follows (the client just watches for the socket to close). */
+ * follows (the client just watches for the socket to close). Runs on the
+ * connection thread, so it carries that request's response headers (the
+ * serving replica). */
 static void watch_send_established(int fd)
 {
-    static const char hdr[] =
-        "HTTP/1.1 200 OK\r\n"
-        "Content-Type: text/event-stream\r\n"
-        "Cache-Control: no-cache\r\n"
-        "Access-Control-Allow-Origin: *\r\n"
-        "Connection: keep-alive\r\n\r\n"
-        ": watch established\n\n";
-    ssize_t n = write(fd, hdr, sizeof(hdr) - 1);
+    char hdr[256 + HS_THREAD_HEADERS_MAX];
+    int len = snprintf(hdr, sizeof(hdr),
+                       "HTTP/1.1 200 OK\r\n"
+                       "Content-Type: text/event-stream\r\n"
+                       "Cache-Control: no-cache\r\n"
+                       "Access-Control-Allow-Origin: *\r\n"
+                       "Connection: keep-alive\r\n%s\r\n"
+                       ": watch established\n\n", hs_thread_response_headers());
+    if (len <= 0 || (size_t)len >= sizeof(hdr))
+        return;
+    ssize_t n = write(fd, hdr, (size_t)len);
     (void)n;   /* best-effort; a write failure is caught as a close by poll */
 }
 
@@ -552,11 +653,20 @@ int pn_session_watch_add(pn_session_watch_mgr *m, int fd, mr_entry *entry,
         !sid[0])
         return -1;
 
-    /* Take the manager's OWN reference for the fd's lifetime (the caller's
-     * mr_acquire ref is released by the caller after this returns). */
-    mr_entry *held = mr_acquire(m->reg, name);
-    if (!held)
+    /* Pantheon Local (§4.8): no watch on another person's session. A check, not
+     * a bind (a watch never claims an id); the release checks again. */
+    const char *principal = hs_thread_principal();
+    if (ms_session_principal_check(entry, sid, principal, hs_thread_principal_admin(),
+                                   MS_PRINCIPAL_CHECK) != MS_OK)
+        return MS_NOT_YOURS;
+
+    /* Pin THIS entry for the fd's lifetime (the caller's mr_acquire ref is
+     * released by the caller after this returns). A pin, not a reference: an
+     * open watch must never keep an unload waiting — the unload closes it
+     * through watch_close_for_unload instead. */
+    if (mr_watch_pin(m->reg, entry) != 0)
         return -1;
+    mr_entry *held = entry;
 
     pthread_mutex_lock(&m->mu);
 
@@ -567,12 +677,13 @@ int pn_session_watch_add(pn_session_watch_mgr *m, int fd, mr_entry *entry,
         if (w->fd >= 0)
             close(w->fd);          /* the old connection is superseded */
         if (w->entry)
-            mr_release(m->reg, w->entry);
+            mr_watch_unpin(m->reg, w->entry);
         w->entry = held;
         w->fd = fd;
         w->closed_at_ms = 0;       /* alive again — grace cancelled */
         snprintf(w->name, sizeof(w->name), "%s", name);
         snprintf(w->sid, sizeof(w->sid), "%s", sid);
+        snprintf(w->principal, sizeof(w->principal), "%s", principal ? principal : "");
         w->used = 1;
         pthread_mutex_unlock(&m->mu);
         watch_send_established(fd);
@@ -591,7 +702,7 @@ int pn_session_watch_add(pn_session_watch_mgr *m, int fd, mr_entry *entry,
     }
     if (!w) {
         pthread_mutex_unlock(&m->mu);
-        mr_release(m->reg, held);
+        mr_watch_unpin(m->reg, held);
         return -1;                  /* table full — caller keeps + closes fd */
     }
     w->entry = held;
@@ -599,6 +710,7 @@ int pn_session_watch_add(pn_session_watch_mgr *m, int fd, mr_entry *entry,
     w->closed_at_ms = 0;
     snprintf(w->name, sizeof(w->name), "%s", name);
     snprintf(w->sid, sizeof(w->sid), "%s", sid);
+    snprintf(w->principal, sizeof(w->principal), "%s", principal ? principal : "");
     w->used = 1;
     pthread_mutex_unlock(&m->mu);
 

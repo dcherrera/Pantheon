@@ -84,6 +84,7 @@
 
 #ifdef USE_TT
 
+#include <math.h>
 #include <stdio.h>
 #include <time.h>
 #include <stdlib.h>
@@ -92,11 +93,16 @@
 #include "qwen35moe.h"
 #include "qwen35moe_internal.h"
 #include "qwen35moe_tt_internal.h"
+#include "../accel/tt/pn_tt_moe.h"
 
 #include "../accel/tt/pn_tt_dispatch.h"
+#include "../accel/tt/pn_tt_host_gap.h"
 #include "../accel/tt/pn_tt_device.h"
 #include "../accel/tt/pn_tt_matmul_group.h"
 #include "../accel/tt/pn_tt_render.h"
+#include "../accel/tt/pn_tt_topk_tail.h"
+#include "../core/sampler_topn_tail.h"
+#include "../core/sampler_topn_surgery.h"
 #include "../core/bench.h"
 #include "../core/engine.h"
 #include "../core/qweight.h"
@@ -117,6 +123,8 @@ void pn_qwen35moe_tt_red_accept_next_cycle(void)
  *  same spelling, as the llama backend's: used verbatim, provenance unchecked, refuses
  *  rather than quietly reconverting. */
 #define PN_QWEN35_TT_ARTIFACT_ENV "PN_TT_ARTIFACT"
+/** The Qwen3.6 MoE census arm; see `moe_census` in qwen35moe_tt_internal.h. */
+#define PN_QWEN35_TT_Q36_CENSUS_ENV "PN_TT_Q36_CENSUS"
 
 /** Where cached artifacts live. Unset keeps them beside the checkpoint. */
 #define PN_QWEN35_TT_CACHE_DIR_ENV "PN_TT_ARTIFACT_CACHE_DIR"
@@ -138,6 +146,23 @@ void pn_qwen35moe_tt_red_accept_next_cycle(void)
  * The seam
  * ============================================================ */
 
+/** One bound weight's matvec. A split joint Q+gate runs its two halves and re-interleaves
+ *  them, so the host block reading `out` sees the joint layout it always did. */
+static int qwen35_tt_binding_matvec(pn_qwen35_tt *g, const pn_qwen35_tt_binding *b,
+                                    const float *x, float *out)
+{
+    const size_t half = (size_t)b->split_heads * b->split_head_dim;
+
+    if (!b->split)
+        return pn_tt_matvec(g->device, &b->card, x, out);
+    if (pn_tt_matvec(g->device, &b->card, x, g->h_qg_parts) != 0 ||
+        pn_tt_matvec(g->device, &b->gate, x, g->h_qg_parts + half) != 0)
+        return -1;
+    pn_qwen35_tt_interleave_qg(g->h_qg_parts, g->h_qg_parts + half, b->split_heads,
+                               b->split_head_dim, out);
+    return 0;
+}
+
 /**
  * `qwen35moe_mv`'s backend: run this matvec on the card, or decline.
  *
@@ -155,7 +180,7 @@ static int qwen35_tt_mv(void *ctx, const pn_qweight *w, const float *x, float *o
     for (i = 0; i < g->n_bindings; i++) {
         if (g->bindings[i].key != w)
             continue;
-        if (pn_tt_matvec(g->device, &g->bindings[i].card, x, out) != 0) {
+        if (qwen35_tt_binding_matvec(g, &g->bindings[i], x, out) != 0) {
             g->mv_failed++;
             if (!g->failure_reported) {
                 g->failure_reported = 1;
@@ -207,6 +232,47 @@ static int qwen35_tt_bind(pn_qwen35_tt *g, const char *name, const pn_qweight *k
 }
 
 /**
+ * Bind a joint Q+gate `attn_q` that was uploaded as its two halves (option A of the Qwen3.8 fit). `d->attn_q` keeps the joint SHAPE for the strip widths and owns no
+ * DRAM; the halves are what every reader runs.
+ */
+static int qwen35_tt_bind_split_q(pn_qwen35_tt *g, const pn_qwen35moe_config *cfg,
+                                  const char *name, const pn_qweight *key,
+                                  pn_qwen35_tt_layer *d)
+{
+    pn_qwen35_tt_binding *slot;
+    const size_t joint_floats = (size_t)2u * (size_t)cfg->n_head * (size_t)cfg->head_dim;
+
+    if (g->n_bindings >= g->n_expected)
+        return -1;
+    if (pn_tt_device_find_weight_part(g->device, name, 0u, &d->attn_q_only) != 0 ||
+        pn_tt_device_find_weight_part(g->device, name, 1u, &d->attn_gate_only) != 0) {
+        fprintf(stderr, "qwen35_tt: the artifact has neither %s nor both its halves\n", name);
+        return -1;
+    }
+    if (!g->h_qg_parts) {
+        g->h_qg_parts = calloc(joint_floats, sizeof(float));
+        if (!g->h_qg_parts)
+            return -1;
+    }
+    memset(&d->attn_q, 0, sizeof(d->attn_q));
+    d->attn_q.tile_rows = d->attn_q_only.tile_rows;
+    d->attn_q.tile_cols = d->attn_q_only.tile_cols + d->attn_gate_only.tile_cols;
+    d->attn_q.tile_bytes = d->attn_q_only.tile_bytes;
+    d->attn_q.in_features = d->attn_q_only.in_features;
+    d->attn_q.out_features = d->attn_q_only.out_features + d->attn_gate_only.out_features;
+    d->attn_q_split = true;
+    slot = &g->bindings[g->n_bindings++];
+    memset(slot, 0, sizeof(*slot));
+    slot->key = key;
+    slot->card = d->attn_q_only;
+    slot->gate = d->attn_gate_only;
+    slot->split = true;
+    slot->split_heads = (uint32_t)cfg->n_head;
+    slot->split_head_dim = (uint32_t)cfg->head_dim;
+    return 0;
+}
+
+/**
  * How many matmul weights this geometry has, derived and not assumed.
  *
  * Checked against the walk afterwards. The two are computed from different things — this
@@ -243,7 +309,16 @@ static int qwen35_tt_bind_layer(pn_qwen35_tt *g, pn_qwen35moe_model *m,
         if (!l)
             return -1;
         for (i = 0; i < (int)(sizeof(bind) / sizeof(bind[0])); i++) {
+            pn_tt_weight whole;
+
             snprintf(name, sizeof(name), "blk.%d.%s.weight", layer, bind[i].suffix);
+            /* attn_q uploaded as its halves: not resident whole, by design. */
+            if (bind[i].card == &d->attn_q &&
+                pn_tt_device_find_weight(g->device, name, &whole) != 0) {
+                if (qwen35_tt_bind_split_q(g, cfg, name, bind[i].key, d) != 0)
+                    return -1;
+                continue;
+            }
             if (qwen35_tt_bind(g, name, bind[i].key, bind[i].card) != 0)
                 return -1;
         }
@@ -270,12 +345,13 @@ static int qwen35_tt_bind_layer(pn_qwen35_tt *g, pn_qwen35moe_model *m,
         moe = &l->moe;
     }
 
-    (void)cfg;
     {
+        /* The dense SwiGLU, or — on the MoE census arm — the shared expert in its place. */
+        const int dense = cfg->dense_ffn && cfg->n_expert == 0;
         struct { const char *suffix; const pn_qweight *key; pn_tt_weight *card; } ffn[] = {
-            { "ffn_gate", &moe->ffn_gate_shexp, &d->ffn_gate },
-            { "ffn_up", &moe->ffn_up_shexp, &d->ffn_up },
-            { "ffn_down", &moe->ffn_down_shexp, &d->ffn_down },
+            { dense ? "ffn_gate" : "ffn_gate_shexp", &moe->ffn_gate_shexp, &d->ffn_gate },
+            { dense ? "ffn_up" : "ffn_up_shexp", &moe->ffn_up_shexp, &d->ffn_up },
+            { dense ? "ffn_down" : "ffn_down_shexp", &moe->ffn_down_shexp, &d->ffn_down },
         };
         for (i = 0; i < (int)(sizeof(ffn) / sizeof(ffn[0])); i++) {
             snprintf(name, sizeof(name), "blk.%d.%s.weight", layer, ffn[i].suffix);
@@ -350,6 +426,16 @@ static int qwen35_tt_resolve_artifact(pn_model *model, pn_qwen35moe_model *m,
         }
         fprintf(stderr, "qwen35_tt: artifact %s (%s override — its provenance is NOT "
                         "checked against the checkpoint)\n", out, PN_QWEN35_TT_ARTIFACT_ENV);
+        return 0;
+    }
+    if (model->card_artifact && *model->card_artifact) {
+        /* A card metadata GGUF's own artifact (pn_load attached it): there is nothing here
+         * to convert from, and Pantheon Local checked its sha256 at install. */
+        if (snprintf(out, out_bytes, "%s", model->card_artifact) >= (int)out_bytes) {
+            fprintf(stderr, "qwen35_tt: REFUSED — the card artifact's path does not fit\n");
+            return -1;
+        }
+        fprintf(stderr, "qwen35_tt: artifact %s (prebuilt, beside the metadata GGUF)\n", out);
         return 0;
     }
     if (!model->path || !*model->path) {
@@ -434,16 +520,27 @@ int pn_qwen35moe_tt_upload(pn_model *model)
 
     /* Two refusals, and they are different sentences on purpose: telling the SABER user
      * their model does not fit would send them to fix the wrong thing. */
-    if (!cfg->dense_ffn || cfg->n_expert > 0) {
-        fprintf(stderr, "qwen35_tt: this backend serves the DENSE qwen35 branch; this "
-                        "checkpoint is the MoE one (%d experts) and its router and expert "
-                        "gather are not built here. Staying on CPU.\n", cfg->n_expert);
+    const int moe_census = (!cfg->dense_ffn || cfg->n_expert > 0) && getenv(PN_QWEN35_TT_Q36_CENSUS_ENV) &&
+                           atoi(getenv(PN_QWEN35_TT_Q36_CENSUS_ENV)) == 1;
+    /* THE MoE BLOCK (qwen35moe_moe_tt.c, qwen36 plan Phase 5.4): the routed experts, the
+     * router and the shared expert on the card. The census arm keeps its own meaning. */
+    const int moe_block = (!cfg->dense_ffn || cfg->n_expert > 0) && !moe_census;
+    if (moe_block && (cfg->n_expert_used <= 0 || cfg->n_expert_used > 8 ||
+                      cfg->expert_ff % 32 != 0 || cfg->n_expert % 32 != 0)) {
+        fprintf(stderr, "qwen35_tt: this MoE geometry (%d experts, top-%d, expert ff %d) is not "
+                        "one the card's MoE block serves. Staying on CPU.\n", cfg->n_expert,
+                cfg->n_expert_used, cfg->expert_ff);
         return -1;
     }
-    if (cfg->n_embd % 32 != 0 || cfg->ffn_length % 32 != 0) {
+    if (moe_census)
+        fprintf(stderr, "qwen35_tt: MoE CENSUS ARM (%s=1) — %d routed experts NOT on the card, the "
+                        "shared expert bound as the FFN: the DRAM map is 3.6's, the tokens are NOT "
+                        "the model's\n", PN_QWEN35_TT_Q36_CENSUS_ENV, cfg->n_expert);
+    if (cfg->n_embd % 32 != 0 ||
+        ((moe_census || moe_block) ? cfg->shared_ff : cfg->ffn_length) % 32 != 0) {
         fprintf(stderr, "qwen35_tt: REFUSED — a card tile is 32 wide and this geometry "
                         "(n_embd %d, ffn %d) does not divide by it\n",
-                cfg->n_embd, cfg->ffn_length);
+                cfg->n_embd, (moe_census || moe_block) ? cfg->shared_ff : cfg->ffn_length);
         return -1;
     }
 
@@ -461,6 +558,7 @@ int pn_qwen35moe_tt_upload(pn_model *model)
     report = getenv(PN_QWEN35_TT_REPORT_ENV);
     g->report_every = report ? atoi(report) : 0;
     g->n_expected = qwen35_tt_expected_bindings(cfg, n_ssm, n_attn);
+    g->moe_census = moe_census;
     g->n_layers = cfg->n_layer;
     {
         const char *sparse = getenv(PN_QWEN35_TT_SPARSE_ENV);
@@ -478,11 +576,22 @@ int pn_qwen35moe_tt_upload(pn_model *model)
     pn_tt_device_prefer_prefetch_tiles(g->device, 4u);
     /* M4: pipelined matmul reader + 3-chunk CBs (+1.7% decode, +1.0% prefill). */
     pn_tt_device_prefer_matmul_pipe(g->device, true);
+    /* P2a: A-reuse at the hidden Kt (Qwen3.8 5120 / 32 = 160: in-proj, gate/up, attention
+     * projections and the LM head). Exact; plain +3.7% measured (decode-stack P0). */
+    pn_tt_device_prefer_a_reuse_tiles(g->device, (uint32_t)(cfg->n_embd / 32));
     if (qwen35_tt_resolve_artifact(model, m, cfg, n_ssm, artifact, sizeof(artifact)) != 0)
         goto fail;
-    if (pn_tt_device_load_artifact(g->device, artifact) != 0)
+    pn_tt_moe_defer_weights(g->device, moe_block != 0);
+    /* Main's placement unless it cannot fit this card (qwen35moe_tt_fit_plan.h): decided with
+     * the directory open and nothing placed, because option A moves the weights. */
+    if (pn_tt_device_open_artifact(g->device, artifact) != 0)
         goto fail;
+    /* The MTP head resolves first: a dense head enters main's floor. */
     pn_qwen35_tt_mtp_resolve(g, artifact);
+    pn_qwen35_tt_fit_decide(g, cfg, n_ssm, n_attn);
+    if (pn_tt_device_place_artifact(g->device) != 0)
+        goto fail;
+    pn_tt_device_report_dram_stage(g->device, "after weight upload");
 
     g->bindings = calloc((size_t)g->n_expected, sizeof(*g->bindings));
     g->layers = calloc((size_t)cfg->n_layer, sizeof(*g->layers));
@@ -493,6 +602,8 @@ int pn_qwen35moe_tt_upload(pn_model *model)
             goto fail;
     }
     if (qwen35_tt_bind(g, "output.weight", pn_qwen35moe_model_output(m), &g->output) != 0)
+        goto fail;
+    if (moe_block && pn_qwen35_tt_moe_bind(g, m, cfg) != 0)
         goto fail;
 
     if (g->n_bindings != g->n_expected) {
@@ -523,6 +634,11 @@ int pn_qwen35moe_tt_upload(pn_model *model)
      * the projection-only arm, slower and not wrong. */
     if (pn_qwen35_tt_resident_arm(g, m, cfg) != 0)
         goto fail;
+    if (moe_block && !g->moe) {
+        fprintf(stderr, "qwen35_tt: the MoE block needs the resident arm and it did not arm — "
+                        "there is no projection-only MoE. Staying on CPU.\n");
+        goto fail;
+    }
 
     fprintf(stderr, "qwen35_tt: %d matmul weights resident (%.2f GiB), %d SSM + %d "
                     "attention layers, %d matmuls a token, %s arm\n",
@@ -534,6 +650,18 @@ int pn_qwen35moe_tt_upload(pn_model *model)
      * and the activation mirrors as well as the weights — which is what a capacity question
      * has to be answered from, and what the weight figure alone cannot say. */
     pn_tt_device_report_dram(g->device, "after arm");
+    /* L10: the embedding rows a decode token reads on the host (the segment boundary before
+     * the card can start) are faulted in once here: a cold row was a page fault from disk.
+     * DEFAULT on (run_l10_boundaries_d7.sh: plain +0.9%, spec +1.4%, IDENTICAL; 1 GiB of page
+     * cache, ~2.6 s at load); `PN_TT_EMBED_RESIDENT=0` off. */
+    if (!getenv("PN_TT_EMBED_RESIDENT") || atoi(getenv("PN_TT_EMBED_RESIDENT")) != 0) {
+        const double t0 = pn_time_ms();
+        const size_t touched = pn_qwen35moe_model_embed_prefault(m);
+
+        fprintf(stderr, "qwen35_tt: embedding table resident in the page cache — %.1f MiB in "
+                        "%.2f s\n", (double)touched / (1024.0 * 1024.0),
+                (pn_time_ms() - t0) / 1000.0);
+    }
     return 0;
 
 fail:
@@ -566,25 +694,29 @@ fail:
     return -1;
 }
 
+/* `model->weights` is a pn_qwen35moe_model ONLY for the qwen35 family. Callers outside this
+ * family ask too — the prefix cache asks every model whether its K/V is on the card — and
+ * reading a llama's pn_llama_qweights as a pn_qwen35moe_model hands back a garbage `gpu`
+ * pointer. That crashed the TT serve on the first system-prompt chat to a CPU-fallback Qwen3
+ * (SIGSEGV in pn_qwen35_tt_attn_is_on_card). So every pn_model entry asks the arch first. */
+pn_qwen35_tt *pn_qwen35_tt_of(const pn_model *model)
+{
+    if (!model || !model->weights)
+        return NULL;
+    if (model->config.arch != PN_ARCH_QWEN35MOE && model->config.arch != PN_ARCH_BONSAI)
+        return NULL;
+    return (pn_qwen35_tt *)pn_qwen35moe_model_gpu((const pn_qwen35moe_model *)model->weights);
+}
+
 int pn_qwen35moe_model_tt_loaded(const pn_model *model)
 {
-    const pn_qwen35moe_model *m;
-
-    if (!model || !model->weights)
-        return 0;
-    m = (const pn_qwen35moe_model *)model->weights;
-    return pn_qwen35moe_model_gpu(m) != NULL;
+    return pn_qwen35_tt_of(model) != NULL;
 }
 
 int pn_qwen35moe_model_tt_kv_on_card(const pn_model *model)
 {
-    const pn_qwen35moe_model *m;
-    const pn_qwen35_tt *g;
+    const pn_qwen35_tt *g = pn_qwen35_tt_of(model);
 
-    if (!model || !model->weights)
-        return 0;
-    m = (const pn_qwen35moe_model *)model->weights;
-    g = (const pn_qwen35_tt *)pn_qwen35moe_model_gpu(m);
     return g && pn_qwen35_tt_attn_is_on_card(g) ? 1 : 0;
 }
 
@@ -605,6 +737,7 @@ void pn_qwen35moe_tt_free(pn_model *model)
     pn_qwen35moe_model_set_gpu(m, NULL);
     pn_qwen35_tt_resident_release(g);
     pn_qwen35_tt_prefill_release(g);
+    pn_qwen35_tt_mtp_prompt_free(g);
     pn_qwen35_tt_ckpt_release(g);
     free(g->layers);
     free(g->bindings);
@@ -618,13 +751,8 @@ void pn_qwen35moe_tt_free(pn_model *model)
 void pn_qwen35moe_tt_matmul_counts(const pn_model *model, uint64_t *on_card,
                                    uint64_t *on_host, uint64_t *failed)
 {
-    const pn_qwen35moe_model *m;
-    const pn_qwen35_tt *g = NULL;
+    const pn_qwen35_tt *g = pn_qwen35_tt_of(model);
 
-    if (model && model->weights) {
-        m = (const pn_qwen35moe_model *)model->weights;
-        g = (const pn_qwen35_tt *)pn_qwen35moe_model_gpu(m);
-    }
     if (on_card)
         *on_card = g ? g->mv_on_card : 0;
     if (on_host)
@@ -1014,6 +1142,7 @@ static void qwen35_tt_report(const pn_qwen35_tt *g)
     pn_tt_device_phase_seconds(g->device, &upload, &dispatch, &readback);
     pn_tt_device_dispatch_counts(g->device, &resident, &oneshot, &restarts);
     per_token = g->tokens ? (upload + dispatch + readback) / (double)g->tokens : 0.0;
+    pn_tt_host_gap_report("token", (double)g->tokens);
 
     fprintf(stderr, "qwen35_tt: token %llu — %llu matmuls on the card, %llu on the host, "
                     "%llu refused\n", (unsigned long long)g->tokens,
@@ -1090,15 +1219,78 @@ static void qwen35_tt_note_sequential_prefill(pn_qwen35_tt *g, int pos)
             (unsigned long long)g->sequential_prefill_run);
 }
 
-/** Wrap the logit row the chosen arm produced in the tensor the engine expects. */
-static tm_tensor *qwen35_tt_wrap_logits(const float *logits, int n_vocab)
+/** RED `row_hint_drop` (PN_TT_RED): read once. */
+static bool qwen35_tt_red_row_hint_drop(void)
 {
-    int64_t shape[1] = { n_vocab };
+    static int on = -1;
+
+    if (on < 0)
+        on = getenv("PN_TT_RED") && strcmp(getenv("PN_TT_RED"), "row_hint_drop") == 0;
+    return on != 0;
+}
+
+/* Insertion sort: at most PN_QWEN35_TT_TOPK_PAIRS ids. */
+static void qwen35_tt_sort_ids(uint32_t *ids, uint32_t n)
+{
+    uint32_t i, j;
+
+    for (i = 1; i < n; i++) {
+        const uint32_t v = ids[i];
+
+        for (j = i; j > 0 && ids[j - 1] > v; j--)
+            ids[j] = ids[j - 1];
+        ids[j] = v;
+    }
+}
+
+/** Wrap the logit row the chosen arm produced in the tensor the engine expects. */
+static tm_tensor *qwen35_tt_wrap_logits(const pn_qwen35_tt *g, const float *logits, int n_vocab)
+{
+    /* `PN_TT_ROW_RESET`, default on: room for the survivor ids after the row, ALWAYS the same size so
+     * the allocator recycles one block (a size that changes every token is a fresh mmap and
+     * 243 page faults: +0.7 ms measured). */
+    const bool sparse = pn_qwen35_tt_row_reset_on() && g->row_sparse == logits &&
+                        g->row_count > 0u;
+    int64_t shape[1] = { n_vocab + (pn_qwen35_tt_row_reset_on() ? PN_QWEN35_TT_TOPK_PAIRS : 0) };
     tm_tensor *out = tm_empty(shape, 1, TM_F32);
+    float *row;
+    uint32_t i;
 
     if (!out)
         return NULL;
-    memcpy(tm_data_f32(out), logits, (size_t)n_vocab * sizeof(float));
+    out->shape[0] = n_vocab;
+    out->numel = n_vocab;
+    row = tm_data_f32(out);
+    /* A row the sparse head owns is its pairs over -INFINITY — write that (one pass) instead
+     * of copying 993,280 B (a read and a write), and hand the sampler the pairs' ids (engine.h
+     * pn_sampler_row_hint: ascending, after the row, `nnz` of them) so its draw does not scan
+     * 248K floats for them. */
+    if (sparse) {
+        uint32_t *ids = (uint32_t *)(row + n_vocab);
+
+        uint32_t n = g->row_count;
+
+        memcpy(ids, g->row_index, n * sizeof(uint32_t));
+        qwen35_tt_sort_ids(ids, n);
+        for (i = 0; i < (uint32_t)n_vocab; i++)
+            row[i] = -INFINITY;
+        for (i = 0; i < n; i++)
+            row[ids[i]] = logits[ids[i]];
+        if (qwen35_tt_red_row_hint_drop() && n > 1u) {
+            /* RED `row_hint_drop`: the list misses the best pair (the row keeps it) — a draw
+             * that reads the list must pick another token, and the text must DIFFER. */
+            uint32_t best = 0u;
+
+            for (i = 1; i < n; i++)
+                if (row[ids[i]] > row[ids[best]])
+                    best = i;
+            memmove(&ids[best], &ids[best + 1u], (n - best - 1u) * sizeof(uint32_t));
+            n--;
+        }
+        out->nnz = (int64_t)n;
+        return out;
+    }
+    memcpy(row, logits, (size_t)n_vocab * sizeof(float));
     return out;
 }
 
@@ -1156,6 +1348,8 @@ tm_tensor *pn_qwen35moe_forward_tt(pn_model *model, uint32_t token, pn_state *st
 #endif
     qwen35_tt_idle_probe();
     forward_started_ms = pn_time_ms();
+    pn_tt_host_gap_mark("plain", "setup");
+    pn_tt_host_gap_phase("plain");
 
     if (g->resident) {
         const float *logits;
@@ -1167,13 +1361,21 @@ tm_tensor *pn_qwen35moe_forward_tt(pn_model *model, uint32_t token, pn_state *st
          * DRAM; the Gated-Delta-Net recurrence and the attention core run on the host,
          * through the same two functions the CPU oracle calls. */
         qwen35_tt_note_sequential_prefill(g, state->pos);
+        /* TTFT lane: an MTP prompt layer this sequence still owes runs before its next
+         * forward (the plain path's token 2, the serve's last-token commit). GATE ONLY:
+         * `PN_TT_MTP_PROMPT_FORWARD_SETTLE=0` leaves it owed here, so a max_tokens=1 turn
+         * carries it to the next turn's resumed prefill (that path's arm). */
+        if (!(getenv("PN_TT_MTP_PROMPT_FORWARD_SETTLE") &&
+              atoi(getenv("PN_TT_MTP_PROMPT_FORWARD_SETTLE")) == 0))
+            (void)pn_qwen35_tt_mtp_prompt_settle(g, m, pn_qwen35moe_model_config(m), s);
         pn_qwen35_tt_ckpt_note(g, state, state->pos);
         logits = pn_qwen35_tt_resident_forward(g, m, token, s, state->pos, pool);
         if (!logits)
             return NULL;
         {
             double wrap_started_ms = pn_time_ms();
-            out = qwen35_tt_wrap_logits(logits, s->n_vocab);
+            pn_tt_host_gap_split("wrap");
+            out = qwen35_tt_wrap_logits(g, logits, s->n_vocab);
             g->host_logit_seconds += (pn_time_ms() - wrap_started_ms) / 1000.0;
         }
         /* STEP 4 S2b: this position's hidden is the MTP catch-up owed before the next draft. */
@@ -1209,6 +1411,7 @@ tm_tensor *pn_qwen35moe_forward_tt(pn_model *model, uint32_t token, pn_state *st
     }
     if (g->report_every > 0 && g->tokens % (uint64_t)g->report_every == 0)
         qwen35_tt_report(g);
+    pn_tt_host_gap_mark("engine", "plain-emit");
     return out;
 }
 
@@ -1229,7 +1432,7 @@ static void qwen35_tt_set_rows(pn_model *model, uint32_t pairs)
 
     if (!model || !model->weights || model->forward != pn_qwen35moe_forward_tt)
         return;
-    g = (pn_qwen35_tt *)pn_qwen35moe_model_gpu((pn_qwen35moe_model *)model->weights);
+    g = pn_qwen35_tt_of(model);
     if (!g || !g->resident)
         return;
     g->sparse_logits = g->sparse_capable && pairs > 0u;
@@ -1243,7 +1446,7 @@ int pn_qwen35moe_tt_dense_row(void *model_ctx, float *out, int n_vocab)
 
     if (!model || !model->weights || !out)
         return -1;
-    g = (pn_qwen35_tt *)pn_qwen35moe_model_gpu((pn_qwen35moe_model *)model->weights);
+    g = pn_qwen35_tt_of(model);
     if (!g || !g->resident)
         return -1;
     return pn_tt_activation_download(g->device, &g->card.logits, out, (uint32_t)n_vocab);
@@ -1257,11 +1460,65 @@ int pn_qwen35moe_tt_dense_chunks(void *model_ctx, const unsigned char *need, flo
 
     if (!model || !model->weights || !out || !need)
         return -1;
-    g = (pn_qwen35_tt *)pn_qwen35moe_model_gpu((pn_qwen35moe_model *)model->weights);
+    g = pn_qwen35_tt_of(model);
     if (!g || !g->resident)
         return -1;
     return pn_tt_activation_download_chunks(g->device, &g->card.logits, need, out,
                                             (uint32_t)n_vocab);
+}
+
+/* `PN_TT_TAIL_CROSSCHECK=1`: the card's counts of row 0 against a host count over the
+ * dense row, bin for bin. Instrumentation only (it downloads the row it exists to avoid). */
+static void qwen35_tt_tail_crosscheck(pn_qwen35_tt *g, const uint32_t *keys, int bins,
+                                      const uint32_t *counts, int n_vocab)
+{
+    static unsigned long checked, bad;
+    tnt_tail_bins tb;
+    uint32_t host[TNT_TAIL_BINS + 1];
+    float *dense = malloc((size_t)n_vocab * sizeof(float));
+    int j, differ = 0;
+
+    if (!dense || bins > TNT_TAIL_BINS ||
+        pn_tt_activation_download(g->device, &g->card.logits, dense, (uint32_t)n_vocab) != 0) {
+        free(dense);
+        return;
+    }
+    tb.bins = bins;
+    tb.xmin_index = -1;
+    memcpy(tb.keys, keys, (size_t)bins * sizeof(keys[0]));
+    tnt_tail_bins_count(&tb, dense, n_vocab, host);
+    for (j = 0; j <= bins; j++)
+        differ += host[j] != counts[j];
+    checked++;
+    bad += differ != 0;
+    if (differ || (checked & 63u) == 0u)
+        fprintf(stderr, "TAIL CROSSCHECK — %lu rows, %lu differ%s\n", checked, bad,
+                differ ? " (this one)" : "");
+    free(dense);
+}
+
+int pn_qwen35moe_tt_tail_counts(void *model_ctx, int row, const uint32_t *keys, int bins,
+                                uint32_t *counts)
+{
+    pn_model *model = (pn_model *)model_ctx;
+    pn_qwen35_tt *g;
+    uint32_t j, total = 0u;
+
+    if (!model || !model->weights || !keys || !counts || row < 0 || bins < 1)
+        return -1;
+    g = pn_qwen35_tt_of(model);
+    if (!g || !g->resident ||
+        pn_tt_topk_tail_counts(g->device, &g->card.logits, (uint32_t)row, keys, (uint32_t)bins,
+                               counts) != 0)
+        return -1;
+    for (j = 0; j <= (uint32_t)bins; j++)
+        total += counts[j];
+    /* Every padded column of the row is counted too: fewer than the vocabulary is a defect. */
+    if (total < (uint32_t)model->config.n_vocab)
+        return -1;
+    if (row == 0 && getenv("PN_TT_TAIL_CROSSCHECK"))
+        qwen35_tt_tail_crosscheck(g, keys, bins, counts, model->config.n_vocab);
+    return 0;
 }
 
 bool pn_qwen35moe_tt_greedy_exact_on_topn(const pn_sampling_params *params)
@@ -1280,22 +1537,38 @@ uint32_t pn_qwen35moe_tt_select_rows(pn_model *model, const pn_sampling_params *
 
     if (!model || !model->weights || model->forward != pn_qwen35moe_forward_tt || !params)
         return 0u;
-    g = (pn_qwen35_tt *)pn_qwen35moe_model_gpu((pn_qwen35moe_model *)model->weights);
+    g = pn_qwen35_tt_of(model);
     if (!g)
         return 0u;
     if (g->sparse_env == 1) {
         pairs = greedy ? PN_QWEN35_TT_TOPK_GREEDY : PN_QWEN35_TT_TOPK_PAIRS;
     } else if (g->sparse_env == -1 && !needs_full_logits) {
+        const bool surgery = pn_topn_surgery_enabled() && pn_topn_surgery_present(params);
+
         if (pn_qwen35moe_tt_greedy_exact_on_topn(params))
             pairs = PN_QWEN35_TT_TOPK_GREEDY;
+        /* Greedy under a logit bias / presence / frequency penalty: the top-64 row, and the
+         * sampler refills the dense row whenever the surgery could reorder across the N
+         * (sampler_topn_surgery.h). `PN_TT_TOPN_SURGERY=0`: dense rows, as before. */
+        else if (greedy && surgery && !params->tool_grammar && !params->logprobs)
+            pairs = PN_QWEN35_TT_TOPK_PAIRS;
         /* Sampled (llama.cpp/HF order): the renormalised top-k set lies inside the top-64
          * unless the penalties reach past it — the sampler checks that per draw and refills
-         * the dense row (pn_sampler_topn_row_exact). `PN_TT_SAMPLED_TOPN=0`: dense. */
+         * the dense row (pn_sampler_topn_row_verdict). A top-k that is off or above 64 goes
+         * to the tail planner (sampler_topn_tail.h: exact, refills when it cannot decide;
+         * `PN_TT_SAMPLED_TAIL=0` keeps those requests dense). `PN_TT_SAMPLED_TOPN=0`: dense. */
         else if (!greedy && !params->tool_grammar && !params->logprobs &&
-                 !(params->logit_bias && params->n_logit_bias > 0) && params->top_k >= 1 &&
-                 params->top_k <= (int)PN_QWEN35_TT_TOPK_PAIRS &&
-                 !(getenv("PN_TT_SAMPLED_TOPN") && atoi(getenv("PN_TT_SAMPLED_TOPN")) == 0))
-            pairs = PN_QWEN35_TT_TOPK_PAIRS;
+                 (!(params->logit_bias && params->n_logit_bias > 0) ||
+                  (surgery && !pn_topn_surgery_raising_bias(params))) &&
+                 ((params->top_k >= 1 && params->top_k <= (int)PN_QWEN35_TT_TOPK_PAIRS) ||
+                  !(getenv("PN_TT_SAMPLED_TAIL") && atoi(getenv("PN_TT_SAMPLED_TAIL")) == 0)) &&
+                 !(getenv("PN_TT_SAMPLED_TOPN") && atoi(getenv("PN_TT_SAMPLED_TOPN")) == 0)) {
+            /* `PN_TT_SAMPLED_TOPN=n` (1..64): a smaller N, a GATE knob only — the rows then
+             * leave real mass outside the N, so refills, residual draws and deferrals happen. */
+            const int n = getenv("PN_TT_SAMPLED_TOPN") ? atoi(getenv("PN_TT_SAMPLED_TOPN")) : 0;
+            pairs = n >= 1 && n <= (int)PN_QWEN35_TT_TOPK_PAIRS ? (uint32_t)n
+                                                                : PN_QWEN35_TT_TOPK_PAIRS;
+        }
     }
     qwen35_tt_set_rows(model, pairs);
     return g->sparse_logits ? pairs : 0u;
@@ -1307,9 +1580,70 @@ bool pn_qwen35moe_tt_spec_can_sample(pn_model *model)
 
     if (!model || !model->weights)
         return false;
-    g = (pn_qwen35_tt *)pn_qwen35moe_model_gpu((pn_qwen35moe_model *)model->weights);
+    g = pn_qwen35_tt_of(model);
     return g && g->resident && g->sparse_logits &&
            !(getenv("PN_TT_SPEC_HEADS") && atoi(getenv("PN_TT_SPEC_HEADS")) == 0);
+}
+
+bool pn_qwen35_tt_tree_probe_on(void)
+{
+    static int on = -1;
+
+    if (on < 0)
+        on = getenv("PN_TT_SPEC_TREE_PROBE") && atoi(getenv("PN_TT_SPEC_TREE_PROBE")) != 0;
+    return on != 0;
+}
+
+/** THE TREE PROBE's booking for one verify (`PN_TT_SPEC_TREE_PROBE=1`). Only cycles whose
+ *  drafts are all the MTP head's own best pairs count (a prompt-lookup or a drawn draft
+ *  conditions the next head on a token the probe did not see). At the refused position, the
+ *  rank of the emitted token among that head's pairs: rank r >= 1 = a sibling of width r+1
+ *  there would have been accepted (one more token, the row after it). Diagnostics only. */
+static void qwen35_tt_tree_probe(pn_qwen35_tt *g, const uint32_t *drafts, int n_drafts,
+                                 int n_accept, uint32_t next, bool deferred)
+{
+    int j;
+    uint32_t r;
+
+    if (!pn_qwen35_tt_tree_probe_on())
+        return;
+    if (deferred || g->mtp.probe_heads < n_drafts) {
+        g->mtp.probe_skipped++;
+        return;
+    }
+    for (j = 0; j < n_drafts; j++)
+        if (drafts[j] != g->mtp.probe_best[j]) {
+            g->mtp.probe_skipped++;
+            return;
+        }
+    g->mtp.probe_cycles++;
+    g->mtp.probe_rows += (uint64_t)(n_drafts + 1);
+    g->mtp.probe_tokens += (uint64_t)(n_accept + 1);
+    for (j = 0; j < n_accept; j++) {
+        g->mtp.probe_reach[j]++;
+        g->mtp.probe_acc[j]++;
+    }
+    if (n_accept < n_drafts) {
+        g->mtp.probe_reach[n_accept]++;
+        for (r = 0; r < g->mtp.probe_n[n_accept] && g->mtp.probe_ids[n_accept][r] != next; r++)
+            ;
+        g->mtp.probe_rank[n_accept][r < g->mtp.probe_n[n_accept] ? r : PN_QWEN35_TT_TOPK_GREEDY]++;
+    }
+    if (g->mtp.probe_cycles % 64u == 0u) {
+        fprintf(stderr, "SPEC TREE PROBE — cycles %llu rows %llu tokens %llu skipped %llu |",
+                (unsigned long long)g->mtp.probe_cycles, (unsigned long long)g->mtp.probe_rows,
+                (unsigned long long)g->mtp.probe_tokens, (unsigned long long)g->mtp.probe_skipped);
+        for (j = 0; j < 16 && g->mtp.probe_reach[j]; j++) {
+            fprintf(stderr, " p%d reach %llu acc %llu ranks", j,
+                    (unsigned long long)g->mtp.probe_reach[j],
+                    (unsigned long long)g->mtp.probe_acc[j]);
+            for (r = 0; r <= PN_QWEN35_TT_TOPK_GREEDY; r++)
+                fprintf(stderr, "%s%llu", r ? "," : " ",
+                        (unsigned long long)g->mtp.probe_rank[j][r]);
+            fprintf(stderr, " |");
+        }
+        fprintf(stderr, "\n");
+    }
 }
 
 int pn_qwen35moe_tt_spec_step_ex(pn_model *model, pn_state *state, uint32_t seed,
@@ -1323,8 +1657,9 @@ int pn_qwen35moe_tt_spec_step_ex(pn_model *model, pn_state *state, uint32_t seed
     uint32_t tokens[16], argmax[16], forced[16], next = 0u;
     int rows, n_accept = 0, i, committed;
     double started_ms;
+    uint64_t deferred_before;
 
-    if (!model || !model->weights || !state || !emit || n_drafts < 0 || n_drafts > 15 ||
+    if (!pn_qwen35_tt_of(model) || !state || !emit || n_drafts < 0 || n_drafts > 15 ||
         (choose && !pn_qwen35moe_tt_spec_can_sample(model)))
         return -1;
     m = (pn_qwen35moe_model *)model->weights;
@@ -1333,6 +1668,19 @@ int pn_qwen35moe_tt_spec_step_ex(pn_model *model, pn_state *state, uint32_t seed
     s = (pn_qwen35moe_state *)state->kv_cache;
     if (!g || !g->resident || !s || !cfg)
         return -1;
+    /* Verify rows on the MoE block (qwen36 plan S6) ride the batched prefill's strips and
+     * CONCAT routing: without them, refused BEFORE any card work, so the caller's plain decode
+     * continues from an untouched state. */
+    if (g->moe && !pn_qwen35_tt_moe_prefill_ready(g))
+        return -1;
+    /* The MoE reserves its GDN snapshot slots at arm (pn_qwen35_tt_mtp_arm), a dense head
+     * under the fit policy at load (qwen35moe_fit_tt.c): a longer draft list (the serve's
+     * prompt lookup) is verified up to that many rows. Lossless: the rows kept are verified
+     * exactly as before, the rest simply are not drafted. */
+    if (g->spec_rows_cap > 0u && (uint32_t)n_drafts + 1u > g->spec_rows_cap)
+        n_drafts = (int)g->spec_rows_cap - 1;
+    pn_tt_host_gap_mark("verify", "setup");
+    pn_tt_host_gap_phase("verify");
     pn_qwen35_tt_ckpt_note(g, state, state->pos);
     /* The verify's heads need the top-N rows: refuse BEFORE any card work — a verify that
      * ran and then failed would leave the carried state advanced past the committed token
@@ -1344,6 +1692,7 @@ int pn_qwen35moe_tt_spec_step_ex(pn_model *model, pn_state *state, uint32_t seed
         pn_tt_device_idle_clock(g->device, 0, 0.0);
         g->idle_clock_from = g->tokens > 0u ? g->tokens : 1u;
     }
+    deferred_before = g->spec_deferred;
     started_ms = pn_time_ms();
     tokens[0] = seed;
     for (i = 0; i < n_drafts; i++)
@@ -1356,11 +1705,12 @@ int pn_qwen35moe_tt_spec_step_ex(pn_model *model, pn_state *state, uint32_t seed
     {
         /* S2d: the verify runs as STREAMED puller segments (`PN_TT_SPEC_STREAM=0` off). */
         const bool streamed = !getenv("PN_TT_DISPATCH_OBSERVE_SPEC") &&
-                              pn_tt_dispatch_stream_begin(g->device);
+                              pn_tt_dispatch_stream_begin_decode(g->device);
         const int vrc = pn_qwen35_tt_spec_verify(g, m, cfg, s, tokens, rows, state->pos, argmax);
 
         if ((streamed && !pn_tt_dispatch_stream_end()) || vrc != 0)
             return -1;
+        pn_tt_host_gap_red_delay();
     }
     if (getenv("PN_TT_DISPATCH_OBSERVE_SPEC"))
         pn_tt_dispatch_token_end(g->device, 1000000u + g->spec_cycles);
@@ -1410,6 +1760,7 @@ int pn_qwen35moe_tt_spec_step_ex(pn_model *model, pn_state *state, uint32_t seed
         for (i = 0; i < n_accept; i++)
             emit[i] = drafts[i];
     }
+    qwen35_tt_tree_probe(g, drafts, n_drafts, n_accept, next, g->spec_deferred != deferred_before);
     if (getenv("PN_TT_SPEC_TRACE")) {
         fprintf(stderr, "SPEC pos %d seed %u |", state->pos, seed);
         for (i = 0; i < n_drafts; i++)
@@ -1421,6 +1772,9 @@ int pn_qwen35moe_tt_spec_step_ex(pn_model *model, pn_state *state, uint32_t seed
     }
     emit[n_accept] = next;
     committed = n_accept + 1;  /* the seed + the accepted drafts */
+    if (pn_qwen35_tt_dump_verify_rows(g, cfg, &g->card_tall.hidden[g->card_tall.slot], tokens,
+                                      committed, state->pos) != 0)
+        return -1;
     {
         const double t = pn_time_ms();
 
@@ -1428,7 +1782,7 @@ int pn_qwen35moe_tt_spec_step_ex(pn_model *model, pn_state *state, uint32_t seed
         const char *red = getenv("PN_TT_RED");
 
         if (committed < rows && !(red && strcmp(red, "spec_rollback_skip") == 0) &&
-            pn_qwen35_tt_spec_rollback(g, cfg, committed - 1) != 0)
+            pn_qwen35_tt_spec_rollback(g, cfg, rows, committed - 1) != 0)
             return -1;
         g->spec_rollback_ms += pn_time_ms() - t;
     }
@@ -1491,9 +1845,11 @@ int pn_qwen35moe_tt_spec_step_ex(pn_model *model, pn_state *state, uint32_t seed
                     g->spec_gdn_part_ms[2] / cyc, g->spec_gdn_part_ms[3] / cyc,
                     g->spec_gdn_part_ms[4] / cyc);
             pn_tt_dispatch_stream_report(cyc);
+            pn_tt_host_gap_report("cycle", cyc);
         }
         qwen35_tt_report(g);
     }
+    pn_tt_host_gap_mark("engine", "emit");
     return n_accept + 1;
 }
 
@@ -1550,13 +1906,61 @@ static int qwen35_tt_mtp_draft_tail(pn_qwen35_tt *g, pn_qwen35moe_model *m,
 int pn_qwen35moe_tt_mtp_draft(pn_model *model, pn_state *state, uint32_t seed, int k,
                               uint32_t *drafts)
 {
+    return pn_qwen35moe_tt_mtp_draft_ex(model, state, seed, k, drafts, NULL, NULL);
+}
+
+int pn_qwen35moe_tt_spec_counts(pn_model *model, uint64_t *cycles, uint64_t *drafted,
+                                uint64_t *accepted)
+{
+    pn_qwen35_tt *g;
+
+    if (!model || !model->weights || model->forward != pn_qwen35moe_forward_tt)
+        return -1;
+    g = pn_qwen35_tt_of(model);
+    if (!g)
+        return -1;
+    *cycles = g->spec_cycles;
+    *drafted = g->spec_drafted;
+    *accepted = g->spec_accepted;
+    return 0;
+}
+
+static int qwen35_tt_mtp_draft_run(pn_model *model, pn_state *state, uint32_t seed, int k,
+                                   uint32_t *drafts);
+
+/* SAMPLED drafts: every head of this call hands its top-N to `draw` (in draft order), which
+ * draws the draft from q (spec_sampling_chooser.h). Argmax drafts when `draw` is NULL. */
+int pn_qwen35moe_tt_mtp_draft_ex(pn_model *model, pn_state *state, uint32_t seed, int k,
+                                 uint32_t *drafts, pn_spec_draft_fn draw, void *draw_ctx)
+{
+    pn_qwen35_tt *g;
+    int got;
+
+    if (!model || !model->weights)
+        return -1;
+    g = pn_qwen35_tt_of(model);
+    if (!g)
+        return -1;
+    g->mtp.draw = draw;
+    g->mtp.draw_ctx = draw_ctx;
+    g->mtp.draw_index = 0;
+    g->mtp.probe_heads = 0;
+    got = qwen35_tt_mtp_draft_run(model, state, seed, k, drafts);
+    g->mtp.draw = NULL;
+    g->mtp.draw_ctx = NULL;
+    return got;
+}
+
+static int qwen35_tt_mtp_draft_run(pn_model *model, pn_state *state, uint32_t seed, int k,
+                                   uint32_t *drafts)
+{
     pn_qwen35moe_model *m;
     const pn_qwen35moe_config *cfg;
     pn_qwen35moe_state *s;
     pn_qwen35_tt *g;
     int n;
 
-    if (!model || !model->weights || !state || !drafts || k < 1 || k > 15)
+    if (!pn_qwen35_tt_of(model) || !state || !drafts || k < 1 || k > 15)
         return -1;
     m = (pn_qwen35moe_model *)model->weights;
     cfg = pn_qwen35moe_model_config(m);
@@ -1564,11 +1968,19 @@ int pn_qwen35moe_tt_mtp_draft(pn_model *model, pn_state *state, uint32_t seed, i
     s = (pn_qwen35moe_state *)state->kv_cache;
     if (!g || !g->mtp.on || !s || !cfg)
         return -1;
+    /* At most the reserved rows are verified (spec_step_ex): draft no more than that. */
+    if (g->spec_rows_cap > 0u && (uint32_t)k + 1u > g->spec_rows_cap)
+        k = (int)g->spec_rows_cap - 1;
+    /* TTFT lane: the first draft attends to the prompt's MTP K/V — run the owed layer now. */
+    if (pn_qwen35_tt_mtp_prompt_settle(g, m, cfg, s) != 0)
+        return -1;
     n = g->mtp.pend_n;
     /* The catch-up must end exactly where the seed sits, or the drafts are for elsewhere. */
     if (n < 1 || g->mtp.pend_base + n != state->pos)
         return -1;
     g->mtp.pend_n = 0;
+    pn_tt_host_gap_mark("mtp", "setup");
+    pn_tt_host_gap_phase("mtp");
     {
         /* The drafts are decode time: booked into the forward wall the reports divide. */
         const double before = g->mtp.ms;
@@ -1579,7 +1991,7 @@ int pn_qwen35moe_tt_mtp_draft(pn_model *model, pn_state *state, uint32_t seed, i
         if (getenv("PN_TT_DISPATCH_OBSERVE_SPEC"))
             pn_tt_dispatch_token_begin(g->device, 2000000u + g->spec_cycles);
         else
-            streamed = pn_tt_dispatch_stream_begin(g->device);
+            streamed = pn_tt_dispatch_stream_begin_decode(g->device);
         got = qwen35_tt_mtp_draft_steps(g, m, cfg, s, state, seed, k, drafts, n);
         if (streamed && !pn_tt_dispatch_stream_end())
             got = -1;

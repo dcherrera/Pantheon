@@ -29,6 +29,7 @@
 
 #ifdef USE_TT
 
+#include <stdbool.h>
 #include <stdint.h>
 
 /** Bytes of one fp32 tile, and the elements along one of its edges. */
@@ -109,6 +110,25 @@ uint32_t pn_tt_gdn_row_offset(uint32_t tile, uint32_t row, uint32_t chunk);
  */
 int pn_tt_gdn_stage_plane(const float *source, uint32_t first, uint32_t stride,
                           uint32_t conv_dim, float *scratch, unsigned char *tiles_out);
+
+/**
+ * One tile column of one tap plane of the CHUNKWISE family's conv constant: `w[c][tap]` for
+ * the column's 32 channels at EVERY row (ROW-REPLICATED), or at row 0 alone when `row0_only`.
+ *
+ * Row 0 is the decode family's plane (`pn_tt_gdn_stage_plane()`) byte for byte: both gather
+ * `w[c*taps + tap]` and both tilize fp32 with `ft_tt_tilize_strip()`. That identity is what
+ * lets the decode CONV read this constant instead of its own copy (pn_tt_gdn_conv_share.h).
+ *
+ * @param weight    the oracle's row-major `[conv_dim, taps]`
+ * @param plane     `32*32` floats of caller-owned scratch
+ * @param tile_out  4096 bytes
+ * @return          0, or -1 on a bad argument
+ *
+ * Thread-safe: yes (caller owns both buffers)    Reentrant: yes    Signal-safe: no
+ */
+int pn_tt_gdnc_stage_weight_column(const float *weight, uint32_t taps, uint32_t tap,
+                                   uint32_t column, bool row0_only, float *plane,
+                                   unsigned char *tile_out);
 
 /**
  * The first tile of head `head`'s `state` values inside a HEAD-MAJOR ROW-0 STRIP.

@@ -75,6 +75,16 @@
 #ifdef USE_TT
 
 #include "pn_tt_device_internal.h"
+#include "pn_tt_attention_lanes.h"
+#include "pn_tt_attention_splitk.h"
+#include "pn_tt_attention_grid.h"
+#include "pn_tt_attn_deep.h"
+#include "pn_tt_kv_format.h"
+#include "pn_tt_kv_rotate.h"
+#include "pn_tt_eltwise_group.h"
+#include "pn_tt_kv_banks.h"
+#include "pn_tt_kv_append_split.h"
+#include "pn_tt_prefill_reserve.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -92,7 +102,10 @@
 /** The three program directories this file needs beside the matmul and on-card ones. */
 #define PN_TT_ROPE_PROGRAM      "rope"
 #define PN_TT_MEMORY_PROGRAM    "memory"
-#define PN_TT_ATTENTION_PROGRAM "attention"
+/* The flash-decode program follows the KV cache's K and V formats (pn_tt_kv_format.h), and
+ * is their `_split` build when split-K is armed (pn_tt_attention_splitk.h), or that build's
+ * fast-math variant under `PN_TT_ATTN_FAST` (pn_tt_attn_fast.h). */
+#define PN_TT_ATTENTION_PROGRAM pn_tt_attention_program_name(device)
 
 /**
  * Which enabled Tensix each of the three drives.
@@ -113,14 +126,23 @@
 #define PN_TT_CORE_ATTENTION_DEFAULT 84u
 
 /** THE PREFILL CHUNK MIXER'S HEAD SPLIT. `PN_TT_ATTN_CORES` members, member 0 the `attention`
- *  residency itself, the rest from `PN_TT_ATTN_MEMBER_CORE_FIRST` upward. 75..81 are free
- *  since the matmul group moved to 96. The count shrinks until it divides the Q heads. */
+ *  residency itself. Members 1..7 on 75..81 (free since the matmul group moved to 96);
+ *  members 8..15 on the cores just past the wide eltwise block (63..70 at its default 5).
+ *  The count shrinks until it divides the Q heads. */
 #define PN_TT_ATTN_CORES_ENV              "PN_TT_ATTN_CORES"
-/* EIGHT since 2026-10-04: attention 0.78 -> 0.41 -> 0.23 -> 0.15 s of a prefill at
- * 1/2/4/8 cores, 246.7 -> 273.7 tok/s, every arm IDENTICAL, `attn_group` red DIFFERS. */
-#define PN_TT_ATTN_CORES_DEFAULT          8u
+/* SIXTEEN since 2026-10-26 (one Q head a core for Ornith; with KV bank groups 4 the 28.7k
+ * band loop 22.5 -> 10.3 s, TTFT 52.6 -> 40.7 s, decode flat). 8 (since 2026-10-04) when the
+ * wide eltwise block holds 63..70 (`PN_TT_ELTWISE_WIDE_CORES=13`, the old layout). */
+#define PN_TT_ATTN_CORES_DEFAULT          16u
+#define PN_TT_ATTN_CORES_NARROW_DEFAULT   8u
 #define PN_TT_ATTN_MEMBER_CORE_FIRST_ENV  "PN_TT_ATTN_MEMBER_CORE_FIRST"
 #define PN_TT_ATTN_MEMBER_CORE_DEFAULT    75u
+/** Members on 75.. before the rest move past the wide eltwise block (75..81: 82 is RoPE). */
+#define PN_TT_ATTN_MEMBERS_FROM_FIRST     7u
+/** `PN_TT_ATTN_MEMBER_CORE_LIST=a,b,...`: member k (1-based) on the k-th listed core. Set,
+ *  it overrides the default placement; so does `PN_TT_ATTN_MEMBER_CORE_FIRST` (then member k
+ *  is on FIRST + k - 1, the pre-2026-10-26 arithmetic). */
+#define PN_TT_ATTN_MEMBER_CORE_LIST_ENV   "PN_TT_ATTN_MEMBER_CORE_LIST"
 
 /** Position tiles per K/V block — the flash-decode prefetch depth, fixed by the RESIDENCY.
  *
@@ -162,14 +184,10 @@ static int pn_tt_dram_alloc_zeroed(pn_tt_device *device, size_t bytes, uint32_t 
                                    uint32_t *out_address)
 {
     ft_tt_buffer buffer;
-    uint32_t bank;
 
     if (device->dram_bank_count == 0u)
         return -1;
-    bank = device->strip_bank_cursor % device->dram_bank_count;
-    device->strip_bank_cursor++;
-    if (ft_tt_buffer_alloc(&device->allocator, FT_TT_MEM_SPACE_DRAM, bank, bytes, &buffer) !=
-        FT_TT_OK) {
+    if (pn_tt_dram_alloc_any(device, bytes, &buffer) != 0) {
         fprintf(stderr, "pn_tt: DRAM full allocating %zu bytes for the attention family\n",
                 bytes);
         return -1;
@@ -200,29 +218,6 @@ static bool pn_tt_upload_attention_constants(pn_tt_device *device)
                           constants, bytes) == 0;
     free(constants);
     return ok;
-}
-
-/** One layer's K and V regions, identical geometry, on two banks so the append's write and
- *  the next layer's read are not usually the same endpoint. */
-static bool pn_tt_alloc_kv_regions(pn_tt_device *device, uint32_t layer_count)
-{
-    size_t region_bytes = (size_t)device->kv_layout.region_bytes;
-    uint32_t layer;
-
-    device->kv_region = calloc(layer_count, sizeof(*device->kv_region));
-    if (!device->kv_region)
-        return false;
-    device->kv_layer_count = layer_count;
-    for (layer = 0; layer < layer_count; layer++) {
-        pn_tt_kv_region *region = &device->kv_region[layer];
-
-        if (pn_tt_dram_alloc_zeroed(device, region_bytes, &region->k_bank,
-                                    &region->k_address) != 0 ||
-            pn_tt_dram_alloc_zeroed(device, region_bytes, &region->v_bank,
-                                    &region->v_address) != 0)
-            return false;
-    }
-    return true;
 }
 
 /** The RoPE residency. Its circular buffers are placed for the DEPTH, which has to divide
@@ -263,29 +258,44 @@ static bool pn_tt_arm_rope(pn_tt_device *device)
     return pn_tt_start_family(&device->rope);
 }
 
-/** The memory residency, for KV_APPEND only. DM0|DM1: this family has NO compute thread. */
-static bool pn_tt_arm_memory(pn_tt_device *device)
+/** Place a loaded `memory` residency's circular buffers and start it (the family and the
+ *  prefill append split's members alike). */
+static bool pn_tt_memory_place_and_start(pn_tt_device *device, pn_tt_residency *residency)
 {
     ft_tt_launch_cb_entry placed[FT_TT_OP_MEMORY_CB_COUNT];
 
-    if (!pn_tt_prepare_family(device, &device->memory, PN_TT_MEMORY_PROGRAM, "memory",
-                              PN_TT_CORE_MEMORY_ENV, PN_TT_CORE_MEMORY_DEFAULT,
-                              PN_TT_ONCARD_DM_MASK))
-        return false;
     /* The embedding group size is required to be non-zero even though this residency never
      * runs an EMBEDDING descriptor: a zero places no CB and the kernel's grid guard would
      * then refuse the opcode at run time for a build-time reason. It is `dim_tiles` and not
      * the model's embedding width because nothing will ever push through it. */
     if (ft_tt_op_memory_place_cbs(device->attn_embed_tiles, device->attn_dim_tiles,
-                                  PN_TT_TILE_BF16, placed, device->memory.cb_buffer,
-                                  sizeof(device->memory.cb_buffer), &device->memory.cb_mask) !=
+                                  PN_TT_TILE_BF16, placed, residency->cb_buffer,
+                                  sizeof(residency->cb_buffer), &residency->cb_mask) !=
         FT_TT_OK) {
         fprintf(stderr, "pn_tt: the KV-append circular buffers do not fit at %u tiles a "
                         "group\n", device->attn_dim_tiles);
-        pn_tt_residency_release(&device->memory);
+        pn_tt_residency_release(residency);
         return false;
     }
-    return pn_tt_start_family(&device->memory);
+    return pn_tt_start_family(residency);
+}
+
+/** The memory residency, for KV_APPEND only. DM0|DM1: this family has NO compute thread. */
+static bool pn_tt_arm_memory(pn_tt_device *device)
+{
+    if (!pn_tt_prepare_family(device, &device->memory, PN_TT_MEMORY_PROGRAM, "memory",
+                              PN_TT_CORE_MEMORY_ENV, PN_TT_CORE_MEMORY_DEFAULT,
+                              PN_TT_ONCARD_DM_MASK))
+        return false;
+    return pn_tt_memory_place_and_start(device, &device->memory);
+}
+
+bool pn_tt_arm_memory_member(pn_tt_device *device, pn_tt_residency *member, uint32_t core)
+{
+    if (!pn_tt_prepare_family_on_core(device, member, PN_TT_MEMORY_PROGRAM, "memory-member",
+                                      PN_TT_KV_APPEND_CORE_LIST_ENV, core, PN_TT_ONCARD_DM_MASK))
+        return false;
+    return pn_tt_memory_place_and_start(device, member);
 }
 
 /** The flash-decode residency. `block_tiles` is fixed here for its whole life — the kernel
@@ -295,6 +305,7 @@ static bool pn_tt_arm_flash_decode(pn_tt_device *device)
     ft_tt_launch_cb_entry placed[FT_TT_OP_ATTENTION_CB_COUNT];
     ft_tt_op_attention_residency residency;
 
+    memset(&residency, 0, sizeof(residency));
     residency.q_rows = device->attn_q_rows;
     residency.dim_tiles = device->attn_dim_tiles;
     residency.block_tiles = device->attn_block_tiles;
@@ -304,25 +315,29 @@ static bool pn_tt_arm_flash_decode(pn_tt_device *device)
                               PN_TT_CORE_ATTENTION_ENV, PN_TT_CORE_ATTENTION_DEFAULT,
                               PN_TT_ONCARD_TRIAD_MASK))
         return false;
-    if (ft_tt_op_attention_place_cbs(&residency, placed, device->attention.cb_buffer,
-                                     sizeof(device->attention.cb_buffer),
-                                     &device->attention.cb_mask) != FT_TT_OK) {
+    if (ft_tt_op_attention_place_cbs_mixed_kv(&residency, device->kv_layout.tile_bytes,
+                                              device->kv_v_layout.tile_bytes, placed,
+                                              device->attention.cb_buffer,
+                                              sizeof(device->attention.cb_buffer),
+                                              &device->attention.cb_mask) != FT_TT_OK) {
         fprintf(stderr, "pn_tt: the flash-decode circular buffers do not fit at block_tiles "
                         "%u (%zu B of arena)\n", device->attn_block_tiles,
-                ft_tt_op_attention_l1_bytes(&residency));
+                ft_tt_op_attention_l1_bytes_mixed_kv(&residency, device->kv_layout.tile_bytes,
+                                                     device->kv_v_layout.tile_bytes));
         pn_tt_residency_release(&device->attention);
         return false;
     }
     return pn_tt_start_family(&device->attention);
 }
 
-/** Arm ONE head-split member on `core`, with the flash-decode residency's own shape. */
-static bool pn_tt_arm_attention_member(pn_tt_device *device, pn_tt_residency *member,
-                                       uint32_t core)
+/** Arm ONE head-split member (or split-K extra) on `core`, with the flash-decode residency's
+ *  own shape. */
+bool pn_tt_arm_attention_member(pn_tt_device *device, pn_tt_residency *member, uint32_t core)
 {
     ft_tt_launch_cb_entry placed[FT_TT_OP_ATTENTION_CB_COUNT];
     ft_tt_op_attention_residency residency;
 
+    memset(&residency, 0, sizeof(residency));
     residency.q_rows = device->attn_q_rows;
     residency.dim_tiles = device->attn_dim_tiles;
     residency.block_tiles = device->attn_block_tiles;
@@ -331,12 +346,65 @@ static bool pn_tt_arm_attention_member(pn_tt_device *device, pn_tt_residency *me
                                       "attention-member", PN_TT_ATTN_MEMBER_CORE_FIRST_ENV, core,
                                       PN_TT_ONCARD_TRIAD_MASK))
         return false;
-    if (ft_tt_op_attention_place_cbs(&residency, placed, member->cb_buffer,
-                                     sizeof(member->cb_buffer), &member->cb_mask) != FT_TT_OK) {
+    if (ft_tt_op_attention_place_cbs_mixed_kv(&residency, device->kv_layout.tile_bytes,
+                                              device->kv_v_layout.tile_bytes, placed,
+                                              member->cb_buffer, sizeof(member->cb_buffer),
+                                              &member->cb_mask) != FT_TT_OK) {
         pn_tt_residency_release(member);
         return false;
     }
     return pn_tt_start_family(member);
+}
+
+/** The cores past the wide eltwise block that the 8 members past 7 need, when it leaves
+ *  them: the first of them, else UINT32_MAX (the block holds them; the split stays 8). */
+static uint32_t pn_tt_attention_spill_core_first(void)
+{
+    const uint32_t spill = pn_tt_eltwise_wide_core_first() + pn_tt_eltwise_wide_core_count();
+    const uint32_t needed = PN_TT_ATTN_MAX_MEMBERS - 1u - PN_TT_ATTN_MEMBERS_FROM_FIRST;
+
+    return spill + needed <= PN_TT_ELTWISE_WIDE_REGION_END ? spill : UINT32_MAX;
+}
+
+/** The split asked for: `PN_TT_ATTN_CORES`, else 16 when the cores past the wide eltwise
+ *  block are free, else 8. */
+static uint32_t pn_tt_attention_cores_asked(void)
+{
+    const uint32_t fallback = pn_tt_attention_spill_core_first() != UINT32_MAX
+                                  ? PN_TT_ATTN_CORES_DEFAULT
+                                  : PN_TT_ATTN_CORES_NARROW_DEFAULT;
+
+    return pn_tt_env_u32(PN_TT_ATTN_CORES_ENV, fallback);
+}
+
+/** The core member `index` (1-based) arms on: the list's entry; else first + index - 1 when
+ *  `PN_TT_ATTN_MEMBER_CORE_FIRST` is set or the member is one of the first 7; else the
+ *  cores past the wide eltwise block. */
+static uint32_t pn_tt_attention_member_core(uint32_t first, uint32_t index)
+{
+    const char *list = getenv(PN_TT_ATTN_MEMBER_CORE_LIST_ENV);
+    const char *first_env = getenv(PN_TT_ATTN_MEMBER_CORE_FIRST_ENV);
+    uint32_t position = 1u;
+    char *end;
+
+    if (!list || !*list) {
+        const uint32_t spill = pn_tt_attention_spill_core_first();
+
+        if ((first_env && *first_env) || index <= PN_TT_ATTN_MEMBERS_FROM_FIRST ||
+            spill == UINT32_MAX)
+            return first + index - 1u;
+        return spill + (index - 1u - PN_TT_ATTN_MEMBERS_FROM_FIRST);
+    }
+    while (*list) {
+        const unsigned long core = strtoul(list, &end, 10);
+
+        if (end == list)
+            break;
+        if (position++ == index)
+            return (uint32_t)core;
+        list = *end == ',' ? end + 1 : end;
+    }
+    return UINT32_MAX; /* too short: the arm fails there and the split shrinks */
 }
 
 /**
@@ -347,7 +415,7 @@ static bool pn_tt_arm_attention_member(pn_tt_device *device, pn_tt_residency *me
  */
 static void pn_tt_arm_attention_members(pn_tt_device *device)
 {
-    const uint32_t asked = pn_tt_env_u32(PN_TT_ATTN_CORES_ENV, PN_TT_ATTN_CORES_DEFAULT);
+    const uint32_t asked = pn_tt_attention_cores_asked();
     const uint32_t first = pn_tt_env_u32(PN_TT_ATTN_MEMBER_CORE_FIRST_ENV,
                                          PN_TT_ATTN_MEMBER_CORE_DEFAULT);
     uint32_t want = asked < 1u ? 1u : (asked > PN_TT_ATTN_MAX_MEMBERS ? PN_TT_ATTN_MAX_MEMBERS
@@ -359,7 +427,7 @@ static void pn_tt_arm_attention_members(pn_tt_device *device)
         want--;
     for (index = 1u; index < want; index++) {
         if (!pn_tt_arm_attention_member(device, &device->attention_member[index - 1u],
-                                        first + index - 1u))
+                                        pn_tt_attention_member_core(first, index)))
             break;
         up++;
     }
@@ -369,15 +437,19 @@ static void pn_tt_arm_attention_members(pn_tt_device *device)
     for (index = armed; index < up; index++)
         pn_tt_residency_release(&device->attention_member[index - 1u]);
     device->attention_members = armed;
-    if (asked > 1u)
-        fprintf(stderr, "pn_tt: attention HEAD SPLIT — asked %u, running %u member(s) from core "
-                        "%u (members 1.. on %u..), %u Q heads each\n",
-                asked, armed, device->attention.core_index, first,
-                device->attn_q_heads / armed);
+    if (asked > 1u) {
+        fprintf(stderr, "pn_tt: attention HEAD SPLIT — asked %u, running %u member(s), %u Q "
+                        "heads each, on core %u then", asked, armed,
+                device->attn_q_heads / armed, device->attention.core_index);
+        for (index = 1u; index < armed; index++)
+            fprintf(stderr, "%s%u", index > 1u ? "," : " ",
+                    device->attention_member[index - 1u].core_index);
+        fprintf(stderr, "\n");
+    }
 }
 
 /** Retire and re-arm head-split member `index` (1-based) on its own core. */
-static bool pn_tt_attention_member_rearm(pn_tt_device *device, uint32_t index)
+bool pn_tt_attention_member_rearm(pn_tt_device *device, uint32_t index)
 {
     pn_tt_residency *member = &device->attention_member[index - 1u];
     const uint32_t core = member->core_index;
@@ -466,6 +538,19 @@ static bool pn_tt_attention_cores_are_free(const pn_tt_device *device)
     return free_of_clashes;
 }
 
+void pn_tt_device_set_kv_type(pn_tt_device *device, pn_tt_kv_type type)
+{
+    if (!device)
+        return;
+    device->kv_type_override = type;
+    device->kv_type_set = true;
+}
+
+pn_tt_kv_type pn_tt_device_kv_type(const pn_tt_device *device)
+{
+    return device && device->kv_type_set ? device->kv_type_override : pn_tt_kv_type_requested();
+}
+
 int pn_tt_device_arm_attention(pn_tt_device *device, uint32_t q_heads, uint32_t kv_heads,
                                uint32_t head_dim, uint32_t rope_dim, double rope_theta,
                                uint32_t capacity_positions, uint32_t layer_count)
@@ -478,6 +563,9 @@ int pn_tt_device_arm_attention(pn_tt_device *device, uint32_t q_heads, uint32_t 
         return -1;
     if (!pn_tt_device_oncard_requested(device, PN_TT_ONCARD_ATTENTION))
         return 0;
+    device->kv_type = pn_tt_device_kv_type(device);
+    pn_tt_attention_splitk_choose(device);
+    pn_tt_attention_fast_choose(device);
 
     /* A REFUSAL, not a fallback. Attention was asked for by name; a missing program would
      * otherwise leave it on the host with a different numerics and nothing saying so — the
@@ -486,8 +574,8 @@ int pn_tt_device_arm_attention(pn_tt_device *device, uint32_t q_heads, uint32_t 
         !pn_tt_program_is_present(PN_TT_MEMORY_PROGRAM) ||
         !pn_tt_program_is_present(PN_TT_ATTENTION_PROGRAM)) {
         fprintf(stderr, "pn_tt: REFUSED — on-card attention needs the `rope`, `memory` and "
-                        "`attention` programs and at least one is missing from the program "
-                        "root\n");
+                        "`%s` programs and at least one is missing from the program root\n",
+                PN_TT_ATTENTION_PROGRAM);
         return -1;
     }
     if (!pn_tt_attention_cores_are_free(device))
@@ -504,8 +592,12 @@ int pn_tt_device_arm_attention(pn_tt_device *device, uint32_t q_heads, uint32_t 
     device->rope_table_position = PN_TT_ROPE_NO_POSITION;
     device->rope_chunk1_first = UINT32_MAX;
 
-    if (ft_tt_kv_cache_layout_init(kv_heads, head_dim, capacity_positions, PN_TT_TILE_BF16,
-                                   &device->kv_layout) != FT_TT_OK) {
+    if (ft_tt_kv_cache_layout_init(kv_heads, head_dim, capacity_positions,
+                                   pn_tt_kv_format_tile_bytes(device->kv_type.k_format),
+                                   &device->kv_layout) != FT_TT_OK ||
+        ft_tt_kv_cache_layout_init(kv_heads, head_dim, capacity_positions,
+                                   pn_tt_kv_format_tile_bytes(device->kv_type.v_format),
+                                   &device->kv_v_layout) != FT_TT_OK) {
         fprintf(stderr, "pn_tt: no KV cache layout for %u heads x %u dim x %u positions\n",
                 kv_heads, head_dim, capacity_positions);
         return -1;
@@ -528,27 +620,35 @@ int pn_tt_device_arm_attention(pn_tt_device *device, uint32_t q_heads, uint32_t 
                                 &device->rope_table_bank, &device->rope_table_address) != 0 ||
         pn_tt_dram_alloc_zeroed(device, (size_t)pn_tt_rope_table_tiles(device) * PN_TT_TILE_BF16,
                                 &device->rope_chunk1_bank, &device->rope_chunk1_address) != 0 ||
-        !pn_tt_alloc_kv_regions(device, layer_count)) {
+        pn_tt_kv_banks_configure(device) != 0 || !pn_tt_kv_banks_alloc(device, layer_count)) {
         fprintf(stderr, "pn_tt: REFUSED — the attention family's DRAM did not allocate\n");
         return -1;
     }
 
     device->oncard[PN_TT_ONCARD_ATTENTION] =
         pn_tt_arm_rope(device) && pn_tt_arm_memory(device) && pn_tt_arm_flash_decode(device);
-    if (device->oncard[PN_TT_ONCARD_ATTENTION])
+    if (device->oncard[PN_TT_ONCARD_ATTENTION]) {
         pn_tt_arm_attention_members(device);
+        /* AFTER the attention members, so a core they took is refused by name, not shared. */
+        pn_tt_kv_append_members_arm(device);
+        pn_tt_attention_splitk_arm(device);
+    }
     if (!device->oncard[PN_TT_ONCARD_ATTENTION]) {
         fprintf(stderr, "pn_tt: REFUSED — on-card attention was asked for and one of its "
                         "three residencies did not arm\n");
         return -1;
     }
+    /* K4H: H rides the matmul residency, which is up by now (the artifact placed it). */
+    if (pn_tt_kv_rotate_arm(device) != 0)
+        return -1;
     fprintf(stderr, "pn_tt: attention on the card — %u Q heads / %u KV groups of %u rows, "
                     "head_dim %u, block_tiles %u, KV cache %u positions x %u layers "
-                    "(%.1f MiB)\n",
+                    "(%.1f MiB, %s)\n",
             q_heads, kv_heads, device->attn_q_rows, head_dim, device->attn_block_tiles,
             device->kv_layout.capacity_positions, layer_count,
-            (double)device->kv_layout.region_bytes * 2.0 * (double)layer_count /
-                (1024.0 * 1024.0));
+            (double)(device->kv_layout.region_bytes + device->kv_v_layout.region_bytes) *
+                (double)layer_count / (1024.0 * 1024.0),
+            pn_tt_kv_type_name(device->kv_type));
     return 0;
 }
 
@@ -634,6 +734,42 @@ static int pn_tt_attention_submit(pn_tt_device *device, pn_tt_residency *residen
     device->oncard_seconds += pn_tt_now_seconds() - started;
     device->oncard_ops++;
     return 0;
+}
+
+bool pn_tt_attention_main_rearm(pn_tt_device *device)
+{
+    return pn_tt_attention_rearm(device, &device->attention);
+}
+
+bool pn_tt_attention_memory_rearm(pn_tt_device *device)
+{
+    return pn_tt_attention_rearm(device, &device->memory);
+}
+
+/** A decode / verify call's per-group descriptors: over the lanes when
+ *  `PN_TT_ATTN_DECODE_LANES` asks (pn_tt_attention_lanes.h), else in series on core 84. */
+static int pn_tt_attention_submit_groups(pn_tt_device *device,
+                                         uint32_t words[][FT_TT_OP_ATTENTION_WORDS],
+                                         uint32_t groups)
+{
+    uint32_t group;
+
+    if (pn_tt_attention_decode_lanes(device) > 1u)
+        return pn_tt_attention_issue_lanes(device, words, groups);
+    for (group = 0; group < groups; group++)
+        if (pn_tt_attention_submit(device, &device->attention, FT_TT_QUEUE_OP_ATTENTION,
+                                   words[group]) != 0)
+            return -1;
+    return 0;
+}
+
+/** RED `attn_lanes_kv_shift` (lanes only): group g attends to KV head g + 1 — every output
+ *  tile is written, with the wrong head's values. Must DIFFER. */
+static uint32_t pn_tt_attention_lane_kv_head(const pn_tt_device *device, uint32_t group)
+{
+    if (pn_tt_attention_decode_lanes(device) > 1u && pn_tt_red("attn_lanes_kv_shift"))
+        return (group + 1u) % device->attn_kv_heads;
+    return group;
 }
 
 /* ================================================================
@@ -909,6 +1045,47 @@ int pn_tt_rope_chunk(pn_tt_device *device, const pn_tt_activation *input,
     return pn_tt_attention_submit(device, &device->rope, FT_TT_QUEUE_OP_ROPE, words);
 }
 
+/* The tall passes' per-chunk rotary blocks (slots 2..63 of pn_tt_rope_table_for_chunk), which
+ * a prefill used to allocate as it reached each chunk. `need` non-NULL: count them. */
+static int pn_tt_rope_tall_tables(pn_tt_device *device, pn_tt_bank_need *need)
+{
+    const size_t bytes = ft_tt_op_rope_table_bytes(
+        PN_TT_TILE_DIM, pn_tt_rotary_width(device) / PN_TT_TILE_DIM, PN_TT_TILE_BF16);
+
+    if (!device->rope.running ||
+        !(device->strip_tile_rows > 4u || device->prefill_tile_rows > 4u) ||
+        pn_tt_red("rope_one_slot"))
+        return 0;
+    for (uint32_t slot = 2u; slot < 64u; slot++) {
+        if (device->rope_many_address[slot] != 0u)
+            continue;
+        if (need)
+            pn_tt_bank_need_any(need, bytes);
+        else if (pn_tt_dram_alloc_zeroed(device, bytes, &device->rope_many_bank[slot],
+                                         &device->rope_many_address[slot]) != 0)
+            return -1;
+    }
+    return 0;
+}
+
+void pn_tt_rope_prefill_need(const pn_tt_device *device, pn_tt_bank_need *need)
+{
+    if (device && need)
+        (void)pn_tt_rope_tall_tables((pn_tt_device *)device, need);
+}
+
+int pn_tt_rope_reserve_prefill(pn_tt_device *device)
+{
+    return device ? pn_tt_rope_tall_tables(device, NULL) : -1;
+}
+
+int pn_tt_rope_prepare(pn_tt_device *device, uint32_t position)
+{
+    if (!device || !device->rope.running)
+        return 0;
+    return pn_tt_rope_table_for_position(device, position);
+}
+
 int pn_tt_rope(pn_tt_device *device, const pn_tt_activation *input,
                const pn_tt_activation *output, uint32_t heads, uint32_t position)
 {
@@ -951,26 +1128,26 @@ int pn_tt_rope(pn_tt_device *device, const pn_tt_activation *input,
  * KV append
  * ================================================================ */
 
-/** One region as an operand. K and V share a geometry and differ only in base. */
-static ft_tt_op_operand pn_tt_region_operand(const pn_tt_device *device, uint32_t layer,
-                                             bool values)
+/** Every bank group's append descriptor (pn_tt_kv_banks.h), in group order. */
+static int pn_tt_kv_append_submit(pn_tt_device *device, const ft_tt_op_kv_append_request *request,
+                                  uint32_t layer, bool values)
 {
-    const pn_tt_kv_region *region = &device->kv_region[layer];
-    uint32_t bank = values ? region->v_bank : region->k_bank;
-    ft_tt_op_operand operand;
+    uint32_t words[PN_TT_KV_MAX_BANK_GROUPS][FT_TT_OP_MEMORY_WORDS];
+    uint32_t count = 0u;
 
-    operand.x = (uint16_t)device->dram[bank].x;
-    operand.y = (uint16_t)device->dram[bank].y;
-    operand.address = values ? region->v_address : region->k_address;
-    operand.tile_bytes = PN_TT_TILE_BF16;
-    return operand;
+    if (pn_tt_kv_append_words(device, request, layer, values, words, &count) != 0)
+        return -1;
+    for (uint32_t g = 0; g < count; g++)
+        if (pn_tt_attention_submit(device, &device->memory, FT_TT_QUEUE_OP_KV_APPEND,
+                                   words[g]) != 0)
+            return -1;
+    return 0;
 }
 
 int pn_tt_kv_append(pn_tt_device *device, uint32_t layer, bool values,
                     const pn_tt_activation *source, uint32_t position)
 {
     ft_tt_op_kv_append_request request;
-    uint32_t words[FT_TT_OP_MEMORY_WORDS];
 
     if (!device || !source || !device->memory.running || layer >= device->kv_layer_count)
         return -1;
@@ -979,7 +1156,7 @@ int pn_tt_kv_append(pn_tt_device *device, uint32_t layer, bool values,
         return -1;
 
     memset(&request, 0, sizeof(request));
-    request.cache = &device->kv_layout;
+    request.cache = pn_tt_kv_layout_of(device, values);
     /* RED PROOF: the append lands one position late, so attention reads a K row that belongs
      * to no token and misses this one. It stays INSIDE the region — a mutation that shortens
      * or moves a transfer out of range can take the card down instead of going red
@@ -993,15 +1170,15 @@ int pn_tt_kv_append(pn_tt_device *device, uint32_t layer, bool values,
      * the position's row phase through the activations (see the file note). */
     request.source_row0 = 0u;
     request.source_tiles = device->attn_kv_heads * device->attn_dim_tiles;
-    request.region = pn_tt_region_operand(device, layer, values);
+    request.region.tile_bytes = request.cache->tile_bytes; /* set per bank group */
     if (source->tile_count < request.source_tiles)
         return -1;
-    if (ft_tt_op_kv_append_parameters(&request, words) != FT_TT_OK) {
+    if (pn_tt_kv_append_submit(device, &request, layer, values) != 0) {
         fprintf(stderr, "pn_tt: the KV append at position %u of layer %u is not encodable\n",
                 position, layer);
         return -1;
     }
-    return pn_tt_attention_submit(device, &device->memory, FT_TT_QUEUE_OP_KV_APPEND, words);
+    return 0;
 }
 
 /* ================================================================
@@ -1156,20 +1333,22 @@ static int pn_tt_attention_rows_chunk(pn_tt_device *device, uint32_t layer,
 {
     const uint32_t group_tiles = device->attn_q_rows * device->attn_dim_tiles;
     const uint32_t kv_positions = first_position + rows;
+    uint32_t words[PN_TT_ATTN_LANE_MAX_GROUPS][FT_TT_OP_ATTENTION_WORDS];
+    ft_tt_op_attention_request requests[PN_TT_ATTN_LANE_MAX_GROUPS];
     uint32_t group;
+    int split;
 
-    if (pn_tt_attn_rows_mask(device, first_position, rows, chunk) != 0)
+    if (pn_tt_attn_rows_mask(device, first_position, rows, chunk) != 0 ||
+        device->attn_kv_heads > PN_TT_ATTN_LANE_MAX_GROUPS)
         return -1;
     for (group = 0; group < device->attn_kv_heads; group++) {
+        const uint32_t kv_head = pn_tt_attention_lane_kv_head(device, group);
         ft_tt_op_attention_request request;
-        uint32_t words[FT_TT_OP_ATTENTION_WORDS];
-        uint64_t run_offset = 0;
-        uint32_t run_bytes = 0;
 
-        if (ft_tt_kv_cache_run(&device->kv_layout, group, 0u, PN_TT_TILE_DIM, &run_offset,
-                               &run_bytes) != FT_TT_OK)
-            return -1;
         memset(&request, 0, sizeof(request));
+        if (pn_tt_kv_head_operand(device, layer, false, kv_head, &request.keys) != 0 ||
+            pn_tt_kv_head_operand(device, layer, true, kv_head, &request.values) != 0)
+            return -1;
         request.q_rows = device->attn_q_rows;
         request.dim_tiles = device->attn_dim_tiles;
         request.block_tiles = device->attn_block_tiles;
@@ -1182,22 +1361,23 @@ static int pn_tt_attention_rows_chunk(pn_tt_device *device, uint32_t layer,
                                     chunk * (uint32_t)PN_TT_TILE_BF16;
         request.query = pn_tt_operand(device, query);
         request.query.address += group * group_tiles * PN_TT_TILE_BF16;
-        request.keys = pn_tt_region_operand(device, layer, false);
-        request.keys.address += (uint32_t)run_offset;
-        request.values = pn_tt_region_operand(device, layer, true);
-        request.values.address += (uint32_t)run_offset;
         request.constants.x = (uint16_t)device->dram[device->attn_const_bank].x;
         request.constants.y = (uint16_t)device->dram[device->attn_const_bank].y;
         request.constants.address = device->attn_const_address;
         request.constants.tile_bytes = PN_TT_TILE_BF16;
         request.output = pn_tt_operand(device, output);
         request.output.address += group * group_tiles * PN_TT_TILE_BF16;
-        if (ft_tt_op_attention_parameters(&request, words) != FT_TT_OK ||
-            pn_tt_attention_submit(device, &device->attention, FT_TT_QUEUE_OP_ATTENTION,
-                                   words) != 0)
+        if (ft_tt_op_attention_parameters(&request, words[group]) != FT_TT_OK)
             return -1;
+        requests[group] = request;
     }
-    return 0;
+    /* SPLIT-K past the switch-over (pn_tt_attention_splitk.h); 1 = not split, the lanes. The
+     * verify's rows share each chunk's read; the shortest row's limit is the first one. */
+    split = pn_tt_attention_splitk_issue(device, requests, device->attn_kv_heads,
+                                         first_position + 1u);
+    if (split != 1)
+        return split;
+    return pn_tt_attention_submit_groups(device, words, device->attn_kv_heads);
 }
 
 int pn_tt_attention_rows(pn_tt_device *device, uint32_t layer, const pn_tt_activation *query,
@@ -1237,7 +1417,6 @@ int pn_tt_kv_append_row(pn_tt_device *device, uint32_t layer, bool values,
                         const pn_tt_activation *source, uint32_t source_row, uint32_t position)
 {
     ft_tt_op_kv_append_request request;
-    uint32_t words[FT_TT_OP_MEMORY_WORDS];
 
     if (!device || !source || !device->memory.running || layer >= device->kv_layer_count ||
         source_row >= PN_TT_TILE_DIM)
@@ -1245,28 +1424,26 @@ int pn_tt_kv_append_row(pn_tt_device *device, uint32_t layer, bool values,
     if (pn_tt_matvec_flush(device) != 0)
         return -1;
     memset(&request, 0, sizeof(request));
-    request.cache = &device->kv_layout;
+    request.cache = pn_tt_kv_layout_of(device, values);
     request.position = position;
     request.token_count = 1u;
     request.source = pn_tt_operand(device, source);
     /* RED `spec_kv_row0`: every verify row appends row 0's K/V — must DIFFER. */
     request.source_row0 = pn_tt_red("spec_kv_row0") ? 0u : source_row;
     request.source_tiles = device->attn_kv_heads * device->attn_dim_tiles;
-    request.region = pn_tt_region_operand(device, layer, values);
-    if (source->tile_count < request.source_tiles ||
-        ft_tt_op_kv_append_parameters(&request, words) != FT_TT_OK)
+    request.region.tile_bytes = request.cache->tile_bytes; /* set per bank group */
+    if (source->tile_count < request.source_tiles)
         return -1;
-    return pn_tt_attention_submit(device, &device->memory, FT_TT_QUEUE_OP_KV_APPEND, words);
+    return pn_tt_kv_append_submit(device, &request, layer, values);
 }
 
-int pn_tt_kv_append_chunk(pn_tt_device *device, uint32_t layer, bool values,
-                          const pn_tt_activation *source, uint32_t first_position,
-                          uint32_t rows)
+int pn_tt_kv_append_chunk_request(pn_tt_device *device, uint32_t layer, bool values,
+                                  const pn_tt_activation *source, uint32_t first_position,
+                                  uint32_t rows, ft_tt_op_kv_append_request *out)
 {
     ft_tt_op_kv_append_request request;
-    uint32_t words[FT_TT_OP_MEMORY_WORDS];
 
-    if (!device || !source || !device->memory.running || layer >= device->kv_layer_count)
+    if (!device || !source || !out || !device->memory.running || layer >= device->kv_layer_count)
         return -1;
     if (rows == 0u || rows > PN_TT_TILE_DIM || (first_position % PN_TT_TILE_DIM) != 0u)
         return -1;
@@ -1274,7 +1451,7 @@ int pn_tt_kv_append_chunk(pn_tt_device *device, uint32_t layer, bool values,
         return -1;
 
     memset(&request, 0, sizeof(request));
-    request.cache = &device->kv_layout;
+    request.cache = pn_tt_kv_layout_of(device, values);
     request.position = first_position;
     /* RED PROOF: the whole chunk lands one position late, so every row is a K row that
      * belongs to the token after it. It stays INSIDE the region for the same reason the
@@ -1288,15 +1465,28 @@ int pn_tt_kv_append_chunk(pn_tt_device *device, uint32_t layer, bool values,
      * alignment is a refusal above and not a convenience. */
     request.source_row0 = 0u;
     request.source_tiles = device->attn_kv_heads * device->attn_dim_tiles;
-    request.region = pn_tt_region_operand(device, layer, values);
+    request.region.tile_bytes = request.cache->tile_bytes; /* set per bank group */
     if (source->tile_count < request.source_tiles)
         return -1;
-    if (ft_tt_op_kv_append_parameters(&request, words) != FT_TT_OK) {
+    *out = request;
+    return 0;
+}
+
+int pn_tt_kv_append_chunk(pn_tt_device *device, uint32_t layer, bool values,
+                          const pn_tt_activation *source, uint32_t first_position,
+                          uint32_t rows)
+{
+    ft_tt_op_kv_append_request request;
+
+    if (pn_tt_kv_append_chunk_request(device, layer, values, source, first_position, rows,
+                                      &request) != 0)
+        return -1;
+    if (pn_tt_kv_append_submit(device, &request, layer, values) != 0) {
         fprintf(stderr, "pn_tt: the %u-position KV append at %u of layer %u is not "
                         "encodable\n", rows, first_position, layer);
         return -1;
     }
-    return pn_tt_attention_submit(device, &device->memory, FT_TT_QUEUE_OP_KV_APPEND, words);
+    return 0;
 }
 
 /* ================================================================
@@ -1307,14 +1497,18 @@ int pn_tt_attention(pn_tt_device *device, uint32_t layer, const pn_tt_activation
                     const pn_tt_activation *output, uint32_t kv_positions)
 {
     const uint32_t group_tiles = device->attn_q_rows * device->attn_dim_tiles;
+    uint32_t words[PN_TT_ATTN_LANE_MAX_GROUPS][FT_TT_OP_ATTENTION_WORDS];
+    ft_tt_op_attention_request requests[PN_TT_ATTN_LANE_MAX_GROUPS];
     uint32_t group;
+    int split;
 
     if (!device || !query || !output || !device->attention.running)
         return -1;
     /* Chained projections are awaited HERE — pn_tt_device.h, pn_tt_matvec_enqueue. */
     if (pn_tt_matvec_flush(device) != 0)
         return -1;
-    if (layer >= device->kv_layer_count || kv_positions == 0u)
+    if (layer >= device->kv_layer_count || kv_positions == 0u ||
+        device->attn_kv_heads > PN_TT_ATTN_LANE_MAX_GROUPS)
         return -1;
     if (query->tile_count < device->attn_kv_heads * group_tiles ||
         output->tile_count < device->attn_kv_heads * group_tiles)
@@ -1325,21 +1519,18 @@ int pn_tt_attention(pn_tt_device *device, uint32_t layer, const pn_tt_activation
      * walked once per layer per token instead of eight times (ft_tt_op_attention.h). */
     for (group = 0; group < device->attn_kv_heads; group++) {
         ft_tt_op_attention_request request;
-        uint32_t words[FT_TT_OP_ATTENTION_WORDS];
-        uint64_t run_offset = 0;
-        uint32_t run_bytes = 0;
 
         /* RED PROOF: every group reads KV head 0. Both regions are the same size and both
          * are live, so nothing about the transfer changes — only which head's cache the
          * second group attends to, which is exactly the class of mistake a correlation
          * metric cannot see. */
-        uint32_t kv_head = pn_tt_red("attn_group") ? 0u : group;
-
-        if (ft_tt_kv_cache_run(&device->kv_layout, kv_head, 0u, PN_TT_TILE_DIM, &run_offset,
-                               &run_bytes) != FT_TT_OK)
-            return -1;
+        uint32_t kv_head = pn_tt_red("attn_group") ? 0u
+                                                   : pn_tt_attention_lane_kv_head(device, group);
 
         memset(&request, 0, sizeof(request));
+        if (pn_tt_kv_head_operand(device, layer, false, kv_head, &request.keys) != 0 ||
+            pn_tt_kv_head_operand(device, layer, true, kv_head, &request.values) != 0)
+            return -1;
         request.q_rows = device->attn_q_rows;
         request.dim_tiles = device->attn_dim_tiles;
         request.block_tiles = device->attn_block_tiles;
@@ -1348,27 +1539,25 @@ int pn_tt_attention(pn_tt_device *device, uint32_t layer, const pn_tt_activation
         request.query_row = 0u;
         request.query = pn_tt_operand(device, query);
         request.query.address += group * group_tiles * PN_TT_TILE_BF16;
-        request.keys = pn_tt_region_operand(device, layer, false);
-        request.keys.address += (uint32_t)run_offset;
-        request.values = pn_tt_region_operand(device, layer, true);
-        request.values.address += (uint32_t)run_offset;
         request.constants.x = (uint16_t)device->dram[device->attn_const_bank].x;
         request.constants.y = (uint16_t)device->dram[device->attn_const_bank].y;
         request.constants.address = device->attn_const_address;
         request.constants.tile_bytes = PN_TT_TILE_BF16;
         request.output = pn_tt_operand(device, output);
         request.output.address += group * group_tiles * PN_TT_TILE_BF16;
-        if (ft_tt_op_attention_parameters(&request, words) != FT_TT_OK) {
+        if (ft_tt_op_attention_parameters(&request, words[group]) != FT_TT_OK) {
             fprintf(stderr, "pn_tt: attention over %u positions is not encodable at "
                             "block_tiles %u against a %u-tile capacity\n",
                     kv_positions, device->attn_block_tiles, device->kv_layout.capacity_tiles);
             return -1;
         }
-        if (pn_tt_attention_submit(device, &device->attention, FT_TT_QUEUE_OP_ATTENTION,
-                                   words) != 0)
-            return -1;
+        requests[group] = request;
     }
-    return 0;
+    /* SPLIT-K past the switch-over (pn_tt_attention_splitk.h); 1 = not split, the lanes. */
+    split = pn_tt_attention_splitk_issue(device, requests, device->attn_kv_heads, kv_positions);
+    if (split != 1)
+        return split;
+    return pn_tt_attention_submit_groups(device, words, device->attn_kv_heads);
 }
 
 /** Encode the chunk descriptor for Q head `head`. All words are DRAM addresses. */
@@ -1380,8 +1569,6 @@ static int attention_chunk_head_words(pn_tt_device *device, uint32_t layer,
 {
     const uint32_t head_tiles = device->attn_dim_tiles;
     ft_tt_op_attention_request request;
-    uint64_t run_offset = 0;
-    uint32_t run_bytes = 0;
 
     /* CONTIGUOUS GQA, which is attention's rule and NOT the GDN block's interleaved one
      * (spec §4). Head h reads group `h / q_rows`, the same grouping the per-position arm
@@ -1393,11 +1580,10 @@ static int attention_chunk_head_words(pn_tt_device *device, uint32_t layer,
     if (pn_tt_red("attn_group"))
         kv_head = 0u;
 
-    if (ft_tt_kv_cache_run(&device->kv_layout, kv_head, 0u, PN_TT_TILE_DIM, &run_offset,
-                           &run_bytes) != FT_TT_OK)
-        return -1;
-
     memset(&request, 0, sizeof(request));
+    if (pn_tt_kv_head_operand(device, layer, false, kv_head, &request.keys) != 0 ||
+        pn_tt_kv_head_operand(device, layer, true, kv_head, &request.values) != 0)
+        return -1;
     request.q_rows = rows;
     request.dim_tiles = head_tiles;
     request.block_tiles = device->attn_block_tiles;
@@ -1407,10 +1593,6 @@ static int attention_chunk_head_words(pn_tt_device *device, uint32_t layer,
     request.flags = FT_TT_OP_ATTENTION_FLAG_CHUNK;
     request.query = pn_tt_operand(device, query);
     request.query.address += head * head_tiles * PN_TT_TILE_BF16;
-    request.keys = pn_tt_region_operand(device, layer, false);
-    request.keys.address += (uint32_t)run_offset;
-    request.values = pn_tt_region_operand(device, layer, true);
-    request.values.address += (uint32_t)run_offset;
     request.constants.x = (uint16_t)device->dram[device->attn_const_bank].x;
     request.constants.y = (uint16_t)device->dram[device->attn_const_bank].y;
     request.constants.address = device->attn_const_address;
@@ -1487,6 +1669,158 @@ static int attention_chunk_split(pn_tt_device *device, uint32_t layer,
     return 0;
 }
 
+/** One band's queue call, as the deep flow's I/O context (pn_tt_attn_deep.h). */
+typedef struct attention_deep_call {
+    pn_tt_device *device;
+    uint32_t layer;
+    const pn_tt_activation *query;
+    const pn_tt_activation *output;
+    uint32_t first_position;
+    uint32_t rows;
+} attention_deep_call;
+
+/** Enqueue head `head` of the seeked band on member `m`. A member idle past its limit RETIRES on
+ *  its next enqueue and refuses it (pn_tt_residency.c residency_idle_retire): it is re-armed on
+ *  its own core and sent the same words once more — they address DRAM only. A borrowed grid
+ *  member is not re-armed here; its refusal fails the band. */
+static int attention_deep_enqueue(void *context, uint32_t m, uint32_t band, uint32_t head)
+{
+    const attention_deep_call *call = context;
+    pn_tt_device *device = call->device;
+    pn_tt_residency *member = pn_tt_attention_queue_member(device, m);
+    uint32_t words[FT_TT_OP_ATTENTION_WORDS];
+    bool rearmed;
+
+    (void)band;
+    if (attention_chunk_head_words(device, call->layer, call->query, call->output,
+                                   call->first_position, call->rows, head, words) != 0)
+        return -1;
+    if (pn_tt_residency_enqueue(member, FT_TT_QUEUE_OP_ATTENTION, words, 1u) == 0) {
+        device->oncard_ops++;
+        return 0;
+    }
+    rearmed = m == 0u ? pn_tt_attention_rearm(device, member)
+              : m < device->attention_members ? pn_tt_attention_member_rearm(device, m)
+                                              : false;
+    if (!rearmed)
+        return -1;
+    pn_tt_attention_defer(device, true);
+    if (pn_tt_residency_enqueue(member, FT_TT_QUEUE_OP_ATTENTION, words, 1u) != 0)
+        return -1;
+    device->oncard_ops++;
+    return 0;
+}
+
+/** A REAL wait for everything issued to member `m` — never the bookkeeping-dependent settle. */
+static int attention_deep_settle(void *context, uint32_t m)
+{
+    const attention_deep_call *call = context;
+
+    return pn_tt_residency_await_now(pn_tt_attention_queue_member(call->device, m),
+                                     PN_TT_OP_TIMEOUT_MS);
+}
+
+/**
+ * DEEP-QUEUED PREFILL ATTENTION (pn_tt_attn_deep.h): the 24 head descriptors of the band the
+ * operands are seeked to, issued through the deep FLOW, which counts each member's outstanding
+ * descriptors and really awaits a member before it would hold more than its ring and its
+ * rotating parameter slots allow (min(queue capacity, PN_TT_RESIDENCY_DEFER_SLOTS)). The
+ * members run deferred only for those rotating slots. `pn_tt_attention_chunk_drain()` awaits
+ * every member and ends the layer-pass's flow.
+ */
+int pn_tt_attention_chunk_queue(pn_tt_device *device, uint32_t layer,
+                                const pn_tt_activation *query, const pn_tt_activation *output,
+                                uint32_t first_position, uint32_t rows)
+{
+    const uint32_t head_tiles = device ? device->attn_dim_tiles : 0u;
+    attention_deep_call call;
+    pn_tt_attn_deep_io io;
+
+    if (!device || !query || !output || !device->attention.running)
+        return -1;
+    if (rows == 0u || rows > PN_TT_TILE_DIM || (first_position % PN_TT_TILE_DIM) != 0u ||
+        layer >= device->kv_layer_count)
+        return -1;
+    if (query->tile_count < device->attn_q_heads * head_tiles ||
+        output->tile_count < device->attn_q_heads * head_tiles)
+        return -1;
+    if (pn_tt_matvec_flush(device) != 0)
+        return -1;
+    if (device->attention_deep_flow.members == 0u) {
+        const uint32_t capacity = pn_tt_residency_queue_capacity();
+        const uint32_t depth = capacity < PN_TT_RESIDENCY_DEFER_SLOTS
+                                   ? capacity : PN_TT_RESIDENCY_DEFER_SLOTS;
+
+        if (pn_tt_attn_deep_flow_begin(&device->attention_deep_flow,
+                                       pn_tt_attention_queue_members(device), depth) != 0)
+            return -1;
+    }
+    pn_tt_attention_defer(device, true);
+    call.device = device;
+    call.layer = layer;
+    call.query = query;
+    call.output = output;
+    call.first_position = first_position;
+    call.rows = rows;
+    io.context = &call;
+    io.enqueue = attention_deep_enqueue;
+    io.settle = attention_deep_settle;
+    return pn_tt_attn_deep_issue_band(&device->attention_deep_flow, first_position / 32u,
+                                      device->attn_q_heads, &io);
+}
+
+int pn_tt_attention_chunk_drain(pn_tt_device *device)
+{
+    const double at = pn_tt_now_seconds();
+    attention_deep_call call;
+    pn_tt_attn_deep_io io;
+    int rc = 0;
+
+    if (!device)
+        return -1;
+    memset(&call, 0, sizeof(call));
+    call.device = device;
+    io.context = &call;
+    io.enqueue = attention_deep_enqueue;
+    io.settle = attention_deep_settle;
+    if (device->attention_deep_flow.members != 0u &&
+        pn_tt_attn_deep_flow_drain(&device->attention_deep_flow, &io) != 0)
+        rc = -1;
+    device->attention_deep_flow.members = 0u;
+    pn_tt_attention_defer(device, false);
+    device->oncard_seconds += pn_tt_now_seconds() - at;
+    return rc;
+}
+
+void pn_tt_attention_defer(pn_tt_device *device, bool on)
+{
+    if (!device)
+        return;
+    device->attention.defer_await = on;
+    for (uint32_t m = 1u; m < device->attention_members; m++)
+        device->attention_member[m - 1u].defer_await = on;
+    /* C: the members borrowed onto the grid's cores (pn_tt_attention_grid.h). */
+    for (uint32_t m = 0u; m < device->attention_grid_count; m++)
+        device->attention_grid[m].defer_await = on;
+}
+
+int pn_tt_attention_settle(pn_tt_device *device)
+{
+    int rc = 0;
+
+    if (!device)
+        return -1;
+    if (pn_tt_residency_settle(&device->attention, PN_TT_OP_TIMEOUT_MS) != 0)
+        rc = -1;
+    for (uint32_t m = 1u; m < device->attention_members; m++)
+        if (pn_tt_residency_settle(&device->attention_member[m - 1u], PN_TT_OP_TIMEOUT_MS) != 0)
+            rc = -1;
+    for (uint32_t m = 0u; m < device->attention_grid_count; m++)
+        if (pn_tt_residency_settle(&device->attention_grid[m], PN_TT_OP_TIMEOUT_MS) != 0)
+            rc = -1;
+    return rc;
+}
+
 int pn_tt_attention_chunk(pn_tt_device *device, uint32_t layer, const pn_tt_activation *query,
                           const pn_tt_activation *output, uint32_t first_position,
                           uint32_t rows)
@@ -1531,12 +1865,12 @@ int pn_tt_attention_chunk(pn_tt_device *device, uint32_t layer, const pn_tt_acti
  * The export path — the only place the card cache crosses the link
  * ================================================================ */
 
-/** Bytes one head's `tiles` position tiles occupy, and the offset they start at. */
-static int pn_tt_kv_head_run(const pn_tt_device *device, uint32_t head, uint32_t tiles,
-                             uint64_t *out_offset, uint32_t *out_bytes)
+/** Bytes one head's `tiles` position tiles of K (or V) occupy, and the offset they start at. */
+static int pn_tt_kv_head_run(const pn_tt_device *device, bool values, uint32_t head,
+                             uint32_t tiles, uint64_t *out_offset, uint32_t *out_bytes)
 {
-    return ft_tt_kv_cache_run(&device->kv_layout, head, 0u, tiles * PN_TT_TILE_DIM, out_offset,
-                              out_bytes) == FT_TT_OK
+    return ft_tt_kv_cache_run(pn_tt_kv_layout_of(device, values), head, 0u,
+                              tiles * PN_TT_TILE_DIM, out_offset, out_bytes) == FT_TT_OK
                ? 0
                : -1;
 }
@@ -1548,7 +1882,11 @@ int pn_tt_kv_download(pn_tt_device *device, uint32_t layer, bool values,
     const uint32_t head_dim = device ? device->attn_head_dim : 0u;
     uint32_t tiles, head;
     uint16_t *staged;
+    uint8_t *packed;
     double started;
+    /* K's format or V's: a mixed cache's two regions convert each by its own. */
+    const uint32_t format =
+        device ? (values ? device->kv_type.v_format : device->kv_type.k_format) : 0u;
 
     if (!device || !out || position_count == 0u || layer >= device->kv_layer_count)
         return -1;
@@ -1559,23 +1897,34 @@ int pn_tt_kv_download(pn_tt_device *device, uint32_t layer, bool values,
         return -1;
     tiles = (position_count + PN_TT_TILE_DIM - 1u) / PN_TT_TILE_DIM;
     staged = malloc((size_t)tiles * dim_tiles * PN_TT_TILE_BF16);
-    if (!staged)
+    packed = format != PN_TT_KV_FORMAT_BF16
+                 ? malloc((size_t)tiles * dim_tiles *
+                          pn_tt_kv_layout_of(device, values)->tile_bytes)
+                 : NULL;
+    if (!staged || (format != PN_TT_KV_FORMAT_BF16 && !packed)) {
+        free(staged);
+        free(packed);
         return -1;
+    }
     started = pn_tt_now_seconds();
 
     for (head = 0; head < device->attn_kv_heads; head++) {
-        ft_tt_op_operand region = pn_tt_region_operand(device, layer, values);
-        uint32_t bank = values ? device->kv_region[layer].v_bank
-                               : device->kv_region[layer].k_bank;
+        ft_tt_op_operand region = pn_tt_kv_region_operand(device, layer, values, head);
+        uint32_t bank = pn_tt_kv_head_bank(device, layer, values, head);
         uint64_t offset = 0;
         uint32_t bytes = 0, position;
 
-        if (pn_tt_kv_head_run(device, head, tiles, &offset, &bytes) != 0 ||
-            pn_tt_read_dram(device, bank, region.address + (uint32_t)offset, staged, bytes) !=
-                0) {
+        if (pn_tt_kv_head_run(device, values, head, tiles, &offset, &bytes) != 0 ||
+            pn_tt_read_dram(device, bank, region.address + (uint32_t)offset,
+                            packed ? (void *)packed : (void *)staged, bytes) != 0) {
             free(staged);
+            free(packed);
             return -1;
         }
+        /* A block-float cache decodes to bf16 exactly (pn_tt_kv_format.h). */
+        if (packed)
+            pn_tt_kv_format_tiles_to_bf16(format, packed, (size_t)tiles * dim_tiles,
+                                          staged);
         /* WHOLE TILES, so there is no read-alignment waste at all — which is the arithmetic
          * that makes exporting at export time cheaper than mirroring per token. */
         for (position = 0; position < position_count; position++) {
@@ -1593,8 +1942,18 @@ int pn_tt_kv_download(pn_tt_device *device, uint32_t layer, bool values,
                                                element % PN_TT_TILE_DIM)]);
             }
         }
+        /* K4H: the cache holds k*H; the file holds k (H*H = I), the frame every KV type
+         * shares, so a k4h state file loads into any type and any type's into k4h. */
+        if (!values && device->kv_type.rotate && !pn_tt_red("kv_export_rotated") &&
+            pn_tt_kv_rotate_rows(out + (size_t)head * position_count * head_dim,
+                                 position_count, head_dim) != 0) {
+            free(staged);
+            free(packed);
+            return -1;
+        }
     }
     free(staged);
+    free(packed);
     device->readback_seconds += pn_tt_now_seconds() - started;
     return 0;
 }
@@ -1606,7 +1965,12 @@ int pn_tt_kv_upload(pn_tt_device *device, uint32_t layer, bool values,
     const uint32_t head_dim = device ? device->attn_head_dim : 0u;
     uint32_t tiles, head;
     uint16_t *staged;
+    uint8_t *packed;
+    float *rotated;
     double started;
+    /* K's format or V's: a mixed cache's two regions convert each by its own. */
+    const uint32_t format =
+        device ? (values ? device->kv_type.v_format : device->kv_type.k_format) : 0u;
 
     if (!device || !in || position_count == 0u || layer >= device->kv_layer_count)
         return -1;
@@ -1617,14 +1981,23 @@ int pn_tt_kv_upload(pn_tt_device *device, uint32_t layer, bool values,
         return -1;
     tiles = (position_count + PN_TT_TILE_DIM - 1u) / PN_TT_TILE_DIM;
     staged = calloc((size_t)tiles * dim_tiles, PN_TT_TILE_BF16);
-    if (!staged)
+    packed = format != PN_TT_KV_FORMAT_BF16
+                 ? malloc((size_t)tiles * dim_tiles *
+                          pn_tt_kv_layout_of(device, values)->tile_bytes)
+                 : NULL;
+    rotated = !values && device->kv_type.rotate ? malloc(head_dim * sizeof(*rotated)) : NULL;
+    if (!staged || (format != PN_TT_KV_FORMAT_BF16 && !packed) ||
+        (!values && device->kv_type.rotate && !rotated)) {
+        free(staged);
+        free(packed);
+        free(rotated);
         return -1;
+    }
     started = pn_tt_now_seconds();
 
     for (head = 0; head < device->attn_kv_heads; head++) {
-        ft_tt_op_operand region = pn_tt_region_operand(device, layer, values);
-        uint32_t bank = values ? device->kv_region[layer].v_bank
-                               : device->kv_region[layer].k_bank;
+        ft_tt_op_operand region = pn_tt_kv_region_operand(device, layer, values, head);
+        uint32_t bank = pn_tt_kv_head_bank(device, layer, values, head);
         uint64_t offset = 0;
         uint32_t bytes = 0, position;
 
@@ -1635,6 +2008,19 @@ int pn_tt_kv_upload(pn_tt_device *device, uint32_t layer, bool values,
             const float *source = in + ((size_t)head * position_count + position) * head_dim;
             uint32_t element;
 
+            /* K4H: the file's canonical k goes in as k*H, as the card's append would store it. */
+            if (rotated) {
+                memcpy(rotated, source, head_dim * sizeof(*rotated));
+                if (!pn_tt_red("kv_import_unrotated") &&
+                    pn_tt_kv_rotate_rows(rotated, 1u, head_dim) != 0) {
+                    free(staged);
+                    free(packed);
+                    free(rotated);
+                    return -1;
+                }
+                source = rotated;
+            }
+
             for (element = 0; element < head_dim; element++) {
                 uint16_t *tile = tile_row + (size_t)(element / PN_TT_TILE_DIM) *
                                                 (PN_TT_TILE_BF16 / 2u);
@@ -1644,14 +2030,22 @@ int pn_tt_kv_upload(pn_tt_device *device, uint32_t layer, bool values,
                     ft_bf16_from_float(source[element]);
             }
         }
-        if (pn_tt_kv_head_run(device, head, tiles, &offset, &bytes) != 0 ||
-            pn_tt_write_dram(device, bank, region.address + (uint32_t)offset, staged, bytes) !=
-                0) {
+        /* A block-float cache gets the bytes the card's append would have written. */
+        if (packed)
+            pn_tt_kv_format_tiles_from_bf16(format, staged,
+                                            (size_t)tiles * dim_tiles, packed);
+        if (pn_tt_kv_head_run(device, values, head, tiles, &offset, &bytes) != 0 ||
+            pn_tt_write_dram(device, bank, region.address + (uint32_t)offset,
+                             packed ? (const void *)packed : (const void *)staged, bytes) != 0) {
             free(staged);
+            free(packed);
+            free(rotated);
             return -1;
         }
     }
     free(staged);
+    free(packed);
+    free(rotated);
     device->upload_seconds += pn_tt_now_seconds() - started;
     return 0;
 }

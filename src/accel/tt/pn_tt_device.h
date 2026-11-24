@@ -130,6 +130,7 @@
 
 #include "pn_tt_column_runs.h"
 #include "pn_tt_descriptor_census.h"
+#include "pn_tt_kv_format.h"
 
 /** How many Tensix one projection may be split across. 16 is the cooperative driver's own
  *  bound and not a rectangle — a SPLIT group multicasts nothing.
@@ -216,6 +217,9 @@ typedef struct pn_tt_weight {
      *  one bank, so the coordinate cannot be reduced back to a bank — it has to be kept.
      *  Only the per-bank read accounting reads this; nothing dispatches from it. */
     uint32_t shard_bank[PN_TT_MATMUL_MAX_CORES];
+    /** TIMING PROBE ONLY: `PN_TT_MATMUL_PROBE` applies to this weight (all weights when
+     *  `PN_TT_MATMUL_PROBE_ONLY` is unset, else those whose name matches it). */
+    uint8_t probe_selected;
 } pn_tt_weight;
 
 /** Opaque device handle. One per resident model. */
@@ -262,10 +266,57 @@ int pn_tt_device_keepalive(pn_tt_device *device, double min_idle_seconds);
  */
 int pn_tt_device_load_artifact(pn_tt_device *device, const char *path);
 
+/**
+ * The two halves of `pn_tt_device_load_artifact`, for a backend that decides its upload plan
+ * from the artifact's directory (qwen35moe_tt_fit_plan.h): open maps the file and stages the
+ * scratch rows; place uploads the weights. Open, then any `pn_tt_device_split_weights_at_load`,
+ * then place is the same as load with that rule set first.
+ * @return 0, or -1 with the reason on stderr
+ */
+int pn_tt_device_open_artifact(pn_tt_device *device, const char *path);
+int pn_tt_device_place_artifact(pn_tt_device *device);
+
+/**
+ * Bytes the opened artifact's matmul (N-major) tensors take, in total and for the names that
+ * end in `suffix` (NULL or "" for none). Read from the directory, before any upload.
+ * @return 0, or -1 when no artifact is open
+ */
+int pn_tt_device_artifact_matmul_bytes(const pn_tt_device *device, const char *suffix,
+                                       uint64_t *total, uint64_t *suffix_total);
+
+/** Free DRAM bytes of every bank into `free_bytes` (at most `max_banks`).
+ *  @return the bank count, or 0 on bad arguments */
+uint32_t pn_tt_device_dram_free_banks(const pn_tt_device *device, uint64_t *free_bytes,
+                                      uint32_t max_banks);
+
+/** The round-robin strip cursor `pn_tt_dram_alloc_any()` takes its next bank from. */
+uint32_t pn_tt_device_strip_cursor(const pn_tt_device *device);
+
 /** Look up a resident weight by its artifact name, e.g. "blk.3.ffn_down.weight".
- *  @return 0 and fills `out_weight`, or -1 if the name is not resident. */
+ *  @return 0 and fills `out_weight`, or -1 if the name is not resident WHOLE. */
 int pn_tt_device_find_weight(const pn_tt_device *device, const char *name,
                              pn_tt_weight *out_weight);
+
+/**
+ * Upload every N-major tensor whose name ends in `suffix` and whose width is exactly
+ * `fields * field_tiles` column tiles as its `field_tiles / part_tiles` column parts INSTEAD
+ * of whole (pn_tt_weight_split.h). Part p is columns `p*part_tiles .. (p+1)*part_tiles` of
+ * each field. Call before the weights are placed (`pn_tt_device_load_artifact`, or between
+ * `pn_tt_device_open_artifact` and `pn_tt_device_place_artifact`); one rule per device.
+ *
+ * For a joint Q+gate `attn_q` when on-card attention is requested: every reader then uses
+ * the halves, and the joint copy (0.996 GiB on Qwen3.8-27B) is never uploaded.
+ *
+ * @return 0, or -1 on a shape the parts cannot tile, a second rule, or a loaded artifact
+ */
+int pn_tt_device_split_weights_at_load(pn_tt_device *device, const char *suffix,
+                                       uint32_t fields, uint32_t field_tiles,
+                                       uint32_t part_tiles);
+
+/** Look up column part `part` of a tensor a split rule uploaded as parts.
+ *  @return 0 and fills `out_weight`, or -1 if that part is not resident. */
+int pn_tt_device_find_weight_part(const pn_tt_device *device, const char *name, uint32_t part,
+                                  pn_tt_weight *out_weight);
 
 /**
  * Stage a SECOND, column-permuted copy of an already-loaded weight into card DRAM.
@@ -287,6 +338,12 @@ int pn_tt_device_find_weight(const pn_tt_device *device, const char *name,
  * Thread-safe: no    Reentrant: no    Signal-safe: no
  */
 /**
+ * Census arm (`PN_TT_Q36_CENSUS=1`): reserve, without writing, the DRAM of every routed-expert
+ * stack in the extra (MTP) artifact. Returns the count, or -1 when the DRAM is full.
+ */
+int pn_tt_device_reserve_extra_expert_stacks(pn_tt_device *device);
+
+/**
  * STEP 4 S2 — a SECOND artifact (the MTP draft head): open it, place one of its matmul weights
  * the way the device's own are placed, stage a column subset of one (as
  * pn_tt_device_stage_weight_columns), or read one of its 1-D fp32 tensors (`n` floats, NULL if
@@ -300,9 +357,31 @@ int pn_tt_device_stage_extra_columns(pn_tt_device *device, const char *source_na
                                      pn_tt_weight *out_weight);
 const float *pn_tt_device_extra_vector(const pn_tt_device *device, const char *name, uint32_t n);
 
+/** Bytes of tensor `name` in the extra artifact; 0 when it is not there. */
+uint64_t pn_tt_device_extra_tensor_bytes(const pn_tt_device *device, const char *name);
+
+/** Tile grid and tile size of matmul tensor `name` in the open (main) artifact.
+ *  @return 0, or -1 when the artifact is not open or has no N-major `name` */
+int pn_tt_device_artifact_tensor_tiles(const pn_tt_device *device, const char *name,
+                                       uint32_t *tile_rows, uint32_t *tile_cols,
+                                       uint32_t *tile_bytes);
+
 int pn_tt_device_stage_weight_columns(pn_tt_device *device, const char *source_name,
                                       const pn_tt_column_run *runs, uint32_t run_count,
                                       pn_tt_weight *out_weight);
+
+/**
+ * Columns `runs` of the resident weight `source`, read IN PLACE (pn_tt_weight_view.h): no
+ * second copy, spread over the matmul group's members. Refused when the group cooperates (a
+ * view splits raggedly).
+ *
+ * @return 0, or -1
+ *
+ * Thread-safe: no    Reentrant: no    Signal-safe: yes
+ */
+int pn_tt_device_view_weight_columns(const pn_tt_device *device, const pn_tt_weight *source,
+                                     const pn_tt_column_run *runs, uint32_t run_count,
+                                     pn_tt_weight *out_weight);
 
 /** How many matmul weights are resident, and how many bytes they occupy. */
 uint32_t pn_tt_device_weight_count(const pn_tt_device *device);
@@ -325,9 +404,28 @@ uint64_t pn_tt_device_weight_bytes(const pn_tt_device *device);
 void pn_tt_device_dram_usage(const pn_tt_device *device, uint64_t *used_out,
                              uint64_t *total_out);
 
+/**
+ * DRAM this process holds on device `device_index`: pn_tt_device_dram_usage summed over every
+ * device it has open there (total = the largest). The hardware report's reading of a p150.
+ * There is no cross-process view; another process's use is not in it.
+ *
+ * @return 0, or -1 when this process has no device open on that index
+ *
+ * Thread-safe: yes (the open list is locked; the allocator counters are read as they stand)
+ * Reentrant: yes    Signal-safe: no
+ */
+int pn_tt_device_dram_usage_on(int device_index, uint64_t *used_out, uint64_t *total_out);
+
 /** One stderr line naming `tag`, used and total in GiB. Cheap enough to call on every arm,
  *  and the only place a capacity claim can be READ OFF a run rather than derived. */
 void pn_tt_device_report_dram(const pn_tt_device *device, const char *tag);
+
+/** `PN_TT_DRAM_REPORT=1`: the staged DRAM census (arm stages, each prefill, each checkpoint).
+ *  Measurement only; nothing it prints changes what is allocated. */
+bool pn_tt_device_dram_report_wanted(void);
+
+/** pn_tt_device_report_dram(), only when pn_tt_device_dram_report_wanted(). */
+void pn_tt_device_report_dram_stage(const pn_tt_device *device, const char *tag);
 
 /**
  * Non-zero when the loaded artifact stores `attn_q`/`attn_k` with SPLIT-HALF rotary
@@ -610,6 +708,11 @@ int pn_tt_activation_alloc_rows(pn_tt_device *device, uint32_t tile_count, uint3
 int pn_tt_activation_alloc_replicated_rows(pn_tt_device *device, uint32_t tile_count,
                                            uint32_t replicas, uint32_t tile_rows,
                                            pn_tt_activation *out_activation);
+/** As `pn_tt_activation_alloc_rows`, in the bank with the most free bytes rather than the next
+ *  round-robin one: for an unmirrored strip of a set whose mirrors were placed first
+ *  (pn_tt_strip_placement.h). */
+int pn_tt_activation_alloc_rows_emptiest(pn_tt_device *device, uint32_t tile_count,
+                                         uint32_t tile_rows, pn_tt_activation *out_activation);
 /** PHASE G option 3: record the prefill-only set's height (0 = none). */
 void pn_tt_device_set_prefill_tile_rows(pn_tt_device *device, uint32_t rows);
 
@@ -718,6 +821,11 @@ int pn_tt_activation_zero_bands(pn_tt_device *device, const pn_tt_activation *ac
 int pn_tt_activation_fill_bands(pn_tt_device *device, const pn_tt_activation *activation,
                                 uint32_t bands, unsigned char value);
 
+/** Prefill lane: zero tile-rows [first, end) of the whole allocation only (every replica).
+ *  `first >= end` does nothing. @return 0, or -1 */
+int pn_tt_activation_zero_band_range(pn_tt_device *device, const pn_tt_activation *activation,
+                                     uint32_t first, uint32_t end);
+
 /** How many 32-row bands every activation strip is allocated with. See the `tile_rows` block
  *  above. 1 is the shipped strip, and the whole mechanism collapses to the pre-Mt one there. */
 #define PN_TT_STRIP_TILE_ROWS_ENV "PN_TT_STRIP_TILE_ROWS"
@@ -752,6 +860,9 @@ void pn_tt_device_set_verify_rows(pn_tt_device *device, uint32_t rows);
 /** S2c: the logits row pn_tt_topk() selects over (0 = the decode row). */
 void pn_tt_device_set_topk_row(pn_tt_device *device, uint32_t row);
 
+/** FUSE PROBE (timing only): the next top-k reads its logit blocks and selects nothing. */
+void pn_tt_device_set_topk_drain_only(pn_tt_device *device, bool drain);
+
 /** M5: per-processor CB-wait time of the main residencies (`pn_tt: wait clock` lines). */
 void pn_tt_device_wait_report(pn_tt_device *device, double tokens);
 
@@ -765,6 +876,10 @@ void pn_tt_device_prefer_prefetch_tiles(pn_tt_device *device, uint32_t tiles);
 /** M4: this model wants the pipelined matmul reader with 3-chunk CBs (env overrides
  *  `PN_TT_MATMUL_PIPE`, `PN_TT_MATMUL_CB_DEEP`). Call before the artifact loads. */
 void pn_tt_device_prefer_matmul_pipe(pn_tt_device *device, bool pipe);
+/** BYTES A-REUSE ring in pages (the model's hidden Kt): a matmul whose Kt equals it reads A
+ *  once per row instead of once per column block. 0 = the default (128); `PN_TT_A_REUSE`
+ *  overrides. Set before the artifact loads (the matmul residency arms there). */
+void pn_tt_device_prefer_a_reuse_tiles(pn_tt_device *device, uint32_t tiles);
 
 /**
  * Point a strip at tile-row `row`, so an op written for a 32-row strip runs on band `row`.
@@ -831,6 +946,38 @@ int pn_tt_matvec_resident(pn_tt_device *device, const pn_tt_weight *weight,
 int pn_tt_matvec_enqueue(pn_tt_device *device, const pn_tt_weight *weight,
                          const pn_tt_activation *input, const pn_tt_activation *output);
 
+/**
+ * S3b: ISSUE one fused SwiGLU projection — `output` = silu(input . gate) * (input . up),
+ * written with `output`'s mirrors — and do not wait, as pn_tt_matvec_enqueue(). Needs
+ * `PN_TT_FUSE_SWIGLU=1` (the fused resident program) and the shape the fused kernel serves
+ * (pn_tt_matmul_group_enqueue_swiglu()).
+ *
+ * @return 0 issued (the caller owes a flush before reading `output`, as for any enqueue);
+ *         1 not fused, NOTHING issued — run gate, up and pn_tt_silu_mul() instead;
+ *         -1 error
+ *
+ * Thread-safe: no    Reentrant: no    Signal-safe: no
+ */
+int pn_tt_matvec_enqueue_swiglu(pn_tt_device *device, const pn_tt_weight *gate,
+                                const pn_tt_weight *up, const pn_tt_activation *input,
+                                const pn_tt_activation *output);
+
+/**
+ * S3a: the WAITING form of one projection with the residual add fused — `output` = `residual`
+ * + bf16(input . weight), the bytes pn_tt_matvec_resident(weight, input, project) then
+ * pn_tt_add(residual, project, output) would leave in `output`. Flushes first and waits, as
+ * pn_tt_matvec_resident(). Needs `PN_TT_FUSE_RESADD=1` and the shape the RESADD kernel serves
+ * (pn_tt_matmul_group_enqueue_resadd()).
+ *
+ * @return 0 done; 1 not fused, NOTHING issued — run the projection and pn_tt_add() instead;
+ *         -1 error
+ *
+ * Thread-safe: no    Reentrant: no    Signal-safe: no
+ */
+int pn_tt_matvec_resadd(pn_tt_device *device, const pn_tt_weight *weight,
+                        const pn_tt_activation *input, const pn_tt_activation *residual,
+                        const pn_tt_activation *output);
+
 /** Wait for every projection `pn_tt_matvec_enqueue()` has issued. A no-op when none are
  *  pending. @return 0, or -1 with the reason on stderr */
 int pn_tt_matvec_flush(pn_tt_device *device);
@@ -850,6 +997,19 @@ int pn_tt_norm_constants_upload(pn_tt_device *device, const float *gamma, uint32
 int pn_tt_rms_norm(pn_tt_device *device, const pn_tt_norm_constants *constants,
                    const pn_tt_activation *input, const pn_tt_activation *output);
 
+/** FUSE PRICING PROBE (`PN_TT_FUSE_PROBE`, timing only — an armed run's text is not
+ *  evidence): bit 1 skips every residual add, 2 every SiLU-gated multiply, 4 every solo
+ *  (unsplit) matmul projection, 8 every RMS norm, 16 the verify heads' top-k for rows past 0
+ *  (row 0's answer reused), 32 those rows' top-k as a read-only drain (row 0's answer
+ *  reused). Each bit is the ceiling of fusing that op away. */
+#define PN_TT_FUSE_PROBE_ADD 1u
+#define PN_TT_FUSE_PROBE_SILU_MUL 2u
+#define PN_TT_FUSE_PROBE_SOLO 4u
+#define PN_TT_FUSE_PROBE_NORM 8u
+#define PN_TT_FUSE_PROBE_TOPK_ROWS 16u
+#define PN_TT_FUSE_PROBE_TOPK_DRAIN 32u
+uint32_t pn_tt_fuse_probe_bits(void);
+
 /** out = a + b, on the card. */
 int pn_tt_add(pn_tt_device *device, const pn_tt_activation *a, const pn_tt_activation *b,
               const pn_tt_activation *output);
@@ -858,6 +1018,10 @@ int pn_tt_add(pn_tt_device *device, const pn_tt_activation *a, const pn_tt_activ
  *  because as two it costs a DRAM round trip of the intermediate. */
 int pn_tt_silu_mul(pn_tt_device *device, const pn_tt_activation *a, const pn_tt_activation *b,
                    const pn_tt_activation *output);
+
+/** out = a * b, on the card (the MoE block's routing-weight scale). */
+int pn_tt_mul(pn_tt_device *device, const pn_tt_activation *a, const pn_tt_activation *b,
+              const pn_tt_activation *output);
 
 /**
  * out = sigmoid(gate) * b, on the card — Ornith's ATTENTION output gate.
@@ -958,6 +1122,16 @@ int pn_tt_device_arm_attention(pn_tt_device *device, uint32_t q_heads, uint32_t 
                                uint32_t capacity_positions, uint32_t layer_count);
 
 /**
+ * The KV cache type this load's attention arms with, over `PN_TT_KV_TYPE`: the fit policy's
+ * choice (a profile that allows K4H at a context that needs it). Call before
+ * pn_tt_device_arm_attention(); later calls do not re-shape an armed cache.
+ */
+void pn_tt_device_set_kv_type(pn_tt_device *device, pn_tt_kv_type type);
+
+/** The KV type the attention arm will use (or used): the set one, else `PN_TT_KV_TYPE`. */
+pn_tt_kv_type pn_tt_device_kv_type(const pn_tt_device *device);
+
+/**
  * Bind the card's ONE KV region set to a host sequence, identified by any stable pointer.
  *
  * A key that was displaced and comes back is REFUSED: that is two sequences alternating on
@@ -967,6 +1141,17 @@ int pn_tt_device_arm_attention(pn_tt_device *device, uint32_t q_heads, uint32_t 
  */
 int pn_tt_kv_bind(pn_tt_device *device, const void *sequence_key);
 
+/** L10: write the single-row rotary table for `position` now (the decode forward calls it
+ *  before its first descriptor, so the table write is not a boundary mid-token). 0 when the
+ *  rope family is not armed (nothing to prepare). */
+int pn_tt_rope_prepare(pn_tt_device *device, uint32_t position);
+/** The tall prefill passes' per-chunk rotary blocks: `need` counts them (any bank), `reserve`
+ *  allocates them now instead of at the first long prompt (pn_tt_prefill_reserve.h). Nothing
+ *  when the rope family is not armed or no strip is taller than 4 bands.
+ *  @return reserve: 0, or -1 when one did not allocate */
+struct pn_tt_bank_need;
+void pn_tt_rope_prefill_need(const pn_tt_device *device, struct pn_tt_bank_need *need);
+int pn_tt_rope_reserve_prefill(pn_tt_device *device);
 /** NeoX RoPE at `position`, from `input` into `output`, for `heads` heads.
  *
  *  Out of place on purpose: the reader runs ahead of the writer, so writing over the input
@@ -1044,6 +1229,18 @@ int pn_tt_kv_append_chunk(pn_tt_device *device, uint32_t layer, bool values,
 int pn_tt_attention_chunk(pn_tt_device *device, uint32_t layer, const pn_tt_activation *query,
                           const pn_tt_activation *output, uint32_t first_position,
                           uint32_t rows);
+
+/** Prefill lane ATTENTION PIPE: while on, the attention family's (and members') awaits only
+ *  record; `pn_tt_attention_settle()` awaits them. The caller owns every hazard. */
+void pn_tt_attention_defer(pn_tt_device *device, bool on);
+int pn_tt_attention_settle(pn_tt_device *device);
+
+/** Deep-queued prefill attention (pn_tt_attn_deep.h): queue the band the operands are seeked
+ *  to, every head on the next member, awaiting nothing; drain awaits every member. */
+int pn_tt_attention_chunk_queue(pn_tt_device *device, uint32_t layer,
+                                const pn_tt_activation *query, const pn_tt_activation *output,
+                                uint32_t first_position, uint32_t rows);
+int pn_tt_attention_chunk_drain(pn_tt_device *device);
 
 /**
  * Read one layer's K or V back as fp32 in Pantheon's own [head][position][dim] order — the
