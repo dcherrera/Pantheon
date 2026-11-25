@@ -114,7 +114,7 @@ unenforceable, the rest stays in force.
 Corporate signatures are handled by email rather than by pull request, because
 they need a signature from someone authorized to bind the organization.
 
-1. Email **coreyh55@gmail.com** with the subject `Pantheon CCLA — <organization>`,
+1. Email **david@teamide.dev** with the subject `Pantheon CCLA — <organization>`,
    including the completed block below and Schedule A. A scanned signature, a
    digital signature, or a reply from an authorized signer's corporate email
    address all work.

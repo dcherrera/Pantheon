@@ -396,6 +396,40 @@ void pn_sampler_row_hint(const tm_tensor *t);
 /* How many survivor scans a hint replaced (the gate asserts it advances). */
 unsigned long pn_sampler_row_hint_uses(void);
 
+/* SHORT ROW (a constrained slot's row without the full D2H; why it is exact: the SHORT
+ * ROW block in engine.c). `row` holds the backend's exact top
+ * PN_SHORT_ROW_K entries of the full row R (value desc, id asc; finite), -INFINITY
+ * elsewhere, with no NaN in R and the 256th value strictly above the 257th, which is
+ * `bound` (every token outside the list has a raw value <= bound). The next draw from
+ * `row` decides from it only where that is provably R's token and RNG stream (a grammar
+ * shortlist CLEAR verdict, a greedy argmax above bound, a margin draw whose top 64 lies
+ * above bound); everywhere else it calls fill(ctx, row, n_vocab) to write R into `row`
+ * and runs the usual path on it. 257 because every top-N test in the sampler caps at
+ * 256, so a 257-entry row takes the dense row's branches. Honoured for that one draw.
+ *
+ * Thread-safe: per thread    Reentrant: no */
+#define PN_SHORT_ROW_K 257
+typedef int (*pn_short_row_fill_fn)(void *ctx, float *row, int n_vocab);
+void pn_sampler_short_row(const float *row, float bound, pn_short_row_fill_fn fill, void *ctx);
+
+/* Why a short-row draw fetched R (pn_short_row_stats.refill). */
+enum {
+    PN_SR_ENTRY = 0,   /* logprobs, logit_bias, or a penalty that can raise a token */
+    PN_SR_MASK,        /* live mask, no CLEAR verdict (BOUND / undecided / full scan) */
+    PN_SR_GREEDY,      /* greedy argmax not above bound */
+    PN_SR_TOP64,       /* the 64th candidate not above bound */
+    PN_SR_MARGIN,      /* margin draw refused, ineligible or off */
+    PN_SR_REASONS
+};
+typedef struct {
+    unsigned long draws;                 /* draws handed a short row */
+    unsigned long decided;               /* decided without R */
+    unsigned long refill[PN_SR_REASONS];
+    unsigned long fill_failed;           /* fill callback errors (the draw used the short row) */
+} pn_short_row_stats;
+/* Process-wide counts since start. */
+void pn_sampler_short_row_stats(pn_short_row_stats *out);
+
 /* Sparse-survivor sampler fast path (PN_SPARSE_SAMPLER) — see engine.c.
  * Covers BOTH decode modes: the temperature>0 sampler and the temperature<=0
  * greedy argmax, off the same gather and the same flag.

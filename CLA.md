@@ -150,6 +150,6 @@ pull request. An idea costs nothing to accept.
 
 ---
 
-*Questions about this agreement: coreyh55@gmail.com. If something here is
+*Questions about this agreement: david@teamide.dev. If something here is
 ambiguous, ask rather than guessing — I would rather clarify it than have
 someone rely on a reading I did not intend.*

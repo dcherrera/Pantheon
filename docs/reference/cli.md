@@ -64,6 +64,10 @@ flags are matched by order.
 | `--vocab` | `<path>` | unset | RWKV World tokenizer vocab file. |
 | `--quantize` | *(flag)* | off | INT8-quantize weights at load time. |
 | `--served-name` | `<id>` | unset | Back-compat alias: sets the **first** model's served name when it has no `--name`. Silently ignored if `--name` already set for model 0. |
+| `--gateway` | *(flag)* | off | Serve behind a trusted gateway ([guide](../guides/gateway-mode.md)): API-only routes, bearer key, tenant-scoped evictable sessions, refusals instead of silent downgrades. |
+| `--api-key-file` | `<path>` | unset | Gateway key; required with `--gateway`. |
+| `--admin-host` | `<addr>` | `127.0.0.1` | Gateway mode: admin listener address. |
+| `--admin-port` | `<n>` | unset | Gateway mode: admin listener port; unset = admin routes off. |
 | `-h` / `--help` | *(flag)* | — | Print usage and exit 0. |
 
 ### Per-model flags

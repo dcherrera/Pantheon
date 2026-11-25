@@ -52,6 +52,13 @@ uint64_t ms_now_ms(void)
     return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
 }
 
+static uint64_t g_idle_ttl_default_ms = 12u * 60u * 60u * 1000u;   /* 12 hours */
+
+void ms_set_session_idle_ttl_default_ms(uint64_t ttl_ms)
+{
+    g_idle_ttl_default_ms = ttl_ms;
+}
+
 uint64_t ms_session_idle_ttl_ms(void)
 {
     static uint64_t cached = 0;
@@ -62,9 +69,9 @@ uint64_t ms_session_idle_ttl_ms(void)
             char *end = NULL;
             long v = strtol(env, &end, 10);
             cached = (end != env && *end == '\0' && v >= 0)
-                   ? (uint64_t)v : 12u * 60u * 60u * 1000u;
+                   ? (uint64_t)v : g_idle_ttl_default_ms;
         } else {
-            cached = 12u * 60u * 60u * 1000u;   /* 12 hours */
+            cached = g_idle_ttl_default_ms;
         }
         loaded = 1;
     }

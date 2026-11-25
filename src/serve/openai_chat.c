@@ -70,6 +70,7 @@
 #include "batch_sched.h"
 #include "http_server.h"
 #include "field_patterns_request.h"
+#include "gateway_mode.h"
 #include "json_reader.h"
 #include "session_key.h"
 #include "attn_residency_json.h"
@@ -80,12 +81,14 @@
 #include "model_session.h"
 #include "replica_affinity.h"
 #include "replica_pin.h"
+#include "request_id.h"
 #include "serve_generation.h"
 #include "serve_request_dump.h"
 #include "serve_shutdown.h"
 #include "tool_call_stream.h"
 #include "tool_calling.h"
 #include "tool_raw_excerpt.h"
+#include "usage_record.h"
 #include "base64.h"
 #include "sampling_defaults.h"
 #include "../accel/backend_identity.h"
@@ -164,6 +167,13 @@ typedef struct {
     pn_model_sampling sampling;   /* the sampling fields this request CARRIED;
                                      * re-resolved against the routed model's
                                      * defaults (sampling_defaults.h). */
+    bool             wants_json_schema; /* response_format type json_schema
+                                     * (gateway mode refuses it: no schema
+                                     * grammar yet, and a downgrade is silent to
+                                     * an SDK that never reads the status). */
+    bool             has_media_parts; /* a message carried an image / audio /
+                                     * video / file part (dropped for a text-only
+                                     * model; gateway mode refuses instead). */
 } chat_request;
 
 /* Take ownership of `s` for later free and return it as a borrowed pointer.
@@ -178,14 +188,14 @@ static const char *req_own(chat_request *req, char *s)
     return s;
 }
 
-/* Generate a short pseudo-unique completion id (chatcmpl-XXXXXXXX). */
+/* Room for a completion id: "chatcmpl-" + 24 base62 + NUL, rounded up. */
+#define OAI_COMPLETION_ID_MAX 48
+
+/* A completion id that never repeats, across restarts and replicas
+ * (request_id.h): a gateway joins its billing records on it. */
 static void make_completion_id(char *buf, size_t len)
 {
-    static const char hex[] = "0123456789abcdef";
-    char rnd[9];
-    for (int i = 0; i < 8; i++) rnd[i] = hex[rand() & 0xF];
-    rnd[8] = '\0';
-    snprintf(buf, len, "chatcmpl-%s", rnd);
+    pn_request_id_new("chatcmpl-", buf, len);
 }
 
 
@@ -293,6 +303,7 @@ static void resolve_response_format(chat_request *req, const jr_value *root)
 
     bool json_object = (strcmp(type, "json_object") == 0);
     bool json_schema = (strcmp(type, "json_schema") == 0);
+    req->wants_json_schema = json_schema;
     if (!json_object && !json_schema) {
         req->response_format_status = "ignored_unknown_type";
         return;
@@ -424,6 +435,25 @@ static const char *combine_assistant_tool_calls(chat_request *req,
     return owned ? owned : (content ? content : "");
 }
 
+/* Is this content part an image, audio, video or file part (anything but text)? */
+static bool content_part_is_media(const jr_value *item, const char *type)
+{
+    static const char *const media_types[] = {
+        "image", "image_url", "input_image", "video", "video_url",
+        "audio", "input_audio", "file", "input_file",
+    };
+    static const char *const media_keys[] = {
+        "image", "image_url", "video", "video_url", "audio", "input_audio", "file",
+    };
+    for (size_t i = 0; type && i < sizeof(media_types) / sizeof(media_types[0]); i++)
+        if (strcmp(type, media_types[i]) == 0)
+            return true;
+    for (size_t i = 0; i < sizeof(media_keys) / sizeof(media_keys[0]); i++)
+        if (jr_object_get(item, media_keys[i]))
+            return true;
+    return false;
+}
+
 /* A message's text as the chat template renders it: a string as is; an array's
  * text parts concatenated in order (image/video parts skipped: no vision);
  * else NULL. */
@@ -441,19 +471,17 @@ static const char *message_text(chat_request *req, const jr_value *content)
             if (jr_kind(item) != JR_OBJECT)
                 continue;
             const char *type = jr_as_string(jr_object_get(item, "type"));
-            if (type && (strcmp(type, "image") == 0 || strcmp(type, "video") == 0))
+            if (content_part_is_media(item, type)) {
+                req->has_media_parts = true;
                 continue;
-            if (jr_object_get(item, "image") ||
-                jr_object_get(item, "image_url") ||
-                jr_object_get(item, "video"))
-                continue;
+            }
             const char *txt = jr_as_string(jr_object_get(item, "text"));
             if (!txt)
                 continue;
             size_t tlen = strlen(txt);
-            if (len + tlen > cap) {
+            if (len + tlen + 1 > cap) {
                 size_t new_cap = cap ? cap * 2 : 256;
-                while (new_cap < len + tlen)
+                while (new_cap < len + tlen + 1)
                     new_cap *= 2;
                 char *tmp = realloc(buf, new_cap);
                 if (!tmp) { free(buf); return NULL; }
@@ -466,8 +494,8 @@ static const char *message_text(chat_request *req, const jr_value *content)
         if (!buf) {
             buf = malloc(1);
             if (!buf) return NULL;
-            buf[0] = '\0';
         }
+        buf[len] = '\0';
         return req_own(req, buf);
     }
     return NULL;
@@ -1378,6 +1406,13 @@ typedef struct {
     bool        client_gone;      /* a write to the stream failed (closed, reset,
                                    * or not read within the send timeout): the
                                    * turn's should_abort stops it */
+    sg_result   usage;            /* the request's usage so far: counts only
+                                   * (stream_usage_add), never owned strings */
+    int         usage_choices;    /* completions folded into `usage` */
+    bool        usage_sent;       /* the one usage chunk is on the wire */
+    const char *end_reason;       /* how the last completion ended, for the
+                                   * [usage] line (wire finish_reason, or what
+                                   * stopped it); static string */
 } stream_ctx;
 
 /* Longest silence on the wire while the model writes a tool call.  Whatever
@@ -1484,6 +1519,46 @@ static void send_usage_chunk(stream_ctx *sc, const sg_result *res)
     jw_free(&jw);
 }
 
+/* Fold one completion's counts into the request's usage: the prompt was paid
+ * for once (every choice decodes from the same prefill), completions add up —
+ * the same aggregation as the non-streaming body. */
+static void stream_usage_add(stream_ctx *sc, const sg_result *res)
+{
+    if (sc->usage_choices == 0) {
+        memset(&sc->usage, 0, sizeof(sc->usage));
+        sc->usage.prompt_tokens        = res->prompt_tokens;
+        sc->usage.cached_prompt_tokens = res->cached_prompt_tokens;
+        sc->usage.kv_used_tokens       = res->kv_used_tokens;
+        sc->usage.kv_cap_tokens        = res->kv_cap_tokens;
+        sc->usage.resume_kind          = res->resume_kind;
+        sc->usage.prefill_tokens       = res->prefill_tokens;
+        sc->usage.session_conflict     = res->session_conflict;
+    }
+    sc->usage.completion_tokens += res->completion_tokens;
+    sc->usage_choices++;
+}
+
+/* The request's ONE usage chunk (stream_options.include_usage): sent once, after
+ * the last completion — or before the error event of a turn that ended
+ * abnormally, so the tokens it did generate are still counted. */
+static void stream_send_usage_once(stream_ctx *sc)
+{
+    if (sc->usage_sent || sc->usage_choices == 0)
+        return;
+    send_usage_chunk(sc, &sc->usage);
+    sc->usage_sent = true;
+}
+
+/* The request's counts for the [usage] line. */
+static pn_usage_counts stream_usage_counts(const stream_ctx *sc)
+{
+    pn_usage_counts u = { .prompt = sc->usage.prompt_tokens,
+                          .cached = sc->usage.cached_prompt_tokens,
+                          .completion = sc->usage.completion_tokens,
+                          .choices = sc->usage_choices };
+    return u;
+}
+
 /* KV Phase 1: the machine-readable "context over budget" signal. The prompt
  * exceeds the model's per-session KV cap; the serve refused rather than silently
  * drop-oldest. The client reads type == "context_over_budget" + the
@@ -1502,8 +1577,8 @@ static void send_context_over_budget_http(int client_fd, int kv_used,
 }
 
 /* SSE variant: the stream is already open, so the reject must ride the stream as
- * a terminal error event carrying the same machine-readable type + kv numbers,
- * then the stream ends. */
+ * a terminal error event carrying the same machine-readable type + kv numbers.
+ * The caller ends the stream (one [DONE]; this used to write a second). */
 static void send_context_over_budget_sse(int client_fd, int kv_used, int kv_cap)
 {
     char json[320];
@@ -1513,7 +1588,6 @@ static void send_context_over_budget_sse(int client_fd, int kv_used, int kv_cap)
              "\"kv_used\":%d,\"kv_cap\":%d}}",
              kv_used, kv_cap);
     hs_send_sse(client_fd, json);
-    hs_end_sse(client_fd);
 }
 
 /* A turn refused to protect host memory, on an open SSE stream: an OpenAI
@@ -1767,12 +1841,13 @@ static void stream_finish_choice(stream_ctx *sc, chat_request *req,
         sc->tool_error = &tool_error;
         /* Same precedence as the non-streaming body: a degenerated turn reports
          * the degeneration even when a call was parsed out of it. */
-        send_chunk(sc, "", finish_is_repetition_loop(res) ? res->finish_reason
-                                                          : "tool_calls",
-                   NULL, 0);
+        sc->end_reason = finish_is_repetition_loop(res) ? res->finish_reason
+                                                        : "tool_calls";
+        send_chunk(sc, "", sc->end_reason, NULL, 0);
     } else {
         sc->tool_error = &tool_error;
-        send_chunk(sc, "", rc == 0 ? res->finish_reason : "stop", NULL, 0);
+        sc->end_reason = rc == 0 ? res->finish_reason : "stop";
+        send_chunk(sc, "", sc->end_reason, NULL, 0);
     }
     sc->tool_error = NULL;         /* the borrow ends with this stack frame */
     tc_parse_error_free(&tool_error);
@@ -1787,6 +1862,10 @@ static void stream_finish_choice(stream_ctx *sc, chat_request *req,
  * choices[].index.  Returns the sg rc so the caller can stop after a failure it
  * has already reported on the stream.
  */
+static int stream_close_choice(int client_fd, stream_ctx *sc, chat_request *req,
+                               const sg_gen_params *g, sg_result *res, int rc,
+                               bool batched);
+
 static int run_streaming(int client_fd, pn_model *model, pn_state *state,
                          chat_request *req, const sg_gen_params *gen,
                          stream_ctx *sc, const sg_prefix_ctx *pc)
@@ -1802,26 +1881,7 @@ static int run_streaming(int client_fd, pn_model *model, pn_state *state,
     sg_result res = {0};
     int rc = sg_run_completion(model, state, req->messages, req->n_messages,
                                &g, stream_delta_cb, sc, &res, pc);
-    if (turn_cancelled_by_unload(&g)) {
-        /* Checked before rc: a cancel landing mid-decode ends the loop like a
-         * clean "stop" (rc 0), and closing it as one would pass a cut-off answer
-         * off as complete. */
-        fprintf(stderr, "[serve] model unloading — turn cancelled\n");
-        send_model_unloaded_sse(client_fd);
-        rc = SG_ABORTED;
-    } else if (rc == SG_ABORTED) {
-        /* Client is gone and the slot is released; nothing to send. */
-        fprintf(stderr, "[serve] client disconnected — turn aborted, slot released\n");
-    } else if (rc == SG_ADMIT_DENIED) {
-        send_memory_constrained_sse(client_fd, res.admit_reason);
-    } else if (rc == SG_CONTEXT_OVER_BUDGET) {
-        send_context_over_budget_sse(client_fd, res.kv_used_tokens,
-                                     res.kv_cap_tokens);
-    } else {
-        stream_finish_choice(sc, req, &res, rc);
-        if (req->include_usage)
-            send_usage_chunk(sc, &res);
-    }
+    rc = stream_close_choice(client_fd, sc, req, &g, &res, rc, false);
     if (tool_stream) stream_tool_calls_end(sc, &ts);
     sg_result_free(&res);
     return rc;
@@ -1852,29 +1912,85 @@ static int run_streaming_batched(int client_fd, pn_model *model,
     int rc = sg_run_completion_batched(model, sched, slot, req->messages,
                                        req->n_messages, &g,
                                        stream_delta_cb, sc, &res, sid);
-    if (turn_cancelled_by_unload(&g)) {
-        /* Before rc, for the reason run_streaming gives. */
-        fprintf(stderr, "[serve] model unloading — batched turn cancelled\n");
-        send_model_unloaded_sse(client_fd);
-        rc = SG_ABORTED;
-    } else if (rc == SG_ABORTED) {
-        /* Client is gone and the slot is released; nothing to send. */
-        fprintf(stderr, "[serve] client disconnected — batched turn aborted, "
-                "slot released\n");
-    } else if (rc == SG_STALLED) {
-        send_generation_stalled_sse(client_fd);
-    } else if (rc == SG_ADMIT_DENIED) {
-        send_memory_constrained_sse(client_fd, res.admit_reason);
-    } else if (rc == SG_CONTEXT_OVER_BUDGET) {
-        send_context_over_budget_sse(client_fd, res.kv_used_tokens,
-                                     res.kv_cap_tokens);
-    } else {
-        stream_finish_choice(sc, req, &res, rc);
-        if (req->include_usage)
-            send_usage_chunk(sc, &res);
-    }
+    rc = stream_close_choice(client_fd, sc, req, &g, &res, rc, true);
     if (tool_stream) stream_tool_calls_end(sc, &ts);
     sg_result_free(&res);
+    return rc;
+}
+
+/* What stopped a turn whose generation returned without an error code (a stop
+ * mid-decode ends the loop like a clean "stop"): NULL when nothing did. */
+static const char *turn_stop_cause(const int *client_fd, bool client_gone)
+{
+    if (client_gone || (client_fd && !hs_client_alive(*client_fd)))
+        return "client_gone";
+    if (pn_serve_shutdown_requested())
+        return "shutdown";
+    return NULL;
+}
+
+/*
+ * Close ONE streamed completion on the stream however it ended (shared by both
+ * run paths): fold its counts into the request's usage, send the closing chunks
+ * or the terminal error event, and record the end for the [usage] line.  A turn
+ * that ended abnormally gets the request's usage chunk BEFORE its error event
+ * (include_usage), so the tokens it did generate are still on the bill.  Admission
+ * refusals (memory, context over budget) computed nothing and add nothing.
+ * Returns the rc the caller acts on.
+ */
+static int stream_close_choice(int client_fd, stream_ctx *sc, chat_request *req,
+                               const sg_gen_params *g, sg_result *res, int rc,
+                               bool batched)
+{
+    bool refused = rc == SG_ADMIT_DENIED || rc == SG_CONTEXT_OVER_BUDGET;
+    const char *cause = rc == 0 ? turn_stop_cause(&client_fd, sc->client_gone) : NULL;
+
+    if (!refused)
+        stream_usage_add(sc, res);
+    if (turn_cancelled_by_unload(g)) {
+        /* Checked before rc: a cancel landing mid-decode ends the loop like a
+         * clean "stop" (rc 0), and closing it as one would pass a cut-off answer
+         * off as complete. */
+        fprintf(stderr, "[serve] model unloading — %sturn cancelled\n",
+                batched ? "batched " : "");
+        sc->end_reason = "model_unloaded";
+        if (req->include_usage)
+            stream_send_usage_once(sc);
+        send_model_unloaded_sse(client_fd);
+        return SG_ABORTED;
+    }
+    if (rc == SG_ABORTED) {
+        /* Client gone (or shutdown) and the slot is released. */
+        fprintf(stderr, "[serve] client disconnected — %sturn aborted, slot released\n",
+                batched ? "batched " : "");
+        sc->end_reason = pn_serve_shutdown_requested() ? "shutdown" : "client_gone";
+        if (req->include_usage && !sc->client_gone && hs_client_alive(client_fd))
+            stream_send_usage_once(sc);
+        return rc;
+    }
+    if (rc == SG_STALLED) {
+        sc->end_reason = "stalled";
+        if (req->include_usage)
+            stream_send_usage_once(sc);
+        send_generation_stalled_sse(client_fd);
+        return rc;
+    }
+    if (rc == SG_ADMIT_DENIED) {
+        sc->end_reason = "memory_constrained";
+        send_memory_constrained_sse(client_fd, res->admit_reason);
+        return rc;
+    }
+    if (rc == SG_CONTEXT_OVER_BUDGET) {
+        sc->end_reason = "context_over_budget";
+        send_context_over_budget_sse(client_fd, res->kv_used_tokens,
+                                     res->kv_cap_tokens);
+        return rc;
+    }
+    stream_finish_choice(sc, req, res, rc);
+    if (rc != 0)
+        sc->end_reason = "error";
+    else if (cause)
+        sc->end_reason = cause;
     return rc;
 }
 
@@ -1941,8 +2057,17 @@ static void send_session_capacity_refuse(int client_fd, const mr_route *route,
     pn_replica_pin_send_full(client_fd, route, entry, restart_s);
 }
 
-/* Take a decode slot (see acquire_decode_slot) without answering the client. */
+/* A queued waiter's liveness (bs_waiter_alive_fn): is its client still there? */
+static int oai_waiter_alive(void *ud)
+{
+    return hs_client_alive(*(const int *)ud);
+}
+
+/* Take a decode slot (see acquire_decode_slot) without answering the client. A
+ * client that disconnects while queued leaves the queue (BS_ACQUIRE_CLIENT_GONE)
+ * instead of taking a slot when its turn comes. */
 static bs_acquire_result acquire_decode_slot_quiet(pn_batch_sched *sched, const char *sid,
+                                                   const int *client_fd,
                                                    int *slot_out, int *retry_after)
 {
     /* Refresh the pressure snapshot so the scheduler sees the current host state
@@ -1956,7 +2081,13 @@ static bs_acquire_result acquire_decode_slot_quiet(pn_batch_sched *sched, const 
     static const int SLOT_WAIT_MS = 30000;  /* 30 s max queue wait */
     *retry_after = 0;
     *slot_out = -1;
-    return bs_slot_acquire_or_wait(sched, SLOT_WAIT_MS, slot_out, retry_after, sid);
+    bs_acquire_result ar = bs_slot_acquire_or_wait_watched(sched, SLOT_WAIT_MS, slot_out,
+                                                           retry_after, sid,
+                                                           oai_waiter_alive,
+                                                           (void *)client_fd);
+    if (ar == BS_ACQUIRE_CLIENT_GONE)
+        fprintf(stderr, "[serve] client disconnected while queued — left the queue\n");
+    return ar;
 }
 
 /* The OpenAI error body for a failed slot acquire. */
@@ -1968,6 +2099,8 @@ static void send_acquire_refusal(int client_fd, bs_acquire_result ar, int retry_
         send_session_capacity_refuse(client_fd, route, entry, sid, 0);
         return;
     }
+    if (ar == BS_ACQUIRE_CLIENT_GONE)
+        return;   /* nobody is reading */
 
     int http_code;
     const char *err_code, *err_msg;
@@ -2023,7 +2156,8 @@ static bs_acquire_result acquire_decode_slot(int client_fd,
                                              bool answer_client)
 {
     int retry_after = 0;
-    bs_acquire_result ar = acquire_decode_slot_quiet(sched, sid, slot_out, &retry_after);
+    bs_acquire_result ar = acquire_decode_slot_quiet(sched, sid, &client_fd, slot_out,
+                                                     &retry_after);
     if (ar != BS_ACQUIRE_OK && answer_client)
         send_acquire_refusal(client_fd, ar, retry_after, route, entry, sid);
     return ar;
@@ -2045,9 +2179,11 @@ static bs_acquire_result acquire_with_failover(int client_fd, mr_registry *reg,
 {
     int retry_after = 0;
     mr_entry *at = *entry;
-    bs_acquire_result ar = acquire_decode_slot_quiet(at->sched, sid, slot_out, &retry_after);
+    bs_acquire_result ar = acquire_decode_slot_quiet(at->sched, sid, &client_fd, slot_out,
+                                                     &retry_after);
 
-    while (ar != BS_ACQUIRE_OK && ar != BS_ACQUIRE_SHUTDOWN && route->replica <= 0 &&
+    while (ar != BS_ACQUIRE_OK && ar != BS_ACQUIRE_SHUTDOWN &&
+           ar != BS_ACQUIRE_CLIENT_GONE && route->replica <= 0 &&
            !ms_session_holds_seat(at, sid)) {
         mr_entry *next = mr_failover_session(reg, at, sid, route);
         if (!next || !next->sched) {
@@ -2060,11 +2196,90 @@ static bs_acquire_result acquire_with_failover(int client_fd, mr_registry *reg,
         *entry = at;
         turn_abort->entry = at;
         pn_replica_pin_announce(at);
-        ar = acquire_decode_slot_quiet(at->sched, sid, slot_out, &retry_after);
+        ar = acquire_decode_slot_quiet(at->sched, sid, &client_fd, slot_out, &retry_after);
     }
     if (ar != BS_ACQUIRE_OK)
         send_acquire_refusal(client_fd, ar, retry_after, route, at, sid);
     return ar;
+}
+
+/* Is a model of this name loaded? */
+static bool model_name_loaded(mr_registry *reg, const char *name)
+{
+    mr_info info[MR_MAX_MODELS];
+    int n = mr_snapshot(reg, info, MR_MAX_MODELS);
+    for (int i = 0; i < n; i++)
+        if (strcmp(info[i].name, name) == 0)
+            return true;
+    return false;
+}
+
+/*
+ * Gateway mode (gateway_mode.h): refuse, with an OpenAI-style 400/404, what this
+ * serve would otherwise silently degrade — a customer billed for an answer that
+ * ignored its schema, its image, or the model it named.  Returns true after
+ * answering the client.
+ */
+static bool gateway_refuse_request(int client_fd, mr_registry *reg,
+                                   const chat_request *req)
+{
+    if (req->wants_json_schema) {
+        hs_send_openai_error(client_fd, 400, "invalid_request_error",
+                             "unsupported_parameter", "response_format",
+                             "response_format type 'json_schema' is not supported by "
+                             "this server; use 'json_object'");
+        return true;
+    }
+    if (req->has_media_parts) {
+        hs_send_openai_error(client_fd, 400, "invalid_request_error",
+                             "unsupported_content", "messages",
+                             "this model accepts text only; image, audio, video and "
+                             "file content parts are not supported");
+        return true;
+    }
+    if (req->model && req->model[0] && !model_name_loaded(reg, req->model)) {
+        hs_send_openai_error(client_fd, 404, "invalid_request_error",
+                             "model_not_found", "model",
+                             "the requested model does not exist on this server "
+                             "(see GET /v1/models)");
+        return true;
+    }
+    return false;
+}
+
+/* The [usage] finish of a request whose first slot acquire failed. */
+static const char *acquire_failure_finish(bs_acquire_result ar)
+{
+    switch (ar) {
+    case BS_ACQUIRE_CLIENT_GONE: return "client_gone";
+    case BS_ACQUIRE_SHUTDOWN:    return "shutdown";
+    case BS_ACQUIRE_AT_CAPACITY: return "session_capacity";
+    case BS_ACQUIRE_503:         return "memory_constrained";
+    default:                     return "slot_unavailable";
+    }
+}
+
+/* Fold a non-streamed completion into the request's [usage] counts. */
+static void usage_counts_add(pn_usage_counts *u, const sg_result *res)
+{
+    if (u->choices == 0) {
+        u->prompt = res->prompt_tokens;
+        u->cached = res->cached_prompt_tokens;
+    }
+    u->completion += res->completion_tokens;
+    u->choices++;
+}
+
+/* The [usage] finish of a non-streamed completion that failed with `rc`. */
+static const char *nonstream_failure_finish(int rc, const sg_gen_params *gen)
+{
+    if (turn_cancelled_by_unload(gen)) return "model_unloaded";
+    if (rc == SG_ADMIT_DENIED)         return "memory_constrained";
+    if (rc == SG_CONTEXT_OVER_BUDGET)  return "context_over_budget";
+    if (rc == SG_STALLED)              return "stalled";
+    if (rc == SG_ABORTED)
+        return pn_serve_shutdown_requested() ? "shutdown" : "client_gone";
+    return "error";
 }
 
 void oai_handle_chat(int client_fd, mr_registry *reg, const char *body,
@@ -2092,11 +2307,28 @@ void oai_handle_chat(int client_fd, mr_registry *reg, const char *body,
         return;
     }
 
+    /* Gateway mode: refuse what would be degraded, scope the client's session
+     * key to the gateway's tenant (no tenant = anonymous), and ignore the
+     * client's X-Session-Id and copy pins (header and body). */
+    char gw_sid[PN_GATEWAY_SESSION_KEY_MAX];
+    bool gateway = pn_gateway_enabled();
+    if (gateway) {
+        if (gateway_refuse_request(client_fd, reg, &req)) {
+            chat_request_free(&req);
+            jr_free(root);
+            return;
+        }
+        req.session_id = pn_gateway_session_key(pn_gateway_thread_tenant(),
+                                                req.session_id, gw_sid, sizeof(gw_sid));
+        session_id = NULL;
+        replica_header = NULL;
+    }
+
     /* The copy the client asks for (body "replica" wins over the header). A
      * turn may re-place a bound session that holds no seat on its copy. */
     mr_route route = { .place_unseated = true };
     char pin_err[96];
-    if (pn_replica_pin_parse(root, replica_header, &route.replica, pin_err,
+    if (pn_replica_pin_parse(gateway ? NULL : root, replica_header, &route.replica, pin_err,
                              sizeof(pin_err)) != 0) {
         hs_send_error(client_fd, 400, "invalid_request_error", pin_err);
         chat_request_free(&req);
@@ -2135,8 +2367,10 @@ void oai_handle_chat(int client_fd, mr_registry *reg, const char *body,
     pn_batch_sched  *sched    = entry->sched;   /* non-NULL when C3 is active */
 
     /* Every turn on this entry is now cancellable by an unload of it (plus the
-     * shutdown check parse armed); the streaming paths add client liveness. */
-    oai_turn_abort_ctx turn_abort = { .client_fd = NULL, .entry = entry };
+     * shutdown check parse armed) and by its client leaving: a non-streaming
+     * client that disconnects frees its slot like a streaming one, instead of
+     * holding it to max_tokens for an answer nobody will read. */
+    oai_turn_abort_ctx turn_abort = { .client_fd = &client_fd, .entry = entry };
     req.gen.should_abort = oai_turn_should_abort;
     req.gen.abort_ud = &turn_abort;
 
@@ -2167,8 +2401,11 @@ void oai_handle_chat(int client_fd, mr_registry *reg, const char *body,
                     : (session_id && session_id[0])         ? session_id
                                                             : NULL;
 
-    char id[32];
+    char id[OAI_COMPLETION_ID_MAX];
     make_completion_id(id, sizeof(id));
+    const char *tenant = gateway ? pn_gateway_thread_tenant() : NULL;
+    pn_usage_counts usage = {0};      /* the non-streamed [usage] counts */
+    const char *usage_finish = NULL;  /* ...and how the request ended */
     long created = (long)time(NULL);
 
     /* ── Phase 5: session admission — REFUSE at capacity + idle TTL ──
@@ -2226,6 +2463,7 @@ void oai_handle_chat(int client_fd, mr_registry *reg, const char *body,
                  * the rest did not. */
                 if (ci == 0) {
                     pn_replica_pin_undo(&route, entry, sid);
+                    usage_finish = acquire_failure_finish(ar);
                     goto batched_done;
                 }
                 n_status = "partial_slot_unavailable";
@@ -2258,7 +2496,10 @@ void oai_handle_chat(int client_fd, mr_registry *reg, const char *body,
                                                    choice_sid);
                 if (turn_cancelled_by_unload(&gen))
                     rc = SG_ABORTED;   /* a mid-decode cancel returns 0 */
+                if (rc != SG_ADMIT_DENIED && rc != SG_CONTEXT_OVER_BUDGET)
+                    usage_counts_add(&usage, &ch->res);
                 if (rc != 0) {
+                    usage_finish = nonstream_failure_finish(rc, &gen);
                     if (n_delivered > 0) {
                         /* Some completions already succeeded — return them
                          * rather than throwing the work away, and say why the
@@ -2268,7 +2509,12 @@ void oai_handle_chat(int client_fd, mr_registry *reg, const char *body,
                         memset(ch, 0, sizeof(*ch));
                         break;
                     }
-                    if (rc == SG_ADMIT_DENIED)
+                    if (rc == SG_ABORTED && !turn_cancelled_by_unload(&gen)) {
+                        /* The client left (or the serve is stopping): nobody is
+                         * reading, and the slot is already released. */
+                        fprintf(stderr, "[serve] client disconnected — batched "
+                                "non-streaming turn aborted, slot released\n");
+                    } else if (rc == SG_ADMIT_DENIED)
                         hs_send_error(client_fd, 503, "server_memory_constrained",
                                       ch->res.admit_reason[0]
                                           ? ch->res.admit_reason
@@ -2294,12 +2540,23 @@ void oai_handle_chat(int client_fd, mr_registry *reg, const char *body,
                 }
                 collect_tool_calls(&req, &ch->res, &ch->calls, &ch->n_calls,
                                    &ch->tool_error);
+                if (!usage_finish)
+                    usage_finish = turn_stop_cause(&client_fd, false);
+                if (!usage_finish && n_delivered == 0)
+                    usage_finish = ch->n_calls > 0 && !finish_is_repetition_loop(&ch->res)
+                                 ? "tool_calls" : ch->res.finish_reason;
                 n_delivered++;
             }
         }
 
         if (req.stream) {
-            if (sse_open) hs_end_sse(client_fd);
+            if (sse_open) {
+                /* ONE usage chunk for the whole request, after the last
+                 * completion (unless an abnormal end already sent it). */
+                if (req.include_usage)
+                    stream_send_usage_once(&sc);
+                hs_end_sse(client_fd);
+            }
         } else if (n_delivered > 0) {
             send_completion_json(client_fd, id, created, model_id, choices,
                                  n_delivered,
@@ -2309,6 +2566,11 @@ void oai_handle_chat(int client_fd, mr_registry *reg, const char *body,
         }
 
     batched_done:
+        if (req.stream && sc.end_reason) {
+            usage = stream_usage_counts(&sc);
+            usage_finish = sc.end_reason;
+        }
+        pn_usage_line_log(id, tenant, model_id, &usage, usage_finish);
         /* `choices` is allocated only on the NON-streaming path — a streaming
          * request counts delivered completions but stores none, so this must be
          * guarded on the ARRAY, not on the count. */
@@ -2327,9 +2589,12 @@ void oai_handle_chat(int client_fd, mr_registry *reg, const char *body,
      * (sampler scratch is _Thread_local); a second chat to the SAME model
      * gets the immediate 429, exactly the old single-model behavior. */
     if (mr_trylock_generation(entry) != 0) {
-        hs_send_error(client_fd, 429, "server_busy",
-                      "a generation is already in progress on this model; "
-                      "retry shortly");
+        /* Gateway mode adds the Retry-After the batched 429s carry, so a
+         * gateway's retry waits instead of hammering. */
+        hs_send_error_ex(client_fd, 429, "server_busy",
+                         "a generation is already in progress on this model; "
+                         "retry shortly", gateway ? "Retry-After: 1\r\n" : NULL);
+        pn_usage_line_log(id, tenant, model_id, &usage, "slot_unavailable");
         pn_replica_pin_undo(&route, entry, sid);
         mr_release(reg, entry);
         chat_request_free(&req);
@@ -2350,9 +2615,14 @@ void oai_handle_chat(int client_fd, mr_registry *reg, const char *body,
                                                    ms_now_ms(),
                                                    ms_session_idle_ttl_ms(),
                                                    &restart_tokens);
-        if (v == PN_SESSION_ADMIT_AT_CAPACITY) {
+        if (v == PN_SESSION_ADMIT_AT_CAPACITY && gateway) {
+            /* Gateway mode: a seat is a cache, never a reason to refuse. With
+             * every seat taken the turn runs anonymously (full prefill). */
+            sid = NULL;
+        } else if (v == PN_SESSION_ADMIT_AT_CAPACITY) {
             pthread_mutex_unlock(&entry->gen_lock);
             send_session_capacity_refuse(client_fd, &route, entry, sid, restart_tokens);
+            pn_usage_line_log(id, tenant, model_id, &usage, "session_capacity");
             pn_replica_pin_undo(&route, entry, sid);
             mr_release(reg, entry);
             chat_request_free(&req);
@@ -2405,14 +2675,20 @@ void oai_handle_chat(int client_fd, mr_registry *reg, const char *body,
                                            &ch->res, choice_pc);
                 if (turn_cancelled_by_unload(&gen))
                     rc = SG_ABORTED;   /* a mid-decode cancel returns 0 */
+                if (rc != SG_ADMIT_DENIED && rc != SG_CONTEXT_OVER_BUDGET)
+                    usage_counts_add(&usage, &ch->res);
                 if (rc != 0) {
+                    usage_finish = nonstream_failure_finish(rc, &gen);
                     if (n_delivered > 0) {
                         n_status = "partial_generation_failed";
                         sg_result_free(&ch->res);
                         memset(ch, 0, sizeof(*ch));
                         break;
                     }
-                    if (rc == SG_ADMIT_DENIED)
+                    if (rc == SG_ABORTED && !turn_cancelled_by_unload(&gen))
+                        fprintf(stderr, "[serve] client disconnected — "
+                                "non-streaming turn aborted\n");
+                    else if (rc == SG_ADMIT_DENIED)
                         hs_send_error(client_fd, 503, "server_memory_constrained",
                                       ch->res.admit_reason[0]
                                           ? ch->res.admit_reason
@@ -2434,12 +2710,23 @@ void oai_handle_chat(int client_fd, mr_registry *reg, const char *body,
                 }
                 collect_tool_calls(&req, &ch->res, &ch->calls, &ch->n_calls,
                                    &ch->tool_error);
+                if (!usage_finish)
+                    usage_finish = turn_stop_cause(&client_fd, false);
+                if (!usage_finish && n_delivered == 0)
+                    usage_finish = ch->n_calls > 0 && !finish_is_repetition_loop(&ch->res)
+                                 ? "tool_calls" : ch->res.finish_reason;
                 n_delivered++;
             }
         }
 
         if (req.stream) {
-            if (sse_open) hs_end_sse(client_fd);
+            if (sse_open) {
+                if (req.include_usage)
+                    stream_send_usage_once(&sc);
+                hs_end_sse(client_fd);
+            }
+            usage = stream_usage_counts(&sc);
+            usage_finish = sc.end_reason;
         } else if (n_delivered > 0) {
             send_completion_json(client_fd, id, created, model_id, choices,
                                  n_delivered,
@@ -2455,6 +2742,7 @@ void oai_handle_chat(int client_fd, mr_registry *reg, const char *body,
         for (int ci = 0; choices && ci < n_delivered; ci++)
             chat_choice_free(&choices[ci]);
         free(choices);
+        pn_usage_line_log(id, tenant, model_id, &usage, usage_finish);
     }
 
     /* Phase 5: mark the session active so the idle-TTL reaper measures from the

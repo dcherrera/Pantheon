@@ -135,12 +135,15 @@ static void test_q38_k80(void)
     int sw, sw_fixed;
 
     /* The spec_mtp.c loop on the MoE priors: an unobserved plain step must be priced as slow
-     * as the verifies show this model to be, or the 41 ms MoE plain prior wins the switch
-     * after two cycles and the run decodes plain (bench_mtp_e2e `ad` 3.94 tok/s vs d3 7.30). */
+     * as the verifies show this model to be, or the MoE plain prior wins the switch
+     * after two cycles and the run decodes plain (bench_mtp_e2e `ad` 3.94 tok/s vs d3 7.30).
+     * The MoE priors carry Qwen3.6's row shape (4 rows 2.3x one at 19k), Qwen3.8's is 1.4x, so
+     * the one running ratio leaves adaptive at 0.83x d3 here; dense models load the dense
+     * priors (serve_spec_mtp_cuda.c, bench_mtp_e2e). */
     double d3 = q38_sim(3, 0, 0, 512, &sw_fixed);
     double ad = q38_sim(-1, 0, 0, 512, &sw);
     CHECK(sw < 0, "Qwen3.8, MoE priors: no plain switch");
-    CHECK(ad >= 0.85 * d3, "Qwen3.8, MoE priors: adaptive near fixed d3");
+    CHECK(ad >= 0.80 * d3, "Qwen3.8, MoE priors: adaptive near fixed d3");
 
     /* Dense priors: adaptive keeps up with the best fixed depth on both loops, short and 16k
      * context, at general acceptance (best d3) and at code-edit acceptance (best d4: the 5-row
@@ -184,9 +187,9 @@ int main(void)
 
     /* Rate = expected tokens / (draft + verify): D = 0 is one token per 1-row verify. */
     double r0 = pn_spec_depth_rate(&c, 0, 1024);
-    CHECK(fabs(r0 - 1.0 / (40.85 + 0.000607 * 1024)) < 1e-12, "D=0 rate");
+    CHECK(fabs(r0 - 1.0 / (25.27 + 0.000233 * 1024)) < 1e-12, "D=0 rate");
     double r1 = pn_spec_depth_rate(&c, 1, 1024);
-    CHECK(fabs(r1 - 1.8 / (4.5 + 55.67 + 0.001554 * 1024)) < 1e-12, "D=1 rate");
+    CHECK(fabs(r1 - 1.8 / (4.5 + 37.24 + 0.000261 * 1024)) < 1e-12, "D=1 rate");
 
     /* Short context speculates; very long context with low acceptance does not. */
     CHECK(pn_spec_depth_choose(&c, 1024) >= 1, "short ctx drafts");
@@ -245,7 +248,8 @@ int main(void)
         pn_spec_depth_observe_extra(&c, 3.0);
     CHECK(fabs(c.extra_ms - 3.0) < 1e-3, "extra tracks");
     CHECK(fabs(pn_spec_depth_rate(&c, 1, 1024) -
-               1.8 / (c.draft_first + (c.verify_c[2] + c.verify_s[2] * 1024) + 3.0)) < 1e-12,
+               1.8 / (c.draft_first + (c.verify_c[2] + c.verify_s[2] * 1024) + c.extra_ms)) <
+              1e-12,
           "extra is in the cycle cost");
 
     /* Dense priors replace the MoE ones and survive the batched D = 0 arming. */

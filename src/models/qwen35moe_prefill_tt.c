@@ -80,6 +80,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
+#include <unistd.h>
 
 #include "../accel/tt/pn_tt_attention_grid.h"
 #include "../accel/tt/pn_tt_dispatch.h"
@@ -2079,6 +2081,58 @@ int pn_qwen35_tt_prefill_mtp_prompt_run(pn_qwen35_tt *g, pn_qwen35moe_model *m,
     return rc;
 }
 
+/** `PN_TT_PREFILL_STALL_MS` (default 0): the host stall the grid idle guard is gated with. */
+static uint32_t prefill_stall_ms(void)
+{
+    static long cached = -1;
+
+    if (cached < 0) {
+        const char *env = getenv("PN_TT_PREFILL_STALL_MS");
+
+        cached = env && atol(env) > 0 ? atol(env) : 0;
+    }
+    return (uint32_t)cached;
+}
+
+static long prefill_major_faults(void)
+{
+    struct rusage usage;
+
+    return getrusage(RUSAGE_SELF, &usage) == 0 ? usage.ru_majflt : 0;
+}
+
+/* EMBED BOOK (q38-tt-grid-abort): each pass's host embedding gather — the host work at a pass
+ * boundary that faults the mmap'd table from disk once the page cache has dropped it. */
+static struct {
+    unsigned passes;
+    double seconds, longest;
+    long faults;
+    int longest_at;
+} g_prefill_embed;
+
+static void prefill_embed_book(int base_pos, int rows, double seconds, long faults)
+{
+    g_prefill_embed.passes++;
+    g_prefill_embed.seconds += seconds;
+    g_prefill_embed.faults += faults;
+    if (seconds > g_prefill_embed.longest) {
+        g_prefill_embed.longest = seconds;
+        g_prefill_embed.longest_at = base_pos;
+    }
+    if (seconds >= 1.0)
+        fprintf(stderr, "qwen35_tt: prefill EMBED — the pass at %d gathered %d rows in %.3f s, "
+                        "%ld major page faults\n", base_pos, rows, seconds, faults);
+}
+
+static void prefill_embed_report(void)
+{
+    if (g_prefill_embed.passes)
+        fprintf(stderr, "qwen35_tt: prefill EMBED — %u passes, %.3f s gathering, longest %.3f s "
+                        "(the pass at %d), %ld major page faults\n",
+                g_prefill_embed.passes, g_prefill_embed.seconds, g_prefill_embed.longest,
+                g_prefill_embed.longest_at, g_prefill_embed.faults);
+}
+
 static int prefill_pass(pn_qwen35_tt *g, pn_qwen35moe_model *m,
                         const pn_qwen35moe_config *cfg, const uint32_t *tokens, int rows,
                         int base_pos, bool last)
@@ -2093,10 +2147,25 @@ static int prefill_pass(pn_qwen35_tt *g, pn_qwen35moe_model *m,
     if (prefill_publish_tall_span(g, bands) != 0)
         return -1;
 
+    /* REPRO (q38-tt-grid-abort, host only): `PN_TT_PREFILL_STALL_MS=<ms>` sleeps before every
+     * pass after the first, as a host stall at a pass boundary would. 9000 outlasts a grid
+     * core's idle exit (~8 s): without the grid idle guard the next pass aborts. */
+    if (g_prefill_embed.passes > 0u && !g_verify_mode && prefill_stall_ms() > 0u) {
+        fprintf(stderr, "qwen35_tt: PREFILL STALL — sleeping %u ms before the pass at %d\n",
+                prefill_stall_ms(), base_pos);
+        usleep((useconds_t)prefill_stall_ms() * 1000u);
+    }
     PREFILL_WALL_OPEN(g, PN_PREFILL_WALL_EMBED);
-    for (int r = 0; r < rows; r++)
-        pn_qwen35moe_model_embed_row(m, tokens[r],
-                                     b->hidden + (size_t)r * (size_t)cfg->n_embd);
+    {
+        const double embed_from = prefill_now();
+        const long faults_from = prefill_major_faults();
+
+        for (int r = 0; r < rows; r++)
+            pn_qwen35moe_model_embed_row(m, tokens[r],
+                                         b->hidden + (size_t)r * (size_t)cfg->n_embd);
+        prefill_embed_book(base_pos, rows, prefill_now() - embed_from,
+                           prefill_major_faults() - faults_from);
+    }
     PREFILL_WALL_CLOSE(g, PN_PREFILL_WALL_EMBED);
     s->slot = 0;
     /* A SHORT PASS LEAVES BANDS NOBODY WRITES, and an Mt-band matmul reads all of them. The
@@ -2150,6 +2219,11 @@ static int prefill_pass(pn_qwen35_tt *g, pn_qwen35moe_model *m,
     if (prefill_seek(g, 0u, bands) != 0)
         return -1;
     PREFILL_WALL_CLOSE(g, PN_PREFILL_WALL_STAGE);
+    /* GRID IDLE GUARD at the pass boundary, the one place a host stall (the MTP layer, the
+     * embedding gather above) leaves the grid unfed for seconds: NOP it, or re-arm it if it
+     * sat near its cores' own idle exit. Quiet here: no stream is open. */
+    if (!g_verify_mode && pn_tt_matmul_grid_keepalive(g->device, PN_QWEN35_TT_KEEPALIVE_IDLE_S) < 0)
+        return -1;
 
     PREFILL_WALL_OPEN(g, PN_PREFILL_WALL_LAYERS);
     for (int layer = 0; layer < cfg->n_layer; layer++) {
@@ -2525,6 +2599,7 @@ tm_tensor *pn_qwen35moe_prefill_tt(pn_model *model, const uint32_t *tokens, int 
         pn_tt_lend_min_rows(getenv("PN_TT_PREFILL_LEND"), pn_qwen35moe_dense_ffn(model) != 0),
         pn_tt_lend_deep_on(getenv("PN_TT_ATTN_DEEP"), true));
     pn_qwen35_tt_ckpt_plan(g, state, base, base + batched);
+    memset(&g_prefill_embed, 0, sizeof(g_prefill_embed));
     done = 0;
     while (batched - done >= rows) {
         if (prefill_fault(done) ||
@@ -2533,6 +2608,7 @@ tm_tensor *pn_qwen35moe_prefill_tt(pn_model *model, const uint32_t *tokens, int 
             (void)pn_tt_prefill_lend_end(g->device);
             pn_tt_matmul_grid_end(g->device);
             (void)prefill_tall_exit(g);
+            prefill_embed_report();
             return pn_qwen35_tt_prefill_abort(g, state, "a batched pass failed on the card",
                                               done);
         }
@@ -2550,11 +2626,13 @@ tm_tensor *pn_qwen35moe_prefill_tt(pn_model *model, const uint32_t *tokens, int 
             (void)pn_tt_prefill_lend_end(g->device);
             pn_tt_matmul_grid_end(g->device);
             (void)prefill_tall_exit(g);
+            prefill_embed_report();
             return pn_qwen35_tt_prefill_abort(g, state, "the short tail pass failed", done);
         }
         state->pos += batched - done;
         done = batched;
     }
+    prefill_embed_report();
     pn_qwen35_tt_ckpt_commit(g, state, tokens, base, pn_qwen35moe_model_n_ssm(m));
     PREFILL_WALL_OPEN(g, PN_PREFILL_WALL_FLUSH);
     if (pn_tt_matvec_flush(g->device) != 0) {

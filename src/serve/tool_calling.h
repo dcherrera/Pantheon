@@ -344,7 +344,7 @@ char *tc_join_assistant_history(const char *content, const jr_value *tool_calls,
  * @param n_out   Set to the number of calls (0 if none).
  * @return  0 on success (including zero calls), -1 on OOM.
  *
- * Thread-safe: yes (uses rand() for ids — not cryptographic)
+ * Thread-safe: yes (call ids from tc_new_call_id)
  */
 int tc_parse_tool_calls(const char *text, const jr_value *tools,
                         tc_dialect dialect, tc_tool_call **out, int *n_out);
@@ -374,7 +374,7 @@ int tc_parse_tool_calls(const char *text, const jr_value *tools,
  *             fired. Owned strings — release with tc_parse_repair_free.
  * @return  0 on success (including zero calls), -1 on OOM.
  *
- * Thread-safe: yes (uses rand() for ids — not cryptographic)
+ * Thread-safe: yes (call ids from tc_new_call_id)
  */
 int tc_parse_tool_calls_diagnosed(const char *text, const jr_value *tools,
                                   tc_dialect dialect, tc_tool_call **out,
@@ -395,7 +395,7 @@ int tc_parse_tool_calls_diagnosed(const char *text, const jr_value *tools,
  * @param n_out    set to the number of calls (0 when the object carries none)
  * @return  0 on success (including zero calls), -1 on OOM.
  *
- * Thread-safe: yes (uses rand() for ids — not cryptographic)
+ * Thread-safe: yes (call ids from tc_new_call_id)
  */
 int tc_parse_ornith_object(const char *open, const char *obj_end,
                            const jr_value *tools, tc_tool_call **out, int *n_out);
@@ -407,7 +407,11 @@ int tc_parse_ornith_object(const char *open, const char *obj_end,
  */
 bool tc_tool_name_known(const jr_value *tools, const char *fname);
 
-/** Write a fresh "call_XXXXXXXX" id into buf (rand()-based, not cryptographic). */
+/** Room for a call id: "call_" + 24 base62 characters + NUL, rounded up. */
+#define TC_CALL_ID_MAX 32
+
+/** Write a fresh "call_" + 24 base62 id into buf (OS entropy, request_id.h):
+ *  unique across restarts, so a gateway can join on it. */
 void tc_new_call_id(char *buf, size_t len);
 
 /** Free an array returned by tc_parse_tool_calls. NULL-safe. */

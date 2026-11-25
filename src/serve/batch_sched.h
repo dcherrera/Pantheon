@@ -635,6 +635,11 @@ typedef struct pn_batch_sched_s {
     uint64_t              session_idle_ttl_ms;   /* 0 = never reap */
     pn_session_watched_fn watch_fn;              /* borrowed; NULL = no watches */
     void                 *watch_ctx;
+    bool                  sessions_evictable;    /* gateway mode: a seat is a
+                                                  * cache, not a reservation —
+                                                  * an idle seat goes to other
+                                                  * traffic that needs its slot
+                                                  * (bs_set_sessions_evictable) */
 
     /* ── D3: admission pressure level (snapshot) ──────────────────────────
      * A waiter in the D1 queue also holds off starting its prefill while
@@ -708,7 +713,16 @@ typedef enum {
     BS_ACQUIRE_SHUTDOWN  = -4,   /* scheduler is shutting down                  */
     BS_ACQUIRE_AT_CAPACITY = -5, /* every seat is held by another session
                                   * family: 429 model_at_session_capacity now */
+    BS_ACQUIRE_CLIENT_GONE = -6, /* the waiter's client disconnected while it
+                                  * queued (bs_slot_acquire_or_wait_watched) */
 } bs_acquire_result;
+
+/** A queued waiter's liveness check: non-zero while its client is still
+ *  there. Called with sched->mu held, so it must not block or take mu. */
+typedef int (*bs_waiter_alive_fn)(void *ud);
+
+/** How often a watched waiter re-checks its client while queued. */
+#define BS_WAITER_ALIVE_POLL_MS 250
 
 /**
  * D1 + D3: Reserve a slot, waiting in a bounded FIFO queue if all slots are
@@ -769,6 +783,28 @@ bs_acquire_result bs_slot_acquire_or_wait(pn_batch_sched *sched,
                                           int *slot_out,
                                           int *retry_after_s,
                                           const char *sid);
+
+/**
+ * bs_slot_acquire_or_wait for a caller whose client may leave while it queues:
+ * `alive(alive_ud)` is checked before each claim attempt and at least every
+ * BS_WAITER_ALIVE_POLL_MS while waiting; once it returns 0 the waiter leaves
+ * the queue with BS_ACQUIRE_CLIENT_GONE and never takes a slot. NULL `alive`
+ * is exactly bs_slot_acquire_or_wait.
+ *
+ * Evictable seats (bs_set_sessions_evictable): a request that admission would
+ * refuse first takes the least recently active idle seat of another family
+ * (its warm state is dropped, as the idle reaper does); when every seat is
+ * mid-turn it queues for one instead of getting BS_ACQUIRE_AT_CAPACITY.
+ *
+ * Thread-safe: yes (guards via sched->mu; does NOT touch the GPU turn).
+ */
+bs_acquire_result bs_slot_acquire_or_wait_watched(pn_batch_sched *sched,
+                                                  int wait_ms,
+                                                  int *slot_out,
+                                                  int *retry_after_s,
+                                                  const char *sid,
+                                                  bs_waiter_alive_fn alive,
+                                                  void *alive_ud);
 
 /**
  * PC-batched — session-affinity acquire.  Like bs_slot_acquire, but when
@@ -1136,6 +1172,16 @@ void bs_session_release(pn_batch_sched *sched, const char *sid);
  */
 void bs_set_session_admission(pn_batch_sched *sched, int max_sessions,
                               uint64_t idle_ttl_ms);
+
+/**
+ * Make this scheduler's session seats evictable (gateway mode): an idle seat
+ * is taken from its family whenever a request needs the slot, so a session key
+ * can never lock out other traffic. Off (the default) keeps home behaviour: a
+ * seat is held until released, reaped or its TTL passes.
+ *
+ * Thread-safe: yes (takes mu).
+ */
+void bs_set_sessions_evictable(pn_batch_sched *sched, bool evictable);
 
 /**
  * Install the watch-liveness predicate the idle reaper asks before reaping a

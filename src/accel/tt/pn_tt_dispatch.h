@@ -83,9 +83,17 @@ void pn_tt_dispatch_census_restart(void);
  *         it (unknown queue, a count past its issued, a failed stream: the caller waits for real)
  */
 int pn_tt_dispatch_stream_await(uint16_t x, uint16_t y, uint32_t count);
+/** Queue (x, y) was re-armed outside a stream (a fresh nonce, counts from 0): the stream
+ *  forgets what it knew of it, so no AWAIT or answered poll uses the old nonce or count before
+ *  a captured head teaches the new ones (the grid idle guard, pn_tt_grid_idle.h). */
+void pn_tt_dispatch_stream_queue_rearmed(uint16_t x, uint16_t y);
 /** Print the AWAIT census now (totals since the last restart; nothing unless
  *  `PN_TT_PULLER_AWAIT_CENSUS=1`). The prefill report prints the prompt's own census. */
 void pn_tt_dispatch_census_print(void);
+/** Print the puller's AWAIT retry words (resident_puller_abi.h FT_TT_PULLER_AWAIT_RETRIES):
+ *  mismatching polls read again, and the AWAITs that read any, since the puller armed. Read
+ *  only; nothing when the puller is not resident. The batched prefill's report prints it. */
+void pn_tt_dispatch_report_await_retries(pn_tt_device *device);
 /** PM 6: launch what the stream has captured so far WITHOUT waiting (the card starts on it
  *  while the host waits on something else). true when nothing was streaming or the launch
  *  went; false if the stream has failed. */

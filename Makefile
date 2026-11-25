@@ -320,6 +320,7 @@ PN_SRC = \
 	src/accel/tt/pn_tt_grid_probe.c \
 	src/accel/tt/pn_tt_grid_msplit.c \
 	src/accel/tt/pn_tt_grid_marks.c \
+	src/accel/tt/pn_tt_grid_idle.c \
 	src/accel/tt/pn_tt_kv_banks.c \
 	src/accel/tt/pn_tt_kv_append_split.c \
 	src/accel/tt/pn_tt_kv_format.c \
@@ -384,6 +385,8 @@ PN_SRC = \
 	src/models/qwen35moe_gate_tables.c \
 	src/models/qwen35moe_moe.c \
 	src/models/qwen35moe_routing_dump.c \
+	src/models/qwen35moe_pcie_stage.c \
+	src/models/qwen35moe_step_ledger.c \
 	src/models/qwen35moe_forward.c \
 	src/models/qwen35moe_forward_cuda.c \
 	src/models/qwen35moe_forward_tt.c \
@@ -421,7 +424,7 @@ SERVE_SRC = \
 	src/serve/graph_residency_json.c \
 	src/serve/http_server.c \
 	src/serve/json_value_grammar.c \
-	src/serve/tool_calling.c \
+	src/serve/tool_calling.c src/serve/request_id.c \
 	src/serve/tool_grammar.c \
 	src/serve/tool_grammar_json.c \
 	src/serve/grammar_spec_chooser.c \
@@ -454,6 +457,11 @@ SERVE_SRC = \
 	src/serve/base64.c \
 	src/serve/model_admin.c src/serve/load_env_scope.c \
 	src/serve/openai_chat.c \
+	src/serve/gateway_auth.c \
+	src/serve/gateway_mode.c \
+	src/serve/gateway_request_gate.c \
+	src/serve/serve_gateway_setup.c \
+	src/serve/usage_record.c \
 	src/serve/sampling_defaults.c \
 	src/serve/request_profile.c \
 	src/serve/request_timing_line.c \
@@ -473,14 +481,15 @@ SERVE_SRC = \
 # Foundry's Ingot codec (foundry ingot/): Pantheon Local decodes catalog .ingot downloads
 # (src/local/ingot_fetch.c). An archive compiled with the codec's own flags — never
 # -ffast-math — and listed last in SERVE_SRC so every link of the serve resolves against it.
-# safetensors.c is in it for the module tests; links that compile FOUNDRY_SRC take theirs.
+# The codec calls foundry's safetensors.c, which is NOT in the archive: GNU ld pulls archive members
+# in command-line order, so a copy here clashed with FOUNDRY_SRC's (multiple definition of
+# fs_writer_save). Links that use the archive without FOUNDRY_SRC add safetensors.c themselves.
 # Switching build configs needs `rm -rf build`, as for libpantheon.a.
 INGOT_OBJDIR = build/ingot
 INGOT_LIB    = $(INGOT_OBJDIR)/libpn_ingot.a
 # Every codec source foundry's ingot/ has (a new foundry file links without a Makefile change).
 INGOT_SRC = $(wildcard $(FOUNDRY)/ingot/core/*.c $(FOUNDRY)/ingot/codec/*.c \
-	$(FOUNDRY)/ingot/container/*.c) $(FOUNDRY)/tt/convert/ft_sha256.c \
-	$(FOUNDRY)/safetensors/safetensors.c
+	$(FOUNDRY)/ingot/container/*.c) $(FOUNDRY)/tt/convert/ft_sha256.c
 INGOT_OBJS = $(addprefix $(INGOT_OBJDIR)/,$(notdir $(INGOT_SRC:.c=.o)))
 INGOT_HDR  = $(wildcard $(FOUNDRY)/ingot/*/*.h) $(FOUNDRY)/tt/convert/ft_sha256.h \
 	$(FOUNDRY)/safetensors/safetensors.h
@@ -629,8 +638,8 @@ LIB_OBJS   = $(patsubst %,$(LIB_OBJDIR)/%.o,$(LIB_C_ONLY))
 ifdef USE_METAL
 LIB_OBJS  += $(patsubst %,$(LIB_OBJDIR)/%.o,$(METAL_SRC))
 endif
-# The Ingot objects (minus safetensors, which FOUNDRY_SRC already brings).
-LIB_OBJS  += $(filter-out %/safetensors.o,$(INGOT_OBJS))
+# The Ingot objects (safetensors comes from FOUNDRY_SRC).
+LIB_OBJS  += $(INGOT_OBJS)
 LIB_DEPS   = $(LIB_OBJS:.o=.d)
 
 # Real depfiles: these are the only separately-compiled objects in the build,
@@ -687,7 +696,7 @@ LOCAL_TESTS_FULL += tests/test_local_loads_by_person tests/test_local_serve_prin
 	tests/test_local_seats
 
 # Build + run tests
-test: tests/test_backend_guard tests/test_build tests/test_gguf tests/test_gguf_layer_bytes tests/test_admission_reserve tests/test_context_budget tests/test_reasoning_budget tests/test_host_admission tests/test_host_admit_serve tests/test_die_scratch_ctx tests/test_qwen35_die_projection tests/test_die_layer_split tests/test_arena tests/test_qmv tests/test_tiled_fast_decode tests/test_simd tests/test_simd_props tests/test_chat tests/test_tool_calling tests/test_tool_call_defects tests/test_tool_call_truncation tests/test_empty_argument tests/test_frame_capture tests/test_json_value_grammar tests/test_tool_grammar tests/test_tool_grammar_json tests/test_tool_grammar_reasoned tests/test_tool_grammar_json_reasoned tests/test_field_pattern tests/test_tool_grammar_field_patterns tests/test_tool_grammar_json_field_patterns tests/test_tool_grammar_no_repeat_keys tests/test_field_pattern_steer tests/test_tool_grammar_forced_close_call tests/test_grammar_spec_chooser tests/test_grammar_mask_shortlist tests/test_grammar_topn_sampler tests/test_grammar_repeat_penalty tests/test_topn_surgery tests/test_grammar_exact_bound tests/test_grammar_dense_shortlist tests/test_grammar_select_shortlist tests/test_sampler_margin_draw tests/test_response_format_grammar tests/test_sampling_modifiers tests/test_chat_request tests/test_serve_emitter tests/test_tool_call_stream tests/test_repetition_loop_detector tests/test_serve_spec_lookup tests/test_registry tests/test_base64 tests/test_prefix_cache_sys tests/test_host_heap_churn tests/test_sampler_thread_scratch tests/test_llama_state_snapshot tests/test_prefix_projection tests/test_think_history_as_sent tests/test_think_history_drop_last tests/test_template_parity_qwen tests/test_session_watch tests/test_session_affinity tests/test_bs_load tests/test_bs_finalize_yield tests/test_request_timing_line tests/test_bs_prefill_share tests/test_bs_pd_budget tests/test_decode_watchdog tests/test_think_flip_backlog tests/test_bpe_pretokenize tests/test_pretok_props tests/test_dequant_props tests/test_rwkvx tests/test_qwen35moe tests/test_qwen35_prefill_causality tests/test_qwen35moe_metal_coverage tests/test_qwen35moe_metal_coverage_fake tests/test_die_manager tests/test_model_registry tests/test_model_unload_reclaim tests/test_unload_closes_watch tests/test_embed_row tests/test_tt_column_runs tests/test_qwen35_ckpt_band tests/test_tt_name_list tests/test_tt_core_list tests/test_tt_eltwise_split tests/test_tt_norm_schedule tests/test_tt_norm_role tests/test_tt_role_table tests/test_tt_descriptor_census tests/test_tt_q38_mixw_fit tests/test_tt_q38_fit_banks tests/test_tt_q38_fit_levers tests/test_tt_weight_view tests/test_tt_gate_tables tests/test_tt_reader_runs tests/test_tt_grid_msplit tests/test_tt_grid_marks tests/test_qwen35_ov_plan tests/test_tt_attn_splitk tests/test_tt_dispatch_shape_key tests/test_tt_attn_fast tests/test_tt_attn_deep tests/test_tt_lend_ledger tests/test_tt_dispatch_hoist tests/test_tt_precondition tests/test_tt_gdn_conv_split tests/test_tt_matmul_rows tests/test_tt_stage_pipeline tests/test_graph_capture_retry tests/test_attn_ring_retry tests/test_mtp_ring_clear tests/test_serve_shutdown tests/test_spec_depth tests/test_spec_mtp_couple tests/test_spec_grammar_draw tests/test_qwen35_tp_forget tests/test_qwen35_tp_restore_sync tests/test_dump_reqlog tests/test_act_stats tests/test_act_stats_model tests/test_act_stats_xtx tools/oracle/act_stats_merge tests/test_load_env_scope $(LOCAL_TESTS)
+test: tests/test_backend_guard tests/test_build tests/test_gguf tests/test_gguf_layer_bytes tests/test_admission_reserve tests/test_context_budget tests/test_reasoning_budget tests/test_host_admission tests/test_host_admit_serve tests/test_serve_nonstream_disconnect tests/test_die_scratch_ctx tests/test_qwen35_die_projection tests/test_die_layer_split tests/test_arena tests/test_qmv tests/test_tiled_fast_decode tests/test_simd tests/test_simd_props tests/test_chat tests/test_tool_calling tests/test_tool_call_defects tests/test_tool_call_truncation tests/test_empty_argument tests/test_frame_capture tests/test_json_value_grammar tests/test_tool_grammar tests/test_tool_grammar_json tests/test_tool_grammar_reasoned tests/test_tool_grammar_json_reasoned tests/test_field_pattern tests/test_tool_grammar_field_patterns tests/test_tool_grammar_json_field_patterns tests/test_tool_grammar_no_repeat_keys tests/test_field_pattern_steer tests/test_tool_grammar_forced_close_call tests/test_grammar_spec_chooser tests/test_grammar_mask_shortlist tests/test_grammar_topn_sampler tests/test_grammar_repeat_penalty tests/test_topn_surgery tests/test_grammar_exact_bound tests/test_grammar_dense_shortlist tests/test_grammar_select_shortlist tests/test_sampler_margin_draw tests/test_sampler_short_row tests/test_response_format_grammar tests/test_sampling_modifiers tests/test_chat_request tests/test_serve_emitter tests/test_tool_call_stream tests/test_repetition_loop_detector tests/test_serve_spec_lookup tests/test_registry tests/test_base64 tests/test_gateway_mode tests/test_prefix_cache_sys tests/test_host_heap_churn tests/test_sampler_thread_scratch tests/test_llama_state_snapshot tests/test_prefix_projection tests/test_think_history_as_sent tests/test_think_history_drop_last tests/test_template_parity_qwen tests/test_session_watch tests/test_session_affinity tests/test_bs_load tests/test_bs_finalize_yield tests/test_request_timing_line tests/test_bs_prefill_share tests/test_bs_pd_budget tests/test_decode_watchdog tests/test_think_flip_backlog tests/test_bpe_pretokenize tests/test_pretok_props tests/test_dequant_props tests/test_rwkvx tests/test_qwen35moe tests/test_qwen35_prefill_causality tests/test_qwen35moe_metal_coverage tests/test_qwen35moe_metal_coverage_fake tests/test_die_manager tests/test_model_registry tests/test_model_unload_reclaim tests/test_unload_closes_watch tests/test_embed_row tests/test_tt_column_runs tests/test_qwen35_ckpt_band tests/test_tt_name_list tests/test_tt_core_list tests/test_tt_eltwise_split tests/test_tt_norm_schedule tests/test_tt_norm_role tests/test_tt_role_table tests/test_tt_descriptor_census tests/test_tt_q38_mixw_fit tests/test_tt_q38_fit_banks tests/test_tt_q38_fit_levers tests/test_tt_weight_view tests/test_tt_gate_tables tests/test_tt_reader_runs tests/test_tt_grid_msplit tests/test_tt_grid_marks tests/test_tt_grid_idle tests/test_qwen35_ov_plan tests/test_tt_attn_splitk tests/test_tt_dispatch_shape_key tests/test_tt_attn_fast tests/test_tt_attn_deep tests/test_tt_lend_ledger tests/test_tt_dispatch_hoist tests/test_tt_precondition tests/test_tt_gdn_conv_split tests/test_tt_matmul_rows tests/test_tt_stage_pipeline tests/test_graph_capture_retry tests/test_attn_ring_retry tests/test_mtp_ring_clear tests/test_serve_shutdown tests/test_spec_depth tests/test_spec_mtp_couple tests/test_spec_grammar_draw tests/test_qwen35_tp_forget tests/test_qwen35_pcie_stage tests/test_qwen35_tp_restore_sync tests/test_dump_reqlog tests/test_act_stats tests/test_act_stats_model tests/test_act_stats_xtx tools/oracle/act_stats_merge tests/test_load_env_scope $(LOCAL_TESTS)
 	./tests/test_backend_guard
 	./tests/test_build
 	./tests/test_gguf
@@ -697,6 +706,7 @@ test: tests/test_backend_guard tests/test_build tests/test_gguf tests/test_gguf_
 	./tests/test_reasoning_budget
 	./tests/test_host_admission
 	./tests/test_host_admit_serve
+	./tests/test_serve_nonstream_disconnect
 	./tests/test_die_scratch_ctx
 	./tests/test_qwen35_die_projection
 	./tests/test_die_layer_split
@@ -741,6 +751,10 @@ test: tests/test_backend_guard tests/test_build tests/test_gguf tests/test_gguf_
 	./tests/test_sampler_margin_draw
 	./tests/test_sampler_margin_draw --selftest
 	./tests/test_sampler_margin_draw --red-wrong
+	./tests/test_sampler_short_row
+	./tests/test_sampler_short_row --selftest
+	./tests/test_sampler_short_row --red-margin
+	./tests/test_sampler_short_row --red-greedy
 	./tests/test_grammar_topn_sampler --selftest
 	./tests/test_response_format_grammar
 	./tests/test_sampling_modifiers
@@ -754,6 +768,7 @@ test: tests/test_backend_guard tests/test_build tests/test_gguf tests/test_gguf_
 	./tests/test_spec_grammar_draw
 	./tests/test_spec_grammar_draw --selftest
 	./tests/test_qwen35_tp_forget
+	./tests/test_qwen35_pcie_stage
 	./tests/test_qwen35_tp_restore_sync
 	./tests/test_dump_reqlog
 	mkdir -p build && ./tests/test_act_stats
@@ -764,6 +779,7 @@ test: tests/test_backend_guard tests/test_build tests/test_gguf tests/test_gguf_
 	./tests/test_load_env_scope
 	./tests/test_registry
 	./tests/test_base64
+	./tests/test_gateway_mode
 	./tests/test_prefix_cache_sys
 	./tests/test_host_heap_churn
 	./tests/test_sampler_thread_scratch
@@ -810,6 +826,7 @@ test: tests/test_backend_guard tests/test_build tests/test_gguf tests/test_gguf_
 	./tests/test_tt_reader_runs
 	./tests/test_tt_grid_msplit
 	./tests/test_tt_grid_marks
+	./tests/test_tt_grid_idle
 	./tests/test_qwen35_ov_plan
 	./tests/test_tt_core_list
 	./tests/test_tt_attn_splitk
@@ -895,30 +912,30 @@ tests/test_chat: tests/test_chat.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
 # call the model was still writing. Synthetic fixtures in the observed failure
 # shapes (tests/frame_capture_fixtures.h). Same deps as the parser
 # suite below — pure C, no engine/model/CUDA.
-tests/test_frame_capture: tests/test_frame_capture.c tests/frame_capture_fixtures.h src/serve/tool_calling.c src/serve/json_value_grammar.c src/serve/json_reader.c src/serve/json_writer.c $(ALL_HDR)
-	$(CC) $(CFLAGS) -o $@ tests/test_frame_capture.c src/serve/tool_calling.c src/serve/json_value_grammar.c src/serve/json_reader.c src/serve/json_writer.c \
+tests/test_frame_capture: tests/test_frame_capture.c tests/frame_capture_fixtures.h src/serve/tool_calling.c src/serve/request_id.c src/serve/json_value_grammar.c src/serve/json_reader.c src/serve/json_writer.c $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_frame_capture.c src/serve/tool_calling.c src/serve/request_id.c src/serve/json_value_grammar.c src/serve/json_reader.c src/serve/json_writer.c \
 		-lm $(LDFLAGS)
 
 # tc_parse_tool_calls (+ render) is pure C string parsing over the JSON DOM;
 # links only the three serve string modules, no engine/model/CUDA deps.
-tests/test_tool_calling: tests/test_tool_calling.c tests/abandoned_call_fixture.h src/serve/tool_calling.c src/serve/json_value_grammar.c src/serve/json_reader.c src/serve/json_writer.c $(ALL_HDR)
-	$(CC) $(CFLAGS) -o $@ tests/test_tool_calling.c src/serve/tool_calling.c src/serve/json_value_grammar.c src/serve/json_reader.c src/serve/json_writer.c \
+tests/test_tool_calling: tests/test_tool_calling.c tests/abandoned_call_fixture.h src/serve/tool_calling.c src/serve/request_id.c src/serve/json_value_grammar.c src/serve/json_reader.c src/serve/json_writer.c $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_tool_calling.c src/serve/tool_calling.c src/serve/request_id.c src/serve/json_value_grammar.c src/serve/json_reader.c src/serve/json_writer.c \
 		-lm $(LDFLAGS)
 
 # Structurally-wrong tool-call shapes (leaked dialect tail / reasoning leak /
 # missing + unknown name) and the truncated-JSON argument repair — the two
 # serve-side items from the Qwen harness audit. Same deps as the parser suite
 # above: pure C, no engine/model/CUDA.
-tests/test_tool_call_defects: tests/test_tool_call_defects.c src/serve/tool_calling.c src/serve/json_value_grammar.c src/serve/json_reader.c src/serve/json_writer.c $(ALL_HDR)
-	$(CC) $(CFLAGS) -o $@ tests/test_tool_call_defects.c src/serve/tool_calling.c src/serve/json_value_grammar.c src/serve/json_reader.c src/serve/json_writer.c \
+tests/test_tool_call_defects: tests/test_tool_call_defects.c src/serve/tool_calling.c src/serve/request_id.c src/serve/json_value_grammar.c src/serve/json_reader.c src/serve/json_writer.c $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_tool_call_defects.c src/serve/tool_calling.c src/serve/request_id.c src/serve/json_value_grammar.c src/serve/json_reader.c src/serve/json_writer.c \
 		-lm $(LDFLAGS)
 
 # Truncated tool calls: the grammar and the parser must agree about where a value
 # ended, and a call the grammar never closed must not be handed back as a call.
 # The only test that links BOTH halves — the defect lives in the gap between
 # them. Still pure C: no engine/model/CUDA.
-tests/test_tool_call_truncation: tests/test_tool_call_truncation.c src/serve/tool_calling.c src/serve/json_value_grammar.c src/serve/tool_grammar.c src/serve/tool_param_empty_value_rule.c src/serve/field_pattern.c src/serve/json_reader.c src/serve/json_writer.c $(ALL_HDR)
-	$(CC) $(CFLAGS) -o $@ tests/test_tool_call_truncation.c src/serve/tool_calling.c src/serve/json_value_grammar.c src/serve/tool_grammar.c src/serve/tool_param_empty_value_rule.c src/serve/field_pattern.c src/serve/json_reader.c src/serve/json_writer.c \
+tests/test_tool_call_truncation: tests/test_tool_call_truncation.c src/serve/tool_calling.c src/serve/request_id.c src/serve/json_value_grammar.c src/serve/tool_grammar.c src/serve/tool_param_empty_value_rule.c src/serve/field_pattern.c src/serve/json_reader.c src/serve/json_writer.c $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_tool_call_truncation.c src/serve/tool_calling.c src/serve/request_id.c src/serve/json_value_grammar.c src/serve/tool_grammar.c src/serve/tool_param_empty_value_rule.c src/serve/field_pattern.c src/serve/json_reader.c src/serve/json_writer.c \
 		-lm $(LDFLAGS)
 
 # EMPTY IS NOT ABSENT: a parameter the model CLOSED around an empty value is
@@ -926,8 +943,8 @@ tests/test_tool_call_truncation: tests/test_tool_call_truncation.c src/serve/too
 # empty" (edit's new_string:"" is a deletion) from "the argument never arrived"
 # (a truncated call, which the client charges against a task-ending budget).
 # Pure C string parsing over the JSON DOM — no engine/model/CUDA.
-tests/test_empty_argument: tests/test_empty_argument.c src/serve/tool_calling.c src/serve/json_value_grammar.c src/serve/json_reader.c src/serve/json_writer.c $(ALL_HDR)
-	$(CC) $(CFLAGS) -o $@ tests/test_empty_argument.c src/serve/tool_calling.c src/serve/json_value_grammar.c src/serve/json_reader.c src/serve/json_writer.c \
+tests/test_empty_argument: tests/test_empty_argument.c src/serve/tool_calling.c src/serve/request_id.c src/serve/json_value_grammar.c src/serve/json_reader.c src/serve/json_writer.c $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_empty_argument.c src/serve/tool_calling.c src/serve/request_id.c src/serve/json_value_grammar.c src/serve/json_reader.c src/serve/json_writer.c \
 		-lm $(LDFLAGS)
 
 # Incremental JSON-value well-formedness walk — the shared core that makes a
@@ -940,8 +957,8 @@ tests/test_json_value_grammar: tests/test_json_value_grammar.c src/serve/json_va
 # Grammar-constrained tool decoding FSM (Phase 5). Pure C string/DOM parsing
 # over the tools schema; links only the grammar module + the JSON reader — no
 # engine/model/CUDA deps, fully local.
-tests/test_tool_grammar: tests/test_tool_grammar.c src/serve/tool_grammar.c src/serve/tool_calling.c src/serve/json_value_grammar.c src/serve/tool_param_empty_value_rule.c src/serve/field_pattern.c src/serve/json_reader.c src/serve/json_writer.c $(ALL_HDR)
-	$(CC) $(CFLAGS) -o $@ tests/test_tool_grammar.c src/serve/tool_grammar.c src/serve/tool_calling.c src/serve/json_value_grammar.c src/serve/tool_param_empty_value_rule.c src/serve/field_pattern.c src/serve/json_reader.c src/serve/json_writer.c \
+tests/test_tool_grammar: tests/test_tool_grammar.c src/serve/tool_grammar.c src/serve/tool_calling.c src/serve/request_id.c src/serve/json_value_grammar.c src/serve/tool_param_empty_value_rule.c src/serve/field_pattern.c src/serve/json_reader.c src/serve/json_writer.c $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_tool_grammar.c src/serve/tool_grammar.c src/serve/tool_calling.c src/serve/request_id.c src/serve/json_value_grammar.c src/serve/tool_param_empty_value_rule.c src/serve/field_pattern.c src/serve/json_reader.c src/serve/json_writer.c \
 		-lm $(LDFLAGS)
 
 tests/test_tool_grammar_reasoned: tests/test_tool_grammar_reasoned.c src/serve/tool_grammar.c src/serve/json_value_grammar.c src/serve/tool_param_empty_value_rule.c src/serve/field_pattern.c src/serve/json_reader.c src/serve/json_writer.c $(ALL_HDR)
@@ -984,8 +1001,8 @@ tests/test_tool_grammar_json: tests/test_tool_grammar_json.c src/serve/tool_gram
 # grammar-aware chooser must reproduce plain constrained decoding token for
 # token (self-falsifying simulation).  Links the real JSON grammar and the
 # parser; no engine/model/device.
-tests/test_grammar_spec_chooser: tests/test_grammar_spec_chooser.c src/serve/grammar_spec_chooser.c src/core/grammar_mask_shortlist.c src/core/sampler_topn_tail.c src/serve/tool_grammar_json.c src/serve/tool_calling.c src/serve/json_value_grammar.c src/serve/tool_param_empty_value_rule.c src/serve/field_pattern.c src/serve/json_reader.c src/serve/json_writer.c $(ALL_HDR)
-	$(CC) $(CFLAGS) -o $@ tests/test_grammar_spec_chooser.c src/serve/grammar_spec_chooser.c src/core/grammar_mask_shortlist.c src/core/sampler_topn_tail.c src/serve/tool_grammar_json.c src/serve/tool_calling.c src/serve/json_value_grammar.c src/serve/tool_param_empty_value_rule.c src/serve/field_pattern.c src/serve/json_reader.c src/serve/json_writer.c \
+tests/test_grammar_spec_chooser: tests/test_grammar_spec_chooser.c src/serve/grammar_spec_chooser.c src/core/grammar_mask_shortlist.c src/core/sampler_topn_tail.c src/serve/tool_grammar_json.c src/serve/tool_calling.c src/serve/request_id.c src/serve/json_value_grammar.c src/serve/tool_param_empty_value_rule.c src/serve/field_pattern.c src/serve/json_reader.c src/serve/json_writer.c $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_grammar_spec_chooser.c src/serve/grammar_spec_chooser.c src/core/grammar_mask_shortlist.c src/core/sampler_topn_tail.c src/serve/tool_grammar_json.c src/serve/tool_calling.c src/serve/request_id.c src/serve/json_value_grammar.c src/serve/tool_param_empty_value_rule.c src/serve/field_pattern.c src/serve/json_reader.c src/serve/json_writer.c \
 		-lm $(LDFLAGS)
 
 # The grammar mask decided from a shortlist of the highest logits must leave the
@@ -1030,8 +1047,8 @@ tests/test_sampling_modifiers: tests/test_sampling_modifiers.c src/core/sampling
 # src/accel/backend_identity.c joins the link line because oai_handle_models now
 # names the compiled backend on /v1/models. The module is a handful of string
 # literals with no dependencies of its own, so it costs this harness nothing.
-tests/test_chat_request: tests/test_chat_request.c src/serve/tool_calling.c src/serve/json_value_grammar.c src/serve/json_reader.c src/serve/json_writer.c src/serve/serve_shutdown.c src/serve/serve_request_dump.c src/serve/openai_chat.c src/serve/tool_call_stream.c src/serve/json_canonical_stream.c src/serve/serve_emitter.c src/serve/sampling_defaults.c src/serve/field_pattern.c src/serve/field_patterns_request.c src/accel/backend_identity.c $(ALL_HDR)
-	$(CC) $(CFLAGS) -o $@ tests/test_chat_request.c src/serve/sampling_defaults.c src/serve/tool_calling.c src/serve/json_value_grammar.c src/serve/json_reader.c src/serve/json_writer.c src/serve/request_profile.c src/serve/serve_shutdown.c src/serve/serve_request_dump.c src/serve/tool_call_stream.c src/serve/json_canonical_stream.c src/serve/serve_emitter.c src/serve/field_pattern.c src/serve/field_patterns_request.c src/accel/backend_identity.c \
+tests/test_chat_request: tests/test_chat_request.c src/serve/tool_calling.c src/serve/request_id.c src/serve/gateway_mode.c src/serve/gateway_auth.c src/serve/usage_record.c src/serve/json_value_grammar.c src/serve/json_reader.c src/serve/json_writer.c src/serve/serve_shutdown.c src/serve/serve_request_dump.c src/serve/openai_chat.c src/serve/tool_call_stream.c src/serve/json_canonical_stream.c src/serve/serve_emitter.c src/serve/sampling_defaults.c src/serve/field_pattern.c src/serve/field_patterns_request.c src/accel/backend_identity.c $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_chat_request.c src/serve/sampling_defaults.c src/serve/tool_calling.c src/serve/request_id.c src/serve/gateway_mode.c src/serve/gateway_auth.c src/serve/usage_record.c src/serve/json_value_grammar.c src/serve/json_reader.c src/serve/json_writer.c src/serve/request_profile.c src/serve/serve_shutdown.c src/serve/serve_request_dump.c src/serve/tool_call_stream.c src/serve/json_canonical_stream.c src/serve/serve_emitter.c src/serve/field_pattern.c src/serve/field_patterns_request.c src/accel/backend_identity.c \
 		-lm $(LDFLAGS)
 
 # Stream tool-call detection (serve_generation.c emitter, Phase 2). The emitter
@@ -1051,8 +1068,8 @@ tests/test_serve_emitter: tests/test_serve_emitter.c src/serve/serve_emitter.c $
 # the streamed argument fragments must concatenate to exactly the arguments the
 # end-of-turn parse returns.  libc-only — the emitter, the streamer and the
 # parser, no engine.
-tests/test_tool_call_stream: tests/test_tool_call_stream.c src/serve/tool_call_stream.c src/serve/json_canonical_stream.c src/serve/serve_emitter.c src/serve/tool_calling.c src/serve/json_value_grammar.c src/serve/json_reader.c src/serve/json_writer.c $(ALL_HDR)
-	$(CC) $(CFLAGS) -o $@ tests/test_tool_call_stream.c src/serve/tool_call_stream.c src/serve/json_canonical_stream.c src/serve/serve_emitter.c src/serve/tool_calling.c src/serve/json_value_grammar.c src/serve/json_reader.c src/serve/json_writer.c \
+tests/test_tool_call_stream: tests/test_tool_call_stream.c src/serve/tool_call_stream.c src/serve/json_canonical_stream.c src/serve/serve_emitter.c src/serve/tool_calling.c src/serve/request_id.c src/serve/json_value_grammar.c src/serve/json_reader.c src/serve/json_writer.c $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_tool_call_stream.c src/serve/tool_call_stream.c src/serve/json_canonical_stream.c src/serve/serve_emitter.c src/serve/tool_calling.c src/serve/request_id.c src/serve/json_value_grammar.c src/serve/json_reader.c src/serve/json_writer.c \
 		-lm $(LDFLAGS)
 
 # Decode-time repetition-cycle detector (the saber-orch Q3_K_M collapse: one
@@ -1080,6 +1097,15 @@ tests/test_registry: tests/test_registry.c src/serve/registry.c src/serve/json_r
 # System-prefix cache unit test (SYS1). Links the prefix cache + the state
 # snapshot module only; the test stubs pn_state_new/reset/free over hand-built
 # qwen35moe dual states — no engine/model/CUDA, builds and runs on the Mac.
+# Gateway mode's pure pieces (route allow-list, key, tenant session keys, ids,
+# the [usage] line). libc only.
+GATEWAY_TEST_SRC = src/serve/gateway_mode.c src/serve/gateway_auth.c src/serve/request_id.c \
+	src/serve/gateway_request_gate.c src/serve/http_server.c \
+	src/serve/usage_record.c src/serve/tool_calling.c src/serve/json_value_grammar.c \
+	src/serve/json_reader.c src/serve/json_writer.c
+tests/test_gateway_mode: tests/test_gateway_mode.c $(GATEWAY_TEST_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_gateway_mode.c $(GATEWAY_TEST_SRC) -lm $(LDFLAGS)
+
 tests/test_base64: tests/test_base64.c src/serve/base64.c $(ALL_HDR)
 	$(CC) $(CFLAGS) -o $@ tests/test_base64.c src/serve/base64.c \
 		-lm $(LDFLAGS)
@@ -1458,6 +1484,13 @@ tests/test_spec_sampling_rule: tests/test_spec_sampling_rule.c $(PN_SRC) $(FOUND
 
 # forget_state under QWEN35_TP drops both rank halves' host bindings (CUDA build; no GPU
 # touched). Red: CFLAGS+=-DQW_FORGET_RED must fail.
+# QWEN35_PCIE_* staging: flag parsing (host); with USE_CUDA and QW_PCIE_TEST_GPU=1 on two
+# dies of one board, every lever set moves the exact bytes in order (red: -DPN_PCIE_RED).
+tests/test_qwen35_pcie_stage: tests/test_qwen35_pcie_stage.c src/models/qwen35moe_pcie_stage.c \
+		src/models/qwen35moe_pcie_stage.h
+	$(CC) $(CFLAGS) -o $@ tests/test_qwen35_pcie_stage.c src/models/qwen35moe_pcie_stage.c \
+		$(if $(USE_CUDA),$(FOUNDRY)/cuda/fc_cuda.c) -lm $(LDFLAGS_CUDA)
+
 tests/test_qwen35_tp_forget: tests/test_qwen35_tp_forget.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
 	$(CC) $(CFLAGS) -o $@ tests/test_qwen35_tp_forget.c $(PN_SRC) $(FOUNDRY_SRC) \
 		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
@@ -1657,11 +1690,11 @@ tests/qwen3_parity/probe_layers: tests/qwen3_parity/probe_layers.c $(PN_SRC) $(F
 		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
 
 tests/test_prefix_projection: tests/test_prefix_projection.c $(PN_SRC) $(FOUNDRY_SRC) \
-		src/serve/serve_prompt_tokens.c src/serve/tool_calling.c \
+		src/serve/serve_prompt_tokens.c src/serve/tool_calling.c src/serve/request_id.c \
 		src/serve/json_value_grammar.c \
 		src/serve/json_reader.c src/serve/json_writer.c $(ALL_HDR)
 	$(CC) $(CFLAGS) -o $@ tests/test_prefix_projection.c $(PN_SRC) $(FOUNDRY_SRC) \
-		src/serve/serve_prompt_tokens.c src/serve/tool_calling.c \
+		src/serve/serve_prompt_tokens.c src/serve/tool_calling.c src/serve/request_id.c \
 		src/serve/json_value_grammar.c \
 		src/serve/json_reader.c src/serve/json_writer.c \
 		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
@@ -1669,8 +1702,8 @@ tests/test_prefix_projection: tests/test_prefix_projection.c $(PN_SRC) $(FOUNDRY
 # Pantheon's prompt rendering vs the Qwen3.6 / Qwen3.8 chat templates (goldens
 # from tests/host/render_qwen_template_goldens.py; no Python at test time). Reaches
 # the static request parse by #including openai_chat.c, like test_chat_request.
-TEMPLATE_PARITY_SERVE_SRC = src/serve/serve_prompt_tokens.c src/serve/sampling_defaults.c \
-	src/serve/tool_calling.c src/serve/json_value_grammar.c src/serve/json_reader.c \
+TEMPLATE_PARITY_SERVE_SRC = src/serve/serve_prompt_tokens.c src/serve/sampling_defaults.c src/serve/gateway_mode.c src/serve/gateway_auth.c src/serve/usage_record.c \
+	src/serve/tool_calling.c src/serve/request_id.c src/serve/json_value_grammar.c src/serve/json_reader.c \
 	src/serve/json_writer.c src/serve/request_profile.c src/serve/serve_shutdown.c \
 	src/serve/serve_request_dump.c src/serve/tool_call_stream.c \
 	src/serve/json_canonical_stream.c src/serve/serve_emitter.c \
@@ -1784,6 +1817,12 @@ tests/test_sampler_margin_draw: tests/test_sampler_margin_draw.c $(PN_SRC) $(FOU
 	$(CC) $(CFLAGS) -o $@ tests/test_sampler_margin_draw.c $(PN_SRC) $(FOUNDRY_SRC) \
 		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
 
+# Short logits row (engine.h pn_sampler_short_row): a draw from the exact top 257 + fill is the
+# full row's draw, token and RNG state, on both serve shapes (red arms must mismatch).
+tests/test_sampler_short_row: tests/test_sampler_short_row.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_sampler_short_row.c $(PN_SRC) $(FOUNDRY_SRC) \
+		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
+
 # B6: a thread that samples frees its _Thread_local sampler buffers at exit
 # (the serve samples token #1 on a per-request thread).
 tests/test_sampler_thread_scratch: tests/test_sampler_thread_scratch.c $(PN_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
@@ -1831,6 +1870,10 @@ tests/test_unload_closes_watch: tests/test_unload_closes_watch.c src/serve/model
 # (like test_serve_sched_qwen35) so the JSON assertions run the REAL
 # oai_handle_models / ma_handle_models over a socketpair rather than a
 # reimplementation of them. No GPU, no model file, no network.
+tests/test_serve_nonstream_disconnect: tests/test_serve_nonstream_disconnect.c $(PN_SRC) $(SERVE_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
+	$(CC) $(CFLAGS) -o $@ tests/test_serve_nonstream_disconnect.c $(PN_SRC) $(SERVE_SRC) $(FOUNDRY_SRC) \
+		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
+
 tests/test_host_admit_serve: tests/test_host_admit_serve.c $(PN_SRC) $(SERVE_SRC) $(FOUNDRY_SRC) $(ALL_HDR)
 	$(CC) $(CFLAGS) -o $@ tests/test_host_admit_serve.c $(PN_SRC) $(SERVE_SRC) $(FOUNDRY_SRC) \
 		-lm $(LDFLAGS) $(LDFLAGS_BLAS) $(LDFLAGS_METAL) $(LDFLAGS_CUDA)
@@ -1939,6 +1982,19 @@ tests/test_tt_grid_msplit: tests/test_tt_grid_msplit.c src/accel/tt/pn_tt_grid_m
 tests/test_tt_grid_marks: tests/test_tt_grid_marks.c src/accel/tt/pn_tt_grid_marks.c \
                           src/accel/tt/pn_tt_grid_marks.h
 	$(CC) $(CFLAGS) -o $@ tests/test_tt_grid_marks.c src/accel/tt/pn_tt_grid_marks.c
+
+# The grid idle guard (pn_tt_grid_idle.h): the module alone, no card.
+tests/test_tt_grid_idle: tests/test_tt_grid_idle.c src/accel/tt/pn_tt_grid_idle.c \
+                         src/accel/tt/pn_tt_grid_idle.h
+	$(CC) $(CFLAGS) -o $@ tests/test_tt_grid_idle.c src/accel/tt/pn_tt_grid_idle.c
+
+# The same with a guard that never re-arms: must FAIL.
+test-tt-grid-idle-red:
+	rm -f tests/test_tt_grid_idle_red
+	$(CC) $(CFLAGS) -DPN_TT_GRID_IDLE_RED -o tests/test_tt_grid_idle_red \
+	  tests/test_tt_grid_idle.c src/accel/tt/pn_tt_grid_idle.c
+	! ./tests/test_tt_grid_idle_red
+	rm -f tests/test_tt_grid_idle_red
 
 # The prefill overlap's step placement (qwen35moe_prefill_ov_plan.h): the module alone.
 tests/test_qwen35_ov_plan: tests/test_qwen35_ov_plan.c src/models/qwen35moe_prefill_ov_plan.c \
@@ -2218,7 +2274,7 @@ tests/test_local_catalog: tests/test_local_catalog.c $(LOCAL_CATALOG_TEST_SRC) $
 LOCAL_DOWNLOAD_TEST_SRC = src/local/downloader.c src/local/install_worker.c src/local/model_store.c \
 	src/local/curl_runner.c src/local/sha256.c src/local/catalog_manifest.c src/local/unit_place.c \
 	src/local/ingot_fetch.c src/serve/sampling_defaults.c src/serve/json_reader.c \
-	src/serve/json_writer.c $(INGOT_LIB)
+	src/serve/json_writer.c $(FOUNDRY)/safetensors/safetensors.c $(INGOT_LIB)
 tests/test_local_download: tests/test_local_download.c tests/local_fixture_httpd.h $(LOCAL_DOWNLOAD_TEST_SRC) $(ALL_HDR)
 	$(CC) $(CFLAGS) -o $@ tests/test_local_download.c $(LOCAL_DOWNLOAD_TEST_SRC) -lm $(LDFLAGS)
 

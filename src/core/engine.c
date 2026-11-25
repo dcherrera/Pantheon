@@ -2100,6 +2100,132 @@ static int row_hint_gather(const float *row, int n_vocab, int *ids, float *vals,
     return S;
 }
 
+/* ------------------------------------------------------------------
+ * SHORT ROW (engine.h pn_sampler_short_row). The row names the backend's exact top 257 of
+ * the full row R (value desc, id asc), R holds no NaN and its 256th value is strictly above
+ * its 257th, the bound b. The draw keeps the short row only where the decision provably
+ * equals R's, and otherwise fetches R through the fill callback and runs the usual path on
+ * it. A fill consumes no randomness, so the uniform and the RNG stream are R's either way.
+ *
+ * WHY IT IS EXACT.  (1) With no modifier that can raise a token (no logit_bias; presence,
+ * frequency >= 0; repetition penalty >= 1 or standing down), every step before the draw maps
+ * a value to one <= itself and -inf to -inf: tokens outside the list stay <= b, listed tokens
+ * get the same values as in R. Anything else, and logprobs (they read all of R), fetch R at
+ * entry. (2) Steer: R's argmax is the list's first entry. (3) Live mask: on R the shortlist is
+ * the top 256 and its bound the largest value left out; on the short row both are the same
+ * (unique set: 256th > 257th; bound = b). A CLEAR verdict depends only on the set, the bound,
+ * the verdicts and k, and rewrites the row to the same survivors, so the rest of the draw is
+ * R's. The outside bound sums in the shortlist's heap order, which on R depends on the whole
+ * scan, so on a short row it does not decide: no CLEAR fetches R, which then takes its usual
+ * shortlist / outside bound / full scan. (4) Greedy, mask not live: the listed best w is R's
+ * argmax when w > b. (5) Sampled, mask not live: the margin draw reads only the top 64 after
+ * surgery; when the short row's 64th is > b that is R's top 64, so the plan and its verdict
+ * for the uniform are R's; a refusal (or a 64th <= b) fetches R and redoes the surgery before
+ * the uniform is used. (6) The full scan, fail-open and fail-closed run only on R.
+ *
+ * Cleared by the fill, by a grammar CLEAR rewrite (the row is then the very row R's draw
+ * would sample) and at the end of every draw.
+ *
+ * Red arms (gates only; PN_SHORT_ROW_RED): `bound` lets the grammar shortlist's outside bound
+ * (heap-order sums) decide on the short row; `margin` skips the top-64 check; `greedy` skips
+ * the argmax check. Each must break the identity gate.
+ * ------------------------------------------------------------------ */
+_Static_assert(PN_SHORT_ROW_K == PN_SURV_MAX + 1 && PN_SHORT_ROW_K == GMS_MAX + 1,
+               "a short row must be one entry past every top-N cap");
+_Static_assert(PN_SHORT_ROW_K == PN_QWEN35MOE_SHORT_ROW_K, "the forward presents PN_SHORT_ROW_K");
+static _Thread_local const float *t_short_row = NULL;
+static _Thread_local float t_short_bound = 0.0f;
+static _Thread_local pn_short_row_fill_fn t_short_fill = NULL;
+static _Thread_local void *t_short_ctx = NULL;
+static _Thread_local int t_short_refilled = 0;
+static pn_short_row_stats g_short_stats;
+
+void pn_sampler_short_row(const float *row, float bound, pn_short_row_fill_fn fill, void *ctx)
+{
+    t_short_row = fill ? row : NULL;
+    t_short_bound = bound;
+    t_short_fill = fill;
+    t_short_ctx = ctx;
+}
+
+void pn_sampler_short_row_stats(pn_short_row_stats *out)
+{
+    if (!out)
+        return;
+    out->draws = __atomic_load_n(&g_short_stats.draws, __ATOMIC_RELAXED);
+    out->decided = __atomic_load_n(&g_short_stats.decided, __ATOMIC_RELAXED);
+    for (int i = 0; i < PN_SR_REASONS; i++)
+        out->refill[i] = __atomic_load_n(&g_short_stats.refill[i], __ATOMIC_RELAXED);
+    out->fill_failed = __atomic_load_n(&g_short_stats.fill_failed, __ATOMIC_RELAXED);
+}
+
+static int short_row_red(const char *arm)
+{
+    const char *e = getenv("PN_SHORT_ROW_RED");
+    return e && strcmp(e, arm) == 0;
+}
+
+static int short_row_live(const float *logits)
+{
+    return t_short_row && t_short_row == logits;
+}
+
+/* Write R into `logits` when it is still the short row; 1 when it was fetched. */
+static int short_row_refill(float *logits, int n_vocab, int reason)
+{
+    if (!short_row_live(logits))
+        return 0;
+    t_short_row = NULL;
+    t_row_hint_row = NULL;
+    t_short_refilled = 1;
+    __atomic_fetch_add(&g_short_stats.refill[reason], 1ul, __ATOMIC_RELAXED);
+    if (t_short_fill(t_short_ctx, logits, n_vocab) != 0) {
+        __atomic_fetch_add(&g_short_stats.fill_failed, 1ul, __ATOMIC_RELAXED);
+        fprintf(stderr, "sampler: short row fill failed; sampling the short row\n");
+        return 0;
+    }
+    return 1;
+}
+
+/* Entry (WHY (1)): a modifier that can raise a token outside the list, or logprobs
+ * (they read the whole raw row), needs R before anything reads the row. Written so a NaN
+ * setting also fetches. */
+static int short_row_entry_needs_full(const pn_sampling_params *p)
+{
+    return p->logprobs || (p->logit_bias && p->n_logit_bias > 0) ||
+           !(p->presence_penalty >= 0.0f) || !(p->frequency_penalty >= 0.0f) ||
+           (p->temperature > 0.0f && !(p->repeat_penalty >= 1.0f));
+}
+
+/* The grammar judges ids below its own n_vocab only (steer, shortlist, scan). The short
+ * row's view of that range is R's only when every listed id lies inside it. */
+static int short_row_past_grammar_vocab(const float *logits, int n_vocab,
+                                        const pn_tool_grammar_hook *tg)
+{
+    if (!tg || tg->n_vocab <= 0 || tg->n_vocab >= n_vocab)
+        return 0;
+    for (int i = tg->n_vocab; i < n_vocab; i++) {
+        uint32_t bits;
+        memcpy(&bits, &logits[i], sizeof bits);
+        if (bits != PN_NEG_INF_BITS)
+            return 1;
+    }
+    return 0;
+}
+
+/* Sampled draw (WHY (5)): R's top 64 after surgery is the short row's when the 64th of the
+ * short row is above bound (nothing outside the list can exceed bound). */
+static int short_row_top64_clear(const float *logits, int n_vocab)
+{
+    uint32_t ids[PN_MARGIN_CAND];
+    float vals[PN_MARGIN_CAND];
+
+    if (short_row_red("margin"))
+        return 1;
+    return pn_margin_select_top(logits, n_vocab, PN_MARGIN_CAND, ids, vals) == PN_MARGIN_CAND &&
+           vals[PN_MARGIN_CAND - 1] > t_short_bound;
+}
+
 /* Runtime override for the tests (the token-identity gate flips arms in
  * process). -1 = follow the env; 0/1 = force. */
 static int g_sparse_sampler_override = -1;
@@ -2392,7 +2518,10 @@ static int grammar_mask_from_shortlist(float *logits, int n_vocab,
                             red && strcmp(red, "grammar_bound_blind") == 0 ? 0.0 : 1.0 };
     gms_sampling s = {
         .temperature = params->temperature, .top_k = params->top_k, .top_p = params->top_p,
-        .outside = grammar_exact_bound_on() ? &outside : NULL,
+        /* On a short row only CLEAR may decide: the outside bound sums in the shortlist's
+         * heap order, which on the full row depends on the whole scan (SHORT ROW, WHY (3)). */
+        .outside = grammar_exact_bound_on() &&
+                   !(short_row_live(logits) && !short_row_red("bound")) ? &outside : NULL,
         .repeat_penalty = params->repeat_penalty,
         .presence_penalty = params->presence_penalty,
         .frequency_penalty = params->frequency_penalty,
@@ -2417,6 +2546,8 @@ static int grammar_mask_from_shortlist(float *logits, int n_vocab,
                                           grammar_token_allowed, &ctx);
     if (verdict == GMS_DECIDED_BOUND)
         __atomic_fetch_add(&g_grammar_bound_steps, 1ul, __ATOMIC_RELAXED);
+    if (verdict != GMS_UNDECIDED && short_row_live(logits))
+        t_short_row = NULL;
     if (verdict != GMS_UNDECIDED && hint && grammar_row_hint_on())
         grammar_hint_kept(logits, ids, n);
     pn_ht_lap(PN_HT_S_MASK_DECIDE, ht0);
@@ -3211,7 +3342,7 @@ static uint32_t sample_token_core(float *logits, int n_vocab, pn_sampling_params
     /* A top-N row that cannot decide this draw exactly is swapped for the dense row —
      * never one the grammar mask already rewrote (that would drop the mask). A request
      * whose top-k reaches past the N goes to the tail planner below. */
-    if (params->dense_row && !t_grammar_row_final &&
+    if (params->dense_row && !t_grammar_row_final && !short_row_live(logits) &&
         (params->temperature > 0.0f || pn_topn_surgery_present(params))) {
         const pn_topn_verdict v = pn_sampler_topn_row_verdict(logits, n_vocab, params,
                                                               recent_tokens, n_recent,
@@ -3265,6 +3396,14 @@ static uint32_t sample_token_core(float *logits, int n_vocab, pn_sampling_params
         for (int i = 1; i < n_vocab; i++) {
             if (logits[i] > logits[best]) best = i;
         }
+        /* Short row (SHORT ROW, WHY (4)): R's argmax is the listed best only above bound. */
+        if (short_row_live(logits) && !(logits[best] > t_short_bound) &&
+            !short_row_red("greedy") && short_row_refill(logits, n_vocab, PN_SR_GREEDY)) {
+            sampler_apply_client_surgery(logits, n_vocab, params, recent_tokens, n_recent);
+            best = 0;
+            for (int i = 1; i < n_vocab; i++)
+                if (logits[i] > logits[best]) best = i;
+        }
         pn_ht_lap(PN_HT_S_GREEDY, ht);
         return (uint32_t)best;
     }
@@ -3282,7 +3421,8 @@ static uint32_t sample_token_core(float *logits, int n_vocab, pn_sampling_params
      * compare and not `> -INFINITY`. */
     /* Also whenever a backend hands top-N rows (dense_row set): byte-identical to the full
      * path by test_sparse_sampler_identity, ~10 ms a draw cheaper at 248k vocab. */
-    if ((sparse_sampler_enabled() || params->dense_row) && !g_grammar_masked) {
+    if ((sparse_sampler_enabled() || params->dense_row) && !g_grammar_masked &&
+        !short_row_live(logits)) {
         int   surv_ids[PN_SURV_MAX];
         float surv_vals[PN_SURV_MAX];
         int S = sparse_gather(logits, n_vocab, surv_ids, surv_vals);
@@ -3333,6 +3473,14 @@ static uint32_t sample_token_core(float *logits, int n_vocab, pn_sampling_params
      * path with it — the same token for the same u, and the same RNG stream. The uniform is
      * drawn first; nothing between consumes randomness (no scratch: the original returns
      * before drawing, so this does too). */
+    /* Short row (SHORT ROW, WHY (5)): the margin draw reads R's top 64, which is the short row's
+     * when its 64th is above bound; otherwise, or when the margin draw refuses, fetch R and
+     * redo the surgery on it (the same uniform follows). */
+    if (short_row_live(logits) && !short_row_top64_clear(logits, n_vocab) &&
+        short_row_refill(logits, n_vocab, PN_SR_TOP64)) {
+        sampler_apply_client_surgery(logits, n_vocab, params, recent_tokens, n_recent);
+        sampler_apply_repeat_penalty(logits, n_vocab, params, recent_tokens, n_recent);
+    }
     pn_ht_note_row(0, 1);
     if (!sampler_scratch_get(n_vocab)) return 0;
     float r = rand_float(params);
@@ -3345,6 +3493,10 @@ static uint32_t sample_token_core(float *logits, int n_vocab, pn_sampling_params
             g_margin_draws++;
             return tok;
         }
+    }
+    if (short_row_refill(logits, n_vocab, PN_SR_MARGIN)) {
+        sampler_apply_client_surgery(logits, n_vocab, params, recent_tokens, n_recent);
+        sampler_apply_repeat_penalty(logits, n_vocab, params, recent_tokens, n_recent);
     }
     float *probs = sampler_full_probs(logits, n_vocab, params);
     ht = pn_ht_lap(PN_HT_S_FULL_PROBS, ht);
@@ -3506,9 +3658,17 @@ static uint32_t sample_token(float *logits, int n_vocab, pn_sampling_params *par
             params->repeat_penalty = 1.0f;
         }
     }
+    const int short_row = short_row_live(logits);
+    t_short_refilled = 0;
     token = sample_token_draw(logits, n_vocab, params, recent_tokens, n_recent);
     if (exempt) params->repeat_penalty = repeat_penalty;
     t_row_hint_row = NULL;
+    if (short_row) {
+        __atomic_fetch_add(&g_short_stats.draws, 1ul, __ATOMIC_RELAXED);
+        if (!t_short_refilled)
+            __atomic_fetch_add(&g_short_stats.decided, 1ul, __ATOMIC_RELAXED);
+    }
+    t_short_row = NULL;
     return token;
 }
 
@@ -3542,6 +3702,10 @@ static uint32_t sample_token_draw(float *logits, int n_vocab, pn_sampling_params
      * slot and every session until the process exited. */
     g_grammar_masked = 0;
     t_grammar_row_final = 0;
+    if (short_row_live(logits) && params &&
+        (short_row_entry_needs_full(params) ||
+         short_row_past_grammar_vocab(logits, n_vocab, params->tool_grammar)))
+        short_row_refill(logits, n_vocab, PN_SR_ENTRY);
 
     /* Snapshot the untouched logits FIRST when the request asked for logprobs —
      * everything below (mask, bias, penalties, temperature, top-k/top-p) mutates
@@ -3582,7 +3746,8 @@ static uint32_t sample_token_draw(float *logits, int n_vocab, pn_sampling_params
                 t_grammar_row_final = 1;
                 goto masked;
             }
-            if (grammar_mask_from_chunks(logits, n_vocab, params, tg, TG_MASK)) {
+            if (!short_row_live(logits) &&
+                grammar_mask_from_chunks(logits, n_vocab, params, tg, TG_MASK)) {
                 g_grammar_mask_steps++;
                 g_grammar_chunk_steps++;
                 g_grammar_mask_seconds += grammar_now_seconds() - mask_started;
@@ -3590,9 +3755,11 @@ static uint32_t sample_token_draw(float *logits, int n_vocab, pn_sampling_params
                 t_grammar_row_final = 1;
                 goto masked;
             }
-            g_topn_refills++;
-            if (params->dense_row(params->dense_ctx, logits, n_vocab) != 0)
-                fprintf(stderr, "sampler: dense refill for the grammar mask failed\n");
+            if (!short_row_refill(logits, n_vocab, PN_SR_MASK)) {
+                g_topn_refills++;
+                if (params->dense_row(params->dense_ctx, logits, n_vocab) != 0)
+                    fprintf(stderr, "sampler: dense refill for the grammar mask failed\n");
+            }
             t_grammar_row_final = 1;
             if (grammar_mask_from_shortlist(logits, n_vocab, params, tg, recent_tokens,
                                             n_recent, 1)) {
@@ -3602,6 +3769,7 @@ static uint32_t sample_token_draw(float *logits, int n_vocab, pn_sampling_params
                 goto masked;
             }
         }
+        short_row_refill(logits, n_vocab, PN_SR_MASK);
         g_grammar_fullscan_steps++;
         ht_full = pn_ht_now();
         int nv = tg->n_vocab > 0 && tg->n_vocab < n_vocab ? tg->n_vocab : n_vocab;

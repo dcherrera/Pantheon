@@ -2388,6 +2388,100 @@ static void test_batched_admission_idle_reaper(void)
     bs_destroy(bs);
 }
 
+/* Gateway mode (bs_set_sessions_evictable): a seat is a cache. The shipped K80
+ * pair profile has ONE seat; one customer's prompt_cache_key used to lock every
+ * other customer and every anonymous turn out with 429 for up to 12 h. Now an
+ * idle seat goes to whoever needs the slot, least recently active first. */
+static void test_batched_gateway_seats_evictable(void)
+{
+    printf("test: batched admission, gateway mode: evictable seats\n");
+    pn_model model = {0};
+    model.config.arch = PN_ARCH_QWEN35MOE;
+    pn_batch_sched *bs = mk_sched(&model, 1);
+    bs_set_session_admission(bs, 1, 0);
+    bs_set_sessions_evictable(bs, true);
+    int s = -1;
+
+    seat_warm(bs, 0, "tenantA:k1", 3.0f);
+    CHECK(acquire_now(bs, "tenantA:k1", &s) == BS_ACQUIRE_OK && s == 0 &&
+          still_warm(bs, 0, "tenantA:k1", 3.0f),
+          "the seated session still resumes on its warm slot");
+    bs_slot_release(bs, s);
+    CHECK(acquire_now(bs, NULL, &s) == BS_ACQUIRE_OK && s == 0,
+          "an anonymous turn takes the idle seat instead of a 429");
+    CHECK(bs->slots[0].sid[0] == '\0', "...the evicted session's warm state is gone");
+    bs_slot_release(bs, s);
+    seat_warm(bs, 0, "tenantA:k1", 3.0f);
+    CHECK(acquire_now(bs, "tenantB:k1", &s) == BS_ACQUIRE_OK && s == 0,
+          "another tenant's new key takes the idle seat");
+    bs_slot_release(bs, s);
+    bs_destroy(bs);
+
+    /* Least recently active goes first; a seat mid-turn is never taken. */
+    bs = mk_sched(&model, 2);
+    bs_set_session_admission(bs, 2, 0);
+    bs_set_sessions_evictable(bs, true);
+    seat_warm(bs, 0, "t:old", 1.0f);
+    seat_warm(bs, 1, "t:new", 2.0f);
+    bs->slots[0].last_active_ms = 1000.0;
+    bs->slots[1].last_active_ms = 2000.0;
+    CHECK(acquire_now(bs, "u:x", &s) == BS_ACQUIRE_OK && s == 0,
+          "the least recently active seat is evicted");
+    CHECK(still_warm(bs, 1, "t:new", 2.0f), "...the other keeps its KV");
+    int s2 = -1;
+    CHECK(acquire_now(bs, "u:y", &s2) == BS_ACQUIRE_OK && s2 == 1, "then the next one");
+    int s3 = -1;
+    CHECK(acquire_now(bs, "u:z", &s3) == BS_ACQUIRE_429 && s3 < 0,
+          "both seats mid-turn: queue/busy (429 server_busy), never at_capacity");
+    bs_slot_release(bs, s);
+    bs_slot_release(bs, s2);
+    bs_destroy(bs);
+
+    /* Off (home use): unchanged — the seat is held. */
+    bs = mk_sched(&model, 1);
+    bs_set_session_admission(bs, 1, 0);
+    seat_warm(bs, 0, "user-a", 3.0f);
+    CHECK(acquire_now(bs, NULL, &s) == BS_ACQUIRE_AT_CAPACITY &&
+          still_warm(bs, 0, "user-a", 3.0f),
+          "not evictable: anonymous refused, the seat kept (home behaviour)");
+    bs_destroy(bs);
+}
+
+/* A queued waiter whose client leaves never takes a slot: it leaves the queue
+ * with BS_ACQUIRE_CLIENT_GONE within one poll tick, not at the 30 s deadline. */
+static int waiter_alive_flag;
+static int waiter_alive(void *ud) { (void)ud; return waiter_alive_flag; }
+
+static void test_batched_waiter_leaves_when_client_gone(void)
+{
+    printf("test: batched queue, a waiter whose client left\n");
+    pn_model model = {0};
+    model.config.arch = PN_ARCH_QWEN35MOE;
+    pn_batch_sched *bs = mk_sched(&model, 1);
+    bs->queue_cap = BS_QUEUE_DEPTH_DEFAULT;
+    int busy = -1, s = -1, ra = 0;
+    CHECK(acquire_now(bs, NULL, &busy) == BS_ACQUIRE_OK, "the only slot is busy");
+    waiter_alive_flag = 0;
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    bs_acquire_result ar = bs_slot_acquire_or_wait_watched(bs, 5000, &s, &ra, NULL,
+                                                           waiter_alive, NULL);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double ms = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+    CHECK(ar == BS_ACQUIRE_CLIENT_GONE && s < 0, "the gone client leaves the queue");
+    CHECK(ms < 1000.0, "...at once, not at the wait deadline");
+    CHECK(bs->n_queued == 0, "...and no longer counts as queued");
+    waiter_alive_flag = 1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    ar = bs_slot_acquire_or_wait_watched(bs, 600, &s, &ra, NULL, waiter_alive, NULL);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    ms = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+    CHECK(ar == BS_ACQUIRE_TIMEOUT && ms >= 550.0,
+          "a live client still waits to the deadline (poll ticks are not the deadline)");
+    bs_slot_release(bs, busy);
+    bs_destroy(bs);
+}
+
 static void test_batched_admission_restore(void)
 {
     printf("test: batched admission, session restore\n");
@@ -2920,6 +3014,8 @@ int main(void)
     test_batched_admission_four_seats();
     test_batched_admission_no_session_id();
     test_batched_admission_idle_reaper();
+    test_batched_gateway_seats_evictable();
+    test_batched_waiter_leaves_when_client_gone();
     test_batched_admission_restore();
     test_single_user_family_admission();
     test_turn_checkpoint_resume();

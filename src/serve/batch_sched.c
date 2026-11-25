@@ -836,6 +836,11 @@ static void driver_deposit_locked(pn_batch_sched *sched, const uint32_t *tokens,
                                             tgh && tgh->refresh && tgh->st
                                                 ? tgh->refresh(tgh->st) : 0);
             ht = dumped ? pn_ht_now() : ht;   /* the copy is not sampler time */
+            float sr_bound;
+            if (pn_qwen35moe_owns_state(sched->model) &&
+                pn_qwen35moe_short_row(sl->state, &sr_bound))   /* QWEN35_SHORT_ROW */
+                pn_sampler_short_row(lo[g], sr_bound, pn_qwen35moe_short_row_fill,
+                                     pn_qwen35moe_short_row_ctx(sl->state));
             next = pn_sample_next_token(lo[g], sched->n_vocab,
                                         &sl->sp, sl->recent,
                                         sl->n_recent);
@@ -2922,6 +2927,15 @@ void bs_set_session_admission(pn_batch_sched *sched, int max_sessions,
     pthread_mutex_unlock(&sched->mu);
 }
 
+void bs_set_sessions_evictable(pn_batch_sched *sched, bool evictable)
+{
+    if (!sched)
+        return;
+    pthread_mutex_lock(&sched->mu);
+    sched->sessions_evictable = evictable;
+    pthread_mutex_unlock(&sched->mu);
+}
+
 void bs_set_watch_hook(pn_batch_sched *sched, pn_session_watched_fn fn,
                        void *ctx)
 {
@@ -3348,6 +3362,12 @@ static int bs_slot_bind_common(pn_batch_sched *sched, int idx,
         else if (sl->mtp_on && sp->tool_grammar && bs_spec_grammar_draws(sp->tool_grammar))
             fprintf(stderr, "[spec] census: mode=mtp-grammar path=batched slot=%d\n", idx);
 #endif
+#ifdef USE_CUDA
+        /* A grammar slot that speculates draws its cycle's rows outside the driver's
+         * short-row handoff: keep its row full (QWEN35_SHORT_ROW). */
+        if (sl->mtp_on && sp && sp->tool_grammar && bs_spec_grammar_draws(sp->tool_grammar))
+            pn_qwen35moe_state_set_short_row_ok(sl->state, 0);
+#endif
         sl->spec_live_pos = -1;
         sl->status       = BS_SLOT_BOUND;
     }
@@ -3698,11 +3718,61 @@ static int same_session_wait_ms(int wait_ms)
     return ms < wait_ms ? ms : (wait_ms > 0 ? wait_ms : 0);
 }
 
+/* Admission under mu, evicting an idle seat of another family first when seats
+ * are evictable. May drop and retake mu (the eviction takes it itself), so the
+ * caller re-reads anything it read under mu before. */
+static bool admission_ok_or_evict_locked(pn_batch_sched *sched, const char *sid)
+{
+    if (bs_admission_check_locked(sched, sid) == BS_ACQUIRE_OK)
+        return true;
+    if (!sched->sessions_evictable)
+        return false;
+    pthread_mutex_unlock(&sched->mu);
+    bool evicted = bs_admission_evict_lru_idle(sched, sid);
+    pthread_mutex_lock(&sched->mu);
+    return evicted && bs_admission_check_locked(sched, sid) == BS_ACQUIRE_OK;
+}
+
+/* a < b for CLOCK_REALTIME deadlines. */
+static bool deadline_before(const struct timespec *a, const struct timespec *b)
+{
+    return a->tv_sec < b->tv_sec || (a->tv_sec == b->tv_sec && a->tv_nsec < b->tv_nsec);
+}
+
+/* Wait on cv_idle until `deadline`; a watched waiter wakes at least every
+ * BS_WAITER_ALIVE_POLL_MS to re-check its client, and such a tick is not the
+ * deadline (returns 0). Under mu. */
+static int wait_idle_until(pn_batch_sched *sched, const struct timespec *deadline,
+                           bool watched)
+{
+    struct timespec tick;
+
+    if (!watched)
+        return pthread_cond_timedwait(&sched->cv_idle, &sched->mu, deadline);
+    make_deadline(&tick, BS_WAITER_ALIVE_POLL_MS);
+    if (!deadline_before(&tick, deadline))
+        return pthread_cond_timedwait(&sched->cv_idle, &sched->mu, deadline);
+    int rc = pthread_cond_timedwait(&sched->cv_idle, &sched->mu, &tick);
+    return rc == ETIMEDOUT ? 0 : rc;
+}
+
 bs_acquire_result bs_slot_acquire_or_wait(pn_batch_sched *sched,
                                           int wait_ms,
                                           int *slot_out,
                                           int *retry_after_s,
                                           const char *sid)
+{
+    return bs_slot_acquire_or_wait_watched(sched, wait_ms, slot_out, retry_after_s,
+                                           sid, NULL, NULL);
+}
+
+bs_acquire_result bs_slot_acquire_or_wait_watched(pn_batch_sched *sched,
+                                                  int wait_ms,
+                                                  int *slot_out,
+                                                  int *retry_after_s,
+                                                  const char *sid,
+                                                  bs_waiter_alive_fn alive,
+                                                  void *alive_ud)
 {
     if (slot_out)      *slot_out      = -1;
     if (retry_after_s) *retry_after_s = 0;
@@ -3720,11 +3790,17 @@ bs_acquire_result bs_slot_acquire_or_wait(pn_batch_sched *sched,
 
     /* Session admission, atomically with the claim below (both under mu): a
      * refused session is told now, never queued behind seats that will not
-     * free for it. */
-    if (bs_admission_check_locked(sched, sid) != BS_ACQUIRE_OK) {
+     * free for it.  With evictable seats an idle seat is taken instead, and
+     * when every seat is mid-turn the request queues for one. */
+    bool admitted = admission_ok_or_evict_locked(sched, sid);
+    if (!admitted && !sched->sessions_evictable) {
         pthread_mutex_unlock(&sched->mu);
         if (retry_after_s) *retry_after_s = 30;
         return BS_ACQUIRE_AT_CAPACITY;
+    }
+    if (sched->shutdown) {
+        pthread_mutex_unlock(&sched->mu);
+        return BS_ACQUIRE_SHUTDOWN;
     }
 
     /* A resend of a request this session is still prefilling waits for that
@@ -3736,7 +3812,7 @@ bs_acquire_result bs_slot_acquire_or_wait(pn_batch_sched *sched,
     make_deadline(&hold_until, hold_ms);
 
     /* Fast path: slot free and pressure OK — claim immediately. */
-    if (!hold && sched->pressure_level < BS_PRESSURE_HOLD_LEVEL) {
+    if (admitted && !hold && sched->pressure_level < BS_PRESSURE_HOLD_LEVEL) {
         int s = try_claim_idle(sched, sid);
         if (s >= 0) {
             pthread_mutex_unlock(&sched->mu);
@@ -3773,12 +3849,34 @@ bs_acquire_result bs_slot_acquire_or_wait(pn_batch_sched *sched,
             result = BS_ACQUIRE_SHUTDOWN;
             break;
         }
+        /* A client that left while queued never takes a slot. */
+        if (alive && !alive(alive_ud)) {
+            result = BS_ACQUIRE_CLIENT_GONE;
+            break;
+        }
 
-        /* Other families may have taken the last seats while we waited. */
-        if (bs_admission_check_locked(sched, sid) != BS_ACQUIRE_OK) {
+        /* Other families may have taken the last seats while we waited.
+         * Evictable seats: take an idle one, else wait for one to go idle. */
+        bool admitted = admission_ok_or_evict_locked(sched, sid);
+        if (sched->shutdown)
+            continue;
+        if (!admitted && !sched->sessions_evictable) {
             if (retry_after_s) *retry_after_s = 30;
             result = BS_ACQUIRE_AT_CAPACITY;
             break;
+        }
+        if (!admitted) {
+            if (wait_ms <= 0) {
+                if (retry_after_s) *retry_after_s = 2;
+                result = BS_ACQUIRE_429;
+                break;
+            }
+            if (wait_idle_until(sched, &deadline, alive != NULL) != 0) {
+                if (retry_after_s) *retry_after_s = 2;
+                result = BS_ACQUIRE_TIMEOUT;
+                break;
+            }
+            continue;
         }
 
         /* D3: if pressure is TIGHT/CRITICAL, stay queued — don't admit a new
@@ -3796,8 +3894,7 @@ bs_acquire_result bs_slot_acquire_or_wait(pn_batch_sched *sched,
                 break;
             }
             /* Timed wait for pressure to clear or a slot to open. */
-            int rc = pthread_cond_timedwait(&sched->cv_idle, &sched->mu,
-                                            &deadline);
+            int rc = wait_idle_until(sched, &deadline, alive != NULL);
             if (rc != 0) {
                 /* Timeout. */
                 if (retry_after_s) *retry_after_s = 2;
@@ -3840,8 +3937,7 @@ bs_acquire_result bs_slot_acquire_or_wait(pn_batch_sched *sched,
             break;
         }
 
-        int rc = pthread_cond_timedwait(&sched->cv_idle, &sched->mu,
-                                        &deadline);
+        int rc = wait_idle_until(sched, &deadline, alive != NULL);
         if (rc != 0) {
             if (retry_after_s) *retry_after_s = 2;
             result = BS_ACQUIRE_TIMEOUT;

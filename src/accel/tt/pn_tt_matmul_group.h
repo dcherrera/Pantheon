@@ -455,6 +455,14 @@ typedef struct pn_tt_matmul_group {
     pn_tt_grid_marks grid_marks;       /**< G.2: a mark per detached projection */
     uint32_t grid_last_mark;           /**< the mark of the last detached projection */
     uint64_t grid_mark_waits, grid_mark_full; /**< waits by mark / that fell back to a full wait */
+    /** GRID IDLE GUARD (pn_tt_grid_idle.h): host seconds of the last grid descriptor (0 none),
+     *  the longest host gap between two (and the projection count it ended at), the re-arms
+     *  and keepalive NOP rounds it took this prefill. */
+    double grid_alive_seconds;
+    double grid_longest_gap;
+    uint64_t grid_longest_gap_at;
+    bool grid_longest_gap_streamed; /**< the longest gap ended inside a stream */
+    uint32_t grid_idle_rearms, grid_keepalive_rounds;
     bool grid_unsplit_ok; /**< pn_tt_matmul_grid_unsplit_allow() */
     uint32_t grid_stash_address;
     uint32_t grid_tile_bytes, grid_depth;
@@ -639,6 +647,15 @@ void pn_tt_matmul_group_retire(pn_tt_device *device);
 
 /** PM 5 keepalive: NOP an idle decode group's members (see pn_tt_matmul_group.c). */
 int pn_tt_matmul_group_keepalive(pn_tt_device *device, double min_idle_seconds);
+
+/**
+ * GRID IDLE GUARD (pn_tt_grid_idle.h) at a quiet point (no stream open): a running prefill grid
+ * idle >= `min_idle_seconds` gets a NOP on every core; idle near the retire limit is stopped by
+ * asking and started fresh. Exact: no descriptor changes. `PN_TT_RED=grid_idle_guard_off` makes
+ * it do nothing (the arm that must abort under `PN_TT_PREFILL_STALL_MS`).
+ * @return NOPs sent, 0 if none were due, -1 on a card error
+ */
+int pn_tt_matmul_grid_keepalive(pn_tt_device *device, double min_idle_seconds);
 
 /** Idle past `PN_TT_RESIDENCY_IDLE_RETIRE_MS` with nothing outstanding? See the .c. */
 bool pn_tt_matmul_group_idle_expired(const pn_tt_device *device, double *out_idle_seconds);

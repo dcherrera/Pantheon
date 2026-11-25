@@ -1041,6 +1041,43 @@ static void sg_require_full_logits(const sg_tg_ctx *c,
     if (on && !sg_needs_full_logits(c, params)) return;
     if (!pn_qwen35moe_owns_state(model)) return;
     pn_qwen35moe_state_set_full_logits(state, on);
+    if (!on)
+        pn_qwen35moe_state_set_short_row_ok(state, 0);
+}
+
+/* Short logits row (QWEN35_SHORT_ROW, qwen35moe.h): offer it to a grammar turn without
+ * logprobs / logit_bias, only on a path whose sampler takes the handoff below (single-user,
+ * and the batched L3 driver: batch_sched.c). Withdrawn with the full row at turn end. */
+static void sg_short_row_offer(const sg_tg_ctx *c, const sg_gen_params *params,
+                               pn_model *model, pn_state *state, int on)
+{
+    if (!state || !pn_qwen35moe_owns_state(model)) return;
+    pn_qwen35moe_state_set_short_row_ok(state, on && c->enabled &&
+                                                   !sg_full_logits_always(params));
+}
+
+/* Before a draw from `row`: when the forward handed this state a short row, the sampler
+ * gets its bound and the fill (engine.h pn_sampler_short_row). */
+static void sg_short_row_handoff(pn_model *model, pn_state *state, const float *row)
+{
+    float bound;
+
+    if (state && pn_qwen35moe_owns_state(model) && pn_qwen35moe_short_row(state, &bound))
+        pn_sampler_short_row(row, bound, pn_qwen35moe_short_row_fill,
+                             pn_qwen35moe_short_row_ctx(state));
+}
+
+/* The short-row counters, process-wide since start (fallback rate = 1 - decided/draws). */
+static void sg_short_row_report(void)
+{
+    pn_short_row_stats st;
+
+    pn_sampler_short_row_stats(&st);
+    if (!st.draws) return;
+    fprintf(stderr, "[short_row] draws=%lu decided=%lu refill entry=%lu mask=%lu greedy=%lu "
+            "top64=%lu margin=%lu fill_failed=%lu\n", st.draws, st.decided,
+            st.refill[PN_SR_ENTRY], st.refill[PN_SR_MASK], st.refill[PN_SR_GREEDY],
+            st.refill[PN_SR_TOP64], st.refill[PN_SR_MARGIN], st.fill_failed);
 }
 
 /* ============================================================
@@ -3330,6 +3367,7 @@ int sg_run_completion(pn_model *model, pn_state *state,
         sg_require_full_logits(&tg, params, model, state, 1);
     else
         sg_arm_full_logits(&tg, params, model, state);
+    sg_short_row_offer(&tg, params, model, state, 1);
 
     /* OpenAI `logprobs` (inert unless the request asked).  Sized like gen_toks:
      * max_tokens plus the reasoning force-close headroom. */
@@ -3411,6 +3449,7 @@ int sg_run_completion(pn_model *model, pn_state *state,
 #endif
         {
             pn_sampler_row_hint(logits); /* a backend's survivor list, this draw only */
+            sg_short_row_handoff(model, state, (const float *)logits->data);
             next = pn_sample_next_token((float *)logits->data, n_vocab,
                                         &sp, recent, n_recent);
             tm_free(logits);
@@ -3766,6 +3805,7 @@ int sg_run_completion(pn_model *model, pn_state *state,
     sg_tg_report_response_format(&tg, result);
     sg_tg_report_tool_call(&tg, result);
     sg_tg_report_mask_density(&tg);
+    sg_short_row_report();
     sg_require_full_logits(&tg, params, model, state, 0);
     sg_tg_free(&tg);
     /* Frees only the raw record buffer — the RESOLVED entries live on the result
@@ -3974,6 +4014,7 @@ int sg_run_completion_batched(pn_model *model, pn_batch_sched *sched,
         sg_require_full_logits(&tg, params, model, state, 1);
     else
         sg_arm_full_logits(&tg, params, model, state);
+    sg_short_row_offer(&tg, params, model, state, bs_driver_sampling(sched));
 
     /* OpenAI `logprobs` (inert unless the request asked).  The sink pointer is
      * copied into the slot's sampling params by bs_slot_bind, so the DRIVER
@@ -4091,6 +4132,7 @@ int sg_run_completion_batched(pn_model *model, pn_batch_sched *sched,
 
     /* ── 6. Sample first decode token from prefill logits ── */
     pn_reqprof_phase_start(PN_REQ_FIRST_SAMPLE);
+    sg_short_row_handoff(model, state, (const float *)logits->data);
     uint32_t next = pn_sample_next_token((float *)logits->data,
                                          model->config.n_vocab,
                                          &sp, recent, n_recent);
@@ -4526,6 +4568,7 @@ out:
     sg_tg_report_response_format(&tg, result);
     sg_tg_report_tool_call(&tg, result);
     sg_tg_report_mask_density(&tg);
+    sg_short_row_report();
     sg_require_full_logits(&tg, params, model, state, 0);
     sg_tg_free(&tg);
     /* Same reasoning for the logprob sink (also reached through sl->sp): the

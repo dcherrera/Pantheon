@@ -711,6 +711,26 @@ tm_tensor *pn_qwen35moe_forward_metal(pn_model *model, uint32_t token,
  */
 void pn_qwen35moe_state_set_full_logits(pn_state *state, int on);
 
+/** Short logits row (QWEN35_SHORT_ROW, default on, "0" = off; engine.h pn_sampler_short_row): a
+ * full_logits slot whose turn allows it gets the
+ * exact top PN_QWEN35MOE_SHORT_ROW_K of its row instead of the 1 MB copy, the full
+ * row kept on the die for pn_qwen35moe_short_row_fill. The serve allows it per turn
+ * (a grammar turn without logprobs / logit_bias); off clears it. No-op for NULL. */
+#define PN_QWEN35MOE_SHORT_ROW_K 257
+void pn_qwen35moe_state_set_short_row_ok(pn_state *state, int on);
+
+/** 1 and *bound (the 257th value) when `state`'s logits row is a short row this step,
+ *  else 0 (the row is what it always was). Hand both to pn_sampler_short_row with
+ *  pn_qwen35moe_short_row_fill and the qwen35 state (pn_qwen35moe_short_row_ctx). */
+int pn_qwen35moe_short_row(pn_state *state, float *bound);
+
+/** The fill context for `state` (its qwen35 state), or NULL. */
+void *pn_qwen35moe_short_row_ctx(pn_state *state);
+
+/** pn_short_row_fill_fn: write the step's full row into `row` (the state's logits) from
+ *  the die; 0 on success, also when the row is already full. */
+int pn_qwen35moe_short_row_fill(void *ctx, float *row, int n_vocab);
+
 /** True when `model`'s pn_state is a pn_qwen35moe_state (MoE + dense Bonsai). */
 int pn_qwen35moe_owns_state(const pn_model *model);
 

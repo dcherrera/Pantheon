@@ -1249,3 +1249,36 @@ void pn_qwen35moe_state_set_full_logits(pn_state *state, int on)
     if (!state || !state->kv_cache) return;
     ((pn_qwen35moe_state *)state->kv_cache)->full_logits = on ? 1 : 0;
 }
+
+void pn_qwen35moe_state_set_short_row_ok(pn_state *state, int on)
+{
+    if (!state || !state->kv_cache) return;
+    ((pn_qwen35moe_state *)state->kv_cache)->short_row_ok = on ? 1 : 0;
+}
+
+int pn_qwen35moe_short_row(pn_state *state, float *bound)
+{
+    const pn_qwen35moe_state *s = state ? (const pn_qwen35moe_state *)state->kv_cache : NULL;
+
+    if (!s || !s->short_row_live) return 0;
+    if (bound) *bound = s->short_row_bound;
+    return 1;
+}
+
+void *pn_qwen35moe_short_row_ctx(pn_state *state)
+{
+    return state ? state->kv_cache : NULL;
+}
+
+int pn_qwen35moe_short_row_fill(void *ctx, float *row, int n_vocab)
+{
+    pn_qwen35moe_state *s = (pn_qwen35moe_state *)ctx;
+
+    if (!s || !s->short_row_live) return 0;
+#ifdef USE_CUDA
+    return pn_qwen35moe_short_row_fill_cuda(s, row, n_vocab);
+#else
+    (void)row; (void)n_vocab;
+    return -1;
+#endif
+}

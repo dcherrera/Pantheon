@@ -41,6 +41,8 @@ The authoritative, code-audited reference (2026-07-12) — every environment fla
 
 - [**HTTP API**](reference/http-api.md) — `/v1/models`, `/v1/chat/completions` (SSE), `/admin/models/*`, `/admin/dies`
 
+- [**Gateway mode**](guides/gateway-mode.md) — `serve --gateway` behind a trusted gateway: API-only routes, bearer key, tenant-scoped sessions, billing records
+
 - [**Supported Models**](reference/supported-models.md) — every verified model with its quant, config, measured throughput and a runnable command
 
 ## Architecture — serving-era (code-audited 2026-07-12)

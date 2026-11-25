@@ -126,6 +126,8 @@
 #include "qwen35moe_internal.h"
 #include "qwen35moe_kv_q4.h"
 #include "qwen35moe_mtp_ring.h"
+#include "qwen35moe_pcie_stage.h"
+#include "qwen35moe_step_ledger.h"
 
 #ifdef USE_CUDA
 
@@ -804,6 +806,10 @@ typedef struct pn_qwen35moe_gpu {
     uint64_t tp_sgraph_key[2], tp_sgraph_warm[2];
     int tp_sgraph_fail[2];
     fc_event *tp_gev[PN_DIE_LAYER_SPLIT_MAX_DIES];
+    /* QWEN35_PCIE_*: staging of the step's input / hop / position copies (qw_pcie_for);
+     * NULL = legacy blocking copies. pcie_failed: creation failed once, never retried. */
+    qw_pcie_stage *pcie;
+    int pcie_failed;
     /* Per rank: global conv channel of each local one, global v-head of each
      * local one (host state transfers gather / scatter through these). */
     int *tp_chan[2], *tp_vhead[2];
@@ -883,6 +889,12 @@ typedef struct pn_qwen35moe_gpu {
      * is NOT per slot — it belongs to the per-user pn_qwen35moe_state whose
      * logits buffer it describes. */
     const void *slot_state[PN_QWEN35MOE_GPU_MAX_SLOTS];
+    /* Short logits row: a constrained slot's full row kept on the head die until its
+     * draw (srow_state[r] = the state it belongs to, NULL = free; the buffers are kept
+     * for reuse and freed with the model). */
+    const void *srow_state[PN_QWEN35MOE_GPU_MAX_SLOTS];
+    fc_buffer *srow_buf[PN_QWEN35MOE_GPU_MAX_SLOTS];
+    fc_cuda_ctx *srow_ctx[PN_QWEN35MOE_GPU_MAX_SLOTS];
     /* What each slot row's SSM image is, so a resumed turn can re-seed the
      * shared SSM buffers ON THE CARD instead of from host RAM: the bound
      * state's KV content generation at bind and the position the image is at
@@ -3690,6 +3702,8 @@ void pn_qwen35moe_gpu_free(pn_qwen35moe_model *model)
         fc_graph_free(g->seg[i].graph);
         fc_event_free(g->as_ev[i]);
     }
+    qw_pcie_stage_free(g->pcie);
+    g->pcie = NULL;
     for (int i = 0; i < PN_DIE_LAYER_SPLIT_MAX_DIES; i++) {   /* QWEN35_TP */
         for (int l = 0; l < QW_N_LANES; l++) {
             qw_tp_xset *x = &g->tpx[l];
@@ -3744,6 +3758,8 @@ void pn_qwen35moe_gpu_free(pn_qwen35moe_model *model)
             fc_graph_free(g->vgraph[i][r].graph);
     }
     fc_buffer_free(g->spec_logits);
+    for (int r = 0; r < PN_QWEN35MOE_GPU_MAX_SLOTS; r++)
+        fc_buffer_free(g->srow_buf[r]);
     for (int i = 0; i < 4; i++) {
         free(g->bhost[i]);
         free(g->bhost2[i]);
@@ -3783,6 +3799,9 @@ void pn_qwen35moe_gpu_forget_state_cuda(const pn_qwen35moe_state *s)
         for (int r = 0; r < PN_QWEN35MOE_GPU_MAX_SLOTS; r++)
             if (g->ckpt_state[r] == (const void *)s)
                 g->ckpt_state[r] = NULL;
+        for (int r = 0; r < PN_QWEN35MOE_GPU_MAX_SLOTS; r++)
+            if (g->srow_state[r] == (const void *)s)
+                g->srow_state[r] = NULL;
         /* Attention: the per-slot bind bookkeeping. kv_slot_kv is the pointer
          * the ring-realloc rescue dereferences; kv_slot_host_id / kv_gen /
          * kv_synced_pos name the same session's ring buffers by ADDRESS, so
@@ -5113,6 +5132,7 @@ static void gpu_present_topk(pn_qwen35moe_state *s, const int *ids,
 {
     float *dst = s->logits;
 
+    s->short_row_live = 0;          /* a short row is marked by its presenter, after this */
     if (!s->topk_filled) {          /* first fetch into this state's buffer */
         for (int i = 0; i < n_vocab; i++)
             dst[i] = -INFINITY;
@@ -5138,13 +5158,32 @@ static void gpu_present_topk(pn_qwen35moe_state *s, const int *ids,
  *
  * Full mode (k == 0, or any top-k failure): the original full n_vocab D2H
  * copy. */
-static void gpu_fetch_logits(fc_cuda_ctx *ctx, fc_buffer *logits_g,
+static int short_row_on(void);
+static unsigned int short_row_topk_opts(void);
+static int short_row_presented(void);
+static int short_row_keep(pn_qwen35moe_gpu *g, fc_cuda_ctx *ctx, fc_buffer *logits_all,
+                          int u, pn_qwen35moe_state *s, int n_vocab);
+
+static void gpu_fetch_logits(pn_qwen35moe_gpu *g, fc_cuda_ctx *ctx, fc_buffer *logits_g,
                              pn_qwen35moe_state *s, int n_vocab)
 {
     int k = gpu_topk_k();
     if (s && s->full_logits) k = 0;   /* constrained decode needs every logit */
     int ids[FC_TOPK_MAX];
     float vals[FC_TOPK_MAX];
+    int nan_row = 1;
+
+    /* Short row for a single-row decode (g given; see gpu_present_slots_logits). */
+    if (g && s && s->full_logits && s->short_row_ok && short_row_on() &&
+        fc_topk_logits_slots_opt_ctx(ctx, logits_g, 1, n_vocab, PN_QWEN35MOE_SHORT_ROW_K, ids,
+                                     vals, &nan_row, short_row_topk_opts()) == 0 &&
+        nan_row == 0 && vals[PN_QWEN35MOE_SHORT_ROW_K - 2] > vals[PN_QWEN35MOE_SHORT_ROW_K - 1] &&
+        short_row_keep(g, ctx, logits_g, 0, s, n_vocab) == 0) {
+        gpu_present_topk(s, ids, vals, short_row_presented(), n_vocab);
+        s->short_row_bound = vals[PN_QWEN35MOE_SHORT_ROW_K - 1];
+        s->short_row_live = 1;
+        return;
+    }
 
     if (k > 0 &&
         fc_topk_logits_ctx(ctx, logits_g, n_vocab, k, ids, vals) == 0) {
@@ -5154,6 +5193,7 @@ static void gpu_fetch_logits(fc_cuda_ctx *ctx, fc_buffer *logits_g,
 
     fc_buffer_to_cpu(logits_g, s->logits);
     s->topk_filled = 0;             /* logits holds real values everywhere */
+    s->short_row_live = 0;
 }
 
 /* QWEN35_PERSLOT_FULL_LOGITS (default on; =0 decides for the whole batch):
@@ -5168,6 +5208,98 @@ static int perslot_full_logits_on(void)
         v = (env && env[0] == '0') ? 0 : 1;
     }
     return v;
+}
+
+/* QWEN35_SHORT_ROW (default on; "0" = off): a constrained slot whose turn allows it
+ * (short_row_ok) gets its exact top PN_QWEN35MOE_SHORT_ROW_K instead of the full
+ * 1 MB row over the host link, the full row kept on the die for the sampler's fill
+ * (engine.h pn_sampler_short_row; why the draw stays exact: engine.c SHORT ROW). */
+static int short_row_on(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *env = getenv("QWEN35_SHORT_ROW");
+        v = qw_env_flag_default_on(env);
+    }
+    return v;
+}
+
+/* QWEN35_TOPK_FAST (default on; "0" = off): the short row's device top-k ranks over several
+ * blocks per row and replays as a captured graph with a pinned result copy
+ * (fc_topk_logits_slots_opt_ctx). Same pairs and NaN flags; ~0.15 ms less a step at 1
+ * slot, ~0.6 ms at 4 on a K80. */
+static unsigned int short_row_topk_opts(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *env = getenv("QWEN35_TOPK_FAST");
+        v = qw_env_flag_default_on(env);
+    }
+    return v ? FC_TOPK_OPT_ROW_BLOCKS | FC_TOPK_OPT_GRAPH : 0u;
+}
+
+/* Red arms (gates only; PN_SHORT_ROW_RED): `fill` = the fill reports success and writes
+ * nothing, so every draw that needed the full row samples the short one; `k40` = that, with
+ * only the top 40 presented (the short row always trusted, and too short). */
+static int short_row_red(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("PN_SHORT_ROW_RED");
+        v = !e ? 0 : strcmp(e, "fill") == 0 ? 1 : strcmp(e, "k40") == 0 ? 2 : 0;
+    }
+    return v;
+}
+static int short_row_red_fill(void) { return short_row_red() != 0; }
+static int short_row_presented(void) { return short_row_red() == 2 ? 40 : PN_QWEN35MOE_SHORT_ROW_K; }
+
+/* Keep row u of `logits_all` (on ctx) on the die for s's draw. 0 on success; -1 = no
+ * keep slot or no memory (the caller copies the full row as before). */
+static int short_row_keep(pn_qwen35moe_gpu *g, fc_cuda_ctx *ctx, fc_buffer *logits_all,
+                          int u, pn_qwen35moe_state *s, int n_vocab)
+{
+    const size_t row_bytes = (size_t)n_vocab * sizeof(float);
+    int r = -1;
+
+    for (int i = 0; i < PN_QWEN35MOE_GPU_MAX_SLOTS && r < 0; i++)
+        if (g->srow_state[i] == (const void *)s)
+            r = i;
+    for (int i = 0; i < PN_QWEN35MOE_GPU_MAX_SLOTS && r < 0; i++)
+        if (!g->srow_state[i])
+            r = i;
+    if (r < 0)
+        return -1;
+    if (!g->srow_buf[r] || g->srow_ctx[r] != ctx) {
+        fc_buffer_free(g->srow_buf[r]);
+        g->srow_buf[r] = fc_buffer_alloc_ctx(ctx, row_bytes);
+        g->srow_ctx[r] = g->srow_buf[r] ? ctx : NULL;
+        if (!g->srow_buf[r])
+            return -1;
+    }
+    fc_buffer_copy_d2d_ctx(ctx, g->srow_buf[r], 0, logits_all, (size_t)u * row_bytes, row_bytes);
+    g->srow_state[r] = s;
+    s->short_row_slot = r;
+    s->short_row_g = g;
+    return 0;
+}
+
+int pn_qwen35moe_short_row_fill_cuda(pn_qwen35moe_state *s, float *row, int n_vocab)
+{
+    pn_qwen35moe_gpu *g = (pn_qwen35moe_gpu *)s->short_row_g;
+    const int r = s->short_row_slot;
+
+    if (!g || r < 0 || r >= PN_QWEN35MOE_GPU_MAX_SLOTS || g->srow_state[r] != (const void *)s ||
+        !g->srow_buf[r])
+        return -1;
+    s->short_row_live = 0;
+    if (row == s->logits)
+        s->topk_filled = 0;          /* the row holds real values everywhere */
+    if (short_row_red_fill())
+        return 0;
+    /* The keep copy runs on the head's stream; commit it before the legacy-stream D2H. */
+    fc_sync_ctx(g->srow_ctx[r]);
+    fc_buffer_to_cpu_at(g->srow_buf[r], row, 0, (size_t)n_vocab * sizeof(float));
+    return 0;
 }
 
 /* Deliver each slot's LM-head result out of the batched [nslots][n_vocab]
@@ -5207,8 +5339,8 @@ static int perslot_full_logits_on(void)
  *
  * Thread-safe: no (per-die, called inside the model's GPU turn)
  */
-static int gpu_present_slots_logits(fc_cuda_ctx *ctx, fc_buffer *logits_all,
-                                    gpu_die_scratch *sc,
+static int gpu_present_slots_logits(pn_qwen35moe_gpu *g, fc_cuda_ctx *ctx,
+                                    fc_buffer *logits_all, gpu_die_scratch *sc,
                                     pn_qwen35moe_state *const *sts, int nslots,
                                     int n_vocab)
 {
@@ -5217,8 +5349,48 @@ static int gpu_present_slots_logits(fc_cuda_ctx *ctx, fc_buffer *logits_all,
     int ids_all[PN_QWEN35MOE_GPU_MAX_SLOTS * FC_TOPK_MAX];
     float vals_all[PN_QWEN35MOE_GPU_MAX_SLOTS * FC_TOPK_MAX];
 
-    for (int u = 0; u < nslots; u++)
+    for (int u = 0; u < nslots; u++) {
         if (!sts[u]) return -1;
+        sts[u]->short_row_live = 0;
+    }
+
+    /* Short rows (short_row_on): one exact top-K' over every row, K' = max(k, 257); the
+     * unconstrained slots take its first k (the same pairs a k call returns: the order is
+     * total), an eligible constrained slot its 257 when the row is clean (no NaN, 256th
+     * strictly above 257th), else the full row as below. */
+    if (k > 0 && perslot_full_logits_on() && short_row_on()) {
+        const int ks = k > PN_QWEN35MOE_SHORT_ROW_K ? k : PN_QWEN35MOE_SHORT_ROW_K;
+        int n_short = 0, nan_rows[PN_QWEN35MOE_GPU_MAX_SLOTS];
+        for (int u = 0; u < nslots; u++)
+            if (sts[u]->full_logits && sts[u]->short_row_ok) n_short++;
+        if (n_short > 0 && ks <= FC_TOPK_MAX && nslots <= PN_QWEN35MOE_GPU_MAX_SLOTS &&
+            fc_topk_logits_slots_opt_ctx(ctx, logits_all, nslots, n_vocab, ks, ids_all,
+                                         vals_all, nan_rows, short_row_topk_opts()) == 0) {
+            if (qw_ledger_on())
+                qw_ledger_lap(QW_LH_PRESENT_WAIT);
+            for (int u = 0; u < nslots; u++) {
+                const int *iu = ids_all + (size_t)u * ks;
+                const float *vu = vals_all + (size_t)u * ks;
+                if (!sts[u]->full_logits) {
+                    gpu_present_topk(sts[u], iu, vu, k, n_vocab);
+                } else if (sts[u]->short_row_ok && nan_rows[u] == 0 &&
+                           vu[PN_QWEN35MOE_SHORT_ROW_K - 2] > vu[PN_QWEN35MOE_SHORT_ROW_K - 1] &&
+                           short_row_keep(g, ctx, logits_all, u, sts[u], n_vocab) == 0) {
+                    gpu_present_topk(sts[u], iu, vu, short_row_presented(), n_vocab);
+                    sts[u]->short_row_bound = vu[PN_QWEN35MOE_SHORT_ROW_K - 1];
+                    sts[u]->short_row_live = 1;
+                } else {
+                    fc_buffer_to_cpu_at(logits_all, sts[u]->logits,
+                                        (size_t)u * row_bytes, row_bytes);
+                    sts[u]->topk_filled = 0;
+                }
+            }
+            if (qw_ledger_on())
+                qw_ledger_lap(QW_LH_PRESENT_COPY);
+            return 0;
+        }
+        /* No eligible slot, or the K' call failed: exactly the path below. */
+    }
 
     if (k > 0 && perslot_full_logits_on()) {
         int n_topk = 0;
@@ -5236,17 +5408,22 @@ static int gpu_present_slots_logits(fc_cuda_ctx *ctx, fc_buffer *logits_all,
              * matvec is on ctx->stream, so commit it explicitly. */
             fc_sync_ctx(ctx);
         }
+        if (qw_ledger_on())
+            qw_ledger_lap(QW_LH_PRESENT_WAIT);
         if (reduced || n_topk == 0) {
             for (int u = 0; u < nslots; u++) {
                 if (sts[u]->full_logits) {
                     fc_buffer_to_cpu_at(logits_all, sts[u]->logits,
                                         (size_t)u * row_bytes, row_bytes);
                     sts[u]->topk_filled = 0;
+                    sts[u]->short_row_live = 0;
                 } else {
                     gpu_present_topk(sts[u], ids_all + (size_t)u * k,
                                      vals_all + (size_t)u * k, k, n_vocab);
                 }
             }
+            if (qw_ledger_on())
+                qw_ledger_lap(QW_LH_PRESENT_COPY);
             return 0;
         }
         /* The batched reduction failed: fall through to the legacy path, which
@@ -5265,7 +5442,7 @@ static int gpu_present_slots_logits(fc_cuda_ctx *ctx, fc_buffer *logits_all,
         fc_buffer_copy_d2d_ctx(ctx, sc->r_logits, 0, logits_all,
                                (size_t)u * row_bytes, row_bytes);
         fc_sync_ctx(ctx);
-        gpu_fetch_logits(ctx, sc->r_logits, sts[u], n_vocab);
+        gpu_fetch_logits(NULL, ctx, sc->r_logits, sts[u], n_vocab);
     }
     return 0;
 }
@@ -5314,7 +5491,7 @@ static float *tp_forward_token(pn_qwen35moe_model *m, pn_qwen35moe_gpu *g, uint3
                     cfg->rms_norm_eps);
     gpu_matvec(&g->output, sc->r_xnorm, sc->r_logits, g->host.a, g->host.b);
     fc_sync_ctx(ctx);
-    gpu_fetch_logits(ctx, sc->r_logits, s, cfg->n_vocab);
+    gpu_fetch_logits(g, ctx, sc->r_logits, s, cfg->n_vocab);
     return s->logits;
 }
 
@@ -5439,7 +5616,7 @@ float *pn_qwen35moe_forward_token_cuda(pn_qwen35moe_model *m, uint32_t token,
         if (prof_on()) { fc_sync_ctx(g->ctx[d]); prof_phase[3] += prof_now() - th0; }
         double tl0 = prof_on() ? prof_now() : 0.0;
         fc_sync_ctx(g->ctx[d]);
-        gpu_fetch_logits(g->ctx[d], logits_g, s, cfg->n_vocab);
+        gpu_fetch_logits(g, g->ctx[d], logits_g, s, cfg->n_vocab);
         if (prof_on()) prof_phase[4] += prof_now() - tl0;
         qwen35moe_dbg("result_output", -1, s->logits, cfg->n_vocab);
     }
@@ -8282,6 +8459,65 @@ static int tp_verify_stage(pn_qwen35moe_model *m, pn_qwen35moe_gpu *g, int s,
  * runs its layers on its pair, the hop to stage 1 is staged through the host
  * (never a cross-board peer copy), and the head runs on die 3 (head_ctx). On
  * return *ctx_out / *b_out / *sc_out are the head die's context and scratch. */
+/* ---- QWEN35_PCIE_*: the TP step's per-step copies through qwen35moe_pcie_stage ---- */
+
+/* Rows the input / hop staging holds: the widest decode-slots step or verify. */
+#define QW_PCIE_MAX_ROWS \
+    (PN_QWEN35MOE_GPU_MAX_SLOTS > FC_ATTN_ROWS_MAX ? PN_QWEN35MOE_GPU_MAX_SLOTS : FC_ATTN_ROWS_MAX)
+
+/* The TP step's staging when a QWEN35_PCIE_* lever is on and `bytes` fit it (created on
+ * first use), else NULL: the legacy blocking copies through bhost[0]. */
+static qw_pcie_stage *qw_pcie_for(pn_qwen35moe_gpu *g, const pn_qwen35moe_config *cfg,
+                                  size_t bytes)
+{
+    const qw_pcie_flags f = qw_pcie_flags_get();
+    if (!g->tp || !qw_pcie_flags_any(f) || g->pcie_failed)
+        return NULL;
+    if (!g->pcie) {
+        g->pcie = qw_pcie_stage_create(g->ctx,
+                                       (size_t)QW_PCIE_MAX_ROWS * cfg->n_embd * sizeof(float),
+                                       (size_t)2 * PN_QWEN35MOE_GPU_MAX_SLOTS * sizeof(int32_t),
+                                       f);
+        g->pcie_failed = g->pcie == NULL;
+    }
+    return g->pcie && bytes <= qw_pcie_stage_rows_cap(g->pcie) ? g->pcie : NULL;
+}
+
+/* Host rows for stage 0's embedded input: the staging's (once its earlier uploads have
+ * read them) or bhost[0]. NULL on a device error. */
+static float *qw_stage_input_rows(pn_qwen35moe_gpu *g, const pn_qwen35moe_config *cfg,
+                                  size_t bytes)
+{
+    qw_pcie_stage *ps = qw_pcie_for(g, cfg, bytes);
+    return ps ? qw_pcie_stage_input_rows(ps) : g->bhost[0];
+}
+
+/* Whether the host drains stage 0's rank 0 before the hop: every path but the
+ * event-chained hop, which queues the hop behind it instead. */
+static int qw_stage_hop_host_wait(pn_qwen35moe_gpu *g, const pn_qwen35moe_config *cfg,
+                                  size_t bytes)
+{
+    qw_pcie_stage *ps = qw_pcie_for(g, cfg, bytes);
+    return !ps || !qw_pcie_stage_flags(ps).hop_event;
+}
+
+/* Stage s's input rows onto both of its ranks: stage 0's from the input rows
+ * (qw_stage_input_rows), stage 1's from stage 0's rank 0 (`prev`). Returns 0, or -1. */
+static int qw_stage_input_upload(pn_qwen35moe_gpu *g, const pn_qwen35moe_config *cfg, int s,
+                                 gpu_batch_scratch *prev, gpu_batch_scratch *const b[2],
+                                 size_t bytes)
+{
+    qw_pcie_stage *ps = qw_pcie_for(g, cfg, bytes);
+    if (ps)
+        return s == 0 ? qw_pcie_stage_fan_in(ps, b[0]->hidden, b[1]->hidden, bytes)
+                      : qw_pcie_stage_hop(ps, prev->hidden, b[0]->hidden, b[1]->hidden, bytes);
+    if (s == 1)
+        fc_buffer_to_cpu_n(prev->hidden, g->bhost[0], bytes);
+    fc_buffer_from_cpu_n(b[0]->hidden, g->bhost[0], bytes);
+    fc_buffer_from_cpu_n(b[1]->hidden, g->bhost[0], bytes);
+    return 0;
+}
+
 static int tp_batch_walk(pn_qwen35moe_model *m, pn_qwen35moe_gpu *g, const uint32_t *tokens,
                          int n, pn_qwen35moe_state *st, int pos0, int spec,
                          fc_cuda_ctx **ctx_out, gpu_batch_scratch **b_out,
@@ -8304,14 +8540,16 @@ static int tp_batch_walk(pn_qwen35moe_model *m, pn_qwen35moe_gpu *g, const uint3
                 return -1;
         }
         if (s == 0) {
+            float *rows = qw_stage_input_rows(g, cfg, hidden_bytes);
+            if (!rows)
+                return -1;
             for (int t = 0; t < n; t++)
-                pn_qwen35moe_model_embed_row(m, tokens[t], g->bhost[0] + (size_t)t * c);
-        } else {
+                pn_qwen35moe_model_embed_row(m, tokens[t], rows + (size_t)t * c);
+        } else if (qw_stage_hop_host_wait(g, cfg, hidden_bytes)) {
             fc_sync_ctx(g->ctx[0]);
-            fc_buffer_to_cpu_n(prev->hidden, g->bhost[0], hidden_bytes);
         }
-        fc_buffer_from_cpu_n(b[0]->hidden, g->bhost[0], hidden_bytes);
-        fc_buffer_from_cpu_n(b[1]->hidden, g->bhost[0], hidden_bytes);
+        if (qw_stage_input_upload(g, cfg, s, prev, b, hidden_bytes) < 0)
+            return -1;
         /* A MoE verify runs the device-position bodies as a stage graph. */
         int vrc = spec && cfg->n_expert ? tp_verify_stage(m, g, s, b, st, pos0, n) : 1;
         if (vrc < 0)
@@ -8392,6 +8630,18 @@ static int verify_layer_prep(pn_qwen35moe_model *m, pn_qwen35moe_gpu *g, fc_cuda
     return 0;
 }
 
+/* Verify attention runs the decode slots call (the rows as slots of one ring); QWEN35_VERIFY_KVF=0
+ * keeps the rows kernel. Latched. */
+static int verify_kvf_on(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *env = getenv("QWEN35_VERIFY_KVF");
+        v = !(env && env[0] == '0');
+    }
+    return v;
+}
+
 /* The attention half of a verify layer, device-position kernels only. */
 static int verify_attn_body(pn_qwen35moe_gpu *g, gpu_attn_layer *d,
                             const pn_qwen35moe_config *cfg, gpu_batch_scratch *b, int n,
@@ -8419,7 +8669,28 @@ static int verify_attn_body(pn_qwen35moe_gpu *g, gpu_attn_layer *d,
                                    d->k_sink_g, d->v_sink_g, d->k_win_g, d->v_win_g,
                                    cfg->n_head_kv, cfg->head_dim, max_seq, pos_g, rows_g, n,
                                    pn_kvq4_sink(), pn_kvq4_win());
-    if (fc_attn_flash_decode_rows_q4_dev_ctx(ctx, b->a_q, d->k_cache_g, d->v_cache_g,
+    if (verify_kvf_on()) {
+        /* The n rows as n slots of the single-user ring (rows_g all 0, pos_g pos0..): the
+         * decode step's own call, so each row is that step's kernel at its position. */
+        float scale = qw_scale_inv_sqrt(cfg->head_dim);
+        int kps = dec_keys_per_split();
+        if (fold && fc_attn_flash_decode_slots_q4_gated_ctx(
+                        ctx, b->a_q, d->k_cache_g, d->v_cache_g, d->k_sink_g, d->v_sink_g,
+                        d->k_win_g, d->v_win_g, g->bv_m_g[di], g->bv_l_g[di], g->bv_acc_g[di],
+                        b->a_out, cfg->n_head, cfg->n_head_kv, cfg->head_dim, max_seq, pos_g,
+                        rows_g, n, launch_splits, kps, PN_QWEN35MOE_DEC_SPLIT_MAX,
+                        pn_kvq4_sink(), pn_kvq4_win(), attn_sink(), attn_window(), scale,
+                        b->a_z) != 0)
+            fold = 0;   /* as the decode step: ungated call, then the gate below */
+        if (!fold && fc_attn_flash_decode_slots_q4_ctx(
+                         ctx, b->a_q, d->k_cache_g, d->v_cache_g, d->k_sink_g, d->v_sink_g,
+                         d->k_win_g, d->v_win_g, g->bv_m_g[di], g->bv_l_g[di],
+                         g->bv_acc_g[di], b->a_out, cfg->n_head, cfg->n_head_kv,
+                         cfg->head_dim, max_seq, pos_g, rows_g, n, launch_splits, kps,
+                         PN_QWEN35MOE_DEC_SPLIT_MAX, pn_kvq4_sink(), pn_kvq4_win(),
+                         attn_sink(), attn_window(), scale) < 0)
+            return -1;
+    } else if (fc_attn_flash_decode_rows_q4_dev_ctx(ctx, b->a_q, d->k_cache_g, d->v_cache_g,
                                              d->k_sink_g, d->v_sink_g, d->k_win_g, d->v_win_g,
                                              g->bv_m_g[di], g->bv_l_g[di], g->bv_acc_g[di],
                                              fold ? b->a_z : NULL, b->a_out, cfg->n_head,
@@ -8911,7 +9182,7 @@ static float *gpu_batch_head_last_row(pn_qwen35moe_gpu *g,
                            (size_t)c * sizeof(float));
     gpu_matvec(&g->output, sc->r_xnorm, sc->r_logits, h.a, h.b);
     fc_sync_ctx(ctx);
-    gpu_fetch_logits(ctx, sc->r_logits, s, cfg->n_vocab);
+    gpu_fetch_logits(NULL, ctx, sc->r_logits, s, cfg->n_vocab);
     return s->logits;
 }
 
@@ -9079,6 +9350,7 @@ static float *gpu_batch_tokens_core(pn_qwen35moe_model *m,
         memcpy(s->logits, all_logits + (size_t)(n - 1) * cfg->n_vocab,
                (size_t)cfg->n_vocab * sizeof(float));
         s->topk_filled = 0;             /* s->logits holds real values */
+        s->short_row_live = 0;
         return s->logits;
     }
 
@@ -9986,7 +10258,16 @@ static fc_buffer *gpu_pos_buf_upload(pn_qwen35moe_gpu *g,
         staged[cap + u] = rows[u];
         b->rows_h[u] = rows[u];
     }
-    fc_buffer_from_cpu_n(g->pos_buf[die_idx], staged, sizeof(staged));
+    /* QWEN35_PCIE_POS: through the TP step's per-die staging, async. */
+    int rc = g->tp && g->pcie && qw_pcie_stage_flags(g->pcie).pos && die_idx < 4 &&
+                     ctx == g->ctx[die_idx]
+                 ? qw_pcie_stage_upload_small(g->pcie, die_idx, g->pos_buf[die_idx], staged,
+                                              sizeof(staged))
+                 : 1;
+    if (rc < 0)
+        return NULL;
+    if (rc > 0)
+        fc_buffer_from_cpu_n(g->pos_buf[die_idx], staged, sizeof(staged));
     b->rows_g = g->rows_view[die_idx];
     return g->pos_buf[die_idx];
 }
@@ -12386,7 +12667,7 @@ static int gpu_group_head(pn_qwen35moe_gpu *g, fc_cuda_ctx *ctx,
     }
     if (gpu_matvec_nx(&g->output, b->x_norm, g->spec_logits, count) < 0)
         return -1;
-    return gpu_present_slots_logits(ctx, g->spec_logits, sc, sts + slot_base,
+    return gpu_present_slots_logits(g, ctx, g->spec_logits, sc, sts + slot_base,
                                     count, cfg->n_vocab);
 }
 
@@ -12541,6 +12822,7 @@ static int gpu_split_head_slots(pn_qwen35moe_gpu *g,
                                 (size_t)u * nb * sizeof(float),
                                 (size_t)nb * sizeof(float));
             sts[u]->topk_filled = 0;    /* the row holds real values everywhere */
+            sts[u]->short_row_live = 0;
             continue;
         }
         const int   *ia = ids_a  + (size_t)u * k;
@@ -12591,8 +12873,11 @@ static int gpu_head_from_slots(pn_qwen35moe_gpu *g,
     double sp_t0 = 0.0;
     double t3t = 0.0;
     int t3p = t3prof_every();
+    const int lg = qw_ledger_on();
     sprof_begin(ctx, &sp_t0);
     if (t3p) t3t = prof_now();
+    if (lg)
+        qw_ledger_gpu(QW_LG_H_BEG, ctx);
     fc_rms_norm_nx_ctx(ctx, b->hidden, g->output_norm.buf, b->x_norm, c,
                        cfg->rms_norm_eps, nslots);
     /* A solo step's row can join the MTP head's backlog (pn_qwen35moe_mtp_push_rows after
@@ -12630,8 +12915,12 @@ static int gpu_head_from_slots(pn_qwen35moe_gpu *g,
         return -1;
     }
     if (t3p) { fc_sync_ctx(ctx); t3p_lap(T3P_FULL_MV, &t3t); }
+    if (lg) {
+        qw_ledger_gpu(QW_LG_H_END, ctx);
+        qw_ledger_lap(QW_LH_HEAD_ISSUE);
+    }
     sprof_lap(SPROF_LM_HEAD, ctx, &sp_t0);
-    if (gpu_present_slots_logits(ctx, g->spec_logits, sc, sts, nslots,
+    if (gpu_present_slots_logits(g, ctx, g->spec_logits, sc, sts, nslots,
                                  cfg->n_vocab) < 0) {
         fprintf(stderr, "[qwen35moe] decode_slots: top-k presentation of %d "
                 "rows failed\n", nslots);
@@ -12802,6 +13091,10 @@ static int tp_slots_stage_run(pn_qwen35moe_model *m, pn_qwen35moe_gpu *g, int s,
             if (ok && gr) {
                 g->tp_sgraph[s] = gr;
                 g->tp_sgraph_key[s] = key;
+                if (qw_ledger_on()) {
+                    qw_ledger_stage_mode(s, 'C');
+                    qw_ledger_graph_census(s, nslots, gr);
+                }
             } else {
                 fc_graph_free(gr);
                 if (++g->tp_sgraph_fail[s] == 4)
@@ -12811,6 +13104,8 @@ static int tp_slots_stage_run(pn_qwen35moe_model *m, pn_qwen35moe_gpu *g, int s,
         }
     }
     if (graph && g->tp_sgraph[s]) {
+        if (qw_ledger_on())
+            qw_ledger_stage_mode(s, 'R');
         if (fc_event_record_ctx(c1, e1) != 0 || fc_event_wait_ctx(c0, e1) != 0 ||
             fc_graph_launch(g->tp_sgraph[s]) != 0 ||
             fc_event_record_ctx(c0, e0) != 0 || fc_event_wait_ctx(c1, e0) != 0)
@@ -12818,6 +13113,8 @@ static int tp_slots_stage_run(pn_qwen35moe_model *m, pn_qwen35moe_gpu *g, int s,
         return 0;
     }
     g->tp_sgraph_warm[s] = key;
+    if (qw_ledger_on())
+        qw_ledger_stage_mode(s, 'D');
     for (int layer = lo; layer < hi; layer++)
         if (tp_slots_layer_dev(m, g, s, layer, b, pos_g, &pls[2 * (layer - lo)], nslots) < 0)
             return -1;
@@ -13025,10 +13322,13 @@ static int tp_slots_step(pn_qwen35moe_model *m, pn_qwen35moe_gpu *g, const uint3
     fc_buffer *pos_g[2] = { NULL, NULL };
     gpu_die_scratch *sc = NULL;
     qw_attn_slots_plan *pls = calloc((size_t)2 * cfg->n_layer, sizeof(*pls));
+    const int lg = qw_ledger_on();
     int rc = -1;
 
     if (!pls)
         return -1;
+    if (lg)
+        qw_ledger_step_begin(nslots, pos, cur != NULL);
     double t_ph = cur ? prof_now() : 0.0;
 #define QW_PD_PHASE(i) do { if (cur) { const double t_ = prof_now(); \
                                      cur->ph_ms[i] = 1000.0 * (t_ - t_ph); t_ph = t_; } } while (0)
@@ -13050,31 +13350,52 @@ static int tp_slots_step(pn_qwen35moe_model *m, pn_qwen35moe_gpu *g, const uint3
                 goto out;
         }
         if (s == 0) {
+            float *rows = qw_stage_input_rows(g, cfg, hidden_bytes);
+            if (!rows)
+                goto out;
             for (int u = 0; u < nslots; u++)
-                pn_qwen35moe_model_embed_row(m, tokens[u], g->bhost[0] + (size_t)u * c);
+                pn_qwen35moe_model_embed_row(m, tokens[u], rows + (size_t)u * c);
 #ifdef PN_PDO_RED
             /* Red build, PN_PDO_RED_ULP=1: the exactness gates must see a one-ulp change
              * on the decode lane. */
             if (g->lane == QW_LANE_DECODE && getenv("PN_PDO_RED_ULP"))
-                g->bhost[0][0] = nextafterf(g->bhost[0][0], INFINITY);
+                rows[0] = nextafterf(rows[0], INFINITY);
 #endif
         } else {
             QW_PD_PHASE(0);
-            fc_sync_ctx(g->ctx[0]);
+            if (lg)
+                qw_ledger_lap(QW_LH_MIRROR0);
+            if (qw_stage_hop_host_wait(g, cfg, hidden_bytes))
+                fc_sync_ctx(g->ctx[0]);
             QW_PD_PHASE(1);
+            if (lg) {
+                qw_ledger_lap(QW_LH_WAIT0);
+                qw_ledger_inject("hop");
+            }
             if (cur && qw_pd_hand_off(cur) < 0)
                 goto out;
-            fc_buffer_to_cpu_n(prev->hidden, g->bhost[0], hidden_bytes);
         }
-        fc_buffer_from_cpu_n(b[0]->hidden, g->bhost[0], hidden_bytes);
-        fc_buffer_from_cpu_n(b[1]->hidden, g->bhost[0], hidden_bytes);
+        if (qw_stage_input_upload(g, cfg, s, prev, b, hidden_bytes) < 0)
+            goto out;
         if (s == 1)
             QW_PD_PHASE(2);
+        if (lg && s == 1)
+            qw_ledger_lap(QW_LH_HOP);
         uint64_t key = tp_slots_stage_prep(m, g, s, b, pos_g, sts, pos, nslots, pls);
+        if (lg) {
+            qw_ledger_lap(s == 0 ? QW_LH_SETUP0 : QW_LH_SETUP1);
+            qw_ledger_gpu(s == 0 ? QW_LG_S0_BEG : QW_LG_S1_BEG, g->ctx[2 * s]);
+        }
         if (!key || tp_slots_stage_run(m, g, s, b, pos_g, pls, nslots, key) < 0) {
             fprintf(stderr, "[qwen35moe] QWEN35_TP slots step failed on stage %d (n=%d)\n", s,
                     nslots);
             goto out;
+        }
+        if (lg) {
+            qw_ledger_gpu(s == 0 ? QW_LG_S0_END : QW_LG_S1_END, g->ctx[2 * s]);
+            qw_ledger_lap(s == 0 ? QW_LH_LAUNCH0 : QW_LH_LAUNCH1);
+            if (s == 0)
+                qw_ledger_inject("shadow");
         }
         /* The host KV mirror (lazy under TP: marks it stale). */
         for (int layer = g->layer_lo[2 * s]; layer < g->layer_hi[2 * s]; layer++) {
@@ -13093,6 +13414,8 @@ static int tp_slots_step(pn_qwen35moe_model *m, pn_qwen35moe_gpu *g, const uint3
         if (s == 1)
             QW_PD_PHASE(4);
     }
+    if (lg)
+        qw_ledger_lap(QW_LH_MIRROR1);
     g->pd_cycle = cur != NULL;
     rc = gpu_head_from_slots(g, cfg, g->ctx[3], b[1], sc, sts, nslots, 1, 0.0);
     g->pd_cycle = 0;
@@ -13102,6 +13425,8 @@ static int tp_slots_step(pn_qwen35moe_model *m, pn_qwen35moe_gpu *g, const uint3
     QW_PD_PHASE(6);
 #undef QW_PD_PHASE
 out:
+    if (lg)
+        qw_ledger_step_end(rc);
     free(pls);
     return rc;
 }
@@ -15100,7 +15425,7 @@ int pn_qwen35moe_forward_token_cuda_poll(pn_qwen35moe_model *m,
     }
     /* Top-k fetch syncs only THIS card's stream (already drained by the
      * event) — no global barrier across cards. */
-    gpu_fetch_logits(ctx, sc->r_logits, s, cfg->n_vocab);
+    gpu_fetch_logits(g, ctx, sc->r_logits, s, cfg->n_vocab);
     g->as_phase = QW_ASYNC_IDLE;
     return 0;
 }

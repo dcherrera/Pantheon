@@ -45,6 +45,8 @@ tests/test_tool_call_stream
 tests/test_repetition_loop_detector
 tests/test_registry
 tests/test_base64
+tests/test_gateway_mode
+tests/test_serve_nonstream_disconnect
 tests/test_session_affinity
 tests/test_session_watch
 tests/test_serve_shutdown

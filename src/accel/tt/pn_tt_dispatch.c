@@ -2059,6 +2059,8 @@ static struct {
 
 /* The puller kernel's PULL_AWAIT_TABLE (resident_puller.c). */
 #define TS_AWAIT_TABLE 0x16D000u
+/* The puller kernel's PULL_POLL_BUFFER (resident_puller.c): the line its last AWAIT read. */
+#define TS_POLL_BUFFER 0x16C000u
 
 static bool ts_census_enabled(void)
 {
@@ -2128,6 +2130,22 @@ void pn_tt_dispatch_census_print(void)
     ts_census_report();
 }
 
+void pn_tt_dispatch_report_await_retries(pn_tt_device *device)
+{
+    const ft_tt_noc_access *noc;
+    uint32_t words[4];
+
+    if (!device || !device->puller.running)
+        return;
+    noc = g_td.wrapped ? &g_td.original[TD_ACC_NOC] : td_accessor(device, TD_ACC_NOC);
+    if (!noc->read || noc->read(noc->user, device->puller.core_x, device->puller.core_y,
+                                FT_TT_PULLER_AWAIT_RETRIES, words, sizeof(words)) != FT_TT_OK)
+        return;
+    fprintf(stderr, "pn_tt: puller AWAIT retries — %u mismatching poll(s) read again over %u "
+                    "AWAIT(s) since the puller armed\n",
+            words[0], words[1]);
+}
+
 /* LAUNCH lane: (x, y) -> queue index + 1 (0 = none yet), so a captured write finds its
  * queue in one load instead of a scan of ~140 (three lookups an issued descriptor). Valid
  * while `g_ts_queue_at_count` == g_ts.queue_count; a reset of the queue list empties it. */
@@ -2182,7 +2200,139 @@ static bool ts_emit(const uint32_t *w, size_t n)
     return true;
 }
 
+/** The line the puller's failed AWAIT read last, its token named against the stream's nonce:
+ *  a token one ahead of the count is a read between a writer's token and count stores. */
+static void ts_report_poll_line(uint32_t q)
+{
+    const ft_tt_noc_access *bulk = &g_td.original[TD_ACC_BULK_L1];
+    const pn_tt_residency *puller = &g_ts.device->puller;
+    const uint32_t nonce = g_ts.queues[q].nonce;
+    uint32_t line[4];
+    const char *token = "unknown: the stream did not know the nonce";
+
+    if (bulk->read(bulk->user, puller->core_x, puller->core_y, TS_POLL_BUFFER, line,
+                   sizeof(line)) != FT_TT_OK)
+        return;
+    if (g_ts.queues[q].nonce_known && line[1] != 0u)
+        token = line[2] == td_token_at(nonce, line[1] - 1u) ? "count - 1's (consistent)"
+                : line[2] == td_token_at(nonce, line[1])
+                    ? "count's: read between the writer's token and count stores"
+                    : "neither: another nonce";
+    fprintf(stderr, "pn_tt: STREAM STUCK —     the puller's last line read: count %u token %08x "
+                    "state 0x%x — the token is %s\n",
+            line[1], line[2], line[3], token);
+}
+
 /** Wait until the puller has completed `target` PULLs (its completed count, read directly). */
+/**
+ * A STUCK PULLER, named (q38-tt-regression-bisect: two 28k batched prefills aborted after a
+ * silent 20 s wait on the puller, the grid idled out behind it). For every region the puller
+ * has entered: its error word, the entry it is on (`header[9]` is written as each entry
+ * starts), the last count an AWAIT read and the entry's first words; for an AWAIT entry
+ * (type 4: queue xy, wanted) the awaited core's control block too. Read only.
+ */
+static void ts_report_stuck_puller(const char *where, uint32_t target)
+{
+    pn_tt_residency *puller = &g_ts.device->puller;
+    const ft_tt_noc_access *bulk = &g_td.original[TD_ACC_BULK_L1];
+    uint32_t fields[8], header[16], entry[4], control[8];
+
+    if (bulk->read(bulk->user, puller->core_x, puller->core_y, FT_TT_OP_QUEUE_BASE, fields,
+                   sizeof(fields)) == FT_TT_OK)
+        fprintf(stderr, "pn_tt: STREAM STUCK (%s) — puller (%u,%u) head %u tail %u completed %u "
+                        "state 0x%x; waited for PULL %u, %u launched\n",
+                where, puller->core_x, puller->core_y, fields[2], fields[3], fields[5], fields[7],
+                target, g_ts.launched);
+    for (uint32_t r = 0; r < TS_REGIONS; r++) {
+        const uint32_t base = TD_PROGRAM_BASE + r * TS_REGION_WORDS * 4u;
+
+        if (bulk->read(bulk->user, puller->core_x, puller->core_y, base, header,
+                       sizeof(header)) != FT_TT_OK || header[9] == 0u)
+            continue;
+        if (bulk->read(bulk->user, puller->core_x, puller->core_y, base + header[9], entry,
+                       sizeof(entry)) != FT_TT_OK)
+            memset(entry, 0, sizeof(entry));
+        fprintf(stderr, "pn_tt: STREAM STUCK —   region %u%s: error %u, entry +0x%x = %08x %08x "
+                        "%08x %08x, last await read %u\n",
+                r, r == (g_ts.region + TS_REGIONS - 1u) % TS_REGIONS ? " (last launched)" : "",
+                header[8], header[9], entry[0], entry[1], entry[2], entry[3], header[11]);
+        /* An AWAIT's word 1 is the queue's TABLE INDEX (ts_emit_await), not its xy. */
+        if ((entry[0] & 0xFFu) == 4u && entry[1] < g_ts.queue_count &&
+            bulk->read(bulk->user, g_ts.queues[entry[1]].x, g_ts.queues[entry[1]].y,
+                       FT_TT_OP_QUEUE_BASE, control, sizeof(control)) == FT_TT_OK)
+            fprintf(stderr, "pn_tt: STREAM STUCK —     AWAIT queue %u core (%u,%u) %s for %u: head "
+                            "%u tail %u completed %u state 0x%x; the stream knew nonce %08x "
+                            "(%s), issued %u (%s)\n",
+                    entry[1], g_ts.queues[entry[1]].x, g_ts.queues[entry[1]].y,
+                    pn_tt_core_label(g_ts.queues[entry[1]].x, g_ts.queues[entry[1]].y),
+                    entry[2], control[2], control[3], control[5], control[7],
+                    g_ts.queues[entry[1]].nonce,
+                    g_ts.queues[entry[1]].nonce_known ? "known" : "unknown",
+                    g_ts.queues[entry[1]].issued,
+                    g_ts.queues[entry[1]].issued_known ? "known" : "unknown");
+        if ((entry[0] & 0xFFu) == 4u && header[8] != 0u && entry[1] < g_ts.queue_count)
+            ts_report_poll_line(entry[1]);
+    }
+}
+
+/**
+ * The FIRST stall, named (q38-tt-grid-abort): a puller that has not finished `target` after 4 s,
+ * before the cores it starves reach their own idle exit (~8 s). The 20 s dump comes after
+ * that exit and names the AWAIT on the dead cores, not the one that stalled first. Once a
+ * process (a long stall prints once); read only.
+ */
+static void ts_report_early_stall(const char *where, uint32_t target)
+{
+    static bool reported;
+    char tag[64];
+
+    if (reported)
+        return;
+    reported = true;
+    snprintf(tag, sizeof(tag), "%s, EARLY at 4 s", where);
+    ts_report_stuck_puller(tag, target);
+    {
+        const ft_tt_noc_access *bulk = &g_td.original[TD_ACC_BULK_L1];
+        uint32_t control[8], shown = 0u;
+
+        for (uint32_t q = 0; q < g_ts.queue_count && shown < 32u; q++) {
+            if (bulk->read(bulk->user, g_ts.queues[q].x, g_ts.queues[q].y, FT_TT_OP_QUEUE_BASE,
+                           control, sizeof(control)) != FT_TT_OK)
+                continue;
+            if (control[5] >= control[2] && control[7] != (uint32_t)FT_TT_QUEUE_STATE_EXIT)
+                continue; /* caught up and alive */
+            shown++;
+            fprintf(stderr, "pn_tt: STREAM STUCK —     queue %u core (%u,%u) %s: head %u tail %u "
+                            "completed %u state 0x%x; the stream knew issued %u (%s)\n",
+                    q, g_ts.queues[q].x, g_ts.queues[q].y,
+                    pn_tt_core_label(g_ts.queues[q].x, g_ts.queues[q].y), control[2], control[3],
+                    control[5], control[7], g_ts.queues[q].issued,
+                    g_ts.queues[q].issued_known ? "known" : "unknown");
+        }
+        fprintf(stderr, "pn_tt: STREAM STUCK — %u of %u stream queues behind or not running\n",
+                shown, g_ts.queue_count);
+    }
+}
+
+/** Wait up to `ms` for the puller to have completed `target` PULLs (no failure on timeout). */
+static bool ts_poll_puller(uint32_t target, double ms)
+{
+    pn_tt_residency *puller = &g_ts.device->puller;
+    const ft_tt_noc_access *noc = &g_td.original[TD_ACC_NOC];
+    const double started = pn_time_ms();
+    uint32_t fields[8];
+
+    for (;;) {
+        if (noc->read(noc->user, puller->core_x, puller->core_y, FT_TT_OP_QUEUE_BASE + 0x10u,
+                      fields, 16u) != FT_TT_OK)
+            return false;
+        if ((int32_t)(fields[1] - target) >= 0)
+            return true;
+        if (pn_time_ms() - started > ms)
+            return false;
+    }
+}
+
 static bool ts_wait_puller(uint32_t target)
 {
     pn_tt_residency *puller = &g_ts.device->puller;
@@ -2202,8 +2352,12 @@ static bool ts_wait_puller(uint32_t target)
             g_ts.completed = fields[1];
             break;
         }
-        if (pn_time_ms() - started > 20000.0)
+        if (pn_time_ms() - started > 4000.0)
+            ts_report_early_stall("region wait", target);
+        if (pn_time_ms() - started > 20000.0) {
+            ts_report_stuck_puller("region wait", target);
             return false;
+        }
     }
     g_ts.wait_ms += pn_time_ms() - started;
     return true;
@@ -2427,16 +2581,13 @@ static bool ts_launch(bool wait)
         g_ts.segments++;
     }
     if (ok && wait && g_ts.launched != g_ts.completed) {
-        if (pn_tt_residency_await(puller, 20000u) != 0) {
-            uint32_t header[16];
+        /* Name a stall at 4 s, then wait the rest of the 20 s as before. */
+        const bool early = ts_poll_puller(g_ts.launched, 4000.0);
 
-            for (q = 0; q < TS_REGIONS; q++)
-                if (bulk->read(bulk->user, puller->core_x, puller->core_y,
-                               TD_PROGRAM_BASE + q * TS_REGION_WORDS * 4u, header,
-                               sizeof(header)) == FT_TT_OK && header[8] != 0u)
-                    fprintf(stderr, "pn_tt: STREAM — region %u failed on the puller: error %u at "
-                                    "entry +0x%x (last await count %u)\n", q, header[8],
-                            header[9], header[11]);
+        if (!early)
+            ts_report_early_stall("flush", g_ts.launched);
+        if (pn_tt_residency_await(puller, early ? 20000u : 16000u) != 0) {
+            ts_report_stuck_puller("flush", g_ts.launched);
             ok = false;
         } else {
             g_ts.completed = g_ts.launched;
@@ -3314,6 +3465,19 @@ int pn_tt_dispatch_stream_await(uint16_t x, uint16_t y, uint32_t count)
     if (count == 0u)
         return 1;
     return ts_emit_await(q, count) ? 1 : -1;
+}
+
+void pn_tt_dispatch_stream_queue_rearmed(uint16_t x, uint16_t y)
+{
+    for (uint32_t q = 0; q < g_ts.queue_count; q++)
+        if (g_ts.queues[q].x == x && g_ts.queues[q].y == y) {
+            g_ts.queues[q].nonce_known = false;
+            g_ts.queues[q].issued_known = false;
+            g_ts.queues[q].ring_pending = false;
+            g_ts.queues[q].fresh = false;
+            g_ts.queues[q].staged = 0u;
+            g_ts.queues[q].capacity_nonce = 0u;
+        }
 }
 
 bool pn_tt_dispatch_stream_kick(void)

@@ -32,9 +32,32 @@
 
 #include <unistd.h>   /* dup/dup2/read/close — the stderr capture below */
 
+/* Poisoning realloc for the unit under test: every byte it hands out that the
+ * caller did not write reads 0xA5, so a missing NUL terminator shows up on every
+ * libc instead of only where fresh heap happens to be non-zero. */
+#include <stdlib.h>
+#include <string.h>
+#if defined(__APPLE__)
+#include <malloc/malloc.h>
+#define POISON_USABLE(p) malloc_size(p)
+#else
+#include <malloc.h>
+#define POISON_USABLE(p) malloc_usable_size(p)
+#endif
+static void *poison_realloc(void *p, size_t n)
+{
+    size_t old = p ? POISON_USABLE(p) : 0;
+    void *q = realloc(p, n);
+    if (q && n > old)
+        memset((char *)q + old, 0xA5, n - old);
+    return q;
+}
+
 /* Pull in the unit under test (statics reachable). Rename its main out. */
 #define main oai_chat_main_unused
+#define realloc poison_realloc
 #include "../src/serve/openai_chat.c"
+#undef realloc
 #undef main
 #include "../src/serve/serve_emitter.h"
 
@@ -45,9 +68,24 @@ bs_acquire_result bs_slot_acquire_or_wait(pn_batch_sched *a, int b,
         int *c, int *d, const char *e) {
     (void)a; (void)b; (void)c; (void)d; (void)e; return BS_ACQUIRE_OK;
 }
+bs_acquire_result bs_slot_acquire_or_wait_watched(pn_batch_sched *a, int b, int *c,
+        int *d, const char *e, bs_waiter_alive_fn f, void *g)
+{ (void)a; (void)b; (void)c; (void)d; (void)e; (void)f; (void)g; return BS_ACQUIRE_OK; }
+/* The last OpenAI-shaped error the handler sent (status + code). */
+static int  wire_err_status = 0;
+static char wire_err_code[64];
+void hs_send_openai_error(int a, int b, const char *c, const char *d, const char *e,
+        const char *f)
+{
+    (void)a; (void)c; (void)e; (void)f;
+    wire_err_status = b;
+    snprintf(wire_err_code, sizeof(wire_err_code), "%s", d ? d : "");
+}
 int hs_begin_sse(int a) { (void)a; return 0; }
 int hs_client_alive(int a) { (void)a; return 1; }
-int hs_end_sse(int a) { (void)a; return 0; }
+/* [DONE] events written (the single-[DONE] test). */
+static int wire_done_count = 0;
+int hs_end_sse(int a) { (void)a; wire_done_count++; return 0; }
 void hs_send_error(int a, int b, const char *c, const char *d) {
     (void)a; (void)b; (void)c; (void)d;
 }
@@ -110,6 +148,9 @@ bool pn_memwatch_running(void) { return false; }
 /* Set by a test to say whether the stubbed generation ENFORCED response_format,
  * so the streaming path's status resolution can be driven both ways. */
 static int stub_response_format_ok = 0;
+/* Token counts the stubbed generation reports (the usage tests). */
+static int stub_prompt_tokens = 0;
+static int stub_completion_tokens = 0;
 /* Tokens the stubbed generation emits through a REAL emitter (wired exactly as
  * serve_generation.c wires it, tool tap included), so run_streaming is driven
  * end to end.  NULL = emit nothing (the response-shape tests). */
@@ -123,6 +164,8 @@ int sg_run_completion(pn_model *a, pn_state *b, const sg_message *c, int d,
         const sg_prefix_ctx *i) {
     (void)a; (void)b; (void)c; (void)d; (void)i;
     if (h) h->response_format_ok = stub_response_format_ok;
+    if (h) h->prompt_tokens = stub_prompt_tokens;
+    if (h) h->completion_tokens = stub_completion_tokens;
     if (!stub_pieces) return 0;
     emitter em;
     em_init(&em, f, g, e->stop, e->n_stop, e->has_tools, e->dialect);
@@ -1871,6 +1914,150 @@ static void test_content_array_keeps_text(void) {
     }
 }
 
+/* ============================================================
+ * Billing-grade usage and ids (datacenter gateway serving).
+ * ============================================================ */
+
+/* Count the usage chunks (`"choices":[]` + `"usage"`) in everything streamed. */
+static int count_usage_chunks(const char *wire)
+{
+    int n = 0;
+    for (const char *p = wire; p && (p = strstr(p, "\"choices\":[],\"usage\"")); p++)
+        n++;
+    return n;
+}
+
+/* n > 1 streamed: ONE usage chunk for the request, the prompt counted once and
+ * the completions summed (it used to send one chunk per choice, each with the
+ * full prompt, so a gateway summing chunks billed the prompt n times). */
+static void test_stream_n_choices_one_aggregated_usage_chunk(void) {
+    static const char *const pieces[] = { "hi" };
+    chat_request req;
+    jr_value *root = parse_body(BODY_HEAD ",\"stream\":true,\"n\":3,"
+                                "\"stream_options\":{\"include_usage\":true}}", &req);
+    ASSERT_NOT_NULL(root);
+    jw_free(&wire_all);
+    jw_init(&wire_all);
+    stub_pieces = pieces;
+    stub_n_pieces = 1;
+    stub_prompt_tokens = 40;
+    stub_completion_tokens = 7;
+    stream_ctx sc = { .client_fd = -1, .id = "cmpl-n", .model_id = "test-model" };
+    for (int ci = 0; ci < req.n_choices; ci++) {   /* as oai_handle_chat loops */
+        sc.choice_index = ci;
+        sc.role_sent = false;
+        sg_gen_params gen = gen_params_for_choice(&req, ci);
+        run_streaming(-1, NULL, NULL, &req, &gen, &sc, NULL);
+    }
+    stream_send_usage_once(&sc);
+    stub_pieces = NULL;
+    stub_n_pieces = 0;
+
+    ASSERT_INT_EQ(count_usage_chunks(wire_all.data), 1);
+    jr_value *u = jr_parse(wire_sse);
+    ASSERT_NOT_NULL(u);
+    const jr_value *usage = jr_object_get(u, "usage");
+    ASSERT_INT_EQ((int)jr_as_number(jr_object_get(usage, "prompt_tokens"), -1), 40);
+    ASSERT_INT_EQ((int)jr_as_number(jr_object_get(usage, "completion_tokens"), -1), 21);
+    ASSERT_INT_EQ((int)jr_as_number(jr_object_get(usage, "total_tokens"), -1), 61);
+    jr_free(u);
+    stub_prompt_tokens = stub_completion_tokens = 0;
+    chat_request_free(&req);
+    jr_free(root);
+}
+
+/* A turn an unload cut off still reports what it generated: the usage chunk
+ * lands BEFORE the model_unloaded error event (it used to be skipped). */
+static void test_stream_abnormal_end_reports_usage_before_error(void) {
+    static const char *const pieces[] = { "1\n", "2\n" };
+    chat_request req;
+    jr_value *root = parse_body(BODY_HEAD ",\"stream\":true,"
+                                "\"stream_options\":{\"include_usage\":true}}", &req);
+    ASSERT_NOT_NULL(root);
+    mr_entry entry;
+    memset(&entry, 0, sizeof(entry));
+    oai_turn_abort_ctx routed = { .client_fd = NULL, .entry = &entry };
+    req.gen.should_abort = oai_turn_should_abort;
+    req.gen.abort_ud = &routed;
+    stub_prompt_tokens = 12;
+    stub_completion_tokens = 2;
+    stub_cancel_requested = true;
+    run_stub_stream(&req, pieces, 2, 0);
+    stub_cancel_requested = false;
+    stub_prompt_tokens = stub_completion_tokens = 0;
+
+    const char *usage_at = strstr(wire_all.data, "\"choices\":[],\"usage\"");
+    const char *error_at = strstr(wire_all.data, "\"type\":\"model_unloaded\"");
+    ASSERT_NOT_NULL(usage_at);
+    ASSERT_NOT_NULL(error_at);
+    ASSERT_TRUE(usage_at < error_at);
+    ASSERT_TRUE(strstr(usage_at, "\"completion_tokens\":2") != NULL);
+    chat_request_free(&req);
+    jr_free(root);
+}
+
+/* A streamed context-over-budget refusal ends the stream once: the caller writes
+ * the [DONE], the error helper no longer writes a second one. */
+static void test_stream_over_budget_single_done(void) {
+    jw_free(&wire_all);
+    jw_init(&wire_all);
+    wire_done_count = 0;
+    send_context_over_budget_sse(-1, 9000, 8192);
+    ASSERT_TRUE(strstr(wire_all.data, "context_over_budget") != NULL);
+    ASSERT_INT_EQ(wire_done_count, 0);
+}
+
+/* Completion ids: chatcmpl- + 24 base62, distinct (were 8 hex from rand(),
+ * the same sequence after every restart). */
+static void test_completion_ids_never_repeat(void) {
+    char a[OAI_COMPLETION_ID_MAX], b[OAI_COMPLETION_ID_MAX];
+    make_completion_id(a, sizeof(a));
+    make_completion_id(b, sizeof(b));
+    ASSERT_INT_EQ((int)strlen(a), 9 + 24);
+    ASSERT_TRUE(strncmp(a, "chatcmpl-", 9) == 0);
+    ASSERT_TRUE(strcmp(a, b) != 0);
+    for (int i = 9; a[i]; i++)
+        ASSERT_TRUE((a[i] >= '0' && a[i] <= '9') || (a[i] >= 'a' && a[i] <= 'z') ||
+                    (a[i] >= 'A' && a[i] <= 'Z'));
+}
+
+/* Gateway mode refuses what a text-only serve would silently degrade. */
+static void test_gateway_refuses_json_schema_and_media(void) {
+    chat_request req;
+    jr_value *root = parse_body(BODY_HEAD ",\"response_format\":{\"type\":\"json_schema\","
+                                "\"json_schema\":{\"name\":\"p\",\"schema\":{}}}}", &req);
+    ASSERT_NOT_NULL(root);
+    ASSERT_TRUE(req.wants_json_schema);
+    wire_err_status = 0;
+    ASSERT_TRUE(gateway_refuse_request(-1, NULL, &req));
+    ASSERT_INT_EQ(wire_err_status, 400);
+    ASSERT_STR_EQ(wire_err_code, "unsupported_parameter");
+    chat_request_free(&req);
+    jr_free(root);
+
+    root = parse_body("{\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\","
+                      "\"text\":\"what is this\"},{\"type\":\"image_url\",\"image_url\":"
+                      "{\"url\":\"data:image/png;base64,AAAA\"}}]}]}", &req);
+    ASSERT_NOT_NULL(root);
+    ASSERT_TRUE(req.has_media_parts);
+    ASSERT_STR_EQ(req.messages[0].content, "what is this");   /* home: text kept */
+    wire_err_status = 0;
+    ASSERT_TRUE(gateway_refuse_request(-1, NULL, &req));
+    ASSERT_INT_EQ(wire_err_status, 400);
+    ASSERT_STR_EQ(wire_err_code, "unsupported_content");
+    chat_request_free(&req);
+    jr_free(root);
+
+    root = parse_body(BODY_HEAD "}", &req);   /* plain text, no model named */
+    ASSERT_NOT_NULL(root);
+    ASSERT_FALSE(req.wants_json_schema || req.has_media_parts);
+    wire_err_status = 0;
+    ASSERT_FALSE(gateway_refuse_request(-1, NULL, &req));
+    ASSERT_INT_EQ(wire_err_status, 0);
+    chat_request_free(&req);
+    jr_free(root);
+}
+
 int main(void) {
     printf("\n=== chat_request (tool_choice parse + forced_name lifetime) ===\n\n");
     RUN_TEST(forced_name_survives_dom_free);
@@ -1948,6 +2135,12 @@ int main(void) {
     RUN_TEST(stream_tool_call_reaches_wire_before_turn_ends);
     RUN_TEST(stream_keepalive_while_call_is_held);
     RUN_TEST(content_array_keeps_text);
+    printf("\n=== billing-grade usage, ids, gateway refusals ===\n\n");
+    RUN_TEST(stream_n_choices_one_aggregated_usage_chunk);
+    RUN_TEST(stream_abnormal_end_reports_usage_before_error);
+    RUN_TEST(stream_over_budget_single_done);
+    RUN_TEST(completion_ids_never_repeat);
+    RUN_TEST(gateway_refuses_json_schema_and_media);
     TEST_REPORT();
     return __ft_failed == 0 ? 0 : 1;
 }

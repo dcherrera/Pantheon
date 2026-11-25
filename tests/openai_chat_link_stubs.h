@@ -23,6 +23,12 @@ void bs_notify_pressure(pn_batch_sched *a, int b) { (void)a; (void)b; }
 bs_acquire_result bs_slot_acquire_or_wait(pn_batch_sched *a, int b, int *c,
                                           int *d, const char *e)
 { (void)a; (void)b; (void)c; (void)d; (void)e; return BS_ACQUIRE_OK; }
+bs_acquire_result bs_slot_acquire_or_wait_watched(pn_batch_sched *a, int b, int *c,
+        int *d, const char *e, bs_waiter_alive_fn f, void *g)
+{ (void)a; (void)b; (void)c; (void)d; (void)e; (void)f; (void)g; return BS_ACQUIRE_OK; }
+void hs_send_openai_error(int a, int b, const char *c, const char *d, const char *e,
+        const char *f)
+{ (void)a; (void)b; (void)c; (void)d; (void)e; (void)f; }
 int hs_begin_sse(int a) { (void)a; return 0; }
 int hs_client_alive(int a) { (void)a; return 1; }
 int hs_end_sse(int a) { (void)a; return 0; }

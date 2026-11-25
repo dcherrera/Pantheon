@@ -123,7 +123,7 @@ static void on_root_value_end(void *ud, size_t end, const char *decoded)
      * outranks "name"/"func"), so the call can open now — if the parse would
      * accept the name at all. */
     if (!decoded || !*decoded || !tc_tool_name_known(ts->tools, decoded)) return;
-    char id[24];
+    char id[TC_CALL_ID_MAX];
     tc_new_call_id(id, sizeof(id));
     tcs_wire_call *wc = open_wire_call(ts, id, decoded);
     if (wc) ts->spec = ts->n_calls - 1;

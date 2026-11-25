@@ -35,6 +35,9 @@ typedef struct {
                            * NULL. Read only by the auth hook; never logged. */
     char  *replica;    /* optional X-Pantheon-Replica header value (owned), or
                         * NULL: the copy a new session asks to bind to. */
+    char  *tenant;     /* optional X-Pantheon-Tenant header value (owned), or
+                        * NULL: the customer a trusted gateway names
+                        * (gateway_mode.h; read only in gateway mode). */
 } hs_request;
 
 /* Room for hs_set_thread_response_headers. */
@@ -99,6 +102,15 @@ void hs_send_json(int client_fd, int status, const char *json_body);
  */
 void hs_send_error(int client_fd, int status, const char *type,
                    const char *message);
+
+/**
+ * Send an OpenAI-shaped error with a `code` and an optional `param`:
+ *   {"error":{"message":..,"type":..,"param":..|null,"code":..}}
+ * The shape OpenAI SDKs and gateways key on (e.g. code "unsupported_parameter").
+ */
+void hs_send_openai_error(int client_fd, int status, const char *type,
+                          const char *code, const char *param,
+                          const char *message);
 
 /**
  * Like hs_send_error but injects `extra_headers` (may be NULL) into the

@@ -59,6 +59,7 @@
 #include "json_reader.h"
 #include "json_value_grammar.h"
 #include "json_writer.h"
+#include "request_id.h"
 
 /* ============================================================
  * Dialect resolution (per-model tool-call dialect selection)
@@ -949,11 +950,7 @@ static bool body_leaks_dialect_tail(const char *body, const char *fn_close)
 
 void tc_new_call_id(char *buf, size_t len)
 {
-    static const char hex[] = "0123456789abcdef";
-    char rnd[9];
-    for (int i = 0; i < 8; i++) rnd[i] = hex[rand() & 0xF];
-    rnd[8] = '\0';
-    snprintf(buf, len, "call_%s", rnd);
+    pn_request_id_new("call_", buf, len);
 }
 
 /* Parse one <function=…>…</function> block whose opener is at `fp` (pointing at
@@ -1051,7 +1048,7 @@ static const char *push_call(const char *fp, const char *limit,
             *calls = grown;
             *cap = ncap;
         }
-        char id[24];
+        char id[TC_CALL_ID_MAX];
         tc_new_call_id(id, sizeof(id));
         (*calls)[*n].id = strdup(id);
         (*calls)[*n].name = name;
@@ -1191,7 +1188,7 @@ static const char *push_call_attr(const char *fp, const char *end,
             *calls = grown;
             *cap = ncap;
         }
-        char id[24];
+        char id[TC_CALL_ID_MAX];
         tc_new_call_id(id, sizeof(id));
         (*calls)[*n].id = strdup(id);
         (*calls)[*n].name = name;
@@ -1293,7 +1290,7 @@ static int push_call_json(const jr_value *obj, const jr_value *tools,
         *calls = grown;
         *cap = ncap;
     }
-    char id[24];
+    char id[TC_CALL_ID_MAX];
     tc_new_call_id(id, sizeof(id));
     (*calls)[*n].id = strdup(id);
     (*calls)[*n].name = strdup(name);

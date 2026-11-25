@@ -524,7 +524,7 @@ int pn_qwen35moe_moe_block(const pn_qwen35moe_moe *moe,
  * Must be >= foundry's FC_TOPK_MAX (checked with a static assert in
  * qwen35moe_forward_cuda.c); kept independent so this header stays free of
  * the CUDA backend headers. */
-#define PN_QWEN35MOE_TOPK_MAX 256
+#define PN_QWEN35MOE_TOPK_MAX 512
 
 typedef struct {
     pn_qwen35moe_ssm_state *ssm;   /* [n_ssm] per-SSM-layer recurrent state */
@@ -562,6 +562,17 @@ typedef struct {
      * whole point of constraining — so a request decoding under a grammar sets
      * this and the fetch sends the full row for as long as it is live. */
     int full_logits;
+
+    /* Short logits row (QWEN35_SHORT_ROW; engine.h pn_sampler_short_row).  short_row_ok: the serve allows it for this
+     * turn (a grammar turn without logprobs / logit_bias).  short_row_live: `logits`
+     * holds the exact top PN_QWEN35MOE_SHORT_ROW_K of this step's row, the full row is
+     * kept on the head die (short_row_g's keep slot short_row_slot) until the draw,
+     * and short_row_bound is the 257th value. */
+    int short_row_ok;
+    int short_row_live;
+    float short_row_bound;
+    int short_row_slot;
+    void *short_row_g;
 } pn_qwen35moe_state;
 
 /* Opaque model handle — full definition in qwen35moe.c, also typedef'd in
@@ -647,6 +658,8 @@ int pn_qwen35moe_decode_slots_tokens_cuda(pn_qwen35moe_model *m,
  * an invalid one cannot exist. A test that answered by reading the suspect
  * object would be reading freed memory to decide whether it was freed. */
 void pn_qwen35moe_gpu_forget_state_cuda(const pn_qwen35moe_state *s);
+/* The short row's fill on a CUDA build (pn_qwen35moe_short_row_fill). */
+int pn_qwen35moe_short_row_fill_cuda(pn_qwen35moe_state *s, float *row, int n_vocab);
 
 /* Instrument for the lifetime regression test: how many per-slot kv
  * back-pointers currently land inside [base, base+bytes). Compares addresses

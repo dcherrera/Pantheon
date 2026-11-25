@@ -19,6 +19,7 @@ you commit under more than one address, list each on its own `git-email:` line.
 ```yaml
 - name: David (Corey) Herrera
   git-email: coreyh55@gmail.com
+  git-email: david@teamide.dev
   forge-username: dcherrera
   commit-name: Zero          # git author name on this project's history — same person
   role: project owner and copyright holder

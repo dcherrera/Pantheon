@@ -515,6 +515,10 @@ int pn_tt_device_keepalive(pn_tt_device *device, double min_idle_seconds)
         pn_tt_dispatch_sequence_reset();
     if (sent > 0)
         device->keepalive_nops += (uint64_t)sent;
+    /* The prefill grid too (q38-tt-grid-abort): it had no idle guard at all. Its queues are
+     * not the decode dispatch's, so no sequence reset for it. */
+    if (pn_tt_matmul_grid_keepalive(device, min_idle_seconds) < 0)
+        return -1;
     return sent;
 }
 

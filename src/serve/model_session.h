@@ -75,6 +75,13 @@ uint64_t ms_now_ms(void);
  */
 uint64_t ms_session_idle_ttl_ms(void);
 
+/**
+ * Replace the 12 h default of ms_session_idle_ttl_ms (PN_SESSION_IDLE_TTL_MS
+ * still wins). Gateway mode sets a short one. Call once at startup, before any
+ * model loads. Not thread-safe.
+ */
+void ms_set_session_idle_ttl_default_ms(uint64_t ttl_ms);
+
 /* Outcome of a session-state operation. Maps 1:1 onto the HTTP answers so the
  * two handlers cannot drift apart in how they report the same condition. */
 typedef enum {

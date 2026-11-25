@@ -55,6 +55,14 @@
  * Qwen3.6-35B-A3B Q4_K_M that fits with 1.3 GiB per die to spare. */
 #define MR_ADMIT_CTX_GUESS 8192
 
+/* mr_set_sessions_evictable: gateway mode's seat policy for new schedulers. */
+static bool g_sessions_evictable;
+
+void mr_set_sessions_evictable(bool evictable)
+{
+    g_sessions_evictable = evictable;
+}
+
 /* Weight bytes die `idx` of `n_placed` will actually hold.
  *
  * NOT file_bytes / n_placed. A GGUF also carries token_embd — never uploaded,
@@ -579,6 +587,7 @@ int mr_load_replica(mr_registry *reg, const char *path, const char *name,
          * one without seating it on someone else's KV. */
         bs_set_session_admission(sched, resolved_max_sessions,
                                  ms_session_idle_ttl_ms());
+        bs_set_sessions_evictable(sched, g_sessions_evictable);
         fprintf(stderr, "registry: batch scheduler for '%s': %d session "
                 "blocks / concurrent decode slots (max_concurrent), %d "
                 "resident sessions (max_sessions)\n", name,

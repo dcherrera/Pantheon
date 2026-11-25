@@ -14,17 +14,18 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* K80 dies 6,7 pinned 2505/875, the verify on device-position kernels + per-die CUDA graphs
- * + parallel-expf softmax: verify+commit of n rows = c + s * pos, the line through the 1k and
- * 32k points of gate2_1027_014956 (8k / 14k sit within 2.6 ms of it). The 1k-8k fit of
- * gate2_1022_200928 under-priced long contexts (2 rows at 32k: 98 ms modelled, 107 measured). */
-static const double k_verify_c[PN_SPEC_DEPTH_MAX + 2] = { 0.0, 40.85, 55.67, 71.95, 80.93,
-                                                          109.09 };
-static const double k_verify_s[PN_SPEC_DEPTH_MAX + 2] = { 0.0, 0.000607, 0.001554, 0.002166,
-                                                          0.002454, 0.003261 };
+/* K80 TP2 (dies 4-7, pinned 2505/875), verify attention through the decode slots call, per-die
+ * CUDA graphs: bench_spec_verify_gate verify+commit of n rows = c + s * pos, the least-squares
+ * line through 8k / 19k / 32k (within 1 ms of each). Verify+commit ms at 8k / 19k / 32k:
+ * 27.2 / 29.8 / 32.9, 39.5 / 42.1 / 45.9, 53.1 / 60.2 / 69.2, 62.5 / 67.8 / 76.9, 72.2 / 81.3 /
+ * 95.1. The third row costs more than the others (the n = 3 matvec shape). */
+static const double k_verify_c[PN_SPEC_DEPTH_MAX + 2] = { 0.0, 25.27, 37.24, 47.64, 57.19,
+                                                          64.00 };
+static const double k_verify_s[PN_SPEC_DEPTH_MAX + 2] = { 0.0, 0.000233, 0.000261, 0.000655,
+                                                          0.000588, 0.000936 };
 /* The batched decode-slots step at K = 1 (the batched serve's D = 0), same runs:
- * 41.8 / 44.2 / 47.9 / 59.6 ms at 1k / 8k / 14k / 32k. */
-static const double k_slots_c = 41.18, k_slots_s = 0.000563;
+ * 29.8 / 33.0 / 35.7 ms at 8k / 19k / 32k. */
+static const double k_slots_c = 28.02, k_slots_s = 0.000239;
 /* Gate 1, temp 0.7, the 9 prompts measured at every depth: per-position acceptance
  * 0.80 / 0.63 / 0.50 / 0.42 -> conditional 0.80, 0.79, 0.79, 0.84. */
 static const double k_accept[PN_SPEC_DEPTH_MAX + 1] = { 1.0, 0.80, 0.79, 0.79, 0.84 };
@@ -81,11 +82,11 @@ void pn_spec_depth_init(pn_spec_depth *c, int dmax)
     memcpy(c->verify_c, k_verify_c, sizeof(k_verify_c));
     memcpy(c->verify_s, k_verify_s, sizeof(k_verify_s));
     memcpy(c->accept, k_accept, sizeof(k_accept));
-    /* The plain step as the e2e bench measures it (sampling included): 42.1 / 48.9 / 55.6 /
-     * 67.7 ms at 1k / 8k / 14k / 32k — steeper than the gate bench's synthetic-context
-     * slots step (0.30 us/pos); the switch must compare against the real one. */
-    c->plain_c = 41.3;
-    c->plain_s = 0.000805;
+    /* The single-session plain step (model->forward, full logits + host argmax), same runs as
+     * the verify priors: 31.9 / 33.2 / 35.7 ms at 8k / 19k / 32k. It runs the verify core with
+     * one row, so it shares the verify's attention kernel (the rows kernel gave 0.61 us/pos). */
+    c->plain_c = 30.47;
+    c->plain_s = 0.000155;
     c->draft_first = 4.5;
     c->draft_next = 4.5;
     c->conf_cal = 1.0;

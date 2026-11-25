@@ -69,6 +69,8 @@
 #include "../core/mem/pn_memwatch.h"
 #include "../accel/backend_identity.h"
 #include "../accel/die_manager.h"
+#include "gateway_mode.h"
+#include "gateway_request_gate.h"
 #include "http_server.h"
 #include "model_admin.h"
 #include "model_registry.h"
@@ -78,6 +80,7 @@
 #include "request_profile.h"
 #include "request_timing_line.h"
 #include "serve_backend_guard.h"
+#include "serve_gateway_setup.h"
 #include "serve_registry.h"
 #include "serve_shutdown.h"
 #include "session_watch.h"
@@ -125,6 +128,7 @@ typedef struct {
 typedef struct {
     int        client_fd;
     serve_ctx *ctx;
+    bool       admin_listener;   /* accepted on the gateway admin listener */
 } connection_job;
 
 /* mr_load one --model through the shared admin load path (MTP env + sampling
@@ -214,11 +218,20 @@ static void print_serve_usage(void)
     printf("  --config <path>       HuggingFace config.json (safetensors models)\n");
     printf("  --vocab <path>        RWKV World tokenizer vocab file\n");
     printf("  --quantize            INT8 quantize weights at load time\n");
+    printf("  --gateway             Serve behind a trusted gateway (docs/guides/gateway-mode.md):\n");
+    printf("                        the port answers only POST /v1/chat/completions,\n");
+    printf("                        GET /v1/models and GET /health/{live,ready}, with the\n");
+    printf("                        gateway's bearer key; session keys are scoped to the\n");
+    printf("                        X-Pantheon-Tenant header and seats are evictable\n");
+    printf("  --api-key-file <path> The gateway key (required with --gateway; chmod 600)\n");
+    printf("  --admin-host <addr>   Gateway mode: admin/session routes on this address\n");
+    printf("                        (default 127.0.0.1; needs --admin-port)\n");
+    printf("  --admin-port <n>      Gateway mode: admin listener port (absent = admin off)\n");
     printf("\nEndpoints: GET /v1/models, POST /v1/chat/completions (SSE stream supported),\n");
     printf("           GET /admin/models, POST /admin/models/load, POST /admin/models/unload,\n");
     printf("           GET /admin/dies,\n");
     printf("           POST /admin/session/export, POST /session/restore, POST /session/release,\n");
-    printf("           GET /session/estimate\n");
+    printf("           GET /session/estimate, GET /health/live, GET /health/ready\n");
 }
 
 /* Parse a comma-separated die list ("0,1") into out[0..max). Returns the
@@ -449,6 +462,20 @@ static int dispatch(int cfd, serve_ctx *ctx, const hs_request *req)
                                     tokens, blob_bytes, upload_bps);
         return 0;
     }
+    if (strcmp(req->method, "GET") == 0 && strcmp(req->path, "/health/live") == 0) {
+        hs_send_json(cfd, 200, "{\"status\":\"live\"}");
+        return 0;
+    }
+    if (strcmp(req->method, "GET") == 0 && strcmp(req->path, "/health/ready") == 0) {
+        /* Ready = a model is loaded and the serve is not draining, so a gateway
+         * stops routing here before a SIGTERM drain, not after. */
+        if (mr_count(ctx->reg) > 0 && !pn_serve_shutdown_requested())
+            hs_send_json(cfd, 200, "{\"status\":\"ready\"}");
+        else
+            hs_send_error_ex(cfd, 503, "not_ready", "no model loaded or shutting down",
+                             "Retry-After: 5\r\n");
+        return 0;
+    }
     if (strcmp(req->method, "GET") == 0 && strcmp(req->path, "/") == 0) {
         /* The health probe answers with the backend too. This is the cheapest
          * route on the server and the one a monitor already hits, so it is the
@@ -489,7 +516,7 @@ static int request_is_host_wait(const hs_request *req)
  * adopted the fd (a held /session/watch or a Pantheon Local host wait, whose
  * owner closes it itself). Shared between the per-connection thread and the
  * inline fallback path. */
-static void handle_connection(int cfd, serve_ctx *ctx)
+static void handle_connection(int cfd, serve_ctx *ctx, bool admin_listener)
 {
     hs_request req;
     int adopted = 0;
@@ -504,10 +531,17 @@ static void handle_connection(int cfd, serve_ctx *ctx)
         pn_reqprof_note_route(req.method, req.path);
         hs_set_thread_response_headers(NULL);   /* this request's own, set by its route */
         hs_set_thread_principal(NULL, 0);       /* set by the auth hook (Pantheon Local) */
-        if (hs_auth_check(cfd, &req) == 0)
+        /* Gateway mode's API listener: allowed route, gateway key, tenant
+         * (gateway_request_gate.h). The admin listener and a plain serve keep
+         * today's path. */
+        int refused = (pn_gateway_enabled() && !admin_listener)
+                    ? pn_gateway_gate_request(cfd, &req)
+                    : hs_auth_check(cfd, &req);
+        if (refused == 0)
             adopted = dispatch(cfd, ctx, &req);
         hs_set_thread_response_headers(NULL);
         hs_set_thread_principal(NULL, 0);
+        pn_gateway_set_thread_tenant(NULL);
         hs_request_free(&req);
     }
     pn_reqprof_end();
@@ -520,7 +554,7 @@ static void handle_connection(int cfd, serve_ctx *ctx)
 static void *connection_thread(void *arg)
 {
     connection_job *job = arg;
-    handle_connection(job->client_fd, job->ctx);
+    handle_connection(job->client_fd, job->ctx, job->admin_listener);
     free(job);
     /* B5: hand this request's freed host memory back to the OS. */
     pn_host_heap_release();
@@ -529,15 +563,20 @@ static void *connection_thread(void *arg)
 
 /* Spawn a detached connection thread. On failure (e.g. thread limit) fall back
  * to handling the connection inline so the request is never dropped. */
-static void spawn_connection(int cfd, serve_ctx *ctx)
+static void spawn_connection(int cfd, serve_ctx *ctx, bool admin_listener)
 {
     connection_job *job = malloc(sizeof(*job));
-    if (!job) { handle_connection(cfd, ctx); return; }
+    if (!job) { handle_connection(cfd, ctx, admin_listener); return; }
     job->client_fd = cfd;
     job->ctx = ctx;
+    job->admin_listener = admin_listener;
 
     pthread_attr_t attr;
-    if (pthread_attr_init(&attr) != 0) { handle_connection(cfd, ctx); free(job); return; }
+    if (pthread_attr_init(&attr) != 0) {
+        handle_connection(cfd, ctx, admin_listener);
+        free(job);
+        return;
+    }
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
 
     pthread_t tid;
@@ -545,7 +584,7 @@ static void spawn_connection(int cfd, serve_ctx *ctx)
     pthread_attr_destroy(&attr);
     if (rc != 0) {
         fprintf(stderr, "serve: pthread_create failed (%d); handling inline\n", rc);
-        handle_connection(cfd, ctx);
+        handle_connection(cfd, ctx, admin_listener);
         free(job);
     }
 }
@@ -707,6 +746,10 @@ int pn_serve_main(int argc, char **argv)
     int port = SERVE_DEFAULT_PORT;
     int quantize = 0;
     bool local_mode = false;
+    bool gateway_mode = false;
+    const char *api_key_file = NULL;
+    const char *admin_host = SERVE_DEFAULT_HOST;
+    int admin_port = 0;
 
     /* FIRST line this process writes. The backend is a compile-time constant
      * and the only reason it was ever unknown is that nothing printed it: a
@@ -857,6 +900,18 @@ int pn_serve_main(int argc, char **argv)
             quantize = 1;
         } else if (strcmp(argv[i], "--local") == 0) {
             local_mode = true;
+        } else if (strcmp(argv[i], "--gateway") == 0) {
+            gateway_mode = true;
+        } else if (strcmp(argv[i], "--api-key-file") == 0 && i + 1 < argc) {
+            api_key_file = argv[++i];
+        } else if (strcmp(argv[i], "--admin-host") == 0 && i + 1 < argc) {
+            admin_host = argv[++i];
+        } else if (strcmp(argv[i], "--admin-port") == 0 && i + 1 < argc) {
+            admin_port = atoi(argv[++i]);
+            if (admin_port <= 0 || admin_port > 65535) {
+                fprintf(stderr, "serve: bad --admin-port '%s'\n", argv[i]);
+                return 1;
+            }
         } else {
             fprintf(stderr, "serve: unknown option '%s'\n", argv[i]);
             print_serve_usage();
@@ -869,6 +924,28 @@ int pn_serve_main(int argc, char **argv)
         print_serve_usage();
         return 1;
     }
+    /* Gateway mode is plain serve behind a trusted gateway: never the appliance,
+     * and its flags mean nothing without it. Set up BEFORE any model loads (the
+     * session policy is read at load). */
+    if (gateway_mode && local_mode) {
+        fprintf(stderr, "serve: --gateway and --local cannot be combined\n");
+        return 1;
+    }
+    if (!gateway_mode && (api_key_file || admin_port > 0)) {
+        fprintf(stderr, "serve: --api-key-file and --admin-port need --gateway\n");
+        return 1;
+    }
+    if (gateway_mode) {
+        char gw_err[256];
+        if (pn_serve_gateway_setup(api_key_file, gw_err, sizeof(gw_err)) != 0) {
+            fprintf(stderr, "serve: gateway mode refused: %s\n", gw_err);
+            return 1;
+        }
+        fprintf(stderr, "serve: gateway mode (API routes only, bearer key required, "
+                "tenant-scoped evictable sessions, admin %s)\n",
+                admin_port > 0 ? "on its own listener" : "off");
+    }
+
     /* Back-compat: --served-name names the first model when it has no --name. */
     if (served_name && !specs[0].name)
         specs[0].name = served_name;
@@ -1016,6 +1093,19 @@ int pn_serve_main(int argc, char **argv)
         mr_free(&reg);
         return 1;
     }
+    /* Gateway mode: admin and session routes on their own listener (loopback by
+     * default), or nowhere. */
+    int admin_fd = -1;
+    if (gateway_mode && admin_port > 0) {
+        admin_fd = hs_listen(admin_host, admin_port);
+        if (admin_fd < 0) {
+            hs_close(listen_fd);
+            pn_session_watch_stop(watch);
+            mr_free(&reg);
+            return 1;
+        }
+        fprintf(stderr, "serve: admin listener on http://%s:%d\n", admin_host, admin_port);
+    }
     {
         mr_info info[MR_MAX_MODELS];
         int n = mr_snapshot(&reg, info, MR_MAX_MODELS);
@@ -1044,15 +1134,18 @@ int pn_serve_main(int argc, char **argv)
      * the kernel may deliver SIGTERM to any thread that has it unblocked, so
      * "accept() returns EINTR" is not a guarantee — a connection thread running
      * the handler still wakes us here. */
-    struct pollfd watched[2];
+    struct pollfd watched[3];
     int n_watched = 1;
 
     watched[0].fd = listen_fd;
     watched[0].events = POLLIN;
     watched[1].fd = pn_serve_shutdown_wake_fd();
     watched[1].events = POLLIN;
-    if (watched[1].fd >= 0)
-        n_watched = 2;
+    watched[2].fd = admin_fd;       /* -1 = no admin listener: poll ignores it */
+    watched[2].events = POLLIN;
+    watched[2].revents = 0;
+    if (watched[1].fd >= 0 || admin_fd >= 0)
+        n_watched = 3;
 
     while (!pn_serve_shutdown_requested()) {
         /* PM 5: a 1 s tick while idle keeps the accelerator's resident families armed
@@ -1067,8 +1160,13 @@ int pn_serve_main(int argc, char **argv)
             (void)mr_keepalive(ctx.reg);
             continue;
         }
-        if (n_watched == 2 && (watched[1].revents & POLLIN))
+        if (watched[1].fd >= 0 && (watched[1].revents & POLLIN))
             break;                      /* a shutdown signal was recorded */
+        if (admin_fd >= 0 && (watched[2].revents & POLLIN)) {
+            int cfd = hs_accept(admin_fd);
+            if (cfd >= 0)
+                spawn_connection(cfd, &ctx, true);
+        }
         if (watched[0].revents & (POLLERR | POLLNVAL)) {
             /* The listening socket is unusable. Stop rather than spin: poll()
              * reports these every call, so `continue` here would be a busy
@@ -1079,10 +1177,12 @@ int pn_serve_main(int argc, char **argv)
         if (watched[0].revents & POLLIN) {
             int cfd = hs_accept(listen_fd);
             if (cfd < 0) continue;
-            spawn_connection(cfd, &ctx);
+            spawn_connection(cfd, &ctx, false);
         }
     }
 
+    if (admin_fd >= 0)
+        hs_close(admin_fd);
     serve_run_shutdown(listen_fd, watch, &reg);
 
     /* Re-raise with the default disposition so the exit status reflects the

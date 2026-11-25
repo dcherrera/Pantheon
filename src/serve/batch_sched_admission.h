@@ -71,6 +71,16 @@ void bs_admission_reap_idle(pn_batch_sched *sched, const char *sid,
                             double now_ms);
 
 /**
+ * Evictable seats (sched->sessions_evictable): take the least recently active
+ * idle slot held by another family than `sid`'s (NULL = anonymous) and with no
+ * session watch, dropping its warm state as the reaper does, so the caller's
+ * admission can succeed. The evicted session simply re-prefills on its next
+ * turn. Takes mu itself; calls the watch hook without it.
+ * @return true when a seat was freed
+ */
+bool bs_admission_evict_lru_idle(pn_batch_sched *sched, const char *sid);
+
+/**
  * Drop every session's warm state from slot `sl` (sid, history, projections,
  * turn checkpoints, system-prefix snapshot). The caller has reserved the slot
  * (status PREFILL), so no other thread writes it. Defined in batch_sched.c.

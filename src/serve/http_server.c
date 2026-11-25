@@ -162,6 +162,11 @@ int hs_read_request(int client_fd, hs_request *req)
         const char *e = strstr(pin, "\r\n");
         req->replica = strndup(pin, e ? (size_t)(e - pin) : strlen(pin));
     }
+    const char *tenant = find_header(buf, "X-Pantheon-Tenant");
+    if (tenant) {
+        const char *e = strstr(tenant, "\r\n");
+        req->tenant = strndup(tenant, e ? (size_t)(e - tenant) : strlen(tenant));
+    }
     const char *auth = find_header(buf, "Authorization");
     if (auth) {
         const char *e = strstr(auth, "\r\n");
@@ -212,6 +217,7 @@ void hs_request_free(hs_request *req)
     free(req->body);
     free(req->session_id);
     free(req->replica);
+    free(req->tenant);
     free(req->authorization);
     memset(req, 0, sizeof(*req));
 }
@@ -295,6 +301,41 @@ void hs_send_error(int client_fd, int status, const char *type,
                    const char *message)
 {
     hs_send_error_ex(client_fd, status, type, message, NULL);
+}
+
+/* Escape `s` minimally (quotes, backslashes; control bytes dropped) into out. */
+static void escape_json_min(const char *s, char *out, size_t cap)
+{
+    size_t j = 0;
+    for (; s && *s && j + 2 < cap; s++) {
+        if ((unsigned char)*s < 0x20)
+            continue;
+        if (*s == '"' || *s == '\\') out[j++] = '\\';
+        out[j++] = *s;
+    }
+    out[j] = '\0';
+}
+
+void hs_send_openai_error(int client_fd, int status, const char *type,
+                          const char *code, const char *param,
+                          const char *message)
+{
+    char body[1024], msg[512], ty[64], cd[64], pa[64];
+    escape_json_min(message, msg, sizeof(msg));
+    escape_json_min(type, ty, sizeof(ty));
+    escape_json_min(code, cd, sizeof(cd));
+    escape_json_min(param, pa, sizeof(pa));
+    char param_json[80];
+    if (param && param[0])
+        snprintf(param_json, sizeof(param_json), "\"%s\"", pa);
+    else
+        snprintf(param_json, sizeof(param_json), "null");
+    int bn = snprintf(body, sizeof(body),
+                      "{\"error\":{\"message\":\"%s\",\"type\":\"%s\","
+                      "\"param\":%s,\"code\":\"%s\"}}", msg, ty, param_json, cd);
+    if (bn < 0 || (size_t)bn >= sizeof(body))
+        return;
+    hs_send_json(client_fd, status, body);
 }
 
 void hs_send_error_ex(int client_fd, int status, const char *type,

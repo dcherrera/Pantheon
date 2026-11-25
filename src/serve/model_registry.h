@@ -257,6 +257,13 @@ int  mr_init(mr_registry *reg);
 void mr_free(mr_registry *reg);
 
 /**
+ * Make every batch scheduler created from now on hold evictable session seats
+ * (bs_set_sessions_evictable; gateway mode). Call once at startup, before any
+ * model loads. Not thread-safe.
+ */
+void mr_set_sessions_evictable(bool evictable);
+
+/**
  * Load a model and register it under `name` (NULL → file basename). `dies` /
  * `n_dies` pin an explicit die-set; pass NULL/0 to auto-place via the die
  * manager (or CPU-resident when it is not running). `reasoning_budget` is the

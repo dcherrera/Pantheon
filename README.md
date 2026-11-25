@@ -2,13 +2,22 @@
 
 **An inference engine that assumes you don't have enough.**
 
-Not enough VRAM, not enough host RAM, not enough cores, not enough context, and
-not enough budget for current-generation GPUs. Pantheon is a memory-aware inference
-engine and OpenAI-compatible model server built for that case: a small host, older or
-mixed cards, several models per process.
+Pantheon is a memory-aware inference engine and OpenAI-compatible model server in pure
+C11, built for a small host, older or mixed cards, and several models per process: not
+enough VRAM, host RAM, cores, context, or budget for current-generation GPUs.
 
-It is pure C11 on top of [Foundry](https://git.teamide.dev/David/Foundry.git), its
-companion tensor library (a git submodule in the public repository). Beyond Foundry it needs only
+- **Runs on:** CPU, Apple Metal, Tesla K80 (Kepler, 2014), Tenstorrent Blackhole p150a.
+- **Headline, measured:** Qwen3.6-35B-A3B at Q8_0 on two Tesla K80s in a 2-core / 8 GB host
+  decodes **33.5-38 tok/s for one user at 6-26k tokens of context**, and **24.5 tok/s
+  aggregate for four agents** working at once (live server, 2026-11-25;
+  [details](#qwen36-35b-a3b-q8_0-on-two-k80s)).
+- **Degrades instead of failing:** a ranked memory ladder, admission checked against live
+  host RAM and VRAM, and a context-over-budget error that tells the client the real numbers.
+- **Quick start:** `git clone --recursive https://github.com/dcherrera/Pantheon.git && cd Pantheon && make USE_BLAS=1 pantheon`
+  ([steps](#quick-start)).
+
+It builds on [Foundry](https://github.com/dcherrera/Foundry), its
+companion tensor library (a git submodule in this repository). Beyond Foundry it needs only
 libc, libm, pthreads and libdl, plus vendored Monocypher (BSD-2-Clause, see NOTICE);
 Pantheon Local also runs the system `curl` for model downloads. BLAS (Accelerate on macOS, OpenBLAS on Linux) is
 optional, and the optional Metal backend links Apple's frameworks. Each backend builds
@@ -67,12 +76,15 @@ be silent corruption.
 
 ## Old hardware
 
-The CUDA backend targets **`sm_37` — Kepler, 2014**. Measured by the author on one Tesla
-K80 (both GK210 dies) in a 2-core / 8 GB host: a **35B-A3B hybrid MoE served at 32K–128K
-context**: Qwen3.6-35B-A3B and Nex-N2-mini (Q3_K_M) both decode at ~21 tok/s and prefill
-~110-120 tok/s up to ~8k tokens ([K80 quick start](#qwen36-and-nex-n2-mini-on-a-tesla-k80),
-[supported models](docs/reference/supported-models.md)). On two K80s, Qwen3.6-35B-A3B at **Q8_0** decodes at
-**~33 tok/s at 8k** and ~29 tok/s at 25k ([two-K80 numbers](#qwen36-35b-a3b-q8_0-on-two-k80s)).
+The CUDA backend targets **`sm_37` — Kepler, 2014**. Measured by the author in a 2-core /
+8 GB host:
+
+- **One Tesla K80** (both GK210 dies): a 35B-A3B hybrid MoE at Q3_K_M served at 32K–128K
+  context. Qwen3.6-35B-A3B and Nex-N2-mini decode at ~21 tok/s and prefill ~110-120 tok/s up
+  to ~8k tokens ([K80 quick start](#qwen36-and-nex-n2-mini-on-a-tesla-k80),
+  [supported models](docs/reference/supported-models.md)).
+- **Two Tesla K80s:** Qwen3.6-35B-A3B at **Q8_0** decodes at 33.5-38 tok/s for one user
+  ([numbers below](#qwen36-35b-a3b-q8_0-on-two-k80s)).
 
 Correctness on that path, stated precisely:
 
@@ -101,9 +113,10 @@ an older one. To build a binary you can copy between x86-64 machines, add `PORTA
 (`-march=x86-64-v2`, no AVX). Per-platform details: [`docs/guides/install.md`](docs/guides/install.md).
 
 ```bash
-git clone --recursive https://git.teamide.dev/David/Pantheon.git pantheon
+git clone --recursive https://github.com/dcherrera/Pantheon.git pantheon
 cd pantheon && make USE_BLAS=1 pantheon
 # already cloned without --recursive?  git submodule update --init
+# mirror: https://git.teamide.dev/David/Pantheon.git
 
 hf download bartowski/SmolLM2-135M-Instruct-GGUF \
   SmolLM2-135M-Instruct-Q8_0.gguf --local-dir models/
@@ -124,7 +137,7 @@ Ornith 1.5 9B is the only model supported on Tenstorrent cards for now. On Linux
 Blackhole p150a:
 
 ```bash
-git clone --recursive https://git.teamide.dev/David/Pantheon.git pantheon
+git clone --recursive https://github.com/dcherrera/Pantheon.git pantheon
 cd pantheon && ./install.sh     # build pantheon-tt, set up card access (asks before sudo)
 ./run_ornith.sh                 # download the model (~10 GB, once), serve on 127.0.0.1:8080
 ```
@@ -141,7 +154,7 @@ On Linux with a Tesla K80 and the NVIDIA 470 driver. **Supported K80 models: Qwe
 and Nex-N2-mini (both Q3_K_M), one model per card** (both dies):
 
 ```bash
-git clone --recursive https://git.teamide.dev/David/Pantheon.git pantheon
+git clone --recursive https://github.com/dcherrera/Pantheon.git pantheon
 cd pantheon && ./install.sh --k80   # build pantheon-cuda (no CUDA toolkit needed)
 ./k80_qwen36.sh                     # or ./k80_nexn2.sh; downloads ~17 GB once, serves on 127.0.0.1
 ```
@@ -167,21 +180,30 @@ spot. Options are in each script's header.
 
 ### Qwen3.6-35B-A3B Q8_0 on two K80s
 
-Pantheon Local profile `k80-two-boards`: Qwen3.6-35B-A3B at Q8_0, tensor-parallel across two K80 cards (four dies), in the
-same 2-core / 8 GB host. Measured 2026-11-23 on real agent traffic (tool-call turns, one user, live server):
+Pantheon Local profile `k80-two-boards`: Qwen3.6-35B-A3B at Q8_0, tensor-parallel across two
+K80 cards (four dies), 65,536 context × 4 slots, Q4 KV cache, in the same 2-core / 8 GB host.
 
-| prompt | decode |
-|---|---|
-| 6-9k tokens | 32.9 tok/s |
-| 10-13.5k tokens | 32.0 tok/s |
-| 14-17k tokens | 31.1 tok/s |
-| 18-21.5k tokens | 30.3 tok/s |
-| 22-25.7k tokens | 29.4 tok/s |
+**Real use, measured 2026-11-25** on the live server through real agent traffic (read-only
+code tasks; tool-call turns, so no MTP). Decode tok/s, median per request, one user:
 
-- First token on a fresh prompt: 5k tokens in 23 s, 19k tokens in 101 s (~190-220 tok/s prefill). Follow-up turns only
-  prefill what's new (measured 146-183 tok/s).
-- Requests without a tool grammar use the model's MTP head: 36-39 tok/s at a 3.7k-token prompt (2026-11-19).
-- Four users decoding together: 40-44 tok/s total, 10-11 tok/s each, at 6-29k tokens (2026-11-19).
+| prompt | decode | previous build (2026-11-24) |
+|---|---|---|
+| 6-9k tokens | **38.0** | 33.0 |
+| 10-13.5k tokens | **37.1** | 32.2 |
+| 14-17k tokens | **35.5** | 31.1 |
+| 18-21.5k tokens | **34.7** | 30.3 |
+| 22-25.7k tokens | **33.5** | 29.0 |
+
+- Four agents working together on real tasks: **24.5 tok/s aggregate** over a 20-minute
+  window (previous build: 22.9). Real use stays prefill-bound: each tool turn prefills 1-2k
+  tokens while the others decode, so this sits far below the decode-only figure.
+- First token on a fresh 5k-token prompt: ~21 s (~245 tok/s prefill, 2026-11-24). Follow-up
+  turns only prefill what's new (130-183 tok/s).
+- Requests without a tool grammar use the model's MTP head: 36-39 tok/s at a 3.7k-token
+  prompt (2026-11-19, earlier build).
+- **Bench, not real use** (8k context, locked clocks): 1 slot 35.8 → 39.0
+  tok/s, 4 slots 66.2 → 78.2 tok/s aggregate, from the exact short logits row, the faster
+  top-k and the PCIe staging levers, all on by default (`=0` turns each off).
 
 ## Serving
 
@@ -358,7 +380,8 @@ Pantheon uses **Foundry** for tensor compute, safetensors, tokenization, quantiz
 attention primitives and the CUDA layer. Same author, same license.
 
 In the public repository Foundry is a git submodule at `foundry/`
-([`https://git.teamide.dev/David/Foundry.git`](https://git.teamide.dev/David/Foundry.git)).
+([`https://github.com/dcherrera/Foundry`](https://github.com/dcherrera/Foundry); mirror at
+[`git.teamide.dev/David/Foundry`](https://git.teamide.dev/David/Foundry)).
 The Makefile resolves it as `FOUNDRY=/path`, then `./foundry` (the submodule, or a
 symlink in a development checkout), then `../foundry` (a sibling checkout); if none exists it stops with a message
 saying so rather than a wall of missing headers.

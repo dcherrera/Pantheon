@@ -36,6 +36,7 @@
 #include "pn_tt_core_boot_guard.h"
 #include "pn_tt_dispatch.h"
 #include "pn_tt_grid_marks.h"
+#include "pn_tt_grid_idle.h"
 
 #include "pn_tt_core_list.h"
 #include "pn_tt_grid_msplit.h"
@@ -1577,6 +1578,24 @@ static int pn_tt_group_member_start(pn_tt_device *device, uint32_t member,
 
 /** Stage and KICK one resident matmul triad on `slot`. `grid` = a PHASE G prefill grid core:
  *  no group completion, no post probe, never cooperative, and a B stash CB. */
+/** A grid core's own idle bound (q38-tt-grid-abort): `PN_TT_GRID_IDLE_SPINS` (default the
+ *  decode members' 400M, ~8 s). A gate knob: a stalled host outlasts the default and not
+ *  2,000,000,000 (~40 s), which says the cores' own exit is what the stall reached. */
+static uint32_t pn_tt_grid_idle_spins(void)
+{
+    static uint32_t spins;
+
+    if (spins == 0u) {
+        spins = pn_tt_env_u32("PN_TT_GRID_IDLE_SPINS", PN_TT_IDLE_SPIN_LIMIT);
+        if (spins == 0u)
+            spins = PN_TT_IDLE_SPIN_LIMIT;
+        if (spins != PN_TT_IDLE_SPIN_LIMIT)
+            fprintf(stderr, "pn_tt: prefill grid idle bound %u spins (PN_TT_GRID_IDLE_SPINS)\n",
+                    spins);
+    }
+    return spins;
+}
+
 static int pn_tt_slot_start(pn_tt_device *device, pn_tt_matmul_member *slot, uint32_t member,
                             uint32_t weight_tile_bytes, uint32_t depth, bool grid)
 {
@@ -1654,7 +1673,7 @@ static int pn_tt_slot_start(pn_tt_device *device, pn_tt_matmul_member *slot, uin
         ft_tt_queue_kernel_binding binding;
 
         memset(&binding, 0, sizeof(binding));
-        binding.idle_spin_limit = PN_TT_IDLE_SPIN_LIMIT;
+        binding.idle_spin_limit = grid ? pn_tt_grid_idle_spins() : PN_TT_IDLE_SPIN_LIMIT;
         binding.cb_wait_spin_limit = PN_TT_CB_WAIT_SPIN_LIMIT;
         /* Per-processor status. "The triad is stuck" is not a diagnosis; "NCRISC is in
          * CB_WAIT_FRONT at descriptor 12" is, and only these slots can say it. */
@@ -3651,6 +3670,8 @@ int pn_tt_matmul_grid_begin(pn_tt_device *device)
     group->grid_running = true;
     pn_tt_grid_marks_reset(&group->grid_marks, group->grid_count);
     group->grid_last_mark = PN_TT_GRID_MARK_NONE;
+    /* The cores idle from their start: the guard counts from here. */
+    group->grid_alive_seconds = pn_tt_now_seconds();
     pn_tt_device_telemetry_log(device, "grid started");
     return 0;
 }
@@ -3904,8 +3925,14 @@ static void pn_tt_grid_failure_dump(pn_tt_device *device)
                         proc, status[0], status[1], status[2], status[3], status[4], status[5],
                         status[6], status[7]);
     }
-    fprintf(stderr, "pn_tt: GRID FAIL — %u of %u grid cores not complete or in error\n", shown,
-            group->grid_count);
+    fprintf(stderr, "pn_tt: GRID FAIL — %u of %u grid cores not complete or in error; the last "
+                    "grid descriptor went out %.3f s ago, longest feed gap %.3f s (before "
+                    "projection %llu, %s)\n",
+            shown, group->grid_count,
+            group->grid_alive_seconds > 0.0 ? pn_tt_now_seconds() - group->grid_alive_seconds
+                                            : -1.0,
+            group->grid_longest_gap, (unsigned long long)group->grid_longest_gap_at,
+            group->grid_longest_gap_streamed ? "in a stream" : "quiet");
 }
 
 /** Each grid core's issued count (G.2 marks). */
@@ -3983,11 +4010,22 @@ void pn_tt_matmul_grid_end(pn_tt_device *device)
             (unsigned long long)group->grid_fallbacks,
             (unsigned long long)group->grid_msplit_pieces,
             (unsigned long long)group->grid_unsplit_projections, group->grid_seconds);
+    fprintf(stderr, "pn_tt: prefill grid — longest feed gap %.3f s (before projection %llu, %s), "
+                    "%u idle re-arm(s), %u keepalive NOP round(s)\n",
+            group->grid_longest_gap, (unsigned long long)group->grid_longest_gap_at,
+            group->grid_longest_gap_streamed ? "in a stream" : "quiet",
+            group->grid_idle_rearms, group->grid_keepalive_rounds);
+    group->grid_alive_seconds = 0.0;
+    group->grid_longest_gap = 0.0;
+    group->grid_longest_gap_at = 0u;
+    group->grid_idle_rearms = 0u;
+    group->grid_keepalive_rounds = 0u;
     if (group->grid_mark_waits || group->grid_mark_full)
         fprintf(stderr, "pn_tt: prefill grid — G.2 marks: %llu waits by step, %llu fell back to a "
                         "full wait\n",
                 (unsigned long long)group->grid_mark_waits,
                 (unsigned long long)group->grid_mark_full);
+    pn_tt_dispatch_report_await_retries(device);
     pn_tt_grid_probe_report();
 }
 
@@ -4135,6 +4173,138 @@ static bool pn_tt_grid_marks_enabled(void)
     return cached != 0;
 }
 
+/* ---- GRID IDLE GUARD (pn_tt_grid_idle.h) ------------------------------------------------- */
+
+/** A grid descriptor just went out: book the gap since the last one. */
+static void pn_tt_grid_fed(pn_tt_matmul_group *group)
+{
+    const double now = pn_tt_now_seconds();
+
+    if (group->grid_alive_seconds > 0.0 && now - group->grid_alive_seconds > group->grid_longest_gap) {
+        group->grid_longest_gap = now - group->grid_alive_seconds;
+        group->grid_longest_gap_at = group->grid_projections;
+        group->grid_longest_gap_streamed = !pn_tt_dispatch_quiet();
+    }
+    group->grid_alive_seconds = now;
+}
+
+static double pn_tt_grid_idle_seconds(const pn_tt_matmul_group *group)
+{
+    return group->grid_alive_seconds > 0.0 ? pn_tt_now_seconds() - group->grid_alive_seconds
+                                           : -1.0;
+}
+
+static double pn_tt_grid_idle_limit_seconds(void)
+{
+    return pn_tt_red("grid_idle_guard_off")
+               ? 0.0
+               : (double)pn_tt_residency_idle_retire_limit_ms() / 1000.0;
+}
+
+/**
+ * The grid sat idle near its cores' own exit: everything it was given is waited for, every
+ * core is stopped by ASKING (one that already idled out has exited and answers at once) and
+ * started fresh on its booted firmware, as pn_tt_matmul_grid_begin starts it. Quiet only (no
+ * stream open). The same descriptors follow on the same cores: bit-identical.
+ */
+static int pn_tt_grid_idle_rearm(pn_tt_device *device, double idle)
+{
+    pn_tt_matmul_group *group = &device->group;
+    const double from = pn_tt_now_seconds();
+    int rc = pn_tt_grid_flush(device);
+
+    group->grid_detached = 0u;
+    if (rc != FT_TT_OK) {
+        fprintf(stderr, "pn_tt: grid idle %.1f s — its outstanding work did not complete, so it "
+                        "cannot be re-armed exactly\n", idle);
+        return rc;
+    }
+    for (uint32_t i = 0; i < group->grid_count; i++) {
+        pn_tt_matmul_member *slot = &group->grid[i];
+
+        pn_tt_group_member_stop(device, slot);
+        if (!pn_tt_slot_exited(device, slot) ||
+            pn_tt_slot_start(device, slot, i, device->resident_tile_bytes,
+                             device->resident_depth, true) != FT_TT_OK) {
+            fprintf(stderr, "pn_tt: grid idle %.1f s — core %u did not re-arm\n", idle,
+                    slot->core_index);
+            return FT_TT_EIO;
+        }
+        slot->running = true;
+        pn_tt_dispatch_stream_queue_rearmed(slot->queue->x, slot->queue->y);
+    }
+    pn_tt_grid_marks_reset(&group->grid_marks, group->grid_count);
+    group->grid_last_mark = PN_TT_GRID_MARK_NONE;
+    group->grid_ring = 0u;
+    group->grid_idle_rearms++;
+    group->grid_alive_seconds = pn_tt_now_seconds();
+    fprintf(stderr, "pn_tt: prefill grid idle %.1f s (limit %.0f ms) — %u cores stopped by ASKING "
+                    "and re-armed in %.3f s, before a descriptor can reach a half-exited triad\n",
+            idle, pn_tt_grid_idle_limit_seconds() * 1000.0, group->grid_count,
+            pn_tt_now_seconds() - from);
+    return FT_TT_OK;
+}
+
+/** The guard at an issue: re-arm a grid idle past the limit (quiet), else only say so. */
+static int pn_tt_grid_idle_guard(pn_tt_device *device)
+{
+    pn_tt_matmul_group *group = &device->group;
+    const double idle = pn_tt_grid_idle_seconds(group);
+
+    if (pn_tt_grid_idle_decide(idle, 0.0, pn_tt_grid_idle_limit_seconds(), false) !=
+        PN_TT_GRID_IDLE_REARM)
+        return FT_TT_OK;
+    if (!pn_tt_dispatch_quiet() || group->chained != 0u) {
+        fprintf(stderr, "pn_tt: prefill grid idle %.1f s inside a stream or a chain — not "
+                        "re-armed here\n", idle);
+        return FT_TT_OK;
+    }
+    return pn_tt_grid_idle_rearm(device, idle);
+}
+
+int pn_tt_matmul_grid_keepalive(pn_tt_device *device, double min_idle_seconds)
+{
+    pn_tt_matmul_group *group;
+    double idle;
+    uint32_t sent = 0u;
+
+    if (!device)
+        return 0;
+    group = &device->group;
+    if (!group->grid_running || !pn_tt_dispatch_quiet() || group->chained != 0u ||
+        group->grid_detached != 0u)
+        return 0;
+    idle = pn_tt_grid_idle_seconds(group);
+    switch (pn_tt_grid_idle_decide(idle, min_idle_seconds, pn_tt_grid_idle_limit_seconds(),
+                                   true)) {
+    case PN_TT_GRID_IDLE_REARM:
+        return pn_tt_grid_idle_rearm(device, idle) == FT_TT_OK ? 0 : -1;
+    case PN_TT_GRID_IDLE_NOP:
+        break;
+    default:
+        return 0;
+    }
+    for (uint32_t i = 0; i < group->grid_count; i++) {
+        pn_tt_matmul_member *slot = &group->grid[i];
+        ft_tt_queue_descriptor descriptor;
+
+        if (!slot->running)
+            continue;
+        memset(&descriptor, 0, sizeof(descriptor));
+        descriptor.opcode = FT_TT_QUEUE_OP_NOP;
+        if (ft_tt_queue_stage(pn_tt_issue_access(&device->runtime, group->issue_shape),
+                              slot->queue, &descriptor, 1u) != FT_TT_OK ||
+            ft_tt_queue_publish(&device->runtime.noc, slot->queue) != FT_TT_OK)
+            return -1;
+        group->grid_pending[i] = true;
+        sent++;
+    }
+    pn_tt_grid_fed(group);
+    group->grid_keepalive_rounds++;
+    /* Waited like any grid work, so the marks and the ring stay exact. */
+    return pn_tt_grid_flush(device) == FT_TT_OK ? (int)sent : -1;
+}
+
 /**
  * Room in the grid's rings for `depth` more descriptors a core. The rings hold 8; a chain longer
  * than 6 is flushed first. Detached projections (PHASE W2) count against the same ring, and so
@@ -4144,8 +4314,10 @@ static bool pn_tt_grid_marks_enabled(void)
 static int pn_tt_grid_room(pn_tt_device *device, uint32_t depth)
 {
     pn_tt_matmul_group *group = &device->group;
-    int rc;
+    int rc = pn_tt_grid_idle_guard(device);
 
+    if (rc != FT_TT_OK)
+        return rc;
     if (group->chained + group->grid_detached < 6u && group->grid_ring + depth <= 6u)
         return FT_TT_OK;
     if (group->chained == 0u && pn_tt_grid_marks_enabled()) {
@@ -4272,6 +4444,7 @@ static int pn_tt_grid_issue(pn_tt_device *device, const pn_tt_weight *weight,
         group->chained++;
         group->grid_ring += depth;
         pn_tt_grid_marks_issued(&group->grid_marks, depth, false);
+        pn_tt_grid_fed(group);
     }
     return rc;
 }
@@ -4317,6 +4490,7 @@ static int pn_tt_grid_issue_unsplit(pn_tt_device *device, const pn_tt_weight *we
         group->chained++;
     group->grid_ring += 1u;
     pn_tt_grid_marks_issued(&group->grid_marks, 1u, detached);
+    pn_tt_grid_fed(group);
     return FT_TT_OK;
 }
 
@@ -4367,6 +4541,7 @@ int pn_tt_matmul_grid_issue_detached(pn_tt_device *device, const pn_tt_weight *w
         group->grid_ring += depth;
         pn_tt_grid_marks_issued(&group->grid_marks, depth, true);
         pn_tt_grid_mark_push(group);
+        pn_tt_grid_fed(group);
     }
     return rc;
 }
